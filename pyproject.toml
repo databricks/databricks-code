@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbx-code"
+version = "0.1.0"
+description = "Bootstrap Codex against a Databricks workspace with minimal setup."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "databricks-sql-connector>=3.6.0",
+]
+
+[project.scripts]
+dbx-code = "dbx_code.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
