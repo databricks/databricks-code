@@ -5,7 +5,7 @@ from setuptools.command.install import install
 
 def _run_bootstrap():
     try:
-        from dbx_code.bootstrap import main as bootstrap_main
+        from databricks_code.bootstrap import main as bootstrap_main
 
         bootstrap_main()
     except Exception:

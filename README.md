@@ -1,25 +1,25 @@
-# dbx-code
+# databricks-code
 
-`dbx-code` is a lightweight launcher for running Codex, Claude Code, and Gemini CLI through Databricks.
+`databricks-code` is a lightweight launcher for running Codex, Claude Code, and Gemini CLI through Databricks.
 
 It is designed for a simple setup flow:
 
 ```bash
 git clone <repo-url>
-cd dbx-code
+cd databricks-code
 pip install .
-dbx-code
+databricks-code
 ```
 
-On first run, `dbx-code` handles local bootstrap, prompts for your Databricks workspace, configures the selected coding tool, and launches it.
+On first run, `databricks-code` handles local bootstrap, prompts for your Databricks workspace, configures the selected coding tool, and launches it.
 
-## Why dbx-code
+## Why databricks-code
 
 - Minimal setup for Databricks-backed coding tools
 - One workspace configuration shared across Codex, Claude Code, and Gemini CLI
 - Automatic Databricks authentication handoff
-- Managed local config files with restore support through `dbx-code logout`
-- Built-in AI Gateway usage reporting with `dbx-code usage`
+- Managed local config files with restore support through `databricks-code logout`
+- Built-in AI Gateway usage reporting with `databricks-code usage`
 
 ## Supported Tools
 
@@ -33,12 +33,12 @@ Install and launch:
 
 ```bash
 git clone <repo-url>
-cd dbx-code
+cd databricks-code
 pip install .
-dbx-code
+databricks-code
 ```
 
-On first launch, `dbx-code` will:
+On first launch, `databricks-code` will:
 
 1. Install missing local dependencies it manages:
    `databricks`, `codex`, `claude`, `gemini`
@@ -51,10 +51,10 @@ On first launch, `dbx-code` will:
 After setup, normal usage is simple:
 
 ```bash
-dbx-code
-dbx-code --tool codex
-dbx-code --tool claude
-dbx-code --tool gemini
+databricks-code
+databricks-code --tool codex
+databricks-code --tool claude
+databricks-code --tool gemini
 ```
 
 ## Configuration
@@ -62,7 +62,7 @@ dbx-code --tool gemini
 Use `configure` to update workspace settings or saved models:
 
 ```bash
-dbx-code configure
+databricks-code configure
 ```
 
 The interactive flow supports:
@@ -75,8 +75,8 @@ The interactive flow supports:
 Examples:
 
 ```bash
-dbx-code --tool claude --model databricks-claude-opus-4-6
-dbx-code --tool gemini --model databricks-gemini-2-5-pro
+databricks-code --tool claude --model databricks-claude-opus-4-6
+databricks-code --tool gemini --model databricks-gemini-2-5-pro
 ```
 
 Notes:
@@ -88,10 +88,10 @@ Notes:
 ## Commands
 
 ```bash
-dbx-code configure
-dbx-code status
-dbx-code usage
-dbx-code logout
+databricks-code configure
+databricks-code status
+databricks-code usage
+databricks-code logout
 ```
 
 - `configure`
@@ -106,7 +106,7 @@ dbx-code logout
 ## Usage Reporting
 
 ```bash
-dbx-code usage
+databricks-code usage
 ```
 
 `usage` requires Databricks AI Gateway V2. When enabled, it queries `system.ai_gateway.usage` and shows:
@@ -116,25 +116,25 @@ dbx-code usage
 - top models this week
 - a 7-day breakdown for Codex, Claude Code, and Gemini CLI
 
-If the workspace is not configured for AI Gateway V2, `dbx-code usage` will stop early and tell you to re-run `dbx-code configure`.
+If the workspace is not configured for AI Gateway V2, `databricks-code usage` will stop early and tell you to re-run `databricks-code configure`.
 
 ## Managed Local Files
 
-`dbx-code` manages these local files:
+`databricks-code` manages these local files:
 
 - `~/.codex/config.toml`
 - `~/.claude/settings.json`
 - `~/.gemini/.env`
 
-If one of these files already exists, `dbx-code` creates a backup before writing its managed version. `dbx-code logout` restores the backup.
+If one of these files already exists, `databricks-code` creates a backup before writing its managed version. `databricks-code logout` restores the backup.
 
 ## Authentication
 
 - Databricks authentication always uses the workspace URL you configured
 - If AI Gateway V2 is enabled, tool base URLs point to the AI Gateway hostname while authentication still uses the original workspace URL
 - Codex and Claude use a Databricks token helper instead of storing a fixed token
-- Gemini refreshes its Databricks bearer token automatically while launched through `dbx-code`
-- `dbx-code usage` fetches a fresh Databricks token on each run
+- Gemini refreshes its Databricks bearer token automatically while launched through `databricks-code`
+- `databricks-code usage` fetches a fresh Databricks token on each run
 
 ## Documentation
 
