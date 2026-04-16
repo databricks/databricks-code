@@ -7,7 +7,7 @@ name = "databricks-code"
 version = "0.1.0"
 description = "Bootstrap Codex against a Databricks workspace with minimal setup."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
   "databricks-sql-connector>=3.6.0",
 ]

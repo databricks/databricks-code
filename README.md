@@ -7,7 +7,7 @@ It is designed for a simple setup flow:
 ```bash
 git clone <repo-url>
 cd databricks-code
-pip install .
+pipx install .
 databricks-code
 ```
 
@@ -34,7 +34,7 @@ Install and launch:
 ```bash
 git clone <repo-url>
 cd databricks-code
-pip install .
+pipx install .
 databricks-code
 ```
 
@@ -145,7 +145,7 @@ If one of these files already exists, `databricks-code` creates a backup before 
 
 ## Requirements
 
-- Python 3.9+
-- `pip`
+- Python 3.12+
+- `pipx` (recommended) or `pip`
 - `npm` if tool CLIs need to be installed automatically
 
