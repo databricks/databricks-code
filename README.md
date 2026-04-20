@@ -17,15 +17,15 @@ On first run, `databricks-code` handles local bootstrap, prompts for your Databr
 
 - Minimal setup for Databricks-backed coding tools
 - One workspace configuration shared across Codex, Claude Code, and Gemini CLI
-- Automatic Databricks authentication handoff
+- Oauth Databricks authentication support
 - Managed local config files with restore support through `databricks-code logout`
 - Built-in AI Gateway usage reporting with `databricks-code usage`
 
 ## Supported Tools
 
 - Codex
-- Claude Code
 - Gemini CLI
+- Claude Code
 
 ## Quick Start
 
