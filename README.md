@@ -1,11 +1,11 @@
-# databricks-code
+# Databricks Code
 
 `databricks-code` is a lightweight launcher for running Codex, Claude Code, and Gemini CLI through Databricks.
 
 It is designed for a simple setup flow:
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/databricks/databricks-code.git
 cd databricks-code
 pipx install .
 databricks-code
@@ -13,7 +13,7 @@ databricks-code
 
 On first run, `databricks-code` handles local bootstrap, prompts for your Databricks workspace, configures the selected coding tool, and launches it.
 
-## Why databricks-code
+## Why Databricks Code
 
 - Minimal setup for Databricks-backed coding tools
 - One workspace configuration shared across Codex, Claude Code, and Gemini CLI
@@ -32,7 +32,7 @@ On first run, `databricks-code` handles local bootstrap, prompts for your Databr
 Install and launch:
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/databricks/databricks-code.git
 cd databricks-code
 pipx install .
 databricks-code
@@ -149,3 +149,14 @@ If one of these files already exists, `databricks-code` creates a backup before 
 - `pipx` (recommended) or `pip`
 - `npm` if tool CLIs need to be installed automatically
 
+## Contributing
+
+Contributions are welcome. Fork the repo, create a feature branch, and open a pull request against `main`.
+
+## Security
+
+Please report security vulnerabilities to security@databricks.com rather than opening a public issue.
+
+## License
+
+See [LICENSE.md](./LICENSE.md) and [NOTICE.md](./NOTICE.md).
