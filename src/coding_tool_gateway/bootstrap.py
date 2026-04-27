@@ -1,8 +1,8 @@
-"""Best-effort runtime/bootstrap installer for databricks-code dependencies."""
+"""Best-effort runtime/bootstrap installer for coding-tool-gateway dependencies."""
 
 from __future__ import annotations
 
-from databricks_code.cli import TOOL_SPECS, ensure_bootstrap_dependencies, print_err
+from coding_tool_gateway.cli import TOOL_SPECS, ensure_bootstrap_dependencies, print_err
 
 
 def main() -> int:
@@ -10,7 +10,7 @@ def main() -> int:
         for tool in TOOL_SPECS:
             ensure_bootstrap_dependencies(tool)
     except RuntimeError as exc:
-        print_err(f"databricks-code bootstrap failed: {exc}")
+        print_err(f"coding-tool-gateway bootstrap failed: {exc}")
         return 1
     return 0
 

@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "databricks-code"
+name = "coding-tool-gateway"
 version = "0.1.0"
 description = "Bootstrap Codex against a Databricks workspace with minimal setup."
 readme = "README.md"
@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-databricks-code = "databricks_code.cli:main"
+coding-tool-gateway = "coding_tool_gateway.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
