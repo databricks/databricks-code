@@ -1,4 +1,4 @@
-# Databricks Code
+# Coding Tool Gateway
 
 `databricks-code` is a lightweight launcher for running Codex, Claude Code, and Gemini CLI through Databricks.
 
@@ -13,7 +13,7 @@ databricks-code
 
 On first run, `databricks-code` handles local bootstrap, prompts for your Databricks workspace, configures the selected coding tool, and launches it.
 
-## Why Databricks Code
+## Why Coding Tool Gateway
 
 - Minimal setup for Databricks-backed coding tools
 - One workspace configuration shared across Codex, Claude Code, and Gemini CLI
