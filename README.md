@@ -1,6 +1,6 @@
-# Coding Tool Gateway
+# Coding Gateway
 
-`coding-tool-gateway` is a lightweight launcher for running Codex, Claude Code, and Gemini CLI through Databricks.
+`coding-gateway` is a lightweight launcher for running Codex, Claude Code, and Gemini CLI through Databricks.
 
 ## Requirements
 
@@ -11,8 +11,8 @@
 ## Installation
 
 ```bash
-git clone https://github.com/databricks/coding-tool-gateway.git
-cd coding-tool-gateway
+git clone https://github.com/databricks/coding-gateway.git
+cd coding-gateway
 pipx install .
 ```
 
@@ -25,7 +25,7 @@ Admins configure a workspace once and export a portable config bundle that users
 ### 1. Configure the workspace
 
 ```bash
-coding-tool-gateway configure
+coding-gateway configure
 ```
 
 The interactive flow lets you:
@@ -39,7 +39,7 @@ This writes managed config files for all three tools (`~/.codex/config.toml`, `~
 ### 2. Configure MCP servers (optional)
 
 ```bash
-coding-tool-gateway configure mcp
+coding-gateway configure mcp
 ```
 
 Add Databricks MCP servers to Claude Code. Supported server types:
@@ -54,7 +54,7 @@ You will be prompted for OAuth credentials (client ID and secret) that are reuse
 ### 3. Export a config bundle
 
 ```bash
-coding-tool-gateway export config.json
+coding-gateway export config.json
 ```
 
 This saves your workspace URL, AI Gateway settings, selected models, and MCP servers into a single JSON file. Distribute this file to your users.
@@ -68,15 +68,15 @@ Users import a config bundle provided by their admin to get set up in one step.
 ### 1. Install
 
 ```bash
-git clone https://github.com/databricks/coding-tool-gateway.git
-cd coding-tool-gateway
+git clone https://github.com/databricks/coding-gateway.git
+cd coding-gateway
 pipx install .
 ```
 
 ### 2. Import the config bundle
 
 ```bash
-coding-tool-gateway import config.json
+coding-gateway import config.json
 ```
 
 This will:
@@ -88,16 +88,16 @@ This will:
 ### 3. Launch a tool
 
 ```bash
-coding-tool-gateway                    # launches Codex (default)
-coding-tool-gateway --tool claude
-coding-tool-gateway --tool gemini
+coding-gateway                    # launches Codex (default)
+coding-gateway --tool claude
+coding-gateway --tool gemini
 ```
 
 You can override the model at launch time:
 
 ```bash
-coding-tool-gateway --tool claude --model databricks-claude-opus-4-6
-coding-tool-gateway --tool gemini --model databricks-gemini-2-5-pro
+coding-gateway --tool claude --model databricks-claude-opus-4-6
+coding-gateway --tool gemini --model databricks-gemini-2-5-pro
 ```
 
 ---
@@ -106,14 +106,14 @@ coding-tool-gateway --tool gemini --model databricks-gemini-2-5-pro
 
 | Command | Description |
 |---------|-------------|
-| `coding-tool-gateway status` | Show current workspace, base URLs, managed config files, and selected models |
-| `coding-tool-gateway usage` | Show AI Gateway usage summary (requires AI Gateway V2) |
-| `coding-tool-gateway logout` | Clear saved state and restore backed-up config files |
+| `coding-gateway status` | Show current workspace, base URLs, managed config files, and selected models |
+| `coding-gateway usage` | Show AI Gateway usage summary (requires AI Gateway V2) |
+| `coding-gateway logout` | Clear saved state and restore backed-up config files |
 
 ## Usage Reporting
 
 ```bash
-coding-tool-gateway usage
+coding-gateway usage
 ```
 
 Requires Databricks AI Gateway V2. Queries `system.ai_gateway.usage` and shows:
@@ -124,7 +124,7 @@ Requires Databricks AI Gateway V2. Queries `system.ai_gateway.usage` and shows:
 
 ## Managed Local Files
 
-`coding-tool-gateway` manages these files:
+`coding-gateway` manages these files:
 
 | File | Tool |
 |------|------|
@@ -132,13 +132,13 @@ Requires Databricks AI Gateway V2. Queries `system.ai_gateway.usage` and shows:
 | `~/.claude/settings.json` | Claude Code |
 | `~/.gemini/.env` | Gemini CLI |
 
-Existing files are backed up before being overwritten. `coding-tool-gateway logout` restores backups.
+Existing files are backed up before being overwritten. `coding-gateway logout` restores backups.
 
 ## Authentication
 
 - Databricks authentication uses OAuth via `databricks auth login`
 - Codex and Claude use a Databricks token helper (no fixed token stored)
-- Gemini refreshes its bearer token automatically while running through `coding-tool-gateway`
+- Gemini refreshes its bearer token automatically while running through `coding-gateway`
 - When AI Gateway V2 is enabled, tool base URLs point to the AI Gateway hostname while auth still uses the original workspace URL
 
 ## Documentation

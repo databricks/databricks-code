@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entry point for coding-tool-gateway."""
+"""CLI entry point for coding-gateway."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from urllib import request as urllib_request
 from urllib.parse import urlparse
 
 
-APP_DIR = Path.home() / ".coding-tool-gateway"
+APP_DIR = Path.home() / ".coding-gateway"
 STATE_PATH = APP_DIR / "state.json"
 
 CODEX_CONFIG_DIR = Path.home() / ".codex"
@@ -1145,7 +1145,7 @@ def render_codex_config(workspace: str, use_ai_gateway_v2: bool, org_id: str | N
     auth_command = build_auth_shell_command(workspace)
     base_url = build_tool_base_url("codex", workspace, use_ai_gateway_v2, org_id)
     return (
-        "# Managed by coding-tool-gateway. Run `coding-tool-gateway logout` to restore the prior config.\n"
+        "# Managed by coding-gateway. Run `coding-gateway logout` to restore the prior config.\n"
         'profile = "default"\n'
         "\n"
         "[profiles.default]\n"
@@ -1192,7 +1192,7 @@ def render_gemini_env(
 ) -> str:
     base_url = build_tool_base_url("gemini", workspace, use_ai_gateway_v2, org_id)
     return (
-        "# Managed by coding-tool-gateway. Run `coding-tool-gateway logout` to restore the prior config.\n"
+        "# Managed by coding-gateway. Run `coding-gateway logout` to restore the prior config.\n"
         f'GEMINI_MODEL="{model}"\n'
         f'GOOGLE_GEMINI_BASE_URL="{base_url}"\n'
         'GEMINI_API_KEY_AUTH_MECHANISM="bearer"\n'
@@ -1281,7 +1281,7 @@ def prompt_for_client_secret() -> str:
 
 
 def prompt_for_configuration(tool: str | None = None) -> tuple[str, bool, str | None]:
-    print_section("coding-tool-gateway Setup")
+    print_section("coding-gateway Setup")
     if tool is None:
         print_note("This will configure your Databricks workspace for all supported tools.")
     else:
@@ -1481,7 +1481,7 @@ def configure_model_for_tool(tool: str, model: str | None) -> int:
     print_kv("Base URL", state["base_urls"][tool])
     print_kv("Config file", str(TOOL_SPECS[tool]["config_path"]))
     print_success(f"{TOOL_SPECS[tool]['display']} model configuration saved")
-    print_note(f"Launch via `coding-tool-gateway --tool {tool}`.")
+    print_note(f"Launch via `coding-gateway --tool {tool}`.")
     return 0
 
 
@@ -1515,7 +1515,7 @@ def configure_mcp_command() -> int:
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError(
-            "Workspace is not configured. Run `coding-tool-gateway configure` first."
+            "Workspace is not configured. Run `coding-gateway configure` first."
         )
 
     if not shutil.which("claude"):
@@ -1650,11 +1650,11 @@ def usage() -> int:
     state = load_state()
     workspace = state.get("workspace")
     if not workspace:
-        raise RuntimeError("Workspace is not configured. Run `coding-tool-gateway configure` first.")
+        raise RuntimeError("Workspace is not configured. Run `coding-gateway configure` first.")
     if not bool(state.get("use_ai_gateway_v2")):
         raise RuntimeError(
             "Usage summary requires Databricks AI Gateway V2. "
-            f"Run `coding-tool-gateway configure`, enable AI Gateway V2, then try again. Docs: {AI_GATEWAY_V2_DOCS_URL}"
+            f"Run `coding-gateway configure`, enable AI Gateway V2, then try again. Docs: {AI_GATEWAY_V2_DOCS_URL}"
         )
 
     ensure_databricks_auth(workspace)
@@ -1746,7 +1746,7 @@ def status() -> int:
     managed_configs = state.get("managed_configs") or {}
     selected_models = state.get("selected_models") or {}
 
-    print(heading("coding-tool-gateway Status"))
+    print(heading("coding-gateway Status"))
     print()
     print(
         f"  {status_badge('Configured', 'ok') if workspace else status_badge('Not Configured', 'warn')}"
@@ -1783,13 +1783,13 @@ def status() -> int:
 
     print_section("MCP Servers (Claude Code)")
     print_note("Run `claude mcp list` to see configured MCP servers.")
-    print_note("Run `coding-tool-gateway configure mcp` to add Databricks MCP servers.")
+    print_note("Run `coding-gateway configure mcp` to add Databricks MCP servers.")
 
     print_section("State")
     print_kv("State file", str(STATE_PATH) if STATE_PATH.exists() else "missing")
-    print_note("Use `coding-tool-gateway configure` to update workspace settings or tool models.")
-    print_note("Use `coding-tool-gateway configure mcp` to add Databricks MCP servers to Claude Code.")
-    print_note("Use `coding-tool-gateway logout` to clear managed configs and restore prior files.")
+    print_note("Use `coding-gateway configure` to update workspace settings or tool models.")
+    print_note("Use `coding-gateway configure mcp` to add Databricks MCP servers to Claude Code.")
+    print_note("Use `coding-gateway logout` to clear managed configs and restore prior files.")
     return 0
 
 
@@ -1813,34 +1813,34 @@ def logout() -> int:
     print_kv("Codex config", "restored" if codex_restored else "unchanged")
     print_kv("Claude config", "restored" if claude_restored else "unchanged")
     print_kv("Gemini config", "restored" if gemini_restored else "unchanged")
-    print_success("coding-tool-gateway state cleared")
+    print_success("coding-gateway state cleared")
     return 0
 
 
 def print_help() -> None:
-    print(heading("coding-tool-gateway"))
+    print(heading("coding-gateway"))
     print(muted("Databricks-backed Codex, Claude Code, and Gemini bootstrap"))
     print()
     print(label("Commands"))
-    print(f"  {value('coding-tool-gateway')} {muted('[--tool codex|claude|gemini] [--model MODEL] [tool-args...]')}")
+    print(f"  {value('coding-gateway')} {muted('[--tool codex|claude|gemini] [--model MODEL] [tool-args...]')}")
     print("    Launch the selected tool using the saved workspace configuration.")
-    print(f"  {value('coding-tool-gateway configure')}")
+    print(f"  {value('coding-gateway configure')}")
     print("    Interactively configure workspace settings or Claude/Gemini model selection.")
-    print(f"  {value('coding-tool-gateway configure mcp')}")
+    print(f"  {value('coding-gateway configure mcp')}")
     print("    Add Databricks MCP servers to Claude Code (external, UC Functions, Genie).")
-    print(f"  {value('coding-tool-gateway status')}")
+    print(f"  {value('coding-gateway status')}")
     print("    Show the current workspace, tool configs, and saved model selections.")
-    print(f"  {value('coding-tool-gateway usage')}")
+    print(f"  {value('coding-gateway usage')}")
     print("    Show a fixed Databricks AI Gateway usage summary for the saved AI Gateway V2 workspace.")
-    print(f"  {value('coding-tool-gateway logout')}")
-    print("    Clear coding-tool-gateway state and restore any backed-up tool config files.")
+    print(f"  {value('coding-gateway logout')}")
+    print("    Clear coding-gateway state and restore any backed-up tool config files.")
     print()
     print(label("Behavior"))
-    print_note("On first run, coding-tool-gateway prompts for your Databricks workspace settings.")
-    print_note("`coding-tool-gateway configure` lets you choose whether to configure workspace settings or tool models.")
+    print_note("On first run, coding-gateway prompts for your Databricks workspace settings.")
+    print_note("`coding-gateway configure` lets you choose whether to configure workspace settings or tool models.")
     print_note("Normal launches use the saved or explicit model and do not do interactive model discovery.")
-    print_note("`coding-tool-gateway usage` fetches a fresh Databricks token each time, so expired one-hour tokens are handled automatically.")
-    print_note("`coding-tool-gateway usage` shows a fixed last-7-days breakdown for Codex, Claude Code, and Gemini CLI.")
+    print_note("`coding-gateway usage` fetches a fresh Databricks token each time, so expired one-hour tokens are handled automatically.")
+    print_note("`coding-gateway usage` shows a fixed last-7-days breakdown for Codex, Claude Code, and Gemini CLI.")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
