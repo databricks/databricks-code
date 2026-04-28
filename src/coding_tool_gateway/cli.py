@@ -1260,6 +1260,26 @@ def prompt_for_org_id() -> str:
         print_err("Workspace ID/org ID cannot be empty.")
 
 
+def prompt_for_client_id() -> str:
+    while True:
+        client_id = input(
+            f"{label('OAuth client ID')} {muted('›')} "
+        ).strip()
+        if client_id:
+            return client_id
+        print_err("Client ID cannot be empty.")
+
+
+def prompt_for_client_secret() -> str:
+    while True:
+        client_secret = input(
+            f"{label('OAuth client secret')} {muted('›')} "
+        ).strip()
+        if client_secret:
+            return client_secret
+        print_err("Client secret cannot be empty.")
+
+
 def prompt_for_configuration(tool: str | None = None) -> tuple[str, bool, str | None]:
     print_section("coding-tool-gateway Setup")
     if tool is None:
@@ -1465,6 +1485,132 @@ def configure_model_for_tool(tool: str, model: str | None) -> int:
     return 0
 
 
+def build_mcp_http_entry(url: str, client_id: str, callback_port: int = 8080) -> dict:
+    return {
+        "type": "http",
+        "url": url,
+        "oauth": {
+            "clientId": client_id,
+            "callbackPort": callback_port,
+        },
+    }
+
+
+def add_claude_mcp_server(name: str, entry: dict, client_secret: str) -> None:
+    env = os.environ.copy()
+    env["MCP_CLIENT_SECRET"] = client_secret
+    try:
+        run(
+            ["claude", "mcp", "add-json", name, json.dumps(entry),
+             "--client-secret"],
+            env=env,
+            timeout=30,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Failed to add MCP server '{name}' via claude CLI.") from exc
+
+
+def configure_mcp_command() -> int:
+    state = load_state()
+    workspace = state.get("workspace")
+    if not workspace:
+        raise RuntimeError(
+            "Workspace is not configured. Run `coding-tool-gateway configure` first."
+        )
+
+    if not shutil.which("claude"):
+        raise RuntimeError(
+            "`claude` CLI is not installed. Install it with: npm install -g @anthropic-ai/claude-code"
+        )
+
+    ensure_databricks_auth(workspace)
+
+    print_section("MCP Server Configuration")
+    print_note("Configure Claude Code to connect to Databricks MCP servers.")
+    print_note(f"Workspace: {workspace}")
+
+    print()
+    print(label("OAuth Credentials"))
+    print_note("These will be used for all MCP servers added in this session.")
+    client_id = prompt_for_client_id()
+    client_secret = prompt_for_client_secret()
+
+    added: list[str] = []
+
+    while True:
+        print()
+        selection = prompt_for_choice(
+            "Add MCP Server",
+            "Select server type",
+            [
+                ("external", "External MCP server (e.g. confluence-mcp, jira-mcp)"),
+                ("uc-functions", "UC Functions (Unity Catalog AI functions)"),
+                ("genie", "Genie (AI/BI dashboard)"),
+                ("custom", "Custom MCP server URL"),
+                ("done", "Done — exit"),
+            ],
+        )
+
+        if selection == "done":
+            break
+
+        if selection == "external":
+            server_name = input(
+                f"  {label('MCP server name')} {muted('(e.g. confluence-mcp, jira-mcp)')} {muted('›')} "
+            ).strip()
+            if not server_name:
+                print_err("Server name cannot be empty.")
+                continue
+            url = f"{workspace}/api/2.0/mcp/external/{server_name}"
+            entry_name = server_name
+
+        elif selection == "uc-functions":
+            catalog = input(f"  {label('Catalog name')} {muted('›')} ").strip()
+            schema = input(f"  {label('Schema name')} {muted('›')} ").strip()
+            if not catalog or not schema:
+                print_err("Catalog and schema cannot be empty.")
+                continue
+            url = f"{workspace}/api/2.0/mcp/functions/{catalog}/{schema}"
+            entry_name = f"databricks-uc-{catalog}-{schema}"
+
+        elif selection == "genie":
+            space_id = input(f"  {label('Genie space ID')} {muted('›')} ").strip()
+            if not space_id:
+                print_err("Space ID cannot be empty.")
+                continue
+            url = f"{workspace}/api/2.0/mcp/genie/{space_id}"
+            entry_name = f"databricks-genie-{space_id}"
+
+        elif selection == "custom":
+            url = input(f"  {label('Full MCP server URL')} {muted('›')} ").strip()
+            if not url:
+                print_err("URL cannot be empty.")
+                continue
+            entry_name = input(f"  {label('Server name')} {muted('›')} ").strip()
+            if not entry_name:
+                print_err("Server name cannot be empty.")
+                continue
+
+        else:
+            continue
+
+        entry = build_mcp_http_entry(url, client_id)
+        add_claude_mcp_server(entry_name, entry, client_secret)
+        added.append(entry_name)
+        print_success(f"Added {entry_name}")
+
+    if not added:
+        print_note("No MCP servers added.")
+        return 0
+
+    print_section("MCP Configured")
+    for name in added:
+        print(f"  {success_text('●')} {value(name)}")
+    print_success("MCP servers registered via `claude mcp add-json`")
+    print_note("Run `claude mcp list` to see all configured servers.")
+    return 0
+
+
 def configure_command() -> int:
     selection = prompt_for_choice(
         "Configure",
@@ -1472,11 +1618,15 @@ def configure_command() -> int:
         [
             ("workspace", "Workspace"),
             ("models", "Models"),
+            ("mcp", "MCP servers (Claude Code)"),
         ],
     )
 
     if selection == "workspace":
         return configure_workspace_command()
+
+    if selection == "mcp":
+        return configure_mcp_command()
 
     tool = prompt_for_choice(
         "Model Configuration",
@@ -1631,9 +1781,14 @@ def status() -> int:
         print_kv("Config file", str(config_path) if config_path.exists() else "missing")
         print()
 
+    print_section("MCP Servers (Claude Code)")
+    print_note("Run `claude mcp list` to see configured MCP servers.")
+    print_note("Run `coding-tool-gateway configure mcp` to add Databricks MCP servers.")
+
     print_section("State")
     print_kv("State file", str(STATE_PATH) if STATE_PATH.exists() else "missing")
     print_note("Use `coding-tool-gateway configure` to update workspace settings or tool models.")
+    print_note("Use `coding-tool-gateway configure mcp` to add Databricks MCP servers to Claude Code.")
     print_note("Use `coding-tool-gateway logout` to clear managed configs and restore prior files.")
     return 0
 
@@ -1671,6 +1826,8 @@ def print_help() -> None:
     print("    Launch the selected tool using the saved workspace configuration.")
     print(f"  {value('coding-tool-gateway configure')}")
     print("    Interactively configure workspace settings or Claude/Gemini model selection.")
+    print(f"  {value('coding-tool-gateway configure mcp')}")
+    print("    Add Databricks MCP servers to Claude Code (external, UC Functions, Genie).")
     print(f"  {value('coding-tool-gateway status')}")
     print("    Show the current workspace, tool configs, and saved model selections.")
     print(f"  {value('coding-tool-gateway usage')}")
@@ -1687,6 +1844,17 @@ def print_help() -> None:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    if len(argv) >= 2 and argv[0] == "configure" and argv[1] == "mcp":
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("command")
+        parser.add_argument("subcommand")
+        parser.add_argument("-h", "--help", action="store_true")
+        args = parser.parse_args(argv)
+        args.tool = DEFAULT_TOOL
+        args.model = None
+        args.tool_args = []
+        return args
+
     if argv and argv[0] == "configure":
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("command")
@@ -1695,6 +1863,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.tool = DEFAULT_TOOL
         args.model = None
         args.tool_args = []
+        args.subcommand = None
         return args
 
     if argv and argv[0] in {"status", "logout"}:
@@ -1746,6 +1915,8 @@ def main() -> int:
             return usage()
 
         if args.command == "configure":
+            if getattr(args, "subcommand", None) == "mcp":
+                return configure_mcp_command()
             ensure_bootstrap_dependencies("codex")
             ensure_bootstrap_dependencies("claude")
             ensure_bootstrap_dependencies("gemini")
