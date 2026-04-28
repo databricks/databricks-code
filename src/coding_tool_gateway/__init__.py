@@ -1,1 +1,1 @@
-"""coding-tool-gateway package."""
+"""coding-gateway package."""

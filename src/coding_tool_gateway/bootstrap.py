@@ -1,4 +1,4 @@
-"""Best-effort runtime/bootstrap installer for coding-tool-gateway dependencies."""
+"""Best-effort runtime/bootstrap installer for coding-gateway dependencies."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ def main() -> int:
         for tool in TOOL_SPECS:
             ensure_bootstrap_dependencies(tool)
     except RuntimeError as exc:
-        print_err(f"coding-tool-gateway bootstrap failed: {exc}")
+        print_err(f"coding-gateway bootstrap failed: {exc}")
         return 1
     return 0
 
