@@ -1,4 +1,4 @@
-# Coding Gateway
+# Databricks Coding Gateway
 
 `coding-gateway` is a lightweight launcher for running Codex, Claude Code, and Gemini CLI through Databricks.
 
