@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.11.0"]
+build-backend = "uv_build"
 
 [project]
 name = "coding-gateway"
@@ -15,5 +15,5 @@ dependencies = [
 [project.scripts]
 coding-gateway = "coding_tool_gateway.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.uv.build-backend]
+module-name = "coding_tool_gateway"
