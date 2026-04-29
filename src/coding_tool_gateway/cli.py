@@ -92,6 +92,7 @@ DEFAULT_SELECTED_MODELS = {
 }
 USAGE_BREAKDOWN_DAYS = 7
 USAGE_SUMMARY_DAYS = 30
+BUNDLE_VERSION = 1
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
@@ -1535,6 +1536,9 @@ def configure_mcp_command() -> int:
     client_id = prompt_for_client_id()
     client_secret = prompt_for_client_secret()
 
+    state["mcp_oauth"] = {"client_id": client_id, "client_secret": client_secret}
+    mcp_servers: list[dict] = list(state.get("mcp_servers") or [])
+
     added: list[str] = []
 
     while True:
@@ -1597,6 +1601,16 @@ def configure_mcp_command() -> int:
         entry = build_mcp_http_entry(url, client_id)
         add_claude_mcp_server(entry_name, entry, client_secret)
         added.append(entry_name)
+        mcp_servers.append(
+            {
+                "name": entry_name,
+                "url": url,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            }
+        )
+        state["mcp_servers"] = mcp_servers
+        save_state(state)
         print_success(f"Added {entry_name}")
 
     if not added:
@@ -1644,6 +1658,152 @@ def configure_command() -> int:
         return 0
 
     return configure_model_for_tool(tool, None)
+
+
+def export_command(output_path: str) -> int:
+    state = load_state()
+    workspace = state.get("workspace")
+    if not workspace:
+        raise RuntimeError(
+            "Workspace is not configured. Run `coding-gateway configure` first."
+        )
+
+    bundle = {
+        "bundle_version": BUNDLE_VERSION,
+        "workspace": workspace,
+        "use_ai_gateway_v2": bool(state.get("use_ai_gateway_v2")),
+        "ai_gateway_org_id": state.get("ai_gateway_org_id"),
+        "selected_models": state.get("selected_models") or {},
+        "mcp_servers": state.get("mcp_servers") or [],
+    }
+
+    out = Path(output_path)
+    ensure_parent_dir(out)
+    try:
+        out.write_text(json.dumps(bundle, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to write config bundle: {out}") from exc
+
+    print_section("Exported")
+    print_kv("Workspace", workspace)
+    print_kv(
+        "Models",
+        ", ".join(
+            f"{tool}={model}"
+            for tool, model in bundle["selected_models"].items()
+            if model
+        )
+        or "none",
+    )
+    print_kv("MCP servers", str(len(bundle["mcp_servers"])))
+    print_kv("Output", str(out.resolve()))
+    print_success("Configuration bundle exported successfully")
+    if bundle["mcp_servers"]:
+        print_warning("This bundle contains MCP OAuth client secrets. Share it securely.")
+    print_note("Distribute this file to end users who can apply it with:")
+    print_note(f"  coding-gateway import {out.name}")
+    return 0
+
+
+def import_command(config_path: str) -> int:
+    cfg = Path(config_path)
+    if not cfg.exists():
+        raise RuntimeError(f"Config file not found: {config_path}")
+
+    try:
+        bundle = json.loads(cfg.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Failed to read config bundle: {exc}") from exc
+
+    if not isinstance(bundle, dict):
+        raise RuntimeError("Config bundle must be a JSON object.")
+
+    workspace = bundle.get("workspace")
+    if not isinstance(workspace, str) or not workspace.strip():
+        raise RuntimeError("Config bundle is missing required 'workspace' field.")
+
+    use_ai_gateway_v2 = bool(bundle.get("use_ai_gateway_v2"))
+    org_id = bundle.get("ai_gateway_org_id")
+    if org_id is not None and not isinstance(org_id, str):
+        raise RuntimeError("Config bundle field 'ai_gateway_org_id' must be a string.")
+
+    print_section("Importing Configuration")
+    print_kv("Workspace", workspace)
+
+    install_databricks_cli()
+    state = configure_shared_state(workspace, use_ai_gateway_v2, org_id)
+
+    selected_models = bundle.get("selected_models") or {}
+    if not isinstance(selected_models, dict):
+        raise RuntimeError("Config bundle field 'selected_models' must be an object.")
+    state["selected_models"] = dict(state.get("selected_models") or {})
+    state["selected_models"].update(selected_models)
+    save_state(state)
+
+    state = configure_all_tools(state)
+
+    mcp_servers = bundle.get("mcp_servers") or []
+    if not isinstance(mcp_servers, list):
+        raise RuntimeError("Config bundle field 'mcp_servers' must be an array.")
+
+    if mcp_servers:
+        if not shutil.which("claude"):
+            print_warning(
+                "`claude` CLI not found; skipping MCP server setup. "
+                "Install it with: npm install -g @anthropic-ai/claude-code, "
+                "then re-run this import."
+            )
+        else:
+            mcp_added: list[str] = []
+            state_mcp: list[dict] = []
+            for server in mcp_servers:
+                if not isinstance(server, dict):
+                    print_warning("Skipping invalid MCP server entry.")
+                    continue
+                name = server.get("name")
+                url = server.get("url")
+                client_id = server.get("client_id")
+                client_secret = server.get("client_secret")
+                if not all(
+                    isinstance(value_obj, str) and value_obj.strip()
+                    for value_obj in (name, url, client_id, client_secret)
+                ):
+                    print_warning("Skipping MCP server entry with missing fields.")
+                    continue
+                entry = build_mcp_http_entry(url, client_id)
+                try:
+                    add_claude_mcp_server(name, entry, client_secret)
+                    mcp_added.append(name)
+                    state_mcp.append(server)
+                except RuntimeError as exc:
+                    print_warning(f"Failed to add MCP server '{name}': {exc}")
+
+            state["mcp_servers"] = state_mcp
+            if "mcp_oauth" not in state and state_mcp:
+                state["mcp_oauth"] = {
+                    "client_id": state_mcp[0]["client_id"],
+                    "client_secret": state_mcp[0]["client_secret"],
+                }
+            save_state(state)
+
+            if mcp_added:
+                print_kv("MCP servers", ", ".join(mcp_added))
+
+    print_section("Import Complete")
+    print_kv("Workspace", state["workspace"])
+    print_kv(
+        "Mode",
+        "Databricks AI Gateway V2"
+        if state.get("use_ai_gateway_v2")
+        else "Workspace serving endpoint",
+    )
+    for tool_key in ("codex", "claude", "gemini"):
+        model = (state.get("selected_models") or {}).get(tool_key)
+        if model:
+            print_kv(f"{TOOL_SPECS[tool_key]['display']} model", model)
+    print_success("Configuration imported successfully")
+    print_note("Launch a tool with: coding-gateway --tool <codex|claude|gemini>")
+    return 0
 
 
 def usage() -> int:
@@ -1830,6 +1990,10 @@ def print_help() -> None:
     print("    Add Databricks MCP servers to Claude Code (external, UC Functions, Genie).")
     print(f"  {value('coding-gateway status')}")
     print("    Show the current workspace, tool configs, and saved model selections.")
+    print(f"  {value('coding-gateway export <output-file>')}")
+    print("    Export current configuration to a portable JSON bundle for distribution.")
+    print(f"  {value('coding-gateway import <config-file>')}")
+    print("    Import a configuration bundle and set up all tools non-interactively.")
     print(f"  {value('coding-gateway usage')}")
     print("    Show a fixed Databricks AI Gateway usage summary for the saved AI Gateway V2 workspace.")
     print(f"  {value('coding-gateway logout')}")
@@ -1864,6 +2028,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         args.model = None
         args.tool_args = []
         args.subcommand = None
+        return args
+
+    if argv and argv[0] == "export":
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("command")
+        parser.add_argument("output", nargs="?", default=None)
+        parser.add_argument("-h", "--help", action="store_true")
+        args = parser.parse_args(argv)
+        args.tool = DEFAULT_TOOL
+        args.model = None
+        args.tool_args = []
+        return args
+
+    if argv and argv[0] == "import":
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("command")
+        parser.add_argument("config", nargs="?", default=None)
+        parser.add_argument("-h", "--help", action="store_true")
+        args = parser.parse_args(argv)
+        args.tool = DEFAULT_TOOL
+        args.model = None
+        args.tool_args = []
         return args
 
     if argv and argv[0] in {"status", "logout"}:
@@ -1921,6 +2107,18 @@ def main() -> int:
             ensure_bootstrap_dependencies("claude")
             ensure_bootstrap_dependencies("gemini")
             return configure_command()
+
+        if args.command == "export":
+            output = getattr(args, "output", None)
+            if not output:
+                raise RuntimeError("Usage: coding-gateway export <output-file>")
+            return export_command(output)
+
+        if args.command == "import":
+            config = getattr(args, "config", None)
+            if not config:
+                raise RuntimeError("Usage: coding-gateway import <config-file>")
+            return import_command(config)
 
         tool = normalize_tool(args.tool)
         ensure_bootstrap_dependencies(tool)
