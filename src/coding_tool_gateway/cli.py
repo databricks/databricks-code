@@ -97,6 +97,7 @@ DEFAULT_SELECTED_MODELS = {
 USAGE_BREAKDOWN_DAYS = 7
 USAGE_SUMMARY_DAYS = 30
 BUNDLE_VERSION = 1
+MANAGED_FILE_HEADER = "# Managed by coding-gateway. Run `coding-gateway logout` to restore the prior config.\n"
 
 _dry_run = False
 
@@ -108,6 +109,11 @@ err_console = Console(stderr=True, highlight=False)
 def print_section(title: str) -> None:
     console.print()
     console.print(Panel(title, style="bold blue", expand=False))
+
+
+def print_heading(text: str) -> None:
+    console.print()
+    console.print(f"[bold]{text}[/bold]")
 
 
 def print_kv(key: str, val: str) -> None:
@@ -717,16 +723,8 @@ def simplify_model_name(tool: str, model_name: str) -> str:
 def summarize_models(tool: str, raw_models: object) -> str:
     if not isinstance(raw_models, str) or not raw_models.strip():
         return "-"
-    models = [
-        simplify_model_name(tool, item)
-        for item in raw_models.split(",")
-        if item.strip()
-    ]
-    unique_models: list[str] = []
-    for model_name in models:
-        if model_name not in unique_models:
-            unique_models.append(model_name)
-    return ", ".join(unique_models) if unique_models else "-"
+    parts = extract_model_names(tool, raw_models)
+    return ", ".join(parts) if parts else "-"
 
 
 def extract_model_names(tool: str, raw_models: object) -> list[str]:
@@ -863,12 +861,6 @@ def render_usage_summary(
     monthly_total = 0
     active_tools_last_week: list[str] = []
     weekly_model_tokens: dict[str, int] = {}
-    tool_labels = {
-        "codex": "Codex",
-        "claude": "Claude Code",
-        "gemini": "Gemini CLI",
-    }
-
     for record in records:
         usage_day = coerce_date(record.get("usage_day"))
         if not usage_day:
@@ -879,7 +871,7 @@ def render_usage_summary(
             monthly_total += token_total
         if usage_day >= week_start:
             weekly_total += token_total
-            if isinstance(tool, str) and tool in tool_labels and tool not in active_tools_last_week:
+            if isinstance(tool, str) and tool in TOOL_SPECS and tool not in active_tools_last_week:
                 active_tools_last_week.append(tool)
             if isinstance(tool, str):
                 for model_name in extract_model_names(tool, record.get("models")):
@@ -898,7 +890,7 @@ def render_usage_summary(
         f"{label('Last 30 days:')} {value(format_token_count(monthly_total) + ' tokens')}",
     ]
     if active_tools_last_week:
-        tool_text = ", ".join(tool_labels[tool] for tool in active_tools_last_week)
+        tool_text = ", ".join(TOOL_SPECS[tool]["display"] for tool in active_tools_last_week)
         lines.append(f"{label('Active tools:')} {value(tool_text)}")
     if weekly_model_tokens:
         top_models = sorted(
@@ -1166,8 +1158,8 @@ def render_codex_config(workspace: str, use_ai_gateway_v2: bool) -> str:
     auth_command = build_auth_shell_command(workspace)
     base_url = build_tool_base_url("codex", workspace, use_ai_gateway_v2)
     return (
-        "# Managed by coding-gateway. Run `coding-gateway logout` to restore the prior config.\n"
-        'profile = "default"\n'
+        MANAGED_FILE_HEADER
+        + 'profile = "default"\n'
         "\n"
         "[profiles.default]\n"
         'model_provider = "Databricks"\n'
@@ -1217,8 +1209,8 @@ def render_gemini_env(
 ) -> str:
     base_url = build_tool_base_url("gemini", workspace, use_ai_gateway_v2)
     return (
-        "# Managed by coding-gateway. Run `coding-gateway logout` to restore the prior config.\n"
-        f'GEMINI_MODEL="{model}"\n'
+        MANAGED_FILE_HEADER
+        + f'GEMINI_MODEL="{model}"\n'
         f'GOOGLE_GEMINI_BASE_URL="{base_url}"\n'
         'GEMINI_API_KEY_AUTH_MECHANISM="bearer"\n'
         f'GEMINI_API_KEY="{token}"\n'
@@ -1239,9 +1231,11 @@ def build_gemini_runtime_env(
     return env
 
 
-def prompt_for_workspace() -> str:
+def prompt_for_workspace(description: str = "Enter your Databricks workspace URL") -> str:
+    console.print()
+    console.print(Panel(description, title="coding-gateway Setup", style="bold blue", expand=False))
     while True:
-        raw_value = console.input(f"{label('Databricks workspace URL')} {muted('›')} ").strip()
+        raw_value = console.input(f"  [bold]Workspace URL[/bold] {muted('›')} ").strip()
         try:
             return normalize_workspace_url(raw_value)
         except ValueError as exc:
@@ -1258,8 +1252,8 @@ def prompt_yes_no(prompt: str) -> bool:
         print_err("Please answer yes or no.")
 
 
-def prompt_for_choice(title: str, prompt: str, options: list[tuple[str, str]]) -> str:
-    print_section(title)
+def prompt_for_choice(prompt: str, options: list[tuple[str, str]]) -> str:
+    console.print()
     for index, (_, option_label) in enumerate(options, start=1):
         console.print(f"  [bold]{index}.[/bold] [cyan]{option_label}[/cyan]")
 
@@ -1293,14 +1287,11 @@ def prompt_for_client_secret() -> str:
 
 
 def prompt_for_configuration(tool: str | None = None) -> str:
-    print_section("coding-gateway Setup")
     if tool is None:
-        print_note("This will configure your Databricks workspace for all supported tools.")
+        desc = "Configure your Databricks workspace"
     else:
-        print_note(
-            f"This will configure {TOOL_SPECS[tool]['display']} to use your Databricks endpoint."
-        )
-    return prompt_for_workspace()
+        desc = f"Configure {TOOL_SPECS[tool]['display']} to use your Databricks endpoint."
+    return prompt_for_workspace(desc)
 
 
 def mark_tool_managed(state: dict, tool: str) -> dict:
@@ -1449,18 +1440,18 @@ def configure_workspace_command() -> int:
     state = configure_shared_state(workspace)
     state = configure_all_tools(state)
 
-    print_section("Configured")
-    print_kv("Workspace", state["workspace"])
-    print_kv(
-        "Mode",
+    mode = (
         "Databricks AI Gateway V2"
         if state.get("use_ai_gateway_v2")
-        else "Workspace serving endpoint",
+        else "Workspace serving endpoint"
     )
-    print_kv("Codex config", str(TOOL_SPECS["codex"]["config_path"]))
-    print_kv("Claude config", str(TOOL_SPECS["claude"]["config_path"]))
-    print_kv("Gemini config", str(TOOL_SPECS["gemini"]["config_path"]))
-    print_success("Workspace configuration saved for all tools")
+    summary_lines = [
+        f"[bold]Workspace:[/bold] [cyan]{state['workspace']}[/cyan]",
+        f"[bold]Mode:[/bold] [cyan]{mode}[/cyan]",
+    ]
+    for spec in TOOL_SPECS.values():
+        summary_lines.append(f"[bold]{spec['display']}:[/bold] [green]configured[/green]")
+    console.print(Panel("\n".join(summary_lines), title="Configuration Complete", style="green", expand=False))
     return 0
 
 
@@ -1477,7 +1468,7 @@ def configure_model_for_tool(tool: str, model: str | None) -> int:
     )
     state = configure_tool(tool, state, resolved_model)
 
-    print_section("Configured")
+    print_heading("Configured")
     print_kv("Tool", TOOL_SPECS[tool]["display"])
     print_kv("Workspace", state["workspace"])
     print_kv("Model", resolved_model or "not selected")
@@ -1532,8 +1523,7 @@ def configure_mcp_command() -> int:
     print_note("Configure Claude Code to connect to Databricks MCP servers.")
     print_note(f"Workspace: {workspace}")
 
-    console.print()
-    console.print("[bold]OAuth Credentials[/bold]")
+    print_heading("OAuth Credentials")
     print_note("These will be used for all MCP servers added in this session.")
     client_id = prompt_for_client_id()
     client_secret = prompt_for_client_secret()
@@ -1543,10 +1533,9 @@ def configure_mcp_command() -> int:
 
     added: list[str] = []
 
+    print_section("Add MCP Server")
     while True:
-        console.print()
         selection = prompt_for_choice(
-            "Add MCP Server",
             "Select server type",
             [
                 ("external", "External MCP server (e.g. confluence-mcp, jira-mcp)"),
@@ -1619,7 +1608,7 @@ def configure_mcp_command() -> int:
         print_note("No MCP servers added.")
         return 0
 
-    print_section("MCP Configured")
+    print_heading("MCP Configured")
     for name in added:
         console.print(f"  [bold green]●[/bold green] [cyan]{name}[/cyan]")
     print_success("MCP servers registered via `claude mcp add-json`")
@@ -1657,17 +1646,11 @@ def usage() -> int:
 
     console.print(render_usage_summary(records, requester_name))
 
-    tool_labels = {
-        "codex": "Codex",
-        "claude": "Claude Code",
-        "gemini": "Gemini CLI",
-    }
     table_headers = ["Date", "Day", "Tokens", "Sessions", "Duration", "Models"]
     table_widths = [8, 5, 10, 8, 8, 24]
 
-    for tool, section_title in tool_labels.items():
-        console.print()
-        console.print(f"[bold blue]{section_title} · Last {USAGE_BREAKDOWN_DAYS} Days[/bold blue]")
+    for tool, spec in TOOL_SPECS.items():
+        print_heading(f"{spec['display']} · Last {USAGE_BREAKDOWN_DAYS} Days")
         console.print(
             render_box_table(
                 table_headers,
@@ -1725,13 +1708,12 @@ def status() -> int:
     managed_configs = state.get("managed_configs") or {}
     selected_models = state.get("selected_models") or {}
 
-    console.print(Panel("[bold blue]coding-gateway Status[/bold blue]", expand=False))
-    console.print()
+    console.print(heading("coding-gateway status"))
     console.print(
         f"  {status_badge('Configured', 'ok') if workspace else status_badge('Not Configured', 'warn')}"
     )
 
-    print_section("Provider")
+    print_heading("Provider")
     print_kv("Workspace URL", workspace or "not configured")
     print_kv(
         "Mode",
@@ -1740,11 +1722,9 @@ def status() -> int:
         else "Workspace serving endpoint",
     )
 
-    print_section("Tools")
+    print_heading("Tools")
     for tool, spec in TOOL_SPECS.items():
-        base_url = "not configured"
-        if workspace:
-            base_url = build_tool_base_url(tool, workspace, use_ai_gateway_v2)
+        base_url = state["base_urls"].get(tool, "not configured")
         managed = bool(managed_configs.get(tool))
         config_path = spec["config_path"]
         print_kv("Tool", spec["display"])
@@ -1755,11 +1735,11 @@ def status() -> int:
         print_kv("Config file", str(config_path) if config_path.exists() else "missing")
         console.print()
 
-    print_section("MCP Servers (Claude Code)")
+    print_heading("MCP Servers (Claude Code)")
     print_note("Run `claude mcp list` to see configured MCP servers.")
     print_note("Run `coding-gateway configure mcp` to add Databricks MCP servers.")
 
-    print_section("State")
+    print_heading("State")
     print_kv("State file", str(STATE_PATH) if STATE_PATH.exists() else "missing")
     print_note("Use `coding-gateway configure` to update workspace settings or tool models.")
     print_note("Use `coding-gateway configure mcp` to add Databricks MCP servers to Claude Code.")
@@ -1771,22 +1751,16 @@ def logout() -> int:
     state = load_state()
     managed_configs = state.get("managed_configs") or {}
 
-    codex_restored = restore_file(
-        CODEX_CONFIG_PATH, CODEX_BACKUP_PATH, bool(managed_configs.get("codex"))
-    )
-    claude_restored = restore_file(
-        CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH, bool(managed_configs.get("claude"))
-    )
-    gemini_restored = restore_file(
-        GEMINI_ENV_PATH, GEMINI_BACKUP_PATH, bool(managed_configs.get("gemini"))
-    )
+    results: dict[str, bool] = {
+        tool: restore_file(spec["config_path"], spec["backup_path"], bool(managed_configs.get(tool)))
+        for tool, spec in TOOL_SPECS.items()
+    }
     clear_state()
 
-    print_section("Logout")
+    print_heading("Logout")
     print_kv("Workspace", state.get("workspace") or "none")
-    print_kv("Codex config", "restored" if codex_restored else "unchanged")
-    print_kv("Claude config", "restored" if claude_restored else "unchanged")
-    print_kv("Gemini config", "restored" if gemini_restored else "unchanged")
+    for tool, spec in TOOL_SPECS.items():
+        print_kv(f"{spec['display']} config", "restored" if results[tool] else "unchanged")
     print_success("coding-gateway state cleared")
     return 0
 
@@ -1846,9 +1820,9 @@ def configure(
     global _dry_run
     _dry_run = dry_run
     try:
-        ensure_bootstrap_dependencies("codex")
-        ensure_bootstrap_dependencies("claude")
-        ensure_bootstrap_dependencies("gemini")
+        install_databricks_cli()
+        for t in TOOL_SPECS:
+            install_tool_binary(t)
         configure_workspace_command()
     except RuntimeError as exc:
         print_err(str(exc))
