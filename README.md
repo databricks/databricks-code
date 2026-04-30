@@ -4,8 +4,7 @@
 
 ## Requirements
 
-- Python 3.12+
-- `uv` (recommended) or `pipx`
+- Python 3.12+ — install with `uv` ([uv.astral.sh](https://docs.astral.sh/uv/getting-started/installation/))
 - `npm` if tool CLIs need to be installed automatically
 
 ## Installation
