@@ -4,16 +4,13 @@
 
 ## Requirements
 
-- Python 3.12+
-- `pipx` (recommended) or `pip`
+- Python 3.12+ — install with `uv` ([uv.astral.sh](https://docs.astral.sh/uv/getting-started/installation/))
 - `npm` if tool CLIs need to be installed automatically
 
 ## Installation
 
 ```bash
-git clone https://github.com/databricks/coding-gateway.git
-cd coding-gateway
-pipx install .
+uv tool install git+https://github.com/databricks/coding-gateway
 ```
 
 ---
@@ -68,9 +65,7 @@ Users import a config bundle provided by their admin to get set up in one step.
 ### 1. Install
 
 ```bash
-git clone https://github.com/databricks/coding-gateway.git
-cd coding-gateway
-pipx install .
+uv tool install git+https://github.com/databricks/coding-gateway
 ```
 
 ### 2. Import the config bundle
