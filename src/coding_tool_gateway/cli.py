@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
@@ -19,9 +18,14 @@ import textwrap
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Annotated
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlparse
+
+import typer
+from rich.console import Console
+from rich.panel import Panel
 
 
 APP_DIR = Path.home() / ".coding-gateway"
@@ -94,87 +98,57 @@ USAGE_BREAKDOWN_DAYS = 7
 USAGE_SUMMARY_DAYS = 30
 BUNDLE_VERSION = 1
 
-USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+_dry_run = False
 
 
-class Style:
-    reset = "\033[0m"
-    bold = "\033[1m"
-    blue = "\033[34m"
-    cyan = "\033[36m"
-    green = "\033[32m"
-    yellow = "\033[33m"
-    red = "\033[31m"
-    gray = "\033[90m"
-
-
-def style(text: str, *codes: str) -> str:
-    if not USE_COLOR or not codes:
-        return text
-    return f"{''.join(codes)}{text}{Style.reset}"
-
-
-def heading(text: str) -> str:
-    return style(text, Style.bold, Style.blue)
-
-
-def label(text: str) -> str:
-    return style(text, Style.bold)
-
-
-def value(text: str) -> str:
-    return style(text, Style.cyan)
-
-
-def muted(text: str) -> str:
-    return style(text, Style.gray)
-
-
-def success_text(text: str) -> str:
-    return style(text, Style.green, Style.bold)
-
-
-def warning_text(text: str) -> str:
-    return style(text, Style.yellow, Style.bold)
-
-
-def error_text(text: str) -> str:
-    return style(text, Style.red, Style.bold)
-
-
-def status_badge(text: str, kind: str) -> str:
-    color = {
-        "ok": Style.green,
-        "warn": Style.yellow,
-        "error": Style.red,
-        "info": Style.blue,
-    }.get(kind, Style.bold)
-    return style(text, Style.bold, color)
+console = Console(highlight=False)
+err_console = Console(stderr=True, highlight=False)
 
 
 def print_section(title: str) -> None:
-    print()
-    print(heading(title))
+    console.print()
+    console.print(Panel(title, style="bold blue", expand=False))
 
 
 def print_kv(key: str, val: str) -> None:
-    print(f"  {label(key + ':')} {value(val)}")
+    console.print(f"  [bold]{key}:[/bold] [cyan]{val}[/cyan]")
 
 
 def print_note(text: str) -> None:
-    print(f"{muted('•')} {text}")
+    console.print(f"[dim]•[/dim] {text}")
 
 
 def print_success(message: str) -> None:
-    print(f"{success_text('✔')} {message}")
+    console.print(f"[bold green]✔[/bold green] {message}")
 
 
 def print_warning(message: str) -> None:
-    print(f"{warning_text('!')} {message}")
+    console.print(f"[bold yellow]![/bold yellow] {message}")
 
 
 def print_err(message: str) -> None:
-    print(f"{error_text('ERROR')} {message}", file=sys.stderr)
+    err_console.print(f"[bold red]ERROR[/bold red] {message}")
+
+
+def heading(text: str) -> str:
+    return f"[bold blue]{text}[/bold blue]"
+
+
+def label(text: str) -> str:
+    return f"[bold]{text}[/bold]"
+
+
+def value(text: str) -> str:
+    return f"[cyan]{text}[/cyan]"
+
+
+def muted(text: str) -> str:
+    return f"[dim]{text}[/dim]"
+
+
+def status_badge(text: str, kind: str) -> str:
+    color = {"ok": "green", "warn": "yellow", "error": "red", "info": "blue"}.get(kind, "bold")
+    return f"[bold {color}]{text}[/bold {color}]"
 
 
 @contextmanager
@@ -189,9 +163,11 @@ def spinner(message: str):
         for frame in itertools.cycle("|/-\\"):
             if stop_event.is_set():
                 break
-            print(f"\r{muted(frame)} {message}", end="", flush=True)
+            sys.stdout.write(f"\r\033[2m{frame}\033[0m {message}")
+            sys.stdout.flush()
             time.sleep(0.1)
-        print("\r" + " " * (len(message) + 4) + "\r", end="", flush=True)
+        sys.stdout.write("\r" + " " * (len(message) + 4) + "\r")
+        sys.stdout.flush()
 
     thread = threading.Thread(target=spin, daemon=True)
     thread.start()
@@ -265,12 +241,15 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    if _dry_run:
+        return
     try:
         state = hydrate_state(state)
         APP_DIR.mkdir(parents=True, exist_ok=True)
         STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
     except OSError as exc:
         raise RuntimeError(f"Failed to write state file: {STATE_PATH}") from exc
+
 
 
 def hydrate_state(state: dict) -> dict:
@@ -290,15 +269,7 @@ def hydrate_state(state: dict) -> dict:
     workspace = hydrated.get("workspace")
     if workspace:
         use_ai_gateway_v2 = bool(hydrated.get("use_ai_gateway_v2"))
-        org_id = hydrated.get("ai_gateway_org_id")
-        try:
-            hydrated["base_urls"] = build_shared_base_urls(
-                workspace,
-                use_ai_gateway_v2,
-                org_id,
-            )
-        except ValueError:
-            hydrated["base_urls"] = {}
+        hydrated["base_urls"] = build_shared_base_urls(workspace, use_ai_gateway_v2)
     else:
         hydrated["base_urls"] = {}
 
@@ -321,6 +292,8 @@ def ensure_parent_dir(path: Path) -> None:
 
 
 def backup_existing_file(config_path: Path, backup_path: Path) -> bool:
+    if _dry_run:
+        return False
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         if backup_path.exists():
@@ -349,6 +322,9 @@ def restore_file(config_path: Path, backup_path: Path, managed: bool) -> bool:
 
 
 def write_text_file(path: Path, content: str) -> None:
+    if _dry_run:
+        console.print(f"\n[bold]\\[dry run] {path}[/bold]\n{content}")
+        return
     ensure_parent_dir(path)
     try:
         path.write_text(content, encoding="utf-8")
@@ -357,9 +333,13 @@ def write_text_file(path: Path, content: str) -> None:
 
 
 def write_json_file(path: Path, payload: dict) -> None:
+    content = json.dumps(payload, indent=2) + "\n"
+    if _dry_run:
+        console.print(f"\n[bold]\\[dry run] {path}[/bold]\n{content}")
+        return
     ensure_parent_dir(path)
     try:
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        path.write_text(content, encoding="utf-8")
     except OSError as exc:
         raise RuntimeError(f"Failed to write config file: {path}") from exc
 
@@ -479,6 +459,50 @@ def ensure_databricks_auth(workspace: str) -> None:
             "Databricks login completed, but no access token is available yet."
         )
     print_success("Databricks authentication complete")
+
+
+def fetch_ai_gateway_claude_models(workspace: str, token: str) -> dict[str, str]:
+    hostname = workspace_hostname(workspace)
+    request = urllib_request.Request(
+        f"https://{hostname}/ai-gateway/anthropic/v1/models",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib_error.URLError, urllib_error.HTTPError, json.JSONDecodeError):
+        return {}
+
+    models = [
+        m["id"] for m in data.get("data", [])
+        if isinstance(m.get("id"), str) and not m["id"].endswith("-anthropic")
+    ]
+
+    result = {}
+    for family, key in [("opus", "opus"), ("sonnet", "sonnet"), ("haiku", "haiku")]:
+        candidates = sorted(
+            [m for m in models if f"databricks-claude-{family}-" in m],
+            reverse=True,
+        )
+        if candidates:
+            result[key] = candidates[0]
+    return result
+
+
+def detect_ai_gateway_v2(workspace: str, token: str) -> bool:
+    hostname = workspace_hostname(workspace)
+    request = urllib_request.Request(
+        f"https://{hostname}/ai-gateway/anthropic/v1/messages",
+        method="HEAD",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        urllib_request.urlopen(request, timeout=10)
+        return True
+    except urllib_error.HTTPError as exc:
+        return exc.code != 404
+    except urllib_error.URLError:
+        return False
 
 
 def get_databricks_token(workspace: str) -> str:
@@ -868,7 +892,7 @@ def render_usage_summary(
     lines = [
         heading(f"Usage Summary for {requester_name}"),
         "",
-        f"{success_text('✓')} Databricks AI Gateway usage",
+        "[bold green]✓[/bold green] Databricks AI Gateway usage",
         f"{label('Today:')} {value(format_token_count(daily_total) + ' tokens')}",
         f"{label('Last 7 days:')} {value(format_token_count(weekly_total) + ' tokens')}",
         f"{label('Last 30 days:')} {value(format_token_count(monthly_total) + ' tokens')}",
@@ -902,23 +926,22 @@ def build_tool_base_url(
     tool: str,
     workspace: str,
     use_ai_gateway_v2: bool,
-    org_id: str | None,
 ) -> str:
     if tool == "codex":
         return (
-            f"https://{org_id}.ai-gateway.cloud.databricks.com/codex/v1"
+            f"{workspace}/ai-gateway/codex/v1"
             if use_ai_gateway_v2
             else f"{workspace}/serving-endpoints/codex/v1"
         )
     if tool == "claude":
         return (
-            f"https://{org_id}.ai-gateway.cloud.databricks.com/anthropic"
+            f"{workspace}/ai-gateway/anthropic"
             if use_ai_gateway_v2
             else f"{workspace}/serving-endpoints/anthropic"
         )
     if tool == "gemini":
         return (
-            f"https://{org_id}.ai-gateway.cloud.databricks.com/gemini"
+            f"{workspace}/ai-gateway/gemini"
             if use_ai_gateway_v2
             else f"{workspace}/serving-endpoints/gemini"
         )
@@ -928,12 +951,9 @@ def build_tool_base_url(
 def build_shared_base_urls(
     workspace: str,
     use_ai_gateway_v2: bool,
-    org_id: str | None,
 ) -> dict[str, str]:
-    if use_ai_gateway_v2 and not org_id:
-        raise ValueError("Organization ID is required when AI Gateway V2 is enabled.")
     return {
-        tool: build_tool_base_url(tool, workspace, use_ai_gateway_v2, org_id)
+        tool: build_tool_base_url(tool, workspace, use_ai_gateway_v2)
         for tool in TOOL_SPECS
     }
 
@@ -1041,10 +1061,10 @@ def prompt_for_model_choice(tool: str, models: list[str]) -> str:
     print_section(f"{TOOL_SPECS[tool]['display']} Models")
     print_note("Choose the model to launch with.")
     for index, model_name in enumerate(models, start=1):
-        print(f"  {label(str(index) + '.')} {value(model_name)}")
+        console.print(f"  [bold]{index}.[/bold] [cyan]{model_name}[/cyan]")
 
     while True:
-        raw_value = input(f"{label('Select model')} {muted('›')} ").strip()
+        raw_value = console.input(f"{label('Select model')} {muted('›')} ").strip()
         if not raw_value:
             print_err("Please enter a model number.")
             continue
@@ -1057,7 +1077,7 @@ def prompt_for_model_choice(tool: str, models: list[str]) -> str:
 
 def prompt_for_model_value(tool: str) -> str:
     while True:
-        model_name = input(
+        model_name = console.input(
             f"{label(f'{TOOL_SPECS[tool]['display']} model')} {muted('›')} "
         ).strip()
         if model_name:
@@ -1142,9 +1162,9 @@ def resolve_launch_model(
     return state, default_model
 
 
-def render_codex_config(workspace: str, use_ai_gateway_v2: bool, org_id: str | None) -> str:
+def render_codex_config(workspace: str, use_ai_gateway_v2: bool) -> str:
     auth_command = build_auth_shell_command(workspace)
-    base_url = build_tool_base_url("codex", workspace, use_ai_gateway_v2, org_id)
+    base_url = build_tool_base_url("codex", workspace, use_ai_gateway_v2)
     return (
         "# Managed by coding-gateway. Run `coding-gateway logout` to restore the prior config.\n"
         'profile = "default"\n'
@@ -1168,30 +1188,34 @@ def render_codex_config(workspace: str, use_ai_gateway_v2: bool, org_id: str | N
 def render_claude_settings(
     workspace: str,
     use_ai_gateway_v2: bool,
-    org_id: str | None,
     model: str,
+    claude_models: dict[str, str] | None = None,
 ) -> dict:
-    base_url = build_tool_base_url("claude", workspace, use_ai_gateway_v2, org_id)
-    return {
-        "apiKeyHelper": build_auth_shell_command(workspace),
-        "env": {
-            "ANTHROPIC_MODEL": model,
-            "ANTHROPIC_BASE_URL": base_url,
-            "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "1800000",
-        },
+    base_url = build_tool_base_url("claude", workspace, use_ai_gateway_v2)
+    env: dict[str, str] = {
+        "ANTHROPIC_MODEL": model,
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "1800000",
     }
+    if claude_models:
+        if claude_models.get("opus"):
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = claude_models["opus"]
+        if claude_models.get("sonnet"):
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = claude_models["sonnet"]
+        if claude_models.get("haiku"):
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = claude_models["haiku"]
+    return {"apiKeyHelper": build_auth_shell_command(workspace), "env": env}
 
 
 def render_gemini_env(
     workspace: str,
     use_ai_gateway_v2: bool,
-    org_id: str | None,
     model: str,
     token: str,
 ) -> str:
-    base_url = build_tool_base_url("gemini", workspace, use_ai_gateway_v2, org_id)
+    base_url = build_tool_base_url("gemini", workspace, use_ai_gateway_v2)
     return (
         "# Managed by coding-gateway. Run `coding-gateway logout` to restore the prior config.\n"
         f'GEMINI_MODEL="{model}"\n'
@@ -1204,15 +1228,12 @@ def render_gemini_env(
 def build_gemini_runtime_env(
     workspace: str,
     use_ai_gateway_v2: bool,
-    org_id: str | None,
     model: str,
     token: str,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env["GEMINI_MODEL"] = model
-    env["GOOGLE_GEMINI_BASE_URL"] = build_tool_base_url(
-        "gemini", workspace, use_ai_gateway_v2, org_id
-    )
+    env["GOOGLE_GEMINI_BASE_URL"] = build_tool_base_url("gemini", workspace, use_ai_gateway_v2)
     env["GEMINI_API_KEY_AUTH_MECHANISM"] = "bearer"
     env["GEMINI_API_KEY"] = token
     return env
@@ -1220,7 +1241,7 @@ def build_gemini_runtime_env(
 
 def prompt_for_workspace() -> str:
     while True:
-        raw_value = input(f"{label('Databricks workspace URL')} {muted('›')} ").strip()
+        raw_value = console.input(f"{label('Databricks workspace URL')} {muted('›')} ").strip()
         try:
             return normalize_workspace_url(raw_value)
         except ValueError as exc:
@@ -1229,7 +1250,7 @@ def prompt_for_workspace() -> str:
 
 def prompt_yes_no(prompt: str) -> bool:
     while True:
-        response = input(f"{label(prompt)} {muted('[y/n]')} {muted('›')} ").strip().lower()
+        response = console.input(f"{label(prompt)} {muted('[y/n]')} {muted('›')} ").strip().lower()
         if response in {"y", "yes"}:
             return True
         if response in {"n", "no"}:
@@ -1240,10 +1261,10 @@ def prompt_yes_no(prompt: str) -> bool:
 def prompt_for_choice(title: str, prompt: str, options: list[tuple[str, str]]) -> str:
     print_section(title)
     for index, (_, option_label) in enumerate(options, start=1):
-        print(f"  {label(str(index) + '.')} {value(option_label)}")
+        console.print(f"  [bold]{index}.[/bold] [cyan]{option_label}[/cyan]")
 
     while True:
-        raw_value = input(f"{label(prompt)} {muted('›')} ").strip()
+        raw_value = console.input(f"{label(prompt)} {muted('›')} ").strip()
         if raw_value.isdigit():
             selected_index = int(raw_value)
             if 1 <= selected_index <= len(options):
@@ -1251,19 +1272,9 @@ def prompt_for_choice(title: str, prompt: str, options: list[tuple[str, str]]) -
         print_err("Please enter a valid option number.")
 
 
-def prompt_for_org_id() -> str:
-    while True:
-        org_id = input(
-            f"{label('Databricks workspace ID/org ID')} {muted('›')} "
-        ).strip()
-        if org_id:
-            return org_id
-        print_err("Workspace ID/org ID cannot be empty.")
-
-
 def prompt_for_client_id() -> str:
     while True:
-        client_id = input(
+        client_id = console.input(
             f"{label('OAuth client ID')} {muted('›')} "
         ).strip()
         if client_id:
@@ -1273,7 +1284,7 @@ def prompt_for_client_id() -> str:
 
 def prompt_for_client_secret() -> str:
     while True:
-        client_secret = input(
+        client_secret = console.input(
             f"{label('OAuth client secret')} {muted('›')} "
         ).strip()
         if client_secret:
@@ -1281,7 +1292,7 @@ def prompt_for_client_secret() -> str:
         print_err("Client secret cannot be empty.")
 
 
-def prompt_for_configuration(tool: str | None = None) -> tuple[str, bool, str | None]:
+def prompt_for_configuration(tool: str | None = None) -> str:
     print_section("coding-gateway Setup")
     if tool is None:
         print_note("This will configure your Databricks workspace for all supported tools.")
@@ -1289,14 +1300,7 @@ def prompt_for_configuration(tool: str | None = None) -> tuple[str, bool, str | 
         print_note(
             f"This will configure {TOOL_SPECS[tool]['display']} to use your Databricks endpoint."
         )
-    workspace = prompt_for_workspace()
-    print()
-    print(label("Databricks AI Gateway V2"))
-    print_note("Recommended for Codex, Claude Code, and Gemini CLI.")
-    print_note(f"Docs: {AI_GATEWAY_V2_DOCS_URL}")
-    use_ai_gateway_v2 = prompt_yes_no("Use Databricks AI Gateway V2")
-    org_id = prompt_for_org_id() if use_ai_gateway_v2 else None
-    return workspace, use_ai_gateway_v2, org_id
+    return prompt_for_workspace()
 
 
 def mark_tool_managed(state: dict, tool: str) -> dict:
@@ -1307,23 +1311,26 @@ def mark_tool_managed(state: dict, tool: str) -> dict:
     return state
 
 
-def configure_shared_state(
-    workspace: str,
-    use_ai_gateway_v2: bool,
-    org_id: str | None,
-) -> dict:
+def configure_shared_state(workspace: str) -> dict:
     workspace = normalize_workspace_url(workspace)
-    if use_ai_gateway_v2 and not org_id:
-        raise RuntimeError("Organization ID is required when AI Gateway V2 is enabled.")
-
     ensure_databricks_auth(workspace)
+    with spinner("Detecting AI Gateway..."):
+        token = get_databricks_token(workspace)
+        use_ai_gateway_v2 = detect_ai_gateway_v2(workspace, token)
+    if use_ai_gateway_v2:
+        print_success("AI Gateway detected — using AI Gateway endpoints")
+        with spinner("Fetching available Claude models..."):
+            claude_models = fetch_ai_gateway_claude_models(workspace, token)
+    else:
+        print_note("AI Gateway not detected — using workspace serving endpoints")
+        claude_models = {}
     state = load_state()
     state.update(
         {
             "workspace": workspace,
             "use_ai_gateway_v2": use_ai_gateway_v2,
-            "ai_gateway_org_id": org_id,
-            "base_urls": build_shared_base_urls(workspace, use_ai_gateway_v2, org_id),
+            "claude_models": claude_models,
+            "base_urls": build_shared_base_urls(workspace, use_ai_gateway_v2),
         }
     )
     save_state(state)
@@ -1337,7 +1344,6 @@ def write_codex_tool_config(state: dict) -> dict:
         render_codex_config(
             state["workspace"],
             bool(state.get("use_ai_gateway_v2")),
-            state.get("ai_gateway_org_id"),
         ),
     )
     state = mark_tool_managed(state, "codex")
@@ -1352,8 +1358,8 @@ def write_claude_tool_config(state: dict, model: str) -> dict:
         render_claude_settings(
             state["workspace"],
             bool(state.get("use_ai_gateway_v2")),
-            state.get("ai_gateway_org_id"),
             model,
+            state.get("claude_models") or {},
         ),
     )
     state = mark_tool_managed(state, "claude")
@@ -1369,7 +1375,6 @@ def write_gemini_tool_config(state: dict, model: str) -> dict:
         render_gemini_env(
             state["workspace"],
             bool(state.get("use_ai_gateway_v2")),
-            state.get("ai_gateway_org_id"),
             model,
             token,
         ),
@@ -1389,7 +1394,6 @@ def refresh_gemini_token_once(state: dict) -> str:
         render_gemini_env(
             state["workspace"],
             bool(state.get("use_ai_gateway_v2")),
-            state.get("ai_gateway_org_id"),
             model,
             token,
         ),
@@ -1436,13 +1440,13 @@ def ensure_provider_state(tool: str) -> dict:
         ensure_databricks_auth(workspace)
         return state
 
-    workspace, use_ai_gateway_v2, org_id = prompt_for_configuration(tool)
-    return configure_shared_state(workspace, use_ai_gateway_v2, org_id)
+    workspace = prompt_for_configuration(tool)
+    return configure_shared_state(workspace)
 
 
 def configure_workspace_command() -> int:
-    workspace, use_ai_gateway_v2, org_id = prompt_for_configuration()
-    state = configure_shared_state(workspace, use_ai_gateway_v2, org_id)
+    workspace = prompt_for_configuration()
+    state = configure_shared_state(workspace)
     state = configure_all_tools(state)
 
     print_section("Configured")
@@ -1453,8 +1457,6 @@ def configure_workspace_command() -> int:
         if state.get("use_ai_gateway_v2")
         else "Workspace serving endpoint",
     )
-    if state.get("use_ai_gateway_v2"):
-        print_kv("Workspace ID/org ID", state.get("ai_gateway_org_id") or "missing")
     print_kv("Codex config", str(TOOL_SPECS["codex"]["config_path"]))
     print_kv("Claude config", str(TOOL_SPECS["claude"]["config_path"]))
     print_kv("Gemini config", str(TOOL_SPECS["gemini"]["config_path"]))
@@ -1530,8 +1532,8 @@ def configure_mcp_command() -> int:
     print_note("Configure Claude Code to connect to Databricks MCP servers.")
     print_note(f"Workspace: {workspace}")
 
-    print()
-    print(label("OAuth Credentials"))
+    console.print()
+    console.print("[bold]OAuth Credentials[/bold]")
     print_note("These will be used for all MCP servers added in this session.")
     client_id = prompt_for_client_id()
     client_secret = prompt_for_client_secret()
@@ -1542,7 +1544,7 @@ def configure_mcp_command() -> int:
     added: list[str] = []
 
     while True:
-        print()
+        console.print()
         selection = prompt_for_choice(
             "Add MCP Server",
             "Select server type",
@@ -1559,7 +1561,7 @@ def configure_mcp_command() -> int:
             break
 
         if selection == "external":
-            server_name = input(
+            server_name = console.input(
                 f"  {label('MCP server name')} {muted('(e.g. confluence-mcp, jira-mcp)')} {muted('›')} "
             ).strip()
             if not server_name:
@@ -1569,8 +1571,8 @@ def configure_mcp_command() -> int:
             entry_name = server_name
 
         elif selection == "uc-functions":
-            catalog = input(f"  {label('Catalog name')} {muted('›')} ").strip()
-            schema = input(f"  {label('Schema name')} {muted('›')} ").strip()
+            catalog = console.input(f"  {label('Catalog name')} {muted('›')} ").strip()
+            schema = console.input(f"  {label('Schema name')} {muted('›')} ").strip()
             if not catalog or not schema:
                 print_err("Catalog and schema cannot be empty.")
                 continue
@@ -1578,7 +1580,7 @@ def configure_mcp_command() -> int:
             entry_name = f"databricks-uc-{catalog}-{schema}"
 
         elif selection == "genie":
-            space_id = input(f"  {label('Genie space ID')} {muted('›')} ").strip()
+            space_id = console.input(f"  {label('Genie space ID')} {muted('›')} ").strip()
             if not space_id:
                 print_err("Space ID cannot be empty.")
                 continue
@@ -1586,11 +1588,11 @@ def configure_mcp_command() -> int:
             entry_name = f"databricks-genie-{space_id}"
 
         elif selection == "custom":
-            url = input(f"  {label('Full MCP server URL')} {muted('›')} ").strip()
+            url = console.input(f"  {label('Full MCP server URL')} {muted('›')} ").strip()
             if not url:
                 print_err("URL cannot be empty.")
                 continue
-            entry_name = input(f"  {label('Server name')} {muted('›')} ").strip()
+            entry_name = console.input(f"  {label('Server name')} {muted('›')} ").strip()
             if not entry_name:
                 print_err("Server name cannot be empty.")
                 continue
@@ -1619,190 +1621,9 @@ def configure_mcp_command() -> int:
 
     print_section("MCP Configured")
     for name in added:
-        print(f"  {success_text('●')} {value(name)}")
+        console.print(f"  [bold green]●[/bold green] [cyan]{name}[/cyan]")
     print_success("MCP servers registered via `claude mcp add-json`")
     print_note("Run `claude mcp list` to see all configured servers.")
-    return 0
-
-
-def configure_command() -> int:
-    selection = prompt_for_choice(
-        "Configure",
-        "What do you want to configure",
-        [
-            ("workspace", "Workspace"),
-            ("models", "Models"),
-            ("mcp", "MCP servers (Claude Code)"),
-        ],
-    )
-
-    if selection == "workspace":
-        return configure_workspace_command()
-
-    if selection == "mcp":
-        return configure_mcp_command()
-
-    tool = prompt_for_choice(
-        "Model Configuration",
-        "Which tool do you want to configure",
-        [
-            ("codex", "Codex"),
-            ("claude", "Claude Code"),
-            ("gemini", "Gemini CLI"),
-        ],
-    )
-
-    if tool == "codex":
-        print_section("Codex Models")
-        print_note("Codex model selection is handled inside Codex using `/model`.")
-        return 0
-
-    return configure_model_for_tool(tool, None)
-
-
-def export_command(output_path: str) -> int:
-    state = load_state()
-    workspace = state.get("workspace")
-    if not workspace:
-        raise RuntimeError(
-            "Workspace is not configured. Run `coding-gateway configure` first."
-        )
-
-    bundle = {
-        "bundle_version": BUNDLE_VERSION,
-        "workspace": workspace,
-        "use_ai_gateway_v2": bool(state.get("use_ai_gateway_v2")),
-        "ai_gateway_org_id": state.get("ai_gateway_org_id"),
-        "selected_models": state.get("selected_models") or {},
-        "mcp_servers": state.get("mcp_servers") or [],
-    }
-
-    out = Path(output_path)
-    ensure_parent_dir(out)
-    try:
-        out.write_text(json.dumps(bundle, indent=2) + "\n", encoding="utf-8")
-    except OSError as exc:
-        raise RuntimeError(f"Failed to write config bundle: {out}") from exc
-
-    print_section("Exported")
-    print_kv("Workspace", workspace)
-    print_kv(
-        "Models",
-        ", ".join(
-            f"{tool}={model}"
-            for tool, model in bundle["selected_models"].items()
-            if model
-        )
-        or "none",
-    )
-    print_kv("MCP servers", str(len(bundle["mcp_servers"])))
-    print_kv("Output", str(out.resolve()))
-    print_success("Configuration bundle exported successfully")
-    if bundle["mcp_servers"]:
-        print_warning("This bundle contains MCP OAuth client secrets. Share it securely.")
-    print_note("Distribute this file to end users who can apply it with:")
-    print_note(f"  coding-gateway import {out.name}")
-    return 0
-
-
-def import_command(config_path: str) -> int:
-    cfg = Path(config_path)
-    if not cfg.exists():
-        raise RuntimeError(f"Config file not found: {config_path}")
-
-    try:
-        bundle = json.loads(cfg.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Failed to read config bundle: {exc}") from exc
-
-    if not isinstance(bundle, dict):
-        raise RuntimeError("Config bundle must be a JSON object.")
-
-    workspace = bundle.get("workspace")
-    if not isinstance(workspace, str) or not workspace.strip():
-        raise RuntimeError("Config bundle is missing required 'workspace' field.")
-
-    use_ai_gateway_v2 = bool(bundle.get("use_ai_gateway_v2"))
-    org_id = bundle.get("ai_gateway_org_id")
-    if org_id is not None and not isinstance(org_id, str):
-        raise RuntimeError("Config bundle field 'ai_gateway_org_id' must be a string.")
-
-    print_section("Importing Configuration")
-    print_kv("Workspace", workspace)
-
-    install_databricks_cli()
-    state = configure_shared_state(workspace, use_ai_gateway_v2, org_id)
-
-    selected_models = bundle.get("selected_models") or {}
-    if not isinstance(selected_models, dict):
-        raise RuntimeError("Config bundle field 'selected_models' must be an object.")
-    state["selected_models"] = dict(state.get("selected_models") or {})
-    state["selected_models"].update(selected_models)
-    save_state(state)
-
-    state = configure_all_tools(state)
-
-    mcp_servers = bundle.get("mcp_servers") or []
-    if not isinstance(mcp_servers, list):
-        raise RuntimeError("Config bundle field 'mcp_servers' must be an array.")
-
-    if mcp_servers:
-        if not shutil.which("claude"):
-            print_warning(
-                "`claude` CLI not found; skipping MCP server setup. "
-                "Install it with: npm install -g @anthropic-ai/claude-code, "
-                "then re-run this import."
-            )
-        else:
-            mcp_added: list[str] = []
-            state_mcp: list[dict] = []
-            for server in mcp_servers:
-                if not isinstance(server, dict):
-                    print_warning("Skipping invalid MCP server entry.")
-                    continue
-                name = server.get("name")
-                url = server.get("url")
-                client_id = server.get("client_id")
-                client_secret = server.get("client_secret")
-                if not all(
-                    isinstance(value_obj, str) and value_obj.strip()
-                    for value_obj in (name, url, client_id, client_secret)
-                ):
-                    print_warning("Skipping MCP server entry with missing fields.")
-                    continue
-                entry = build_mcp_http_entry(url, client_id)
-                try:
-                    add_claude_mcp_server(name, entry, client_secret)
-                    mcp_added.append(name)
-                    state_mcp.append(server)
-                except RuntimeError as exc:
-                    print_warning(f"Failed to add MCP server '{name}': {exc}")
-
-            state["mcp_servers"] = state_mcp
-            if "mcp_oauth" not in state and state_mcp:
-                state["mcp_oauth"] = {
-                    "client_id": state_mcp[0]["client_id"],
-                    "client_secret": state_mcp[0]["client_secret"],
-                }
-            save_state(state)
-
-            if mcp_added:
-                print_kv("MCP servers", ", ".join(mcp_added))
-
-    print_section("Import Complete")
-    print_kv("Workspace", state["workspace"])
-    print_kv(
-        "Mode",
-        "Databricks AI Gateway V2"
-        if state.get("use_ai_gateway_v2")
-        else "Workspace serving endpoint",
-    )
-    for tool_key in ("codex", "claude", "gemini"):
-        model = (state.get("selected_models") or {}).get(tool_key)
-        if model:
-            print_kv(f"{TOOL_SPECS[tool_key]['display']} model", model)
-    print_success("Configuration imported successfully")
-    print_note("Launch a tool with: coding-gateway --tool <codex|claude|gemini>")
     return 0
 
 
@@ -1834,7 +1655,7 @@ def usage() -> int:
     records = parse_usage_rows(columns, rows)
     requester_name = find_requester_name(workspace, resolved_http_path, token, records)
 
-    print(render_usage_summary(records, requester_name))
+    console.print(render_usage_summary(records, requester_name))
 
     tool_labels = {
         "codex": "Codex",
@@ -1845,9 +1666,9 @@ def usage() -> int:
     table_widths = [8, 5, 10, 8, 8, 24]
 
     for tool, section_title in tool_labels.items():
-        print()
-        print(heading(f"{section_title} · Last {USAGE_BREAKDOWN_DAYS} Days"))
-        print(
+        console.print()
+        console.print(f"[bold blue]{section_title} · Last {USAGE_BREAKDOWN_DAYS} Days[/bold blue]")
+        console.print(
             render_box_table(
                 table_headers,
                 build_tool_breakdown_rows(records, tool),
@@ -1872,7 +1693,6 @@ def launch_gemini_tool(state: dict, tool_args: list[str]) -> None:
     env = build_gemini_runtime_env(
         state["workspace"],
         bool(state.get("use_ai_gateway_v2")),
-        state.get("ai_gateway_org_id"),
         model,
         token,
     )
@@ -1902,13 +1722,12 @@ def status() -> int:
     state = load_state()
     workspace = state.get("workspace")
     use_ai_gateway_v2 = bool(state.get("use_ai_gateway_v2"))
-    org_id = state.get("ai_gateway_org_id")
     managed_configs = state.get("managed_configs") or {}
     selected_models = state.get("selected_models") or {}
 
-    print(heading("coding-gateway Status"))
-    print()
-    print(
+    console.print(Panel("[bold blue]coding-gateway Status[/bold blue]", expand=False))
+    console.print()
+    console.print(
         f"  {status_badge('Configured', 'ok') if workspace else status_badge('Not Configured', 'warn')}"
     )
 
@@ -1920,17 +1739,12 @@ def status() -> int:
         if use_ai_gateway_v2
         else "Workspace serving endpoint",
     )
-    if use_ai_gateway_v2:
-        print_kv("Workspace ID/org ID", org_id or "missing")
 
     print_section("Tools")
     for tool, spec in TOOL_SPECS.items():
         base_url = "not configured"
         if workspace:
-            try:
-                base_url = build_tool_base_url(tool, workspace, use_ai_gateway_v2, org_id)
-            except ValueError:
-                base_url = "invalid configuration"
+            base_url = build_tool_base_url(tool, workspace, use_ai_gateway_v2)
         managed = bool(managed_configs.get(tool))
         config_path = spec["config_path"]
         print_kv("Tool", spec["display"])
@@ -1939,7 +1753,7 @@ def status() -> int:
         print_kv("Base URL", base_url)
         print_kv("Managed by Databricks", "yes" if managed else "no")
         print_kv("Config file", str(config_path) if config_path.exists() else "missing")
-        print()
+        console.print()
 
     print_section("MCP Servers (Claude Code)")
     print_note("Run `claude mcp list` to see configured MCP servers.")
@@ -1977,176 +1791,120 @@ def logout() -> int:
     return 0
 
 
-def print_help() -> None:
-    print(heading("coding-gateway"))
-    print(muted("Databricks-backed Codex, Claude Code, and Gemini bootstrap"))
-    print()
-    print(label("Commands"))
-    print(f"  {value('coding-gateway')} {muted('[--tool codex|claude|gemini] [--model MODEL] [tool-args...]')}")
-    print("    Launch the selected tool using the saved workspace configuration.")
-    print(f"  {value('coding-gateway configure')}")
-    print("    Interactively configure workspace settings or Claude/Gemini model selection.")
-    print(f"  {value('coding-gateway configure mcp')}")
-    print("    Add Databricks MCP servers to Claude Code (external, UC Functions, Genie).")
-    print(f"  {value('coding-gateway status')}")
-    print("    Show the current workspace, tool configs, and saved model selections.")
-    print(f"  {value('coding-gateway export <output-file>')}")
-    print("    Export current configuration to a portable JSON bundle for distribution.")
-    print(f"  {value('coding-gateway import <config-file>')}")
-    print("    Import a configuration bundle and set up all tools non-interactively.")
-    print(f"  {value('coding-gateway usage')}")
-    print("    Show a fixed Databricks AI Gateway usage summary for the saved AI Gateway V2 workspace.")
-    print(f"  {value('coding-gateway logout')}")
-    print("    Clear coding-gateway state and restore any backed-up tool config files.")
-    print()
-    print(label("Behavior"))
-    print_note("On first run, coding-gateway prompts for your Databricks workspace settings.")
-    print_note("`coding-gateway configure` lets you choose whether to configure workspace settings or tool models.")
-    print_note("Normal launches use the saved or explicit model and do not do interactive model discovery.")
-    print_note("`coding-gateway usage` fetches a fresh Databricks token each time, so expired one-hour tokens are handled automatically.")
-    print_note("`coding-gateway usage` shows a fixed last-7-days breakdown for Codex, Claude Code, and Gemini CLI.")
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=False,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+configure_app = typer.Typer(add_completion=False, no_args_is_help=False)
+app.add_typer(configure_app, name="configure", help="Configure workspace and tool settings.")
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    if len(argv) >= 2 and argv[0] == "configure" and argv[1] == "mcp":
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("command")
-        parser.add_argument("subcommand")
-        parser.add_argument("-h", "--help", action="store_true")
-        args = parser.parse_args(argv)
-        args.tool = DEFAULT_TOOL
-        args.model = None
-        args.tool_args = []
-        return args
-
-    if argv and argv[0] == "configure":
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("command")
-        parser.add_argument("-h", "--help", action="store_true")
-        args = parser.parse_args(argv)
-        args.tool = DEFAULT_TOOL
-        args.model = None
-        args.tool_args = []
-        args.subcommand = None
-        return args
-
-    if argv and argv[0] == "export":
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("command")
-        parser.add_argument("output", nargs="?", default=None)
-        parser.add_argument("-h", "--help", action="store_true")
-        args = parser.parse_args(argv)
-        args.tool = DEFAULT_TOOL
-        args.model = None
-        args.tool_args = []
-        return args
-
-    if argv and argv[0] == "import":
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("command")
-        parser.add_argument("config", nargs="?", default=None)
-        parser.add_argument("-h", "--help", action="store_true")
-        args = parser.parse_args(argv)
-        args.tool = DEFAULT_TOOL
-        args.model = None
-        args.tool_args = []
-        return args
-
-    if argv and argv[0] in {"status", "logout"}:
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("command")
-        parser.add_argument("-h", "--help", action="store_true")
-        args = parser.parse_args(argv)
-        args.tool = DEFAULT_TOOL
-        args.model = None
-        args.tool_args = []
-        return args
-
-    if argv and argv[0] == "usage":
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("command")
-        parser.add_argument("-h", "--help", action="store_true")
-        args = parser.parse_args(argv)
-        args.tool = DEFAULT_TOOL
-        args.model = None
-        args.tool_args = []
-        return args
-
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--tool", default=DEFAULT_TOOL)
-    parser.add_argument("--model")
-    parser.add_argument("-h", "--help", action="store_true")
-    args, tool_args = parser.parse_known_args(argv)
-    args.command = None
-    args.tool_args = tool_args
-    return args
-
-
-def main() -> int:
-    args = parse_args(sys.argv[1:])
-
-    if args.help:
-        print_help()
-        return 0
-
+@app.callback(invoke_without_command=True)
+def launch(
+    ctx: typer.Context,
+    tool: Annotated[str, typer.Option("--tool", help="Tool to launch: codex, claude, or gemini.")] = DEFAULT_TOOL,
+    model: Annotated[str | None, typer.Option("--model", help="Model override for this session.")] = None,
+) -> None:
+    """Launch Codex, Claude Code, or Gemini CLI via Databricks."""
+    if ctx.invoked_subcommand is not None:
+        return
     try:
-        if args.command == "status":
-            return status()
-
-        if args.command == "logout":
-            return logout()
-
-        if args.command == "usage":
-            install_databricks_cli()
-            return usage()
-
-        if args.command == "configure":
-            if getattr(args, "subcommand", None) == "mcp":
-                return configure_mcp_command()
-            ensure_bootstrap_dependencies("codex")
-            ensure_bootstrap_dependencies("claude")
-            ensure_bootstrap_dependencies("gemini")
-            return configure_command()
-
-        if args.command == "export":
-            output = getattr(args, "output", None)
-            if not output:
-                raise RuntimeError("Usage: coding-gateway export <output-file>")
-            return export_command(output)
-
-        if args.command == "import":
-            config = getattr(args, "config", None)
-            if not config:
-                raise RuntimeError("Usage: coding-gateway import <config-file>")
-            return import_command(config)
-
-        tool = normalize_tool(args.tool)
-        ensure_bootstrap_dependencies(tool)
-        state = ensure_provider_state(tool)
-        state, resolved_model = resolve_launch_model(tool, state, args.model)
-        state = configure_tool(tool, state, resolved_model)
-
+        _tool = normalize_tool(tool)
+        ensure_bootstrap_dependencies(_tool)
+        state = ensure_provider_state(_tool)
+        state, resolved_model = resolve_launch_model(_tool, state, model)
+        state = configure_tool(_tool, state, resolved_model)
         print_section("Launching")
-        print_kv("Tool", TOOL_SPECS[tool]["display"])
+        print_kv("Tool", TOOL_SPECS[_tool]["display"])
         if resolved_model:
             print_kv("Model", resolved_model)
-        print_kv("Base URL", state["base_urls"][tool])
-        if tool == "gemini":
+        print_kv("Base URL", state["base_urls"][_tool])
+        if _tool == "gemini":
             print_note("Gemini token refresh is managed automatically every 30 minutes while the session is running.")
-        print_success(f"Starting {TOOL_SPECS[tool]['display']}")
-        if tool == "gemini":
-            launch_gemini_tool(state, args.tool_args)
+        print_success(f"Starting {TOOL_SPECS[_tool]['display']}")
+        if _tool == "gemini":
+            launch_gemini_tool(state, ctx.args)
         else:
-            launch_tool(tool, args.tool_args)
+            launch_tool(_tool, ctx.args)
     except RuntimeError as exc:
         print_err(str(exc))
-        return 1
+        raise typer.Exit(1)
     except KeyboardInterrupt:
         print_err("Interrupted.")
-        return 130
+        raise typer.Exit(130)
 
-    return 0
+
+@configure_app.callback(invoke_without_command=True)
+def configure(
+    ctx: typer.Context,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Print config files without writing them.")] = False,
+) -> None:
+    """Configure workspace URL and auto-detect AI Gateway."""
+    if ctx.invoked_subcommand is not None:
+        return
+    global _dry_run
+    _dry_run = dry_run
+    try:
+        ensure_bootstrap_dependencies("codex")
+        ensure_bootstrap_dependencies("claude")
+        ensure_bootstrap_dependencies("gemini")
+        configure_workspace_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1)
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130)
+
+
+@configure_app.command("mcp")
+def configure_mcp() -> None:
+    """Add Databricks MCP servers to Claude Code."""
+    try:
+        configure_mcp_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1)
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130)
+
+
+@app.command("status")
+def status_cmd() -> None:
+    """Show current workspace, tool configs, and saved model selections."""
+    try:
+        status()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1)
+
+
+@app.command("logout")
+def logout_cmd() -> None:
+    """Clear coding-gateway state and restore backed-up tool config files."""
+    try:
+        logout()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1)
+
+
+@app.command("usage")
+def usage_cmd() -> None:
+    """Show Databricks AI Gateway usage summary (last 7 days)."""
+    try:
+        install_databricks_cli()
+        usage()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1)
+
+
+def main() -> None:
+    app()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
