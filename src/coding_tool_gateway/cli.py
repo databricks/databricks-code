@@ -28,14 +28,16 @@ from rich.console import Console
 from rich.panel import Panel
 
 
-APP_DIR = Path.home() / ".coding-gateway"
+_CONFIG_HOME = Path(os.environ.get("CODING_GATEWAY_CONFIG_HOME", Path.home()))
+
+APP_DIR = _CONFIG_HOME / ".coding-gateway"
 STATE_PATH = APP_DIR / "state.json"
 
-CODEX_CONFIG_DIR = Path.home() / ".codex"
+CODEX_CONFIG_DIR = _CONFIG_HOME / ".codex"
 CODEX_CONFIG_PATH = CODEX_CONFIG_DIR / "config.toml"
-CLAUDE_CONFIG_DIR = Path.home() / ".claude"
+CLAUDE_CONFIG_DIR = _CONFIG_HOME / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "settings.json"
-GEMINI_CONFIG_DIR = Path.home() / ".gemini"
+GEMINI_CONFIG_DIR = _CONFIG_HOME / ".gemini"
 GEMINI_ENV_PATH = GEMINI_CONFIG_DIR / ".env"
 
 CODEX_BACKUP_PATH = APP_DIR / "codex-config.backup.toml"
@@ -1328,6 +1330,116 @@ def configure_shared_state(workspace: str) -> dict:
     return state
 
 
+# Keys managed by coding-gateway — used for merge and surgical removal on logout.
+_CLAUDE_MANAGED_TOP_KEYS = {"apiKeyHelper"}
+_CLAUDE_MANAGED_ENV_KEYS = {
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+}
+_GEMINI_MANAGED_ENV_KEYS = {
+    "GEMINI_MODEL",
+    "GOOGLE_GEMINI_BASE_URL",
+    "GEMINI_API_KEY_AUTH_MECHANISM",
+    "GEMINI_API_KEY",
+}
+
+
+def _merge_claude_settings(gateway_settings: dict) -> dict:
+    """Read existing Claude settings.json and merge only gateway-managed keys."""
+    existing: dict = {}
+    if CLAUDE_SETTINGS_PATH.exists():
+        try:
+            existing = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+    merged = dict(existing)
+    merged["apiKeyHelper"] = gateway_settings["apiKeyHelper"]
+    existing_env = dict(merged.get("env", {}))
+    existing_env.update(gateway_settings["env"])
+    merged["env"] = existing_env
+    return merged
+
+
+def _unmerge_claude_settings() -> bool:
+    """Remove only gateway-managed keys from Claude settings.json."""
+    if not CLAUDE_SETTINGS_PATH.exists():
+        return False
+    try:
+        settings = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    for key in _CLAUDE_MANAGED_TOP_KEYS:
+        settings.pop(key, None)
+    env = settings.get("env")
+    if isinstance(env, dict):
+        for key in _CLAUDE_MANAGED_ENV_KEYS:
+            env.pop(key, None)
+        if not env:
+            settings.pop("env", None)
+    CLAUDE_SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
+def _merge_gemini_env(new_vars: dict[str, str]) -> str:
+    """Read existing .env and update only gateway-managed keys."""
+    existing_lines: list[str] = []
+    if GEMINI_ENV_PATH.exists():
+        try:
+            existing_lines = GEMINI_ENV_PATH.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            existing_lines = []
+    updated_keys: set[str] = set()
+    result_lines: list[str] = []
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped.startswith("#") and "Managed by coding-gateway" in stripped:
+            continue
+        key = stripped.split("=", 1)[0] if "=" in stripped else None
+        if key and key in new_vars:
+            result_lines.append(f'{key}="{new_vars[key]}"')
+            updated_keys.add(key)
+        else:
+            result_lines.append(line)
+    for key, val in new_vars.items():
+        if key not in updated_keys:
+            result_lines.append(f'{key}="{val}"')
+    header = MANAGED_FILE_HEADER.rstrip("\n")
+    if result_lines and result_lines[0] != header:
+        result_lines.insert(0, header)
+    return "\n".join(result_lines) + "\n"
+
+
+def _unmerge_gemini_env() -> bool:
+    """Remove only gateway-managed keys from Gemini .env."""
+    if not GEMINI_ENV_PATH.exists():
+        return False
+    try:
+        lines = GEMINI_ENV_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#") and "Managed by coding-gateway" in stripped:
+            continue
+        key = stripped.split("=", 1)[0] if "=" in stripped else None
+        if key and key in _GEMINI_MANAGED_ENV_KEYS:
+            continue
+        result.append(line)
+    content = "\n".join(result).strip()
+    if content:
+        GEMINI_ENV_PATH.write_text(content + "\n", encoding="utf-8")
+    else:
+        GEMINI_ENV_PATH.unlink(missing_ok=True)
+    return True
+
+
 def write_codex_tool_config(state: dict) -> dict:
     backup_existing_file(CODEX_CONFIG_PATH, CODEX_BACKUP_PATH)
     write_text_file(
@@ -1344,15 +1456,14 @@ def write_codex_tool_config(state: dict) -> dict:
 
 def write_claude_tool_config(state: dict, model: str) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
-    write_json_file(
-        CLAUDE_SETTINGS_PATH,
-        render_claude_settings(
-            state["workspace"],
-            bool(state.get("use_ai_gateway_v2")),
-            model,
-            state.get("claude_models") or {},
-        ),
+    gateway_settings = render_claude_settings(
+        state["workspace"],
+        bool(state.get("use_ai_gateway_v2")),
+        model,
+        state.get("claude_models") or {},
     )
+    merged = _merge_claude_settings(gateway_settings)
+    write_json_file(CLAUDE_SETTINGS_PATH, merged)
     state = mark_tool_managed(state, "claude")
     save_state(state)
     return state
@@ -1361,15 +1472,14 @@ def write_claude_tool_config(state: dict, model: str) -> dict:
 def write_gemini_tool_config(state: dict, model: str) -> dict:
     backup_existing_file(GEMINI_ENV_PATH, GEMINI_BACKUP_PATH)
     token = get_databricks_token(state["workspace"])
-    write_text_file(
-        GEMINI_ENV_PATH,
-        render_gemini_env(
-            state["workspace"],
-            bool(state.get("use_ai_gateway_v2")),
-            model,
-            token,
-        ),
-    )
+    base_url = build_tool_base_url("gemini", state["workspace"], bool(state.get("use_ai_gateway_v2")))
+    new_vars = {
+        "GEMINI_MODEL": model,
+        "GOOGLE_GEMINI_BASE_URL": base_url,
+        "GEMINI_API_KEY_AUTH_MECHANISM": "bearer",
+        "GEMINI_API_KEY": token,
+    }
+    write_text_file(GEMINI_ENV_PATH, _merge_gemini_env(new_vars))
     state = mark_tool_managed(state, "gemini")
     save_state(state)
     return state
@@ -1380,15 +1490,14 @@ def refresh_gemini_token_once(state: dict) -> str:
     model = (state.get("selected_models") or {}).get("gemini")
     if not model:
         raise RuntimeError("No Gemini model is configured.")
-    write_text_file(
-        GEMINI_ENV_PATH,
-        render_gemini_env(
-            state["workspace"],
-            bool(state.get("use_ai_gateway_v2")),
-            model,
-            token,
-        ),
-    )
+    base_url = build_tool_base_url("gemini", state["workspace"], bool(state.get("use_ai_gateway_v2")))
+    new_vars = {
+        "GEMINI_MODEL": model,
+        "GOOGLE_GEMINI_BASE_URL": base_url,
+        "GEMINI_API_KEY_AUTH_MECHANISM": "bearer",
+        "GEMINI_API_KEY": token,
+    }
+    write_text_file(GEMINI_ENV_PATH, _merge_gemini_env(new_vars))
     return token
 
 
@@ -1751,16 +1860,34 @@ def logout() -> int:
     state = load_state()
     managed_configs = state.get("managed_configs") or {}
 
-    results: dict[str, bool] = {
-        tool: restore_file(spec["config_path"], spec["backup_path"], bool(managed_configs.get(tool)))
-        for tool, spec in TOOL_SPECS.items()
-    }
+    results: dict[str, str] = {}
+    # Claude: surgically remove only gateway-managed keys
+    if managed_configs.get("claude"):
+        results["claude"] = "cleaned" if _unmerge_claude_settings() else "unchanged"
+    else:
+        results["claude"] = "unchanged"
+    # Codex: restore from backup (TOML merge not yet implemented)
+    results["codex"] = (
+        "restored"
+        if restore_file(CODEX_CONFIG_PATH, CODEX_BACKUP_PATH, bool(managed_configs.get("codex")))
+        else "unchanged"
+    )
+    # Gemini: surgically remove only gateway-managed keys
+    if managed_configs.get("gemini"):
+        results["gemini"] = "cleaned" if _unmerge_gemini_env() else "unchanged"
+    else:
+        results["gemini"] = "unchanged"
+
+    # Clean up backup files that are no longer needed
+    for path in (CLAUDE_BACKUP_PATH, GEMINI_BACKUP_PATH):
+        path.unlink(missing_ok=True)
+
     clear_state()
 
     print_heading("Logout")
     print_kv("Workspace", state.get("workspace") or "none")
     for tool, spec in TOOL_SPECS.items():
-        print_kv(f"{spec['display']} config", "restored" if results[tool] else "unchanged")
+        print_kv(f"{spec['display']} config", results.get(tool, "unchanged"))
     print_success("coding-gateway state cleared")
     return 0
 
