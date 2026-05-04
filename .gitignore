@@ -5,3 +5,5 @@ build/
 dist/
 .venv/
 .DS_Store
+CLAUDE.md
+.omc/
