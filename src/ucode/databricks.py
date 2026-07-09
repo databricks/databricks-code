@@ -1138,6 +1138,27 @@ def build_auth_token_argv(
     return argv
 
 
+def build_mcp_proxy_argv(
+    url: str, workspace: str, profile: str | None = None, *, use_pat: bool = False
+) -> list[str]:
+    """Argv for the stdio MCP bridge: `ucode mcp-proxy --url ... --host ...`.
+
+    Every coding agent registers this single command as a local stdio MCP
+    server instead of a per-client HTTP endpoint with a bearer header. The proxy
+    forwards to ``url`` and mints a fresh OAuth token on each upstream request,
+    so tokens never expire mid-session — the client only ever spawns a process,
+    which keeps registration uniform across CLIs that disagree on HTTP-auth
+    syntax. Like `build_auth_token_argv`, this resolves the absolute `ucode`
+    path and passes plain arguments (no shell), so it runs identically on every
+    platform."""
+    argv = [_ucode_binary(), "mcp-proxy", "--url", url, "--host", workspace.rstrip("/")]
+    if profile:
+        argv += ["--profile", profile]
+    if use_pat:
+        argv.append("--use-pat")
+    return argv
+
+
 def build_auth_shell_command(
     workspace: str, profile: str | None = None, *, use_pat: bool = False
 ) -> str:

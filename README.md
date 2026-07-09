@@ -89,8 +89,13 @@ Options are shown in this order:
 - Managed Databricks MCPs (Vector Search, UC Functions, etc.)
 - Custom MCP server URL
 
-Discovered external MCP connections are listed directly. MCP auth uses a Databricks token that
-`ucode` sets when launching each tool.
+Discovered external MCP connections are listed directly.
+
+Every Databricks MCP server is registered as a local **stdio** server that runs `ucode mcp-proxy`
+— a small bridge (shipped with `ucode`) between the coding tool and the Databricks
+streamable-HTTP MCP endpoint. The proxy mints a fresh OAuth token from your Databricks CLI profile
+on every request, so MCP auth is handled uniformly for every client and never expires mid-session.
+The coding tool starts and stops the proxy as a child process; there's nothing extra to run.
 
 To set up an agent and its MCP server(s) in one command, pass `--mcp` with fully-qualified
 service name(s) to `ucode configure`:

@@ -282,5 +282,5 @@ def configure_skills_download_command(locations: list[str], *, path: str | None)
 
     download_skills(workspace, token, locations, path)
 
-    register_schemaless_skills_connection(state, workspace, clients)
+    register_schemaless_skills_connection(state, workspace, profile, clients)
     return 0
