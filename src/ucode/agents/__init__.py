@@ -52,6 +52,10 @@ _MODULES = {
 
 TOOL_SPECS: dict[str, ToolSpec] = {name: module.SPEC for name, module in _MODULES.items()}
 
+# Model-routing agents ucode configures end to end. Cursor is deliberately NOT
+# here: it runs models on the user's own Cursor account, so `normalize_tool`
+# rejects it and the model-config paths never see it. The `configure`/MCP flows
+# handle "cursor" separately as an MCP-only client (see MCP_ONLY_CLIENTS).
 TOOL_ALIASES = {
     "codex": "codex",
     "claude": "claude",

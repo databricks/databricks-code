@@ -24,7 +24,7 @@ from questionary.prompts.common import InquirerControl
 from questionary.question import Question
 from questionary.styles import merge_styles_default
 
-from ucode.agents import copilot, gemini, opencode
+from ucode.agents import copilot, cursor, gemini, opencode
 from ucode.config_io import restore_file
 from ucode.databricks import (
     apply_pat_environment,
@@ -79,9 +79,17 @@ MCP_CLIENTS = {
         "display": "GitHub Copilot CLI",
         "list_command": "copilot mcp list",
     },
+    "cursor": {
+        "binary": "cursor-agent",
+        "display": "Cursor",
+        "list_command": "cursor-agent mcp list",
+    },
 }
 SKILLS_MCP_KIND = "skills"
 SKILLS_MCP_SERVER_NAME = "databricks-skill-registry"
+# MCP-only clients ucode never launches for model routing, so they never land in
+# `available_tools`; they're eligible for MCP config purely on being installed.
+MCP_ONLY_CLIENTS = ("cursor",)
 EXTERNAL_MCP_SELECTION_PREFIX = "external:"
 SQL_MCP_VALUE = "managed:sql"
 GENIE_SPACE_SELECTION_PREFIX = "genie-space:"
@@ -263,7 +271,9 @@ def configured_mcp_clients(state: dict, installed_clients: list[str]) -> list[st
         configured_tools = []
     configured = set(configured_tools)
     return [
-        client for client in MCP_CLIENTS if client in configured and client in installed_clients
+        client
+        for client in MCP_CLIENTS
+        if client in installed_clients and (client in configured or client in MCP_ONLY_CLIENTS)
     ]
 
 
@@ -303,6 +313,9 @@ def configure_client_mcp_server(
     if client == "copilot":
         removed = copilot.write_mcp_server_config(name, argv)
         return [MCP_USER_SCOPE] if removed else []
+    if client == "cursor":
+        removed = cursor.write_mcp_server_config(name, argv)
+        return [MCP_USER_SCOPE] if removed else []
     raise RuntimeError(f"Unsupported MCP client '{client}'.")
 
 
@@ -317,6 +330,8 @@ def remove_client_mcp_server(client: str, name: str) -> list[str]:
         return [MCP_USER_SCOPE] if opencode.remove_mcp_server_config(name) else []
     if client == "copilot":
         return [MCP_USER_SCOPE] if copilot.remove_mcp_server_config(name) else []
+    if client == "cursor":
+        return [MCP_USER_SCOPE] if cursor.remove_mcp_server_config(name) else []
     raise RuntimeError(f"Unsupported MCP client '{client}'.")
 
 
