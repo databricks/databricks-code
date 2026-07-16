@@ -201,8 +201,21 @@ class TestModelTokenLimits:
             db_mod.model_token_limits("system.ai.qwen3-next-80b-a3b-instruct")["output"] == 10_000
         )
 
-    def test_uncapped_model_returns_none(self):
+    def test_oss_chat_model_without_specific_entry_uses_fallback(self):
+        # qwen3-coder is an OSS chat model (matches the `qwen` family) but has
+        # no specific limits entry — it must get the conservative floor, never
+        # None (which would leave it uncapped and 400 on a default request).
+        limits = db_mod.model_token_limits("system.ai.qwen3-coder-480b")
+        assert limits == {"context": 128_000, "output": 8_192}
+
+    def test_non_oss_model_returns_none(self):
+        # deepseek is outside every family (not an OSS chat model) -> no cap.
         assert db_mod.model_token_limits("system.ai.deepseek-v3") is None
+
+    def test_embedding_model_returns_none_not_fallback(self):
+        # An embeddings model is excluded from OSS chat, so it must NOT get the
+        # chat fallback limits.
+        assert db_mod.model_token_limits("system.ai.qwen3-embedding-0-6b") is None
 
 
 class TestModelIsReasoning:

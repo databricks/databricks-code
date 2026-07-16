@@ -1189,6 +1189,16 @@ _MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
     "gemma": {"context": 128_000, "output": 8_192},
 }
 
+# Conservative fallback for a model that IS an OSS chat model (bucketed by
+# `_is_oss_chat_model`) but has no specific `_MODEL_TOKEN_LIMITS` entry — e.g. a
+# `qwen3-coder` or future `llama-5`. The discovery families are intentionally
+# broader than the limits table, so without a floor such a model would be
+# offered with no output cap and 400 on a default-size request. 8192 is the
+# lowest cap observed across the cohort, so every mlflow chat model accepts it;
+# pinning it only risks truncating a longer response (the safe failure
+# direction), never a hard 400.
+_OSS_FALLBACK_LIMITS = {"context": 128_000, "output": 8_192}
+
 # OSS families that emit reasoning (openai_reasoning capability, verified
 # 2026-07-16). Pi renders their streamed reasoning_content as thinking when the
 # model entry sets reasoning:true; agents whose SDK surfaces reasoning natively
@@ -1204,11 +1214,15 @@ def model_is_reasoning(model_id: str) -> bool:
 def model_token_limits(model_id: str) -> dict[str, int] | None:
     """Return ``{"context": ..., "output": ...}`` limits for ``model_id``, or None.
 
-    Matches by family substring (e.g. any ``*glm*`` id). None means the model
-    has no known limits and the agent should not pin any."""
+    Prefers a specific `_MODEL_TOKEN_LIMITS` family entry (e.g. any ``*glm*``
+    id). Any other OSS chat model falls back to a conservative floor so it is
+    never offered uncapped (which would 400). None only for non-OSS ids, where
+    the agent should not pin any limit."""
     for family, limits in _MODEL_TOKEN_LIMITS.items():
         if family in model_id:
             return dict(limits)
+    if _is_oss_chat_model(model_id):
+        return dict(_OSS_FALLBACK_LIMITS)
     return None
 
 
