@@ -98,15 +98,24 @@ class TestRenderOverlay:
         overlay, _ = opencode.render_overlay("system.ai.glm-5-2", "tok", _base_urls(), models)
         glm = overlay["provider"]["databricks-oss"]["models"]["system.ai.glm-5-2"]
         # OpenCode's schema requires both context and output on `limit`.
-        assert glm["limit"] == {"context": 200000, "output": 25000}
+        # Probed 2026-07-16: glm-5-2 is 1M context / 65536 output.
+        assert glm["limit"] == {"context": 1_000_000, "output": 65_536}
 
-    def test_non_glm_oss_model_has_no_output_cap(self):
+    def test_kimi_gets_token_limits(self):
+        # kimi is now a capped OSS family (128k context / 65536 output).
         models = {"oss": ["system.ai.kimi-k2-7-code"]}
         overlay, _ = opencode.render_overlay(
             "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
         )
         kimi = overlay["provider"]["databricks-oss"]["models"]["system.ai.kimi-k2-7-code"]
-        assert "limit" not in kimi
+        assert kimi["limit"] == {"context": 128_000, "output": 65_536}
+
+    def test_uncapped_oss_model_has_no_limit(self):
+        # A model outside the limits table gets no `limit` (client default).
+        models = {"oss": ["system.ai.mystery-7b"]}
+        overlay, _ = opencode.render_overlay("system.ai.mystery-7b", "tok", _base_urls(), models)
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.mystery-7b"]
+        assert "limit" not in entry
 
     def test_token_in_api_key(self):
         models = {"anthropic": ["claude-sonnet"]}

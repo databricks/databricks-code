@@ -17,6 +17,7 @@ def _base_urls() -> dict[str, str]:
         "claude": f"{WS}/ai-gateway/anthropic",
         "openai": f"{WS}/ai-gateway/codex/v1",
         "gemini": f"{WS}/ai-gateway/gemini/v1beta",
+        "oss": f"{WS}/ai-gateway/mlflow/v1",
     }
 
 
@@ -26,6 +27,7 @@ def _empty() -> dict:
         "claude_models": {},
         "codex_models": [],
         "gemini_models": [],
+        "oss_models": [],
     }
 
 
@@ -39,6 +41,7 @@ def _overlay(model: str, token: str = "tok", **kwargs):
         bundle["claude_models"],
         bundle["codex_models"],
         bundle["gemini_models"],
+        bundle["oss_models"],
     )
 
 
@@ -81,17 +84,59 @@ class TestRenderOverlayProviders:
         assert provider["api"] == "google-generative-ai"
         assert provider["baseUrl"] == f"{WS}/ai-gateway/gemini/v1beta"
 
-    def test_all_three_providers_when_all_present(self):
+    def test_mlflow_provider_uses_openai_completions(self):
+        overlay, _ = _overlay("system.ai.glm-5-2", oss_models=["system.ai.glm-5-2"])
+        provider = overlay["providers"]["databricks-mlflow"]
+        assert provider["api"] == "openai-completions"
+        assert provider["baseUrl"] == f"{WS}/ai-gateway/mlflow/v1"
+        assert provider["compat"] == {"supportsStore": False, "supportsStrictMode": False}
+
+    def test_no_mlflow_provider_when_no_oss_models(self):
+        overlay, _ = _overlay("gpt-5", codex_models=["gpt-5"])
+        assert "databricks-mlflow" not in overlay.get("providers", {})
+
+    def test_all_four_providers_when_all_present(self):
         overlay, _ = _overlay(
             "claude-sonnet",
             claude_models={"sonnet": "claude-sonnet"},
             codex_models=["gpt-5"],
             gemini_models=["gemini-2"],
+            oss_models=["system.ai.glm-5-2"],
         )
         assert set(overlay["providers"].keys()) == {
             "databricks-claude",
             "databricks-openai",
             "databricks-gemini",
+            "databricks-mlflow",
+        }
+
+
+class TestRenderOverlayOssEnrichment:
+    """OSS mlflow model entries carry reasoning + contextWindow + maxTokens
+    from the shared databricks.model_token_limits / model_is_reasoning tables."""
+
+    def test_reasoning_model_enriched(self):
+        overlay, _ = _overlay("system.ai.glm-5-2", oss_models=["system.ai.glm-5-2"])
+        entry = overlay["providers"]["databricks-mlflow"]["models"][0]
+        assert entry["id"] == "system.ai.glm-5-2"
+        assert entry["reasoning"] is True
+        assert entry["contextWindow"] == 1_000_000
+        assert entry["maxTokens"] == 65_536
+
+    def test_non_reasoning_model_omits_reasoning(self):
+        overlay, _ = _overlay(
+            "system.ai.llama-4-maverick", oss_models=["system.ai.llama-4-maverick"]
+        )
+        entry = overlay["providers"]["databricks-mlflow"]["models"][0]
+        assert "reasoning" not in entry
+        assert entry["contextWindow"] == 128_000
+        assert entry["maxTokens"] == 8_192
+
+    def test_unknown_oss_model_bare(self):
+        # No limits/reasoning table entry -> only id, client keeps defaults.
+        overlay, _ = _overlay("system.ai.mystery-7b", oss_models=["system.ai.mystery-7b"])
+        assert overlay["providers"]["databricks-mlflow"]["models"][0] == {
+            "id": "system.ai.mystery-7b"
         }
 
 
@@ -193,6 +238,10 @@ class TestRenderOverlayModelSelector:
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
         assert overlay["model"] == "databricks-gemini/gemini-2"
 
+    def test_prefixes_oss_model(self):
+        overlay, _ = _overlay("system.ai.glm-5-2", oss_models=["system.ai.glm-5-2"])
+        assert overlay["model"] == "databricks-mlflow/system.ai.glm-5-2"
+
     def test_preserves_already_prefixed_model(self):
         overlay, _ = _overlay(
             "databricks-claude/claude-sonnet",
@@ -227,6 +276,15 @@ class TestPiDefaultModel:
     def test_falls_back_to_gemini(self):
         state = {"claude_models": {}, "codex_models": [], "gemini_models": ["gemini-2"]}
         assert pi.default_model(state) == "gemini-2"
+
+    def test_falls_back_to_oss_last(self):
+        state = {
+            "claude_models": {},
+            "codex_models": [],
+            "gemini_models": [],
+            "oss_models": ["system.ai.glm-5-2"],
+        }
+        assert pi.default_model(state) == "system.ai.glm-5-2"
 
     def test_returns_none_when_empty(self):
         assert pi.default_model({}) is None

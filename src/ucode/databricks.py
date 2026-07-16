@@ -1133,8 +1133,31 @@ _MODEL_SERVICE_NAME_PREFIX = "model-services/"
 _MODEL_SERVICE_REQUIRED_PREFIX = "system.ai."
 
 # Supported OSS chat families, matched by name substring. Add an entry to
-# support a new family.
-_OSS_MODEL_FAMILIES = ("kimi-", "glm-")
+# support a new family. Covers the full chat-completions-only cohort on the
+# `/ai-gateway/mlflow/v1` route (verified 2026-07-16): kimi, glm, inkling,
+# llama, qwen, gpt-oss, gemma.
+_OSS_MODEL_FAMILIES = (
+    "kimi-",
+    "glm-",
+    "inkling",
+    "llama-",
+    "qwen",
+    "gpt-oss-",
+    "gemma-",
+)
+
+# Non-chat services that can share a family substring with a chat model (e.g.
+# `qwen3-embedding-*` matches the `qwen` family) but can't back a chat agent.
+# The model-services API doesn't expose api_types, so exclude by name.
+_OSS_NON_CHAT_SUBSTRINGS = ("embedding", "embed", "rerank")
+
+
+def _is_oss_chat_model(model_id: str) -> bool:
+    """True if the id matches an OSS chat family and isn't a non-chat service."""
+    if any(bad in model_id for bad in _OSS_NON_CHAT_SUBSTRINGS):
+        return False
+    return any(family in model_id for family in _OSS_MODEL_FAMILIES)
+
 
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
@@ -1149,11 +1172,33 @@ ANTHROPIC_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 # config dialect. Both fields are provided because agents like OpenCode require
 # context and output together. Keyed by family substring; add an entry to bound
 # a new model.
+#
+# Output caps probed from the gateway 2026-07-16 (it 400s with "max_tokens (N)
+# cannot exceed <cap>"); context windows from each model's docs/description
+# (conservative when unstated). If the gateway raises a cap or ships a new
+# model, update this table.
 _MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
-    # GLM-4.6: 200k context, but the gateway caps output well below the model's
-    # native 128k — pin 25k so requests aren't rejected.
-    "glm": {"context": 200_000, "output": 25_000},
+    "glm": {"context": 1_000_000, "output": 65_536},
+    "inkling": {"context": 128_000, "output": 65_536},
+    "kimi": {"context": 128_000, "output": 65_536},
+    "gpt-oss": {"context": 128_000, "output": 25_000},
+    "qwen35": {"context": 128_000, "output": 25_000},
+    "qwen3-next": {"context": 128_000, "output": 10_000},
+    "llama-4": {"context": 128_000, "output": 8_192},
+    "llama-3": {"context": 128_000, "output": 8_192},
+    "gemma": {"context": 128_000, "output": 8_192},
 }
+
+# OSS families that emit reasoning (openai_reasoning capability, verified
+# 2026-07-16). Pi renders their streamed reasoning_content as thinking when the
+# model entry sets reasoning:true; agents whose SDK surfaces reasoning natively
+# (OpenCode's @ai-sdk/openai) need no flag.
+_OSS_REASONING_FAMILIES = ("glm", "inkling", "kimi", "gpt-oss", "qwen35")
+
+
+def model_is_reasoning(model_id: str) -> bool:
+    """True if the OSS model reports reasoning output (family-matched)."""
+    return any(family in model_id for family in _OSS_REASONING_FAMILIES)
 
 
 def model_token_limits(model_id: str) -> dict[str, int] | None:
@@ -1295,7 +1340,7 @@ def discover_model_services(
     codex_models = [m for m in ids if "gpt-" in m]
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
 
-    oss_models = [m for m in ids if any(family in m for family in _OSS_MODEL_FAMILIES)]
+    oss_models = [m for m in ids if _is_oss_chat_model(m)]
 
     if not (claude_models or codex_models or gemini_models or oss_models):
         sample = ", ".join(ids[:5])
@@ -2190,6 +2235,7 @@ def build_pi_base_urls(workspace: str) -> dict[str, str]:
         "claude": build_tool_base_url("claude", workspace),
         "openai": build_tool_base_url("codex", workspace),
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
+        "oss": f"{workspace}/ai-gateway/mlflow/v1",
     }
 
 
