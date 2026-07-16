@@ -1,10 +1,14 @@
 [build-system]
-requires = ["uv_build>=0.11.0"]
-build-backend = "uv_build"
+requires = ["hatchling", "uv-dynamic-versioning>=0.7.0"]
+build-backend = "hatchling.build"
 
 [project]
 name = "ucode"
-version = "0.1.0"
+# Version is derived from git tags at build time (see [tool.uv-dynamic-versioning]).
+# On a tag it is the plain tag (e.g. `0.1.0`); between tags it carries the commit
+# count and short hash (e.g. `0.1.0+14.g93986a8`) so a reported version maps back
+# to an exact commit.
+dynamic = ["version"]
 description = "Bootstrap Codex against a Databricks workspace with minimal setup."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -29,8 +33,22 @@ tracing = ["mlflow[databricks]>=3.4"]
 [project.scripts]
 ucode = "ucode.cli:main"
 
-[tool.uv.build-backend]
-module-name = "ucode"
+[tool.hatch.build.targets.wheel]
+packages = ["src/ucode"]
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.uv-dynamic-versioning]
+vcs = "git"
+# On a tagged commit: plain tag (e.g. `0.1.0`). Between tags: append the commit
+# count and short hash as a local segment (e.g. `0.1.0+14.g93986a8`) so a
+# reported version points back to an exact commit for bug reports.
+format-jinja = "{% if distance == 0 %}{{ base }}{% else %}{{ base }}+{{ distance }}.g{{ commit }}{% endif %}"
+# Used only when git metadata is unavailable at build time (e.g. building from a
+# source archive with no `.git`). The normal install paths clone the repo, so
+# this is a last-resort so builds degrade instead of hard-failing.
+fallback-version = "0.0.0"
 
 [dependency-groups]
 dev = [
