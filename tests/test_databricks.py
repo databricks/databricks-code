@@ -302,6 +302,26 @@ class TestDiscoverModelServices:
         assert "system.ai.qwen35-122b-a10b" in oss
         assert "system.ai.qwen3-embedding-0-6b" not in oss
 
+    def test_gpt_oss_is_oss_not_codex(self, monkeypatch):
+        # gpt-oss-* contains "gpt-" but is chat-completions-only, not an
+        # openai-responses codex model. It must bucket into oss ONLY, never
+        # codex (whose openai-responses route would 400 for it).
+        payload = {
+            "model_services": [
+                _model_service("system.ai.gpt-5"),
+                _model_service("system.ai.gpt-oss-120b"),
+            ]
+        }
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=10: (payload, None)
+        )
+
+        _, codex, _, oss, _ = db_mod.discover_model_services(WS, "token")
+
+        assert codex == ["system.ai.gpt-5"]
+        assert "system.ai.gpt-oss-120b" in oss
+        assert "system.ai.gpt-oss-120b" not in codex
+
     def test_paginates_via_next_page_token(self, monkeypatch):
         pages = {
             None: {

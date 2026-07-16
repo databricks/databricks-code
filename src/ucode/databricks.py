@@ -1337,7 +1337,10 @@ def discover_model_services(
         if candidates:
             claude_models[family] = candidates[0]
 
-    codex_models = [m for m in ids if "gpt-" in m]
+    # `gpt-oss-*` also contains "gpt-" but is a chat-completions-only OSS model
+    # (served via /ai-gateway/mlflow/v1), NOT an openai-responses codex model —
+    # exclude it here so it isn't offered under the codex provider (which 400s).
+    codex_models = [m for m in ids if "gpt-" in m and "gpt-oss" not in m]
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
 
     oss_models = [m for m in ids if _is_oss_chat_model(m)]
