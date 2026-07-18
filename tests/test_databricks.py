@@ -218,6 +218,60 @@ class TestModelTokenLimits:
         assert db_mod.model_token_limits("system.ai.qwen3-embedding-0-6b") is None
 
 
+class TestGptModelTokenLimits:
+    def test_gpt56_sol_serves_1m_context_across_id_forms(self):
+        for model_id in (
+            "gpt-5.6-sol",
+            "system.ai.gpt-5-6-sol",
+            "databricks-gpt-5-6-sol",
+            "databricks-openai/gpt-5.6-sol",
+        ):
+            assert db_mod.gpt_model_token_limits(model_id) == {
+                "context": 1_050_000,
+                "output": 128_000,
+            }
+
+    def test_gpt5_windows_are_model_specific(self):
+        assert db_mod.gpt_model_token_limits("system.ai.gpt-5-2")["context"] == 400_000
+        assert db_mod.gpt_model_token_limits("databricks-gpt-5-4")["context"] == 272_000
+        assert db_mod.gpt_model_token_limits("databricks-gpt-5-4-nano")["context"] == 400_000
+        assert db_mod.gpt_model_token_limits("gpt-5.5-pro")["context"] == 1_050_000
+
+    def test_gpt41_window(self):
+        assert db_mod.gpt_model_token_limits("databricks-gpt-4-1") == {
+            "context": 1_047_576,
+            "output": 32_768,
+        }
+
+    def test_unknown_gpt_uses_conservative_floor(self):
+        assert db_mod.gpt_model_token_limits("gpt-6-turbo") == {
+            "context": 128_000,
+            "output": 16_384,
+        }
+
+
+class TestClaudeModelTokenLimits:
+    def test_1m_models_and_output_caps(self):
+        assert db_mod.claude_model_token_limits("databricks-claude-opus-4-8") == {
+            "context": 1_000_000,
+            "output": 128_000,
+        }
+        assert db_mod.claude_model_token_limits("system.ai.claude-sonnet-4-5") == {
+            "context": 1_000_000,
+            "output": 64_000,
+        }
+        assert db_mod.claude_model_token_limits("claude-sonnet-4-6[1m]") == {
+            "context": 1_000_000,
+            "output": 128_000,
+        }
+
+    def test_older_and_unknown_claude_use_200k_floor(self):
+        expected = {"context": 200_000, "output": 64_000}
+        assert db_mod.claude_model_token_limits("claude-opus-4-5") == expected
+        assert db_mod.claude_model_token_limits("claude-haiku-4-5") == expected
+        assert db_mod.claude_model_token_limits("claude-future") == expected
+
+
 class TestModelIsReasoning:
     def test_reasoning_families(self):
         assert db_mod.model_is_reasoning("system.ai.glm-5-2") is True

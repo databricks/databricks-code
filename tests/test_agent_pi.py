@@ -78,6 +78,55 @@ class TestRenderOverlayProviders:
         assert provider["api"] == "openai-responses"
         assert provider["baseUrl"] == f"{WS}/ai-gateway/codex/v1"
 
+    def test_gpt56_sol_model_entry_pins_1m_context(self):
+        # Gateway ids are custom to Pi, so explicit metadata is required to
+        # avoid its 128k custom-model default.
+        overlay, _ = _overlay("gpt-5-6-sol", codex_models=["gpt-5-6-sol"])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+        assert entry["id"] == "gpt-5-6-sol"
+        assert entry["contextWindow"] == 1_050_000
+        assert entry["maxTokens"] == 128_000
+        assert entry["reasoning"] is True
+        assert entry["input"] == ["text", "image"]
+
+    def test_gpt_model_entries_use_model_specific_windows(self):
+        overlay, _ = _overlay(
+            "system.ai.gpt-5-2",
+            codex_models=[
+                "system.ai.gpt-5-2",
+                "databricks-gpt-5-4-nano",
+                "databricks-gpt-5-6-sol",
+            ],
+        )
+        windows = {
+            m["id"]: m["contextWindow"] for m in overlay["providers"]["databricks-openai"]["models"]
+        }
+        assert windows == {
+            "system.ai.gpt-5-2": 400_000,
+            "databricks-gpt-5-4-nano": 400_000,
+            "databricks-gpt-5-6-sol": 1_050_000,
+        }
+
+    def test_claude_entries_pin_limits_and_capabilities(self):
+        overlay, _ = _overlay(
+            "databricks-claude-opus-4-8",
+            claude_models={
+                "opus": "databricks-claude-opus-4-8",
+                "sonnet": "system.ai.claude-sonnet-4-5",
+                "haiku": "databricks-claude-haiku-4-5",
+            },
+        )
+        entries = {m["id"]: m for m in overlay["providers"]["databricks-claude"]["models"]}
+        opus = entries["databricks-claude-opus-4-8"]
+        assert opus["contextWindow"] == 1_000_000
+        assert opus["maxTokens"] == 128_000
+        assert opus["reasoning"] is True
+        assert opus["input"] == ["text", "image"]
+        assert opus["compat"] == {"forceAdaptiveThinking": True}
+        assert entries["system.ai.claude-sonnet-4-5"]["contextWindow"] == 1_000_000
+        assert entries["system.ai.claude-sonnet-4-5"]["maxTokens"] == 64_000
+        assert entries["databricks-claude-haiku-4-5"]["contextWindow"] == 200_000
+
     def test_gemini_provider_uses_google_generative_ai(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
         provider = overlay["providers"]["databricks-gemini"]

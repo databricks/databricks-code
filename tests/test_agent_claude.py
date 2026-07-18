@@ -48,6 +48,30 @@ class TestRenderOverlay:
             overlay["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-7[1m]"
         )
 
+    def test_adds_1m_suffix_for_sonnet_4_5(self):
+        # Sonnet 4.5 supports the 1M context window (its 1M beta shipped before
+        # Opus's), so it must get the [1m] suffix even though it predates the
+        # Opus 4.6 floor.
+        overlay, _ = claude.render_overlay(
+            WS, "s4", claude_models={"sonnet": "databricks-claude-sonnet-4-5"}
+        )
+        assert (
+            overlay["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-5[1m]"
+        )
+
+    def test_does_not_add_1m_suffix_for_sonnet_4_4(self):
+        overlay, _ = claude.render_overlay(
+            WS, "s4", claude_models={"sonnet": "databricks-claude-sonnet-4-4"}
+        )
+        assert overlay["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-4"
+
+    def test_does_not_add_1m_suffix_for_opus_4_5(self):
+        # Opus's 1M window starts at 4.6, so 4.5 stays on the default context.
+        overlay, _ = claude.render_overlay(
+            WS, "s4", claude_models={"opus": "databricks-claude-opus-4-5"}
+        )
+        assert overlay["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-5"
+
     def test_does_not_add_1m_suffix_for_haiku(self):
         overlay, _ = claude.render_overlay(
             WS, "s4", claude_models={"haiku": "databricks-claude-haiku-4-6"}

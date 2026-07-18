@@ -251,8 +251,12 @@ def _maybe_add_1m_suffix(model: str) -> str:
     family, major_raw, minor_raw, _ = match.groups()
     major = int(major_raw)
     minor = int(minor_raw)
+    # 1M-token context window support: Opus from 4.6, Sonnet from 4.5 (Sonnet
+    # 4.5 gained the 1M beta window before Opus did). Without the `[1m]`
+    # suffix the gateway serves these models with the default 200k context, so
+    # gate each family at its own floor rather than a shared version.
     should_suffix = (family == "opus" and (major, minor) >= (4, 6)) or (
-        family == "sonnet" and (major, minor) >= (4, 6)
+        family == "sonnet" and (major, minor) >= (4, 5)
     )
     return f"{model}[1m]" if should_suffix else model
 

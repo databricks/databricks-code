@@ -1226,6 +1226,76 @@ def model_token_limits(model_id: str) -> dict[str, int] | None:
     return None
 
 
+# Pi treats every custom model without explicit metadata as 128k context / 4k
+# output. Gateway ids are custom ids (not Pi's built-ins), so preserve the
+# upstream windows explicitly. Entries are ordered most-specific first after
+# normalizing dotted OpenAI ids and hyphenated Databricks ids to one form.
+# GPT-5.6 Sol/Terra/Luna support the opt-in 1.05M window; 272k is merely Pi's
+# built-in short-context pricing default, not the model's hard context limit.
+_GPT_TOKEN_LIMITS: tuple[tuple[str, dict[str, int]], ...] = (
+    ("gpt-5-6-sol", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-6-terra", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-6-luna", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-5-pro", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-4-pro", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-5", {"context": 272_000, "output": 128_000}),
+    ("gpt-5-4-mini", {"context": 400_000, "output": 128_000}),
+    ("gpt-5-4-nano", {"context": 400_000, "output": 128_000}),
+    ("gpt-5-4", {"context": 272_000, "output": 128_000}),
+    ("gpt-5", {"context": 400_000, "output": 128_000}),
+    ("gpt-4-1", {"context": 1_047_576, "output": 32_768}),
+    ("gpt-4o", {"context": 128_000, "output": 16_384}),
+    ("gpt-4-turbo", {"context": 128_000, "output": 4_096}),
+    ("gpt-4", {"context": 8_192, "output": 8_192}),
+)
+_GPT_FALLBACK_LIMITS = {"context": 128_000, "output": 16_384}
+
+
+def _normalized_foundation_model_id(model_id: str) -> str:
+    """Strip route prefixes and normalize dotted versions to hyphens."""
+    tail = model_id.split("/")[-1]
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    if tail.startswith("databricks-"):
+        tail = tail[len("databricks-") :]
+    return tail.lower().replace(".", "-")
+
+
+def gpt_model_token_limits(model_id: str) -> dict[str, int]:
+    """Return Pi metadata limits for a GPT (codex/openai) gateway model."""
+    tail = _normalized_foundation_model_id(model_id)
+    for family, limits in _GPT_TOKEN_LIMITS:
+        if tail.startswith(family):
+            return dict(limits)
+    return dict(_GPT_FALLBACK_LIMITS)
+
+
+_CLAUDE_FALLBACK_LIMITS = {"context": 200_000, "output": 64_000}
+
+
+def claude_model_token_limits(model_id: str) -> dict[str, int]:
+    """Return Pi metadata limits for a Claude gateway model.
+
+    Claude gateway ids are custom to Pi, so omitting these fields silently
+    applies Pi's 128k/4k custom-model defaults. Current 1M families mirror
+    Anthropic's model metadata: Opus >=4.6 and Sonnet >=4.5. Sonnet 4.5 has a
+    64k output cap; later 1M models have 128k output.
+    """
+    tail = _normalized_foundation_model_id(model_id)
+    match = re.match(r"claude-(opus|sonnet|haiku)-(\d+)-(\d+)", tail)
+    if not match:
+        return dict(_CLAUDE_FALLBACK_LIMITS)
+    family, major_raw, minor_raw = match.groups()
+    version = (int(major_raw), int(minor_raw))
+    if family == "opus" and version >= (4, 6):
+        return {"context": 1_000_000, "output": 128_000}
+    if family == "sonnet" and version >= (4, 6):
+        return {"context": 1_000_000, "output": 128_000}
+    if family == "sonnet" and version >= (4, 5):
+        return {"context": 1_000_000, "output": 64_000}
+    return dict(_CLAUDE_FALLBACK_LIMITS)
+
+
 def _model_service_id(service: dict) -> str | None:
     """Extract the `system.ai.<model-name>` id from one model-service entry.
 
