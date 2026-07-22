@@ -14,6 +14,7 @@ def _base_urls() -> dict[str, str]:
     return {
         "anthropic": f"{WS}/ai-gateway/anthropic/v1",
         "gemini": f"{WS}/ai-gateway/gemini/v1beta",
+        "openai": f"{WS}/ai-gateway/codex/v1",
         "oss": f"{WS}/ai-gateway/mlflow/v1",
     }
 
@@ -211,6 +212,76 @@ class TestRenderOverlay:
         assert overlay["model"] == "databricks-oss/system.ai.kimi-k2-7-code"
 
 
+class TestOpenAIProvider:
+    """OpenCode reaches Databricks GPT-5 / GPT-5.6 / Codex models through the
+    databricks-openai provider (@ai-sdk/openai against /ai-gateway/codex/v1).
+    Without this wiring the codex/openai family is unreachable from OpenCode."""
+
+    def test_openai_provider_added_when_codex_models_present(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        assert "databricks-openai" in overlay["provider"]
+
+    def test_openai_provider_uses_ai_sdk_openai_npm(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        assert overlay["provider"]["databricks-openai"]["npm"] == "@ai-sdk/openai"
+
+    def test_openai_base_url_points_at_codex_gateway(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        options = overlay["provider"]["databricks-openai"]["options"]
+        assert options["baseURL"] == f"{WS}/ai-gateway/codex/v1"
+
+    def test_use_responses_api_set_on_every_codex_model(self):
+        models = {"openai": ["databricks-gpt-5-6-sol", "databricks-gpt-codex"]}
+        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        provider_models = overlay["provider"]["databricks-openai"]["models"]
+        for m in ("databricks-gpt-5-6-sol", "databricks-gpt-codex"):
+            assert provider_models[m]["options"]["useResponsesApi"] is True
+
+    def test_openai_authorization_header(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        headers = overlay["provider"]["databricks-openai"]["options"]["headers"]
+        assert headers["Authorization"] == "Bearer tok"
+
+    def test_managed_keys_include_openai_provider(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        _, keys = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        assert ["provider", "databricks-openai"] in keys
+
+    def test_prefixes_openai_model_with_provider_id(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        assert overlay["model"] == "databricks-openai/databricks-gpt-5-6-sol"
+
+    def test_already_prefixed_openai_model_is_preserved(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        overlay, _ = opencode.render_overlay(
+            "databricks-openai/databricks-gpt-5-6-sol", "tok", _base_urls(), models
+        )
+        assert overlay["model"] == "databricks-openai/databricks-gpt-5-6-sol"
+
+    def test_all_four_providers_when_all_present(self):
+        models = {
+            "anthropic": ["claude-sonnet"],
+            "gemini": ["gemini-2"],
+            "openai": ["databricks-gpt-5-6-sol"],
+            "oss": ["system.ai.kimi-k2-7-code"],
+        }
+        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        assert set(overlay["provider"].keys()) == {
+            "databricks-anthropic",
+            "databricks-google",
+            "databricks-openai",
+            "databricks-oss",
+        }
+
+    def test_provider_keys_listed_in_module(self):
+        assert ["provider", "databricks-openai"] in opencode.PROVIDER_KEYS
+
+
 class TestMcpServerConfig:
     def test_builds_remote_server_entry_with_oauth_token_env_header(self):
         entry = opencode.build_mcp_server_entry(f"{WS}/api/2.0/mcp/external/github")
@@ -322,6 +393,16 @@ class TestOpencodeDefaultModel:
     def test_prefers_anthropic(self):
         state = {"opencode_models": {"anthropic": ["claude-sonnet"], "gemini": ["gemini-2"]}}
         assert opencode.default_model(state) == "claude-sonnet"
+
+    def test_falls_back_to_openai_before_gemini(self):
+        state = {
+            "opencode_models": {
+                "anthropic": [],
+                "openai": ["databricks-gpt-5-6-sol"],
+                "gemini": ["gemini-2"],
+            }
+        }
+        assert opencode.default_model(state) == "databricks-gpt-5-6-sol"
 
     def test_falls_back_to_gemini(self):
         state = {"opencode_models": {"anthropic": [], "gemini": ["gemini-2"]}}

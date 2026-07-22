@@ -102,6 +102,12 @@ class TestBuildOpencodeBaseUrls:
         assert urls["gemini"] == f"{WS}/ai-gateway/gemini/v1beta"
         assert urls["oss"] == f"{WS}/ai-gateway/mlflow/v1"
 
+    def test_returns_openai_codex_gateway(self):
+        # @ai-sdk/openai appends /responses (Responses API) or /chat/completions
+        # to baseURL, so stop just before that suffix. Mirrors build_pi_base_urls.
+        urls = build_opencode_base_urls(WS)
+        assert urls["openai"] == f"{WS}/ai-gateway/codex/v1"
+
 
 class TestBuildSharedBaseUrls:
     def test_contains_all_tools(self):
