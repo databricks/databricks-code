@@ -37,6 +37,7 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
+    discover_oss_models,
     ensure_ai_gateway_v2,
     ensure_databricks_auth,
     ensure_pat_bearer,
@@ -425,6 +426,8 @@ def configure_shared_state(
                     codex_models, codex_reason = discover_codex_models(workspace, token)
             if want_oss:
                 oss_models, oss_reason = ms_oss, ms_reason
+                if not oss_models:
+                    oss_models, oss_reason = discover_oss_models(workspace, token)
         if claude_models:
             opencode_models["anthropic"] = list(claude_models.values())
         if gemini_models:

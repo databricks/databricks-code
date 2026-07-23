@@ -2105,6 +2105,34 @@ def discover_codex_models(workspace: str, token: str) -> tuple[list[str], str | 
     return discover_endpoints_with_api_type(workspace, token, "openai/v1/responses")
 
 
+def discover_oss_models(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """Discover OSS chat models served as AI Gateway foundation-model endpoints.
+
+    Fallback for workspaces that don't register OSS foundation models as
+    `system.ai.*` UC model-services (see `discover_model_services`): those
+    workspaces expose the same models as regular `databricks-*` serving
+    endpoints instead. Lists every endpoint advertising the
+    `mlflow/v1/chat/completions` dialect, then keeps only the OSS chat families
+    (`_is_oss_chat_model`) — on some workspaces the Claude/Gemini endpoints also
+    advertise that dialect, so the family filter is what separates the OSS
+    cohort from them. Mirrors the AI-Gateway fallback the other families use
+    when the UC model-services listing is empty.
+    """
+    endpoints, reason = discover_endpoints_with_api_type(
+        workspace, token, "mlflow/v1/chat/completions"
+    )
+    if not endpoints:
+        return [], reason
+    oss = [e for e in endpoints if _is_oss_chat_model(e)]
+    if oss:
+        return oss, None
+    sample = ", ".join(endpoints[:5])
+    return [], (
+        "foundation-models exposing `mlflow/v1/chat/completions` matched no OSS "
+        f"chat family (got: {sample})"
+    )
+
+
 def fetch_gemini_models(workspace: str, token: str) -> list[str]:
     models, _ = discover_gemini_models(workspace, token)
     return models

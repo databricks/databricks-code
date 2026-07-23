@@ -940,6 +940,82 @@ class TestDiscoverGeminiModels:
         assert models == ["databricks-gpt-4-1", "databricks-gpt-5-2-codex"]
 
 
+def _mlflow_chat_payload(names, *, api_type="mlflow/v1/chat/completions", v2=True):
+    return {
+        "endpoints": [
+            {
+                "name": name,
+                "config": {
+                    "served_entities": [
+                        {
+                            "foundation_model": {
+                                "ai_gateway_v2_supported": v2,
+                                "api_types": [api_type],
+                            }
+                        }
+                    ]
+                },
+            }
+            for name in names
+        ]
+    }
+
+
+class TestDiscoverOssModels:
+    def test_finds_oss_endpoints_via_foundation_models(self, monkeypatch):
+        # Mirrors a workspace with no system.ai UC model-services: OSS models are
+        # plain databricks-* serving endpoints under the mlflow chat dialect.
+        payload = _mlflow_chat_payload(
+            [
+                "databricks-glm-5-2",
+                "databricks-inkling",
+                "databricks-qwen35-122b-a10b",
+                "databricks-gemma-3-12b",
+            ]
+        )
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert reason is None
+        assert "databricks-glm-5-2" in models
+        assert set(models) == {
+            "databricks-glm-5-2",
+            "databricks-inkling",
+            "databricks-qwen35-122b-a10b",
+            "databricks-gemma-3-12b",
+        }
+
+    def test_excludes_claude_and_gemini_sharing_the_mlflow_dialect(self, monkeypatch):
+        # On some workspaces every foundation model advertises the mlflow chat
+        # dialect, so the api_type filter alone is too broad — the OSS family
+        # filter must drop Claude/Gemini and keep only the OSS cohort.
+        payload = _mlflow_chat_payload(
+            [
+                "databricks-claude-opus-4-8",
+                "databricks-gemini-2-5-pro",
+                "databricks-glm-5-2",
+                "databricks-qwen3-embedding-0-6b",
+            ]
+        )
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert reason is None
+        assert models == ["databricks-glm-5-2"]
+
+    def test_reports_reason_when_no_oss_family_matches(self, monkeypatch):
+        payload = _mlflow_chat_payload(["databricks-claude-opus-4-8"])
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert models == []
+        assert reason is not None
+        assert "no OSS" in reason
+
+
 class TestResolvePatToken:
     def test_reads_pat_profile_token_from_cfg(self, monkeypatch, tmp_path):
         cfg = tmp_path / "databrickscfg"
