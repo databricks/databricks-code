@@ -325,7 +325,10 @@ class TestPiUserAgent:
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
         monkeypatch.setattr(pi, "PI_UCODE_HOME", pi_home)
+        monkeypatch.setattr(pi, "PI_CONFIG_DIR", pi_dir)
         monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_PATH", pi_dir / "settings.json")
+        monkeypatch.setattr(pi, "PI_SETTINGS_BACKUP_PATH", tmp_path / "pi-settings.backup.json")
         monkeypatch.setattr(pi, "PI_BACKUP_PATH", tmp_path / "pi.backup.json")
 
         state = {

@@ -910,7 +910,10 @@ class TestPiLaunch:
         config_path = pi_dir / "models.json"
         backup_path = tmp_path / "pi-models.backup.json"
         monkeypatch.setattr(pi, "PI_UCODE_HOME", pi_home)
+        monkeypatch.setattr(pi, "PI_CONFIG_DIR", pi_dir)
         monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_PATH", pi_dir / "settings.json")
+        monkeypatch.setattr(pi, "PI_SETTINGS_BACKUP_PATH", tmp_path / "pi-settings.backup.json")
         monkeypatch.setattr(pi, "PI_BACKUP_PATH", backup_path)
 
         failures = []

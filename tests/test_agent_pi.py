@@ -349,7 +349,7 @@ class TestBuildRuntimeEnv:
 
     def test_sets_ucode_home(self):
         env = pi.build_runtime_env("tok")
-        assert env["HOME"] == str(pi.PI_UCODE_HOME)
+        assert env["PI_CODING_AGENT_DIR"] == str(pi.PI_CONFIG_DIR)
 
 
 class TestPiValidateCmd:
