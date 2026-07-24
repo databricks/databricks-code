@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import cast
 from urllib.parse import urlencode
 
 from ucode.databricks import (
@@ -65,7 +64,7 @@ def list_schema_skills(
         payload, reason = _http_get_json(f"{base_url}?{urlencode(query)}", token, timeout=30)
         if payload is None:
             return [], reason
-        data = cast(dict, payload) if isinstance(payload, dict) else {}
+        data = payload if isinstance(payload, dict) else {}
         for skill in data.get("skills") or []:
             leaf = _skill_bundle_name(skill) if isinstance(skill, dict) else None
             if leaf:
@@ -99,7 +98,7 @@ def list_skill_files(
             payload, reason = _http_get_json(url, token, timeout=30)
             if payload is None:
                 return [], reason
-            data = cast(dict, payload) if isinstance(payload, dict) else {}
+            data = payload if isinstance(payload, dict) else {}
             for entry in data.get("contents") or []:
                 path = entry.get("path") if isinstance(entry, dict) else None
                 if not isinstance(path, str):
@@ -224,6 +223,8 @@ def _fetch_bundles(
 
     Renders a ``k/n`` progress bar that advances as each fetch completes.
     """
+    if not leaves:
+        return {}
     results: dict[str, tuple[dict[str, bytes] | None, str | None]] = {}
     with (
         progress_bar(f"Fetching skills from {catalog}.{schema}", len(leaves)) as advance,

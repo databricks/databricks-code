@@ -286,6 +286,13 @@ class TestWriteSkill:
         assert not (tmp_path / "escape.md").exists()
 
 
+class TestFetchBundles:
+    def test_empty_leaves_returns_empty_without_pool(self):
+        # min(workers, 0) would raise ValueError in ThreadPoolExecutor; the
+        # early return keeps _fetch_bundles safe regardless of caller.
+        assert sd._fetch_bundles(WS, "token", "main", "default", []) == {}
+
+
 class TestDownloadSkills:
     def test_fetches_and_writes_each_leaf(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
