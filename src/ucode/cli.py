@@ -1408,14 +1408,18 @@ def configure_skills(
     ] = False,
     path: Annotated[
         str | None,
-        typer.Option("--path", help="(download) Existing absolute project dir to download into."),
+        typer.Option(
+            "--path",
+            help="(download) Existing absolute dir to download into; defaults to your home dir.",
+        ),
     ] = None,
 ) -> None:
     """Configure Databricks Skills for your coding tools.
 
-    By default, downloads every skill in each ``--location`` schema into
-    ``--path`` and registers a schema-less MCP connection. With ``--mcp``,
-    instead sets the skills MCP connection's scope to exactly the listed schemas.
+    By default, downloads every skill in each ``--location`` schema to disk
+    (under ``--path``, or your home dir when omitted) and registers a schema-less
+    MCP connection. With ``--mcp``, instead sets the skills MCP connection's scope
+    to exactly the listed schemas.
     """
     try:
         if mcp:
@@ -1423,8 +1427,6 @@ def configure_skills(
                 raise RuntimeError("--path is not valid with --mcp.")
             configure_skills_mcp_command(_parse_skill_locations(location))
         else:
-            if path is None:
-                raise RuntimeError("--path is required for download.")
             configure_skills_download_command(_parse_skill_locations(location), path=path)
     except (RuntimeError, ValueError) as exc:
         print_err(str(exc))

@@ -372,12 +372,11 @@ class TestConfigureSkillsCommand:
         assert result.exit_code == 0, result.output
         mock_download.assert_called_once_with(["a.b"], path="/tmp/skills")
 
-    def test_download_without_path_exit_1(self):
+    def test_default_mode_without_path_dispatches_download(self):
         with patch("ucode.cli.configure_skills_download_command") as mock_download:
             result = runner.invoke(app, ["configure", "skills", "--location", "a.b"])
-        assert result.exit_code == 1
-        assert "--path" in _strip_ansi(result.output)
-        mock_download.assert_not_called()
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path=None)
 
     def test_path_with_mcp_exit_1(self):
         with (

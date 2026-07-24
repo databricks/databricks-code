@@ -1887,75 +1887,45 @@ class TestSkillMcpLocations:
 
 
 class TestConfigureSkillsDownloadCommand:
-    def _stub_download(self, monkeypatch, state, *, leaves, bundle=(None, None)):
+    def _stub_download(self, monkeypatch, state):
         saved_states: list[dict] = []
-        written: list[tuple[str, str]] = []
+        download_calls: list[tuple] = []
         _stub_location_base(monkeypatch, state)
         monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a, **kw: [])
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
-        monkeypatch.setattr(mcp, "skill_dir_roots", lambda path: [f"{path}/.claude/skills"])
-        monkeypatch.setattr(mcp, "list_schema_skills", lambda *a, **kw: leaves)
-        monkeypatch.setattr(mcp, "fetch_skill_bundle", lambda *a, **kw: bundle)
         monkeypatch.setattr(
             mcp,
-            "write_skill",
-            lambda roots, leaf, files, *, location: written.append((location, leaf)) or "written",
+            "download_skills",
+            lambda ws, tok, locations, path: download_calls.append((ws, locations, path)),
         )
-        return saved_states, written
+        return saved_states, download_calls
 
-    def test_downloads_leaves_and_registers_schemaless_connection(self, monkeypatch):
-        saved_states, written = self._stub_download(
-            monkeypatch,
-            _skills_state(),
-            leaves=(["pii-handling", "triage"], None),
-            bundle=({"SKILL.md": b"body"}, None),
-        )
+    def test_downloads_and_registers_schemaless_connection(self, monkeypatch):
+        saved_states, download_calls = self._stub_download(monkeypatch, _skills_state())
 
         assert mcp.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
 
-        assert written == [("a.b", "pii-handling"), ("a.b", "triage")]
+        assert download_calls == [(WS, ["a.b"], "/tmp/skills")]
         skills = _find_skills(saved_states[-1]["mcp_servers"])
         assert len(skills) == 1
         assert skills[0]["skill_locations"] == []
         assert skills[0]["url"] == f"{WS}/ai-gateway/skills/"
 
+    def test_none_path_threads_through(self, monkeypatch):
+        _, download_calls = self._stub_download(monkeypatch, _skills_state())
+
+        assert mcp.configure_skills_download_command(["a.b"], path=None) == 0
+
+        assert download_calls == [(WS, ["a.b"], None)]
+
     def test_preserves_prior_mcp_location_set(self, monkeypatch):
         prior = mcp._resolve_skills_mcp_servers(WS, ["claude"], ["X.x", "Y.y"], [])
         state = _skills_state(prior)
-        self._stub_download(
-            monkeypatch,
-            state,
-            leaves=(["pii-handling"], None),
-            bundle=({"SKILL.md": b"body"}, None),
-        )
+        self._stub_download(monkeypatch, state)
 
         assert mcp.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
 
         assert _find_skills(state["mcp_servers"])[0]["skill_locations"] == ["X.x", "Y.y"]
-
-    def test_bundle_failure_warns_and_still_exits_0(self, monkeypatch):
-        saved_states, written = self._stub_download(
-            monkeypatch,
-            _skills_state(),
-            leaves=(["pii-handling"], None),
-            bundle=(None, "HTTP 500 Server Error"),
-        )
-
-        assert mcp.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
-
-        assert written == []
-        assert _find_skills(saved_states[-1]["mcp_servers"])[0]["skill_locations"] == []
-
-    def test_list_failure_skips_location(self, monkeypatch):
-        saved_states, written = self._stub_download(
-            monkeypatch,
-            _skills_state(),
-            leaves=([], "HTTP 404 Not Found"),
-        )
-
-        assert mcp.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
-
-        assert written == []
 
 
 class TestRevertMcpConfigs:

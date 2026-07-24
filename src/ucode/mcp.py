@@ -31,18 +31,16 @@ from ucode.databricks import (
     build_mcp_service_url,
     build_skills_mcp_url,
     ensure_databricks_auth,
-    fetch_skill_bundle,
     get_databricks_token,
     list_databricks_apps,
     list_databricks_connections,
     list_genie_spaces,
     list_mcp_services,
-    list_schema_skills,
     list_uc_functions_catalog_schemas,
     list_vector_search_catalog_schemas,
     workspace_hostname,
 )
-from ucode.skills_download import skill_dir_roots, write_skill
+from ucode.skills_download import download_skills
 from ucode.state import load_full_state, load_state, save_state
 from ucode.ui import (
     print_note,
@@ -1438,31 +1436,19 @@ def _skill_mcp_locations(state: dict) -> list[str]:
     return list((entry or {}).get("skill_locations") or [])
 
 
-def configure_skills_download_command(locations: list[str], *, path: str) -> int:
-    """Download every skill in each schema to ``path`` and register the skills connection.
+def configure_skills_download_command(locations: list[str], *, path: str | None) -> int:
+    """Download every skill in each schema to disk and register the skills connection.
 
-    Writes each skill's bundle into ``<path>/.claude/skills`` and
-    ``<path>/.agents/skills`` (prompting before overwriting an existing dir), then
-    registers/keeps the schema-less MCP connection. ``skill_locations`` is never
-    touched, so a prior ``--mcp`` set survives a download run.
+    Delegates the download to ``download_skills`` (files land under ``path`` or,
+    when ``path`` is None, the user home dir), then registers/keeps the
+    schema-less MCP connection. ``skill_locations`` is never touched, so a prior
+    ``--mcp`` set survives a download run.
     """
     state = load_state()
     workspace, profile, clients = _setup_mcp_clients(state, "Skills")
     token = get_databricks_token(workspace, profile)
-    roots = skill_dir_roots(path)
 
-    for location in locations:
-        catalog, schema = location.split(".")
-        leaves, reason = list_schema_skills(workspace, token, catalog, schema)
-        if reason:
-            print_warning(f"Skipping `{location}`: {reason}.")
-            continue
-        for leaf in leaves:
-            files, reason = fetch_skill_bundle(workspace, token, catalog, schema, leaf)
-            if reason or files is None:
-                print_warning(f"Skipping `{location}.{leaf}`: {reason}.")
-                continue
-            write_skill(roots, leaf, files, location=location)
+    download_skills(workspace, token, locations, path)
 
     _update_skills_mcp(state, workspace, clients, _skill_mcp_locations(state))
     return 0

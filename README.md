@@ -117,10 +117,10 @@ ucode configure skills --location main.default,ml.prod --mcp
 ```
 
 - **Download mode** writes each skill flat as `<leaf>/SKILL.md` (plus its bundled files) into both
-  `<path>/.claude/skills/` and `<path>/.agents/skills/`. `--path` is required and must be an
-  existing absolute directory. Any pre-existing skill dir prompts before it's overwritten. It then
-  registers a schema-less skills MCP connection (utility tools only), leaving any prior `--mcp`
-  scope untouched.
+  `.claude/skills/` and `.agents/skills/`. `--path` (an existing absolute directory) is optional;
+  when omitted, skills are written under your home directory. Any pre-existing skill dir prompts
+  before it's overwritten. It then registers a schema-less skills MCP connection (utility tools
+  only), leaving any prior `--mcp` scope untouched.
 - **MCP mode** sets the connection's location set to exactly `<list>` (override-only) and rebuilds
   its `?schema=` URL; no files are downloaded and `--path` is rejected.
 
@@ -140,7 +140,7 @@ ucode configure skills --location main.default,ml.prod --mcp
 | `ucode configure --profiles DEFAULT --use-pat` | Authenticate with the profile's personal access token — no browser login |
 | `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
 | `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
-| `ucode configure skills --location main.default --path <dir>` | Download a schema's skills into `<dir>` and register a schema-less skills MCP connection |
+| `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
 
 ## Managed Local Files
