@@ -22,8 +22,8 @@ class TestSkillDirRoots:
             skill_dir_roots(str(tmp_path / "nope"))
 
 
-def _write(roots, leaf, files, *, schema_ref="main.default"):
-    return write_skill(roots, leaf, files, schema_ref=schema_ref)
+def _write(roots, leaf, files, *, location="main.default"):
+    return write_skill(roots, leaf, files, location=location)
 
 
 class TestWriteSkill:
@@ -40,20 +40,20 @@ class TestWriteSkill:
 
     def test_existing_skill_prompt_keep(self, tmp_path, monkeypatch):
         roots = skill_dir_roots(str(tmp_path))
-        _write(roots, "triage", {"SKILL.md": b"from-main"}, schema_ref="main.default")
+        _write(roots, "triage", {"SKILL.md": b"from-main"}, location="main.default")
 
         monkeypatch.setattr(sd, "prompt_yes_no", lambda _: False)
-        status = _write(roots, "triage", {"SKILL.md": b"from-ml"}, schema_ref="ml.prod")
+        status = _write(roots, "triage", {"SKILL.md": b"from-ml"}, location="ml.prod")
 
         assert status == "kept"
         assert (roots[0] / "triage/SKILL.md").read_bytes() == b"from-main"
 
     def test_existing_skill_prompt_overwrite(self, tmp_path, monkeypatch):
         roots = skill_dir_roots(str(tmp_path))
-        _write(roots, "triage", {"SKILL.md": b"from-main"}, schema_ref="main.default")
+        _write(roots, "triage", {"SKILL.md": b"from-main"}, location="main.default")
 
         monkeypatch.setattr(sd, "prompt_yes_no", lambda _: True)
-        status = _write(roots, "triage", {"SKILL.md": b"from-ml"}, schema_ref="ml.prod")
+        status = _write(roots, "triage", {"SKILL.md": b"from-ml"}, location="ml.prod")
 
         assert status == "overwritten"
         assert (roots[0] / "triage/SKILL.md").read_bytes() == b"from-ml"

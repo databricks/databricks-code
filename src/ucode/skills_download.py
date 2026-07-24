@@ -1,10 +1,4 @@
-"""Write downloaded Unity Catalog skills to disk for coding agents to load.
-
-Skills are written flat, one directory per skill (``<root>/<leaf>/SKILL.md`` plus
-bundled files), into both `.claude/skills` and `.agents/skills` — the pair that
-covers every skills-capable agent ucode configures. The bytes come from the
-download client in `databricks.py`; this module owns only the filesystem side.
-"""
+"""Write downloaded Unity Catalog skills to disk, one flat dir per skill."""
 
 from __future__ import annotations
 
@@ -13,12 +7,10 @@ from pathlib import Path
 
 from ucode.ui import print_warning, prompt_yes_no
 
-# Cross-agent skill directories: `.claude/skills` (Claude) and `.agents/skills`
-# (the Agent Skills alias the other agents read). Both get the same skills.
-SKILL_DIR_NAMES = (".claude/skills", ".agents/skills")
+# `.claude/skills` (Claude) + `.agents/skills` (the alias other agents read).
+SKILL_BASE_DIR_NAMES = (".claude/skills", ".agents/skills")
 
-# Agent Skills spec: a skill's directory name is its `name`, lowercase a-z 0-9 -.
-_LEAF_PATTERN = re.compile(r"^[a-z0-9-]+$")
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
 
 
 def skill_dir_roots(project_dir: str) -> list[Path]:
@@ -31,11 +23,11 @@ def skill_dir_roots(project_dir: str) -> list[Path]:
         raise ValueError(f"--path must be an absolute path, got `{project_dir}`.")
     if not base.is_dir():
         raise ValueError(f"--path directory does not exist: `{project_dir}`.")
-    return [base / name for name in SKILL_DIR_NAMES]
+    return [base / name for name in SKILL_BASE_DIR_NAMES]
 
 
 def _is_valid_leaf(leaf: str) -> bool:
-    return bool(_LEAF_PATTERN.match(leaf))
+    return bool(SKILL_NAME_PATTERN.match(leaf))
 
 
 def _safe_relative_path(relative_path: str) -> Path | None:
@@ -61,15 +53,12 @@ def _write_bundle(skill_dir: Path, leaf: str, files: dict[str, bytes]) -> None:
         destination.write_bytes(content)
 
 
-def write_skill(roots: list[Path], leaf: str, files: dict[str, bytes], *, schema_ref: str) -> str:
-    """Write one skill's bundle into every root, prompting before overwriting.
+def write_skill(roots: list[Path], leaf: str, files: dict[str, bytes], *, location: str) -> str:
+    """Write ``leaf``'s bundle (``{relpath: bytes}``) into every root.
 
-    ``files`` maps each in-bundle relative path (including ``SKILL.md``) to its
-    bytes. If the skill's directory already exists in any root, ask before
-    overwriting it — the on-disk skill may be from a different schema, so we
-    never clobber it without consent.
-
-    Returns ``"written"``, ``"overwritten"``, ``"kept"``, or ``"skipped"``.
+    Prompts before overwriting an existing skill dir. ``location`` is the source
+    ``<catalog>.<schema>``, shown in that prompt. Returns ``"written"``,
+    ``"overwritten"``, ``"kept"``, or ``"skipped"``.
     """
     if not _is_valid_leaf(leaf):
         print_warning(f"Skipping `{leaf}`: not a valid skill name (lowercase a-z, 0-9, -).")
@@ -77,7 +66,7 @@ def write_skill(roots: list[Path], leaf: str, files: dict[str, bytes], *, schema
 
     already_on_disk = any((root / leaf).exists() for root in roots)
     if already_on_disk and not prompt_yes_no(
-        f"A skill named `{leaf}` already exists. Overwrite it with `{schema_ref}.{leaf}`?"
+        f"A skill named `{leaf}` already exists. Overwrite it with `{location}.{leaf}`?"
     ):
         return "kept"
 
