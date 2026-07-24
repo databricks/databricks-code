@@ -61,21 +61,13 @@ def _write_bundle(skill_dir: Path, leaf: str, files: dict[str, bytes]) -> None:
         destination.write_bytes(content)
 
 
-def write_skill(
-    roots: list[Path],
-    leaf: str,
-    files: dict[str, bytes],
-    *,
-    written_leaves: dict[str, str],
-    schema_ref: str,
-) -> str:
-    """Write one skill's bundle into every root, resolving directory collisions.
+def write_skill(roots: list[Path], leaf: str, files: dict[str, bytes], *, schema_ref: str) -> str:
+    """Write one skill's bundle into every root, prompting before overwriting.
 
     ``files`` maps each in-bundle relative path (including ``SKILL.md``) to its
-    bytes. ``written_leaves`` records what this run has already written
-    (``leaf -> schema_ref``); the caller shares one dict across the whole run so
-    re-downloading the same skill rewrites silently, while a *different* schema
-    landing on an existing leaf prompts to keep or overwrite it.
+    bytes. If the skill's directory already exists in any root, ask before
+    overwriting it — the on-disk skill may be from a different schema, so we
+    never clobber it without consent.
 
     Returns ``"written"``, ``"overwritten"``, ``"kept"``, or ``"skipped"``.
     """
@@ -84,12 +76,7 @@ def write_skill(
         return "skipped"
 
     already_on_disk = any((root / leaf).exists() for root in roots)
-
-    # A collision is only a real conflict if this run didn't just write the leaf
-    # itself (re-downloading the same skill rewrites silently); ask before
-    # clobbering a skill some other schema or earlier run put there.
-    conflicts_with_existing = already_on_disk and leaf not in written_leaves
-    if conflicts_with_existing and not prompt_yes_no(
+    if already_on_disk and not prompt_yes_no(
         f"A skill named `{leaf}` already exists. Overwrite it with `{schema_ref}.{leaf}`?"
     ):
         return "kept"
@@ -97,5 +84,4 @@ def write_skill(
     for root in roots:
         _write_bundle(root / leaf, leaf, files)
 
-    written_leaves[leaf] = schema_ref
     return "overwritten" if already_on_disk else "written"

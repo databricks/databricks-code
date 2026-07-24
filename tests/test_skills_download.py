@@ -22,10 +22,8 @@ class TestSkillDirRoots:
             skill_dir_roots(str(tmp_path / "nope"))
 
 
-def _write(roots, leaf, files, *, written=None, schema_ref="main.default"):
-    if written is None:
-        written = {}
-    return write_skill(roots, leaf, files, written_leaves=written, schema_ref=schema_ref)
+def _write(roots, leaf, files, *, schema_ref="main.default"):
+    return write_skill(roots, leaf, files, schema_ref=schema_ref)
 
 
 class TestWriteSkill:
@@ -40,18 +38,7 @@ class TestWriteSkill:
             assert (root / "triage/SKILL.md").read_bytes() == b"# skill"
             assert (root / "triage/scripts/run.py").read_bytes() == b"print(1)"
 
-    def test_same_skill_twice_in_one_run_overwrites_silently(self, tmp_path, monkeypatch):
-        roots = skill_dir_roots(str(tmp_path))
-        written: dict[str, str] = {}
-
-        _write(roots, "triage", {"SKILL.md": b"v1"}, written=written)
-        monkeypatch.setattr(sd, "prompt_yes_no", _fail_if_called)
-        status = _write(roots, "triage", {"SKILL.md": b"v2"}, written=written)
-
-        assert status == "overwritten"
-        assert (roots[0] / "triage/SKILL.md").read_bytes() == b"v2"
-
-    def test_cross_schema_collision_prompt_keep(self, tmp_path, monkeypatch):
+    def test_existing_skill_prompt_keep(self, tmp_path, monkeypatch):
         roots = skill_dir_roots(str(tmp_path))
         _write(roots, "triage", {"SKILL.md": b"from-main"}, schema_ref="main.default")
 
@@ -61,7 +48,7 @@ class TestWriteSkill:
         assert status == "kept"
         assert (roots[0] / "triage/SKILL.md").read_bytes() == b"from-main"
 
-    def test_cross_schema_collision_prompt_overwrite(self, tmp_path, monkeypatch):
+    def test_existing_skill_prompt_overwrite(self, tmp_path, monkeypatch):
         roots = skill_dir_roots(str(tmp_path))
         _write(roots, "triage", {"SKILL.md": b"from-main"}, schema_ref="main.default")
 
@@ -89,7 +76,3 @@ class TestWriteSkill:
         assert status == "written"
         assert (roots[0] / "triage/SKILL.md").read_bytes() == b"ok"
         assert not (tmp_path / "escape.md").exists()
-
-
-def _fail_if_called(_prompt):
-    raise AssertionError("prompt_yes_no should not be called")
