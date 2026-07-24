@@ -16,7 +16,7 @@ from ucode.databricks import (
 )
 from ucode.mcp import register_schemaless_skills_connection, setup_mcp_clients
 from ucode.state import load_state
-from ucode.ui import print_note, print_success, print_warning, prompt_yes_no
+from ucode.ui import print_note, print_success, print_warning, progress_bar, prompt_yes_no
 
 # `.claude/skills` (Claude) + `.agents/skills` (the alias other agents read).
 SKILL_BASE_DIR_NAMES = (".claude/skills", ".agents/skills")
@@ -191,27 +191,27 @@ def _write_bundle(skill_dir: Path, leaf: str, files: dict[str, bytes]) -> None:
         destination.write_bytes(content)
 
 
-def write_skill(roots: list[Path], leaf: str, files: dict[str, bytes], *, location: str) -> None:
+def write_skill(roots: list[Path], leaf: str, files: dict[str, bytes], *, location: str) -> bool:
     """Write ``leaf``'s bundle (``{relpath: bytes}``) into every root.
 
     Prompts before overwriting an existing skill dir. ``location`` is the source
-    ``<catalog>.<schema>``, shown in that prompt.
+    ``<catalog>.<schema>``, shown in that prompt. Returns True if the skill was
+    written, False if it was skipped or kept.
     """
     if not _is_valid_leaf(leaf):
         print_warning(f"Skipping `{leaf}`: not a valid skill name (lowercase a-z, 0-9, -).")
-        return
+        return False
 
     already_on_disk = any((root / leaf).exists() for root in roots)
     if already_on_disk and not prompt_yes_no(
         f"A skill named `{leaf}` already exists. Overwrite it with `{location}.{leaf}`?"
     ):
         print_note(f"Kept existing `{leaf}`.")
-        return
+        return False
 
     for root in roots:
         _write_bundle(root / leaf, leaf, files)
-    verb = "Overwrote" if already_on_disk else "Downloaded"
-    print_success(f"{verb} `{leaf}` ({len(files)} file(s)).")
+    return True
 
 
 # --- Orchestration ---------------------------------------------------------
@@ -220,24 +220,31 @@ def write_skill(roots: list[Path], leaf: str, files: dict[str, bytes], *, locati
 def _fetch_bundles(
     workspace: str, token: str, catalog: str, schema: str, leaves: list[str]
 ) -> dict[str, tuple[dict[str, bytes] | None, str | None]]:
-    """Fetch every leaf's bundle concurrently, keyed by leaf name."""
+    """Fetch every leaf's bundle concurrently, keyed by leaf name.
+
+    Renders a ``k/n`` progress bar that advances as each fetch completes.
+    """
     results: dict[str, tuple[dict[str, bytes] | None, str | None]] = {}
-    with ThreadPoolExecutor(max_workers=min(_MAX_FETCH_WORKERS, len(leaves))) as pool:
+    with (
+        progress_bar(f"Fetching skills from {catalog}.{schema}", len(leaves)) as advance,
+        ThreadPoolExecutor(max_workers=min(_MAX_FETCH_WORKERS, len(leaves))) as pool,
+    ):
         futures = {
             pool.submit(fetch_skill_bundle, workspace, token, catalog, schema, leaf): leaf
             for leaf in leaves
         }
         for future in as_completed(futures):
             results[futures[future]] = future.result()
+            advance()
     return results
 
 
 def download_skills(workspace: str, token: str, locations: list[str], path: str | None) -> None:
     """Download every skill in each ``<catalog>.<schema>`` location to disk.
 
-    Bundles are fetched concurrently per schema, then written sequentially (so
-    overwrite prompts don't interleave). A failure on one skill warns and skips
-    it without aborting the batch.
+    Bundles are fetched concurrently (with a progress bar) per schema, then
+    written sequentially so overwrite prompts don't interleave. A failure on one
+    skill warns and skips it without aborting the batch.
     """
     roots = skill_dir_roots(path)
     for location in locations:
@@ -250,14 +257,16 @@ def download_skills(workspace: str, token: str, locations: list[str], path: str 
             print_note(f"No skills found in `{location}`.")
             continue
 
-        print_note(f"Downloading {len(leaves)} skill(s) from `{location}`...")
         bundles = _fetch_bundles(workspace, token, catalog, schema, leaves)
+        written = 0
         for leaf in leaves:
             files, reason = bundles[leaf]
             if reason or files is None:
                 print_warning(f"Skipping `{location}.{leaf}`: {reason}.")
                 continue
-            write_skill(roots, leaf, files, location=location)
+            if write_skill(roots, leaf, files, location=location):
+                written += 1
+        print_success(f"Downloaded {written}/{len(leaves)} skill(s) from `{location}`.")
 
 
 def configure_skills_download_command(locations: list[str], *, path: str | None) -> int:

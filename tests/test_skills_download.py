@@ -330,6 +330,28 @@ class TestDownloadSkills:
         assert (tmp_path / ".claude/skills/good/SKILL.md").read_bytes() == b"ok"
         assert not (tmp_path / ".claude/skills/bad").exists()
 
+    def test_prints_downloaded_count_summary(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["a", "b", "c"], None))
+        monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
+
+        assert "Downloaded 3/3 skill(s) from `main.default`" in capsys.readouterr().out
+
+    def test_summary_counts_only_written_skills(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["good", "bad"], None))
+        monkeypatch.setattr(
+            sd,
+            "fetch_skill_bundle",
+            lambda ws, tok, c, s, leaf: (
+                ({"SKILL.md": b"ok"}, None) if leaf == "good" else (None, "HTTP 500 Server Error")
+            ),
+        )
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
+
+        assert "Downloaded 1/2 skill(s) from `main.default`" in capsys.readouterr().out
+
 
 class TestConfigureSkillsDownloadCommand:
     def _stub(self, monkeypatch):
