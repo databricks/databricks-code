@@ -12,9 +12,42 @@ from ucode.ui import (
     format_token_count,
     normalize_workspace_url,
     prompt_for_workspace,
+    prompt_yes_no_default,
     render_box_table,
     status_badge,
 )
+
+
+class TestPromptYesNoDefault:
+    def _answer(self, monkeypatch, value):
+        # value: a string the user "types", or EOFError to simulate closed stdin.
+        def fake_input(_prompt):
+            if value is EOFError:
+                raise EOFError
+            return value
+
+        monkeypatch.setattr("ucode.ui.console.input", fake_input)
+
+    def test_empty_takes_default_true(self, monkeypatch):
+        self._answer(monkeypatch, "")
+        assert prompt_yes_no_default("go?", default=True) is True
+
+    def test_empty_takes_default_false(self, monkeypatch):
+        self._answer(monkeypatch, "")
+        assert prompt_yes_no_default("go?", default=False) is False
+
+    def test_eof_takes_default(self, monkeypatch):
+        # Non-interactive / closed stdin must not abort — it takes the default.
+        self._answer(monkeypatch, EOFError)
+        assert prompt_yes_no_default("go?", default=True) is True
+
+    def test_explicit_no_overrides_default_yes(self, monkeypatch):
+        self._answer(monkeypatch, "n")
+        assert prompt_yes_no_default("go?", default=True) is False
+
+    def test_explicit_yes_overrides_default_false(self, monkeypatch):
+        self._answer(monkeypatch, "yes")
+        assert prompt_yes_no_default("go?", default=False) is True
 
 
 class TestNormalizeWorkspaceUrl:

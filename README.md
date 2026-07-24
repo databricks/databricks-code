@@ -92,6 +92,16 @@ Options are shown in this order:
 Discovered external MCP connections are listed directly. MCP auth uses a Databricks token that
 `ucode` sets when launching each tool.
 
+To set up an agent and its MCP server(s) in one command, pass `--mcp` with fully-qualified
+service name(s) to `ucode configure`:
+
+```bash
+ucode configure --agents claude --mcp system.ai.slack
+```
+
+`--mcp` also works without `--agents` for MCP-only clients (it configures just the workspace,
+then registers the servers); pass a comma-separated list to register several at once.
+
 ---
 
 ## Other Commands
@@ -107,6 +117,7 @@ Discovered external MCP connections are listed directly. MCP auth uses a Databri
 | `ucode configure --profiles DEFAULT` | Configure using existing Databricks CLI profiles (hosts come from `~/.databrickscfg`) |
 | `ucode configure --profiles DEFAULT --use-pat` | Authenticate with the profile's personal access token — no browser login |
 | `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
+| `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
 
 ## Managed Local Files
 

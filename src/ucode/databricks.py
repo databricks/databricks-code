@@ -49,7 +49,8 @@ WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
 AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
-MIN_DATABRICKS_CLI_VERSION = (0, 298, 0)
+# v1.0.0 is the release that ships `databricks aitools`.
+MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 
 
@@ -546,6 +547,41 @@ def install_databricks_cli() -> None:
             "Databricks CLI install completed, but `databricks` is still not on PATH."
         )
     ensure_databricks_cli_version()
+
+
+def install_ai_tools(agent_tokens: list[str], profile: str | None = None) -> None:
+    """Install Databricks AI Tools for the given agents (e.g. ``claude-code``).
+
+    Databricks AI Tools is the set of skills and plugins that teach coding
+    agents how to work with Databricks (installed via ``databricks aitools``).
+    Idempotent and best-effort: any failure only warns (surfacing the CLI's
+    own error), since AI Tools aren't required to launch an agent."""
+    if not agent_tokens:
+        return
+
+    agents_arg = ",".join(agent_tokens)
+    try:
+        with spinner(f"Installing Databricks AI Tools for {agents_arg}..."):
+            run(
+                ["databricks", "aitools", "install", "--agents", agents_arg, "--scope", "global"]
+                + _profile_args(profile),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # The CLI version is already guaranteed by ensure_databricks_cli_version,
+        # so any failure here is something else (e.g. an agent binary missing
+        # from PATH). Surface the CLI's own error rather than guessing a cause.
+        detail = getattr(exc, "stderr", None) or ""
+        if isinstance(detail, bytes):  # TimeoutExpired.stderr is bytes even with text=True
+            detail = detail.decode(errors="replace")
+        detail = detail.strip()
+        reason = detail.splitlines()[-1] if detail else str(exc)
+        print_warning(f"Could not install Databricks AI Tools: {reason}")
+    else:
+        print_success("Databricks AI Tools installed")
 
 
 def _profile_args(profile: str | None) -> list[str]:

@@ -302,6 +302,23 @@ def prompt_yes_no(prompt: str) -> bool:
         print_err("Please answer yes or no.")
 
 
+def prompt_yes_no_default(prompt: str, *, default: bool) -> bool:
+    """Empty answer or closed stdin (EOF) takes ``default`` (no abort on piped runs)."""
+    hint = "(Y/n)" if default else "(y/N)"
+    while True:
+        try:
+            response = console.input(f"{label(prompt)} {muted(hint)} {muted('›')} ").strip().lower()
+        except EOFError:
+            return default
+        if not response:
+            return default
+        if response in {"y", "yes"}:
+            return True
+        if response in {"n", "no"}:
+            return False
+        print_err("Please answer yes or no.")
+
+
 def prompt_for_choice(prompt: str, options: list[tuple[str, str]]) -> str:
     console.print()
     for index, (_, option_label) in enumerate(options, start=1):

@@ -26,6 +26,7 @@ from ucode.databricks import (
     ensure_databricks_cli_version,
     ensure_pat_bearer,
     get_databricks_token,
+    install_ai_tools,
     list_databricks_apps,
     list_databricks_connections,
     list_genie_spaces,
@@ -1554,19 +1555,19 @@ class TestEnsureDatabricksCliVersion:
         return {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
 
     def test_passes_when_version_meets_minimum(self, tmp_path, monkeypatch):
-        env = self._fake_databricks(tmp_path, "Databricks CLI v0.298.0")
+        env = self._fake_databricks(tmp_path, "Databricks CLI v1.0.0")
         monkeypatch.setattr("os.environ", env)
         ensure_databricks_cli_version()  # should not raise
 
     def test_passes_when_version_exceeds_minimum(self, tmp_path, monkeypatch):
-        env = self._fake_databricks(tmp_path, "Databricks CLI v0.299.2")
+        env = self._fake_databricks(tmp_path, "Databricks CLI v1.8.0")
         monkeypatch.setattr("os.environ", env)
         ensure_databricks_cli_version()
 
     def test_auto_upgrades_when_version_too_old(self, tmp_path, monkeypatch):
         import ucode.databricks as db_mod
 
-        env = self._fake_databricks(tmp_path, "Databricks CLI v0.297.0")
+        env = self._fake_databricks(tmp_path, "Databricks CLI v0.299.2")
         monkeypatch.setattr("os.environ", env)
         upgraded = []
         monkeypatch.setattr(
@@ -1715,3 +1716,72 @@ class TestRunUsageQuery:
             db_mod.run_usage_query(WS, "/sql/1.0/warehouses/abc", "tok", "SELECT 1")
         assert "Ask your workspace admin" not in str(exc_info.value)
         assert str(exc_info.value).startswith("Usage query failed:")
+
+
+class TestInstallAiTools:
+    def _capture_run(self, monkeypatch, *, raises=None):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if raises is not None:
+                raise raises
+            return subprocess.CompletedProcess(args, 0, "Installed 1 skill.", "")
+
+        monkeypatch.setattr(db_mod, "run", fake_run)
+        return calls
+
+    def test_no_tokens_skips_entirely(self, monkeypatch):
+        calls = self._capture_run(monkeypatch)
+        install_ai_tools([])
+        assert calls == []
+
+    def test_invokes_aitools_install(self, monkeypatch):
+        calls = self._capture_run(monkeypatch)
+        install_ai_tools(["claude-code", "codex"])
+        assert len(calls) == 1
+        cmd = calls[0]
+        assert cmd[:3] == ["databricks", "aitools", "install"]
+        assert "--agents" in cmd and cmd[cmd.index("--agents") + 1] == "claude-code,codex"
+        assert "--scope" in cmd and cmd[cmd.index("--scope") + 1] == "global"
+        assert "--profile" not in cmd
+
+    def test_passes_profile_when_set(self, monkeypatch):
+        calls = self._capture_run(monkeypatch)
+        install_ai_tools(["claude-code"], profile="myprofile")
+        cmd = calls[0]
+        assert "--profile" in cmd and cmd[cmd.index("--profile") + 1] == "myprofile"
+
+    def test_install_failure_is_non_fatal(self, monkeypatch):
+        self._capture_run(monkeypatch, raises=subprocess.CalledProcessError(1, "databricks"))
+        # Must not raise — AI Tools are best-effort.
+        install_ai_tools(["claude-code"])
+
+    def test_timeout_is_non_fatal(self, monkeypatch):
+        self._capture_run(monkeypatch, raises=subprocess.TimeoutExpired("databricks", 300))
+        install_ai_tools(["claude-code"])
+
+    def test_timeout_stderr_bytes_decoded_in_warning(self, monkeypatch):
+        # TimeoutExpired.stderr is bytes even with text=True; the warning must
+        # decode it, not render a `b'...'` repr.
+        err = subprocess.TimeoutExpired("databricks", 300)
+        err.stderr = b"resolving agents...\ninstall timed out"
+        self._capture_run(monkeypatch, raises=err)
+        warnings = []
+        monkeypatch.setattr(db_mod, "print_warning", warnings.append)
+        install_ai_tools(["claude-code"])
+        assert len(warnings) == 1
+        assert "install timed out" in warnings[0]
+        assert "b'" not in warnings[0]
+
+    def test_failure_surfaces_cli_stderr(self, monkeypatch):
+        # A modern CLI can still fail (e.g. an agent binary missing from PATH);
+        # the warning must show the CLI's real error, not blame the version.
+        err = subprocess.CalledProcessError(1, "databricks")
+        err.stderr = "resolving agents...\ncopilot: cli-not-on-path: could not resolve copilot"
+        self._capture_run(monkeypatch, raises=err)
+        warnings = []
+        monkeypatch.setattr(db_mod, "print_warning", warnings.append)
+        install_ai_tools(["copilot"])
+        assert len(warnings) == 1
+        assert "copilot: cli-not-on-path: could not resolve copilot" in warnings[0]
