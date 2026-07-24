@@ -20,7 +20,7 @@ Tests live in `tests/`.
 
 - Use Python 3.12+.
 - Keep changes scoped to the requested behavior.
-- Follow the existing module boundaries: CLI orchestration in `cli.py`, agent-specific behavior in `agents/<name>.py`, shared agent dispatch in `agents/__init__.py`, Databricks calls in `databricks.py`, and presentation helpers in `ui.py`.
+- Follow the existing module boundaries: CLI orchestration in `cli.py`, agent-specific behavior in `agents/<name>.py`, shared agent dispatch in `agents/__init__.py`, Databricks calls in `databricks.py`, filesystem writes for downloaded skills in `skills_download.py`, and presentation helpers in `ui.py`. Skill download persists no disk state — it writes files to `--path` and registers only the schema-less skills MCP connection.
 - Prefer existing helpers for config file writes, state persistence, UI messages, and Databricks authentication.
 - Add or update focused tests for behavior changes.
 - Do not modify generated or lock files unless the dependency graph intentionally changes.
