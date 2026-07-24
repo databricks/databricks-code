@@ -868,6 +868,45 @@ class TestFetchSkillFile:
         assert reason == "HTTP 404 Not Found"
 
 
+class TestFetchSkillBundle:
+    def test_assembles_relpath_to_bytes_map(self, monkeypatch):
+        contents = {"SKILL.md": b"# skill", "references/a.md": b"aaa"}
+        monkeypatch.setattr(db_mod, "list_skill_files", lambda *a, **k: (list(contents), None))
+        monkeypatch.setattr(
+            db_mod, "fetch_skill_file", lambda ws, tok, c, s, leaf, rel: (contents[rel], None)
+        )
+
+        bundle, reason = db_mod.fetch_skill_bundle(WS, "token", "main", "default", "triage")
+
+        assert reason is None
+        assert bundle == contents
+
+    def test_listing_failure_propagates_reason(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "list_skill_files", lambda *a, **k: ([], "HTTP 404 Not Found"))
+
+        bundle, reason = db_mod.fetch_skill_bundle(WS, "token", "main", "default", "triage")
+
+        assert bundle is None
+        assert reason == "HTTP 404 Not Found"
+
+    def test_file_failure_aborts_whole_bundle(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "list_skill_files", lambda *a, **k: (["SKILL.md", "broken.md"], None)
+        )
+        monkeypatch.setattr(
+            db_mod,
+            "fetch_skill_file",
+            lambda ws, tok, c, s, leaf, rel: (
+                (b"ok", None) if rel == "SKILL.md" else (None, "HTTP 500 Server Error")
+            ),
+        )
+
+        bundle, reason = db_mod.fetch_skill_bundle(WS, "token", "main", "default", "triage")
+
+        assert bundle is None
+        assert reason == "HTTP 500 Server Error"
+
+
 def _foundation_models_payload(names):
     return {
         "endpoints": [

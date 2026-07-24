@@ -1503,6 +1503,27 @@ def fetch_skill_file(
     return _http_get_bytes(url, token, timeout=30)
 
 
+def fetch_skill_bundle(
+    workspace: str, token: str, catalog: str, schema: str, leaf: str
+) -> tuple[dict[str, bytes] | None, str | None]:
+    """Fetch a whole skill bundle as ``{relative_path: bytes}``.
+
+    Lists the skill's files then fetches each one. All-or-nothing: a non-None
+    reason (and None bundle) means the listing or any file fetch failed, so a
+    partially-downloaded skill is never written to disk.
+    """
+    relative_paths, reason = list_skill_files(workspace, token, catalog, schema, leaf)
+    if reason:
+        return None, reason
+    bundle: dict[str, bytes] = {}
+    for relative_path in relative_paths:
+        content, reason = fetch_skill_file(workspace, token, catalog, schema, leaf, relative_path)
+        if content is None:
+            return None, reason
+        bundle[relative_path] = content
+    return bundle, None
+
+
 # Maps the gateway routing dialect a coding tool speaks to the Model Provider
 # Service `provider_type`s it can be backed by. claude speaks Anthropic's API,
 # which both the `anthropic` and `amazon_bedrock` provider types serve (Bedrock
