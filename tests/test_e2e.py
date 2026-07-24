@@ -948,14 +948,17 @@ class TestPiLaunch:
             pytest.skip("No Pi-compatible models available on this workspace")
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        # Pi reads models.json below HOME/.pi/agent. Point both pi's runtime
-        # HOME and our writer at the same isolated tmp home.
+        # Point PI_CODING_AGENT_DIR and ucode's config writer at the same
+        # isolated directory without changing the process HOME.
         pi_home = tmp_path / "pi-home"
         pi_dir = pi_home / ".pi" / "agent"
         config_path = pi_dir / "models.json"
         backup_path = tmp_path / "pi-models.backup.json"
         monkeypatch.setattr(pi, "PI_UCODE_HOME", pi_home)
+        monkeypatch.setattr(pi, "PI_CONFIG_DIR", pi_dir)
         monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_PATH", pi_dir / "settings.json")
+        monkeypatch.setattr(pi, "PI_SETTINGS_BACKUP_PATH", tmp_path / "pi-settings.backup.json")
         monkeypatch.setattr(pi, "PI_BACKUP_PATH", backup_path)
 
         failures = []
