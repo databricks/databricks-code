@@ -693,6 +693,181 @@ class TestListMcpServices:
         assert reason and reason.startswith("HTTP 404")
 
 
+class TestListSchemaSkills:
+    def test_keeps_finalized_skills_and_uses_bundle_name(self, monkeypatch):
+        payload = {
+            "skills": [
+                {
+                    "name": "skills/main.default.pii-handling",
+                    "bundle_name": "pii-handling",
+                    "finalize_time": "2026-06-26T05:58:25Z",
+                },
+                {
+                    "name": "skills/main.default.triage",
+                    "bundle_name": "triage",
+                    "finalize_time": "2026-06-26T05:58:26Z",
+                },
+                {"name": "skills/main.default.draft", "bundle_name": "draft"},
+            ]
+        }
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
+        )
+
+        leaves, reason = db_mod.list_schema_skills(WS, "token", "main", "default")
+
+        assert reason is None
+        assert leaves == ["pii-handling", "triage"]
+
+    def test_falls_back_to_resource_name_leaf(self, monkeypatch):
+        payload = {
+            "skills": [
+                {
+                    "name": "skills/main.default.pii-handling",
+                    "finalize_time": "2026-06-26T05:58:25Z",
+                }
+            ]
+        }
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
+        )
+
+        leaves, reason = db_mod.list_schema_skills(WS, "token", "main", "default")
+
+        assert reason is None
+        assert leaves == ["pii-handling"]
+
+    def test_follows_pagination(self, monkeypatch):
+        pages = [
+            {
+                "skills": [{"bundle_name": "a", "finalize_time": "t"}],
+                "next_page_token": "tok",
+            },
+            {"skills": [{"bundle_name": "b", "finalize_time": "t"}]},
+        ]
+        captured_tokens = []
+
+        def fake_get(url, token, timeout=30):
+            captured_tokens.append("page_token=tok" in url)
+            return pages.pop(0), None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        leaves, reason = db_mod.list_schema_skills(WS, "token", "main", "default")
+
+        assert reason is None
+        assert leaves == ["a", "b"]
+        assert captured_tokens == [False, True]
+
+    def test_targets_uc_skills_api_for_the_schema(self, monkeypatch):
+        captured = {}
+
+        def fake_get(url, token, timeout=30):
+            captured["url"] = url
+            return {"skills": []}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        db_mod.list_schema_skills(WS, "token", "main", "default")
+
+        assert "/api/2.1/unity-catalog/skills?" in captured["url"]
+        assert "parent=schemas%2Fmain.default" in captured["url"]
+
+    def test_http_failure_propagates_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (None, "HTTP 500 Server Error")
+        )
+
+        leaves, reason = db_mod.list_schema_skills(WS, "token", "main", "default")
+
+        assert leaves == []
+        assert reason == "HTTP 500 Server Error"
+
+
+class TestListSkillFiles:
+    def test_walks_nested_directories_into_relative_paths(self, monkeypatch):
+        # The Files API returns absolute `/Volumes/...` paths.
+        vol = "/Volumes/main/default/triage"
+        listings = {
+            "Volumes/main/default/triage": {
+                "contents": [
+                    {"path": f"{vol}/SKILL.md", "is_directory": False},
+                    {"path": f"{vol}/references/", "is_directory": True},
+                ]
+            },
+            "Volumes/main/default/triage/references": {
+                "contents": [{"path": f"{vol}/references/primary.md", "is_directory": False}]
+            },
+        }
+
+        def fake_get(url, token, timeout=30):
+            directory = url.split("/api/2.0/fs/directories/", 1)[1]
+            return listings[directory], None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        paths, reason = db_mod.list_skill_files(WS, "token", "main", "default", "triage")
+
+        assert reason is None
+        assert sorted(paths) == ["SKILL.md", "references/primary.md"]
+
+    def test_follows_pagination(self, monkeypatch):
+        vol = "/Volumes/main/default/triage"
+        pages = [
+            {
+                "contents": [{"path": f"{vol}/a.md", "is_directory": False}],
+                "next_page_token": "tok",
+            },
+            {"contents": [{"path": f"{vol}/b.md", "is_directory": False}]},
+        ]
+
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (pages.pop(0), None)
+        )
+
+        paths, reason = db_mod.list_skill_files(WS, "token", "main", "default", "triage")
+
+        assert reason is None
+        assert sorted(paths) == ["a.md", "b.md"]
+
+    def test_http_failure_propagates_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (None, "HTTP 404 Not Found")
+        )
+
+        paths, reason = db_mod.list_skill_files(WS, "token", "main", "default", "triage")
+
+        assert paths == []
+        assert reason == "HTTP 404 Not Found"
+
+
+class TestFetchSkillFile:
+    def test_returns_raw_bytes_from_files_api(self, monkeypatch):
+        captured = {}
+
+        def fake_get_bytes(url, token, timeout=30):
+            captured["url"] = url
+            return b"# SKILL\n", None
+
+        monkeypatch.setattr(db_mod, "_http_get_bytes", fake_get_bytes)
+
+        body, reason = db_mod.fetch_skill_file(WS, "token", "main", "default", "triage", "SKILL.md")
+
+        assert reason is None
+        assert body == b"# SKILL\n"
+        assert captured["url"] == f"{WS}/api/2.0/fs/files/Volumes/main/default/triage/SKILL.md"
+
+    def test_http_failure_propagates_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_bytes", lambda url, token, timeout=30: (None, "HTTP 404 Not Found")
+        )
+
+        body, reason = db_mod.fetch_skill_file(WS, "token", "main", "default", "triage", "gone.md")
+
+        assert body is None
+        assert reason == "HTTP 404 Not Found"
+
+
 def _foundation_models_payload(names):
     return {
         "endpoints": [

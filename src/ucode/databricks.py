@@ -290,6 +290,35 @@ def _http_post_json(
         return None, f"network error: {exc.reason}"
 
 
+def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes | None, str | None]:
+    """GET raw bytes. Returns (body, None) on success, (None, reason) on failure.
+
+    Like `_http_get_json` but leaves the body undecoded, since skill bundles can
+    contain binary files.
+    """
+    request = urllib_request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib_request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+        _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
+        return body, None
+    except urllib_error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        except Exception:
+            detail = ""
+        _debug(f"GET {url}", f"HTTP {exc.code} {exc.reason}")
+        reason = f"HTTP {exc.code} {exc.reason}"
+        excerpt = detail.strip()[:200]
+        if excerpt:
+            reason = f"{reason}: {excerpt}"
+        return None, reason
+    except urllib_error.URLError as exc:
+        _debug(f"GET {url}", f"URLError: {exc.reason}")
+        return None, f"network error: {exc.reason}"
+
+
 def get_current_user_name(workspace: str, token: str) -> str | None:
     """Return the current user's login (email) via SCIM `Me`, or None on failure.
 
@@ -1376,6 +1405,102 @@ def build_skills_mcp_url(workspace: str, locations: list[str]) -> str:
     if not locations:
         return base
     return base + "?" + urlencode([("schema", loc) for loc in locations])
+
+
+# --- Skill download (UC skills API + Files API) ----------------------------
+
+
+def _skill_bundle_name(skill: dict) -> str | None:
+    """The downloadable leaf name of a skill, or None if it isn't finalized.
+
+    Only finalized skills (those with a ``finalize_time``) have bundle content
+    to download. ``bundle_name`` is the leaf; fall back to the last dotted
+    segment of the resource ``name`` (``skills/<cat>.<sch>.<leaf>``).
+    """
+    if not skill.get("finalize_time"):
+        return None
+    bundle_name = skill.get("bundle_name")
+    if isinstance(bundle_name, str) and bundle_name:
+        return bundle_name
+    name = skill.get("name")
+    return name.rsplit(".", 1)[-1] if isinstance(name, str) else None
+
+
+def list_schema_skills(
+    workspace: str, token: str, catalog: str, schema: str
+) -> tuple[list[str], str | None]:
+    """List the finalized skill leaf names in ``<catalog>.<schema>``.
+
+    A non-None reason indicates the listing call itself failed.
+    """
+    hostname = workspace_hostname(workspace)
+    base_url = f"https://{hostname}/api/2.1/unity-catalog/skills"
+    query = {"parent": f"schemas/{catalog}.{schema}"}
+
+    leaves: list[str] = []
+    page_token: str | None = None
+    while True:
+        if page_token:
+            query["page_token"] = page_token
+        payload, reason = _http_get_json(f"{base_url}?{urlencode(query)}", token, timeout=30)
+        if payload is None:
+            return [], reason
+        data = cast(dict, payload) if isinstance(payload, dict) else {}
+        for skill in data.get("skills") or []:
+            leaf = _skill_bundle_name(skill) if isinstance(skill, dict) else None
+            if leaf:
+                leaves.append(leaf)
+        page_token = data.get("next_page_token")
+        if not page_token:
+            return leaves, None
+
+
+def list_skill_files(
+    workspace: str, token: str, catalog: str, schema: str, leaf: str
+) -> tuple[list[str], str | None]:
+    """List a skill bundle's files, as paths relative to the skill directory.
+
+    Recursively walks the skill's UC Volume directory (including ``SKILL.md``).
+    A non-None reason indicates the listing call itself failed.
+    """
+    hostname = workspace_hostname(workspace)
+    dirs_base = f"https://{hostname}/api/2.0/fs/directories"
+    volume_prefix = f"/Volumes/{catalog}/{schema}/{leaf}/"
+
+    relative_paths: list[str] = []
+    pending = [f"Volumes/{catalog}/{schema}/{leaf}"]
+    while pending:
+        directory = pending.pop()
+        page_token: str | None = None
+        while True:
+            url = f"{dirs_base}/{directory}"
+            if page_token:
+                url = f"{url}?{urlencode({'page_token': page_token})}"
+            payload, reason = _http_get_json(url, token, timeout=30)
+            if payload is None:
+                return [], reason
+            data = cast(dict, payload) if isinstance(payload, dict) else {}
+            for entry in data.get("contents") or []:
+                path = entry.get("path") if isinstance(entry, dict) else None
+                if not isinstance(path, str):
+                    continue
+                if entry.get("is_directory"):
+                    pending.append(path.strip("/"))
+                else:
+                    relative_paths.append(path.removeprefix(volume_prefix))
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+    return relative_paths, None
+
+
+def fetch_skill_file(
+    workspace: str, token: str, catalog: str, schema: str, leaf: str, relative_path: str
+) -> tuple[bytes | None, str | None]:
+    """Fetch one skill bundle file's raw bytes from its UC Volume."""
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}/api/2.0/fs/files/Volumes/{catalog}/{schema}/{leaf}/{relative_path}"
+    return _http_get_bytes(url, token, timeout=30)
 
 
 # Maps the gateway routing dialect a coding tool speaks to the Model Provider
