@@ -1,4 +1,4 @@
-"""Pi coding agent: writes ~/.pi/agent/models.json with Databricks-backed providers.
+"""Pi coding agent: writes a ucode-private models.json with Databricks-backed providers.
 
 Pi (https://pi.dev) is a multi-provider coding agent. We register four
 providers in its `models.json`, each speaking the API dialect best suited to
@@ -181,7 +181,7 @@ def render_overlay(
     gemini_models: list[str],
     oss_models: list[str],
 ) -> tuple[dict, list[list[str]]]:
-    """Return (overlay, managed_key_paths) for ~/.pi/agent/models.json."""
+    """Return (overlay, managed_key_paths) for Pi's private agent config."""
     providers: dict = {}
     keys: list[list[str]] = [["model"]]
     # Pi expands header values that match an env var name. Our UA contains
@@ -373,7 +373,7 @@ def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
 def build_runtime_env(token: str) -> dict[str, str]:
     env = os.environ.copy()
     env["OAUTH_TOKEN"] = token
-    env["HOME"] = str(PI_UCODE_HOME)
+    env["PI_CODING_AGENT_DIR"] = str(PI_CONFIG_DIR)
     return env
 
 
