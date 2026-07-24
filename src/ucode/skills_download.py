@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import urlencode
 
-from ucode.databricks import _http_get_bytes, _http_get_json, workspace_hostname
+from ucode.databricks import (
+    _http_get_bytes,
+    _http_get_json,
+    get_databricks_token,
+    workspace_hostname,
+)
+from ucode.mcp import register_schemaless_skills_connection, setup_mcp_clients
+from ucode.state import load_state
 from ucode.ui import print_note, print_success, print_warning, prompt_yes_no
 
 # `.claude/skills` (Claude) + `.agents/skills` (the alias other agents read).
@@ -251,3 +258,19 @@ def download_skills(workspace: str, token: str, locations: list[str], path: str 
                 print_warning(f"Skipping `{location}.{leaf}`: {reason}.")
                 continue
             write_skill(roots, leaf, files, location=location)
+
+
+def configure_skills_download_command(locations: list[str], *, path: str | None) -> int:
+    """Download every skill in each schema to disk and register the skills connection.
+
+    Downloads to ``path`` (or the home dir when None), then registers/keeps the
+    schema-less MCP connection. ``skill_locations`` is never touched, so a prior
+    ``--mcp`` set survives a download run."""
+    state = load_state()
+    workspace, profile, clients = setup_mcp_clients(state, "Skills")
+    token = get_databricks_token(workspace, profile)
+
+    download_skills(workspace, token, locations, path)
+
+    register_schemaless_skills_connection(state, workspace, clients)
+    return 0

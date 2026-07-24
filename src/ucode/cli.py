@@ -55,11 +55,11 @@ from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
     configure_mcp_command,
-    configure_skills_download_command,
     configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
     revert_mcp_configs,
 )
+from ucode.skills_download import configure_skills_download_command
 from ucode.state import (
     STATE_PATH,
     clear_state,

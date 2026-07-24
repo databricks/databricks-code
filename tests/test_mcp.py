@@ -1886,44 +1886,31 @@ class TestSkillMcpLocations:
         assert mcp._skill_mcp_locations(_skills_state()) == []
 
 
-class TestConfigureSkillsDownloadCommand:
-    def _stub_download(self, monkeypatch, state):
+class TestRegisterSchemalessSkillsConnection:
+    def _stub(self, monkeypatch):
         saved_states: list[dict] = []
-        download_calls: list[tuple] = []
-        _stub_location_base(monkeypatch, state)
         monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a, **kw: [])
+        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["claude"])
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
-        monkeypatch.setattr(
-            mcp,
-            "download_skills",
-            lambda ws, tok, locations, path: download_calls.append((ws, locations, path)),
-        )
-        return saved_states, download_calls
+        return saved_states
 
-    def test_downloads_and_registers_schemaless_connection(self, monkeypatch):
-        saved_states, download_calls = self._stub_download(monkeypatch, _skills_state())
+    def test_registers_bare_route_when_none_exists(self, monkeypatch):
+        saved_states = self._stub(monkeypatch)
+        state = _skills_state([])
 
-        assert mcp.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
+        mcp.register_schemaless_skills_connection(state, WS, ["claude"])
 
-        assert download_calls == [(WS, ["a.b"], "/tmp/skills")]
         skills = _find_skills(saved_states[-1]["mcp_servers"])
         assert len(skills) == 1
         assert skills[0]["skill_locations"] == []
         assert skills[0]["url"] == f"{WS}/ai-gateway/skills/"
 
-    def test_none_path_threads_through(self, monkeypatch):
-        _, download_calls = self._stub_download(monkeypatch, _skills_state())
-
-        assert mcp.configure_skills_download_command(["a.b"], path=None) == 0
-
-        assert download_calls == [(WS, ["a.b"], None)]
-
     def test_preserves_prior_mcp_location_set(self, monkeypatch):
+        self._stub(monkeypatch)
         prior = mcp._resolve_skills_mcp_servers(WS, ["claude"], ["X.x", "Y.y"], [])
         state = _skills_state(prior)
-        self._stub_download(monkeypatch, state)
 
-        assert mcp.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
+        mcp.register_schemaless_skills_connection(state, WS, ["claude"])
 
         assert _find_skills(state["mcp_servers"])[0]["skill_locations"] == ["X.x", "Y.y"]
 

@@ -329,3 +329,39 @@ class TestDownloadSkills:
 
         assert (tmp_path / ".claude/skills/good/SKILL.md").read_bytes() == b"ok"
         assert not (tmp_path / ".claude/skills/bad").exists()
+
+
+class TestConfigureSkillsDownloadCommand:
+    def _stub(self, monkeypatch):
+        calls: dict[str, object] = {}
+        monkeypatch.setattr(sd, "load_state", lambda: {"state": True})
+        monkeypatch.setattr(
+            sd, "setup_mcp_clients", lambda state, section: (WS, "profile", ["claude"])
+        )
+        monkeypatch.setattr(sd, "get_databricks_token", lambda ws, profile: "token")
+        monkeypatch.setattr(
+            sd,
+            "download_skills",
+            lambda ws, tok, locations, path: calls.update(download=(ws, tok, locations, path)),
+        )
+        monkeypatch.setattr(
+            sd,
+            "register_schemaless_skills_connection",
+            lambda state, ws, clients: calls.update(register=(ws, clients)),
+        )
+        return calls
+
+    def test_downloads_then_registers_connection(self, monkeypatch):
+        calls = self._stub(monkeypatch)
+
+        assert sd.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
+
+        assert calls["download"] == (WS, "token", ["a.b"], "/tmp/skills")
+        assert calls["register"] == (WS, ["claude"])
+
+    def test_none_path_threads_through(self, monkeypatch):
+        calls = self._stub(monkeypatch)
+
+        assert sd.configure_skills_download_command(["a.b"], path=None) == 0
+
+        assert calls["download"] == (WS, "token", ["a.b"], None)
