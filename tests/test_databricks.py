@@ -235,6 +235,108 @@ class TestModelTokenLimits:
         assert db_mod.model_token_limits("system.ai.qwen3-embedding-0-6b") is None
 
 
+class TestGptModelTokenLimits:
+    def test_gpt56_sol_serves_1m_context_across_id_forms(self):
+        for model_id in (
+            "gpt-5.6-sol",
+            "system.ai.gpt-5-6-sol",
+            "databricks-gpt-5-6-sol",
+            "databricks-openai/gpt-5.6-sol",
+        ):
+            assert db_mod.gpt_model_token_limits(model_id) == {
+                "context": 1_050_000,
+                "output": 128_000,
+            }
+
+    def test_gpt5_windows_are_model_specific(self):
+        assert db_mod.gpt_model_token_limits("system.ai.gpt-5-2")["context"] == 400_000
+        assert db_mod.gpt_model_token_limits("databricks-gpt-5-4")["context"] == 272_000
+        assert db_mod.gpt_model_token_limits("databricks-gpt-5-4-nano")["context"] == 400_000
+        assert db_mod.gpt_model_token_limits("gpt-5.5-pro")["context"] == 1_050_000
+
+    def test_gpt41_window(self):
+        assert db_mod.gpt_model_token_limits("databricks-gpt-4-1") == {
+            "context": 1_047_576,
+            "output": 32_768,
+        }
+
+    @pytest.mark.parametrize(
+        "model_id",
+        ["gpt-5.40", "gpt-4.10", "gpt-6-turbo"],
+    )
+    def test_unknown_specific_gpt_uses_family_or_conservative_fallback(self, model_id):
+        expected = (
+            {"context": 400_000, "output": 128_000}
+            if model_id == "gpt-5.40"
+            else {"context": 8_192, "output": 8_192}
+            if model_id == "gpt-4.10"
+            else {"context": 128_000, "output": 16_384}
+        )
+        assert db_mod.gpt_model_token_limits(model_id) == expected
+
+    def test_route_prefixes_are_stripped_case_insensitively(self):
+        assert db_mod.gpt_model_token_limits("SYSTEM.AI.GPT-5-6-SOL") == {
+            "context": 1_050_000,
+            "output": 128_000,
+        }
+        assert db_mod.gpt_model_token_limits("DATABRICKS-GPT-4-1") == {
+            "context": 1_047_576,
+            "output": 32_768,
+        }
+
+    def test_preferred_gpt_model_uses_semantic_version_across_prefixes(self):
+        assert (
+            db_mod.preferred_gpt_model(
+                ["databricks-gpt-5", "system.ai.gpt-5-6-sol", "databricks-gpt-5-5"]
+            )
+            == "system.ai.gpt-5-6-sol"
+        )
+        assert db_mod.preferred_gpt_model(["not-gpt", "claude-opus-4-8"]) == "not-gpt"
+
+    def test_preferred_gpt_model_falls_back_to_generic_responses_endpoint(self):
+        assert db_mod.preferred_gpt_model(["c1", "custom-responses"]) == "c1"
+
+    def test_preferred_gpt_model_excludes_gpt_oss(self):
+        assert db_mod.preferred_gpt_model(["gpt-oss-120b", "c1"]) == "c1"
+        assert db_mod.preferred_gpt_model(["system.ai.gpt-oss-120b"]) is None
+
+
+class TestClaudeModelCapabilities:
+    @pytest.mark.parametrize(
+        ("model_id", "context", "output", "supports_1m", "adaptive"),
+        [
+            ("databricks-claude-opus-4-5", 200_000, 64_000, False, False),
+            ("databricks-claude-opus-4-6", 1_000_000, 128_000, True, True),
+            ("system.ai.claude-opus-5", 1_000_000, 128_000, True, True),
+            ("claude-sonnet-4-4", 200_000, 64_000, False, False),
+            ("system.ai.claude-sonnet-4-5", 1_000_000, 64_000, True, False),
+            ("claude-sonnet-4-6[1m]", 1_000_000, 64_000, True, True),
+            ("claude-sonnet-5", 1_000_000, 64_000, True, True),
+            ("claude-haiku-4-5", 200_000, 64_000, False, False),
+            ("system.ai.claude-fable-5", 1_000_000, 128_000, False, True),
+            ("claude-future", 200_000, 64_000, False, False),
+        ],
+    )
+    def test_shared_capability_policy(
+        self,
+        model_id,
+        context,
+        output,
+        supports_1m,
+        adaptive,
+    ):
+        capabilities = db_mod.claude_model_capabilities(model_id)
+        assert capabilities.context == context
+        assert capabilities.output == output
+        assert capabilities.supports_1m is supports_1m
+        assert capabilities.force_adaptive_thinking is adaptive
+        assert db_mod.claude_model_supports_1m(model_id) is supports_1m
+        assert db_mod.claude_model_token_limits(model_id) == {
+            "context": context,
+            "output": output,
+        }
+
+
 class TestModelIsReasoning:
     def test_reasoning_families(self):
         assert db_mod.model_is_reasoning("system.ai.glm-5-2") is True
