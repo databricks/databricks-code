@@ -135,7 +135,16 @@ def _pi_claude_model_entry(model_id: str) -> dict:
         "maxTokens": limits["output"],
     }
     normalized = model_id.lower().replace(".", "-")
-    if re.search(r"claude-(?:opus|sonnet)-4-(?:[6-9]|[1-9]\d)", normalized):
+    # Claude 4.6+ and all 5+ models use the adaptive thinking API
+    # (thinking.type.adaptive) instead of the legacy enabled/disabled toggle
+    # (thinking.type.enabled). Without forceAdaptiveThinking, pi sends
+    # thinking.type.enabled and the gateway 400s:
+    #   "thinking.type.enabled" is not supported for this model.
+    if re.search(
+        r"claude-(?:opus|sonnet)-(?:[5-9]|[1-9]\d)-\d"
+        r"|claude-(?:opus|sonnet)-4-(?:[6-9]|[1-9]\d)",
+        normalized,
+    ):
         entry["compat"] = {"forceAdaptiveThinking": True}
     return entry
 

@@ -127,6 +127,34 @@ class TestRenderOverlayProviders:
         assert entries["system.ai.claude-sonnet-4-5"]["maxTokens"] == 64_000
         assert entries["databricks-claude-haiku-4-5"]["contextWindow"] == 200_000
 
+    def test_claude_opus_5_gets_force_adaptive_thinking(self):
+        # Opus 5 uses the adaptive thinking API (thinking.type.adaptive)
+        # instead of the legacy enabled toggle. Without forceAdaptiveThinking
+        # pi sends thinking.type.enabled and the gateway 400s.
+        overlay, _ = _overlay(
+            "databricks-claude-opus-5-0",
+            claude_models={
+                "opus": "databricks-claude-opus-5-0",
+                "sonnet": "databricks-claude-sonnet-5-0",
+            },
+        )
+        entries = {m["id"]: m for m in overlay["providers"]["databricks-claude"]["models"]}
+        assert entries["databricks-claude-opus-5-0"]["compat"] == {"forceAdaptiveThinking": True}
+        assert entries["databricks-claude-sonnet-5-0"]["compat"] == {"forceAdaptiveThinking": True}
+        # Opus 5 still gets 1M context / 128k output from token limits.
+        assert entries["databricks-claude-opus-5-0"]["contextWindow"] == 1_000_000
+        assert entries["databricks-claude-opus-5-0"]["maxTokens"] == 128_000
+
+    def test_claude_sonnet_4_5_does_not_get_force_adaptive_thinking(self):
+        # Sonnet 4.5 predates the adaptive thinking API change, so it must
+        # NOT get forceAdaptiveThinking (only 4.6+ and 5+ do).
+        overlay, _ = _overlay(
+            "system.ai.claude-sonnet-4-5",
+            claude_models={"sonnet": "system.ai.claude-sonnet-4-5"},
+        )
+        entry = overlay["providers"]["databricks-claude"]["models"][0]
+        assert "compat" not in entry
+
     def test_gemini_provider_uses_google_generative_ai(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
         provider = overlay["providers"]["databricks-gemini"]
