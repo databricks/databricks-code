@@ -53,9 +53,12 @@ from ucode.databricks import (
     TOKEN_REFRESH_INTERVAL_SECONDS,
     build_pi_base_urls,
     classify_model_family,
+    claude_model_capabilities,
     get_databricks_token,
+    gpt_model_token_limits,
     model_is_reasoning,
     model_token_limits,
+    preferred_gpt_model,
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
@@ -115,6 +118,25 @@ def _resolve_model_selector(
     return model
 
 
+def _pi_claude_model_entry(model_id: str) -> dict:
+    """Build a Claude entry with explicit limits.
+
+    Databricks model ids do not match Pi's built-in Anthropic ids, so a bare
+    custom entry silently gets Pi's 128k context / 4k output defaults.
+    """
+    capabilities = claude_model_capabilities(model_id)
+    entry: dict = {
+        "id": model_id,
+        "reasoning": True,
+        "input": ["text", "image"],
+        "contextWindow": capabilities.context,
+        "maxTokens": capabilities.output,
+    }
+    if capabilities.force_adaptive_thinking:
+        entry["compat"] = {"forceAdaptiveThinking": True}
+    return entry
+
+
 def _pi_oss_model_entry(model_id: str) -> dict:
     """Build a Pi mlflow model entry enriched from the shared limits/reasoning
     tables: `reasoning:true` for reasoning models (Pi renders their streamed
@@ -130,6 +152,23 @@ def _pi_oss_model_entry(model_id: str) -> dict:
             entry["contextWindow"] = limits["context"]
         if limits.get("output"):
             entry["maxTokens"] = limits["output"]
+    return entry
+
+
+def _pi_gpt_model_entry(model_id: str) -> dict:
+    """Build a Pi openai (codex) model entry with `contextWindow`/`maxTokens`
+    from `databricks.gpt_model_token_limits`. GPT ids aren't in Pi's built-in
+    catalog, so without an explicit window Pi falls back to a small default and
+    truncates long sessions."""
+    limits = gpt_model_token_limits(model_id)
+    entry: dict = {
+        "id": model_id,
+        "contextWindow": limits["context"],
+        "maxTokens": limits["output"],
+    }
+    if "gpt-5" in model_id.lower().replace(".", "-"):
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
     return entry
 
 
@@ -161,7 +200,7 @@ def render_overlay(
             # the legacy beta header instead when this is false.
             "compat": {"supportsEagerToolInputStreaming": False},
             "headers": ua_headers,
-            "models": [{"id": m} for m in claude_ids],
+            "models": [_pi_claude_model_entry(m) for m in claude_ids],
         }
         keys.append(["providers", "databricks-claude"])
     if codex_models:
@@ -171,7 +210,7 @@ def render_overlay(
             "apiKey": token,
             "authHeader": True,
             "headers": ua_headers,
-            "models": [{"id": m} for m in codex_models],
+            "models": [_pi_gpt_model_entry(m) for m in codex_models],
         }
         keys.append(["providers", "databricks-openai"])
     if gemini_models:
@@ -305,9 +344,9 @@ def default_model(state: dict) -> str | None:
     for family in ("opus", "sonnet", "haiku"):
         if claude_models.get(family):
             return claude_models[family]
-    codex_models = state.get("codex_models") or []
-    if codex_models:
-        return codex_models[0]
+    codex_model = preferred_gpt_model(state.get("codex_models") or [])
+    if codex_model:
+        return codex_model
     gemini_models = state.get("gemini_models") or []
     if gemini_models:
         return gemini_models[0]
