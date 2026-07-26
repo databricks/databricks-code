@@ -3000,27 +3000,53 @@ def discover_endpoints_with_api_type(
         return [], reason
 
     data = cast(dict, payload) if isinstance(payload, dict) else {}
-    endpoints = data.get("endpoints", [])
+    raw_endpoints = data.get("endpoints", [])
+    endpoints = raw_endpoints if isinstance(raw_endpoints, list) else []
     out: list[str] = []
     saw_endpoint_without_v2 = False
+    saw_malformed = not isinstance(raw_endpoints, list)
     for ep in endpoints:
-        name = ep.get("name", "")
-        entities = ep.get("config", {}).get("served_entities", [])
+        if not isinstance(ep, dict):
+            saw_malformed = True
+            continue
+        name = ep.get("name")
+        config = ep.get("config")
+        if not isinstance(name, str) or not name or not isinstance(config, dict):
+            saw_malformed = True
+            continue
+        raw_entities = config.get("served_entities", [])
+        if not isinstance(raw_entities, list):
+            saw_malformed = True
+            continue
         api_types: set[str] = set()
         any_v2 = False
-        for se in entities:
-            fm = se.get("foundation_model", {})
+        for se in raw_entities:
+            if not isinstance(se, dict):
+                saw_malformed = True
+                continue
+            fm = se.get("foundation_model")
+            if not isinstance(fm, dict):
+                saw_malformed = True
+                continue
             if fm.get("ai_gateway_v2_supported") is True:
                 any_v2 = True
-                api_types.update(fm.get("api_types", []))
-        if not any_v2 and entities:
+                raw_api_types = fm.get("api_types", [])
+                if isinstance(raw_api_types, list):
+                    api_types.update(value for value in raw_api_types if isinstance(value, str))
+                else:
+                    saw_malformed = True
+        if not any_v2 and raw_entities:
             saw_endpoint_without_v2 = True
         if api_type in api_types:
             out.append(name)
     if out:
         return sorted(out, key=sort_key), None
     if not endpoints:
+        if saw_malformed:
+            return [], "foundation-models listing returned malformed `endpoints`"
         return [], "foundation-models listing returned no endpoints"
+    if saw_malformed:
+        return [], "foundation-models listing contained no valid matching endpoints"
     if saw_endpoint_without_v2:
         return [], (
             f"no endpoint exposes api_type `{api_type}` with "
@@ -3048,6 +3074,34 @@ def discover_codex_models(workspace: str, token: str) -> tuple[list[str], str | 
     # and default is e.g. gpt-5-4 rather than the alphabetically-first gpt-5.
     return discover_endpoints_with_api_type(
         workspace, token, "openai/v1/responses", sort_key=model_version_sort_key
+    )
+
+
+def discover_oss_models(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """Discover OSS chat models served as AI Gateway foundation-model endpoints.
+
+    Fallback for workspaces that don't register OSS foundation models as
+    `system.ai.*` UC model-services (see `discover_model_services`): those
+    workspaces expose the same models as regular `databricks-*` serving
+    endpoints instead. Lists every endpoint advertising the
+    `mlflow/v1/chat/completions` dialect, then keeps only the OSS chat families
+    (`_is_oss_chat_model`) — on some workspaces the Claude/Gemini endpoints also
+    advertise that dialect, so the family filter is what separates the OSS
+    cohort from them. Mirrors the AI-Gateway fallback the other families use
+    when the UC model-services listing is empty.
+    """
+    endpoints, reason = discover_endpoints_with_api_type(
+        workspace, token, "mlflow/v1/chat/completions"
+    )
+    if not endpoints:
+        return [], reason
+    oss = [e for e in endpoints if _is_oss_chat_model(e)]
+    if oss:
+        return oss, None
+    sample = ", ".join(endpoints[:5])
+    return [], (
+        "foundation-models exposing `mlflow/v1/chat/completions` matched no OSS "
+        f"chat family (got: {sample})"
     )
 
 
@@ -3359,6 +3413,9 @@ def build_opencode_base_urls(workspace: str) -> dict[str, str]:
     return {
         "anthropic": build_tool_base_url("claude", workspace) + "/v1",
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
+        # @ai-sdk/openai appends "/responses" (or "/chat/completions") to baseURL,
+        # so stop just before that — matches the Pi adapter's build_pi_base_urls.
+        "openai": build_tool_base_url("codex", workspace),
         "oss": f"{workspace}/ai-gateway/mlflow/v1",
     }
 
