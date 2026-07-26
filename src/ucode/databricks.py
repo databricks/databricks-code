@@ -24,6 +24,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, cast, overload
@@ -1495,6 +1496,112 @@ def model_token_limits(model_id: str) -> dict[str, int] | None:
     if _is_oss_chat_model(model_id):
         return dict(_OSS_FALLBACK_LIMITS)
     return None
+
+
+# Pi treats every custom model without explicit metadata as 128k context / 4k
+# output. Gateway ids are custom ids (not Pi's built-ins), so preserve the
+# upstream windows explicitly. Entries are ordered most-specific first after
+# normalizing dotted OpenAI ids and hyphenated Databricks ids to one form.
+# GPT-5.6 Sol/Terra/Luna support the opt-in 1.05M window; 272k is merely Pi's
+# built-in short-context pricing default, not the model's hard context limit.
+_GPT_TOKEN_LIMITS: tuple[tuple[str, dict[str, int]], ...] = (
+    ("gpt-5-6-sol", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-6-terra", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-6-luna", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-5-pro", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-4-pro", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-5", {"context": 272_000, "output": 128_000}),
+    ("gpt-5-4-mini", {"context": 400_000, "output": 128_000}),
+    ("gpt-5-4-nano", {"context": 400_000, "output": 128_000}),
+    ("gpt-5-4", {"context": 272_000, "output": 128_000}),
+    ("gpt-5", {"context": 400_000, "output": 128_000}),
+    ("gpt-4-1", {"context": 1_047_576, "output": 32_768}),
+    ("gpt-4o", {"context": 128_000, "output": 16_384}),
+    ("gpt-4-turbo", {"context": 128_000, "output": 4_096}),
+    ("gpt-4", {"context": 8_192, "output": 8_192}),
+)
+_GPT_FALLBACK_LIMITS = {"context": 128_000, "output": 16_384}
+
+
+def _normalized_foundation_model_id(model_id: str) -> str:
+    """Strip route prefixes case-insensitively and normalize dotted versions."""
+    tail = model_id.split("/")[-1].lower()
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    if tail.startswith("databricks-"):
+        tail = tail[len("databricks-") :]
+    return tail.replace(".", "-")
+
+
+def gpt_model_token_limits(model_id: str) -> dict[str, int]:
+    """Return Pi metadata limits for a GPT (codex/openai) gateway model."""
+    tail = _normalized_foundation_model_id(model_id)
+    for family, limits in _GPT_TOKEN_LIMITS:
+        if tail == family or tail.startswith(f"{family}-"):
+            return dict(limits)
+    return dict(_GPT_FALLBACK_LIMITS)
+
+
+@dataclass(frozen=True)
+class ClaudeModelCapabilities:
+    context: int
+    output: int
+    supports_1m: bool = False
+    force_adaptive_thinking: bool = False
+
+
+_CLAUDE_FALLBACK_CAPABILITIES = ClaudeModelCapabilities(context=200_000, output=64_000)
+_CLAUDE_MODEL_RE = re.compile(r"^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?")
+
+
+def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
+    """Return the shared Claude capability policy for every agent.
+
+    Opus gained the opt-in 1M window in 4.6; Sonnet gained it in 4.5.
+    Sonnet's verified 1M tiers retain a conservative 64k output cap. Fable 5
+    is 1M by default (so it needs no ``[1m]`` suffix) with a 128k output cap.
+    Opus 4.5, Haiku, and unrecognized ids use the conservative 200k fallback.
+    """
+    tail = _normalized_foundation_model_id(model_id)
+    match = _CLAUDE_MODEL_RE.match(tail)
+    if not match:
+        return _CLAUDE_FALLBACK_CAPABILITIES
+    family, major_raw, minor_raw = match.groups()
+    version = (int(major_raw), int(minor_raw or 0))
+    if family == "opus" and version >= (4, 6):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=128_000,
+            supports_1m=True,
+            force_adaptive_thinking=True,
+        )
+    if family == "sonnet" and version >= (4, 6):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=64_000,
+            supports_1m=True,
+            force_adaptive_thinking=True,
+        )
+    if family == "sonnet" and version >= (4, 5):
+        return ClaudeModelCapabilities(context=1_000_000, output=64_000, supports_1m=True)
+    if family == "fable" and version >= (5, 0):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=128_000,
+            force_adaptive_thinking=True,
+        )
+    return _CLAUDE_FALLBACK_CAPABILITIES
+
+
+def claude_model_supports_1m(model_id: str) -> bool:
+    """Whether Claude Code should request the model's opt-in ``[1m]`` tier."""
+    return claude_model_capabilities(model_id).supports_1m
+
+
+def claude_model_token_limits(model_id: str) -> dict[str, int]:
+    """Return Pi metadata limits from the shared Claude capability policy."""
+    capabilities = claude_model_capabilities(model_id)
+    return {"context": capabilities.context, "output": capabilities.output}
 
 
 def _model_service_id(service: dict) -> str | None:
