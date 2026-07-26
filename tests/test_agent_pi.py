@@ -78,6 +78,60 @@ class TestRenderOverlayProviders:
         assert provider["api"] == "openai-responses"
         assert provider["baseUrl"] == f"{WS}/ai-gateway/codex/v1"
 
+    def test_gpt56_sol_model_entry_pins_1m_context(self):
+        # Gateway ids are custom to Pi, so explicit metadata is required to
+        # avoid its 128k custom-model default.
+        overlay, _ = _overlay("gpt-5-6-sol", codex_models=["gpt-5-6-sol"])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+        assert entry["id"] == "gpt-5-6-sol"
+        assert entry["contextWindow"] == 1_050_000
+        assert entry["maxTokens"] == 128_000
+        assert entry["reasoning"] is True
+        assert entry["input"] == ["text", "image"]
+
+    def test_gpt_model_entries_use_model_specific_windows(self):
+        overlay, _ = _overlay(
+            "system.ai.gpt-5-2",
+            codex_models=[
+                "system.ai.gpt-5-2",
+                "databricks-gpt-5-4-nano",
+                "databricks-gpt-5-6-sol",
+            ],
+        )
+        windows = {
+            m["id"]: m["contextWindow"] for m in overlay["providers"]["databricks-openai"]["models"]
+        }
+        assert windows == {
+            "system.ai.gpt-5-2": 400_000,
+            "databricks-gpt-5-4-nano": 400_000,
+            "databricks-gpt-5-6-sol": 1_050_000,
+        }
+
+    def test_claude_entries_pin_limits_and_capabilities(self):
+        overlay, _ = _overlay(
+            "databricks-claude-opus-4-8",
+            claude_models={
+                "opus": "databricks-claude-opus-4-8",
+                "sonnet": "system.ai.claude-sonnet-4-5",
+                "haiku": "databricks-claude-haiku-4-5",
+                "fable": "system.ai.claude-fable-5",
+            },
+        )
+        entries = {m["id"]: m for m in overlay["providers"]["databricks-claude"]["models"]}
+        opus = entries["databricks-claude-opus-4-8"]
+        assert opus["contextWindow"] == 1_000_000
+        assert opus["maxTokens"] == 128_000
+        assert opus["reasoning"] is True
+        assert opus["input"] == ["text", "image"]
+        assert opus["compat"] == {"forceAdaptiveThinking": True}
+        assert entries["system.ai.claude-sonnet-4-5"]["contextWindow"] == 1_000_000
+        assert entries["system.ai.claude-sonnet-4-5"]["maxTokens"] == 64_000
+        assert entries["databricks-claude-haiku-4-5"]["contextWindow"] == 200_000
+        fable = entries["system.ai.claude-fable-5"]
+        assert fable["contextWindow"] == 1_000_000
+        assert fable["maxTokens"] == 128_000
+        assert fable["compat"] == {"forceAdaptiveThinking": True}
+
     def test_gemini_provider_uses_google_generative_ai(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
         provider = overlay["providers"]["databricks-gemini"]
@@ -267,9 +321,28 @@ class TestPiDefaultModel:
         state = {"claude_models": {"haiku": "h4"}}
         assert pi.default_model(state) == "h4"
 
-    def test_falls_back_to_codex(self):
-        state = {"claude_models": {}, "codex_models": ["gpt-5"]}
-        assert pi.default_model(state) == "gpt-5"
+    def test_pins_first_discovered_codex_model_verbatim(self):
+        # Discovery order is meaningful (#282): Pi takes the first id as-is
+        # rather than re-sorting for the newest version.
+        state = {
+            "claude_models": {},
+            "codex_models": ["databricks-gpt-5", "system.ai.gpt-5-6-sol", "gpt-5-5"],
+        }
+        assert pi.default_model(state) == "databricks-gpt-5"
+
+    def test_falls_back_to_generic_responses_endpoint(self):
+        state = {"claude_models": {}, "codex_models": ["c1"]}
+        assert pi.default_model(state) == "c1"
+
+    def test_takes_codex_list_verbatim_regardless_of_id_shape(self):
+        # Keeping gpt-oss out of `codex_models` is discovery's job (capability
+        # bucketing); Pi's default does not second-guess the list it is given.
+        state = {
+            "claude_models": {},
+            "codex_models": ["gpt-oss-120b"],
+            "gemini_models": ["gemini-2"],
+        }
+        assert pi.default_model(state) == "gpt-oss-120b"
 
     def test_falls_back_to_gemini(self):
         state = {"claude_models": {}, "codex_models": [], "gemini_models": ["gemini-2"]}
