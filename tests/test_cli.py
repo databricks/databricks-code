@@ -28,6 +28,17 @@ runner = CliRunner()
 TOOLS = ["codex", "claude", "gemini", "opencode"]
 
 
+def test_oss_discovery_diagnostic_names_all_consumers(monkeypatch):
+    import ucode.cli as cli_mod
+
+    notes = []
+    monkeypatch.setattr(cli_mod, "print_note", notes.append)
+
+    cli_mod._print_discovery_diagnostics({"_discovery_reasons": {"oss": "not found"}})
+
+    assert notes[0] == "OSS models (needed for: opencode, pi): not found"
+
+
 @pytest.fixture(autouse=True)
 def no_state_writes():
     """Prevent any test from writing to the real state file on disk."""
