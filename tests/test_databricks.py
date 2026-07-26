@@ -127,6 +127,12 @@ class TestBuildOpencodeBaseUrls:
         assert urls["gemini"] == f"{WS}/ai-gateway/gemini/v1beta"
         assert urls["oss"] == f"{WS}/ai-gateway/mlflow/v1"
 
+    def test_returns_openai_codex_gateway(self):
+        # @ai-sdk/openai appends /responses (Responses API) or /chat/completions
+        # to baseURL, so stop just before that suffix. Mirrors build_pi_base_urls.
+        urls = build_opencode_base_urls(WS)
+        assert urls["openai"] == f"{WS}/ai-gateway/codex/v1"
+
 
 class TestBuildSharedBaseUrls:
     def test_contains_all_tools(self):
@@ -283,6 +289,24 @@ class TestGptModelTokenLimits:
             "context": 1_047_576,
             "output": 32_768,
         }
+
+
+class TestPreferredGptModel:
+    def test_preferred_gpt_model_uses_semantic_version_across_prefixes(self):
+        assert (
+            db_mod.preferred_gpt_model(
+                ["databricks-gpt-5", "system.ai.gpt-5-6-sol", "databricks-gpt-5-5"]
+            )
+            == "system.ai.gpt-5-6-sol"
+        )
+        assert db_mod.preferred_gpt_model(["not-gpt", "claude-opus-4-8"]) == "not-gpt"
+
+    def test_preferred_gpt_model_falls_back_to_generic_responses_endpoint(self):
+        assert db_mod.preferred_gpt_model(["c1", "custom-responses"]) == "c1"
+
+    def test_preferred_gpt_model_excludes_gpt_oss(self):
+        assert db_mod.preferred_gpt_model(["gpt-oss-120b", "c1"]) == "c1"
+        assert db_mod.preferred_gpt_model(["system.ai.gpt-oss-120b"]) is None
 
 
 class TestClaudeModelCapabilities:
@@ -1258,6 +1282,65 @@ class TestModelVersionSortKey:
         assert ordered[1:] == ["another-endpoint", "custom-endpoint"]
 
 
+class TestDiscoverEndpointsWithApiType:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"endpoints": None},
+            {"endpoints": "not-a-list"},
+            {"endpoints": [None, "not-an-endpoint"]},
+            {"endpoints": [{"name": 123, "config": {}}]},
+            {"endpoints": [{"name": "model", "config": None}]},
+            {"endpoints": [{"name": "model", "config": {"served_entities": None}}]},
+            {"endpoints": [{"name": "model", "config": {"served_entities": [None, "bad"]}}]},
+            {
+                "endpoints": [
+                    {
+                        "name": "model",
+                        "config": {"served_entities": [{"foundation_model": None}]},
+                    }
+                ]
+            },
+            {
+                "endpoints": [
+                    {
+                        "name": "model",
+                        "config": {
+                            "served_entities": [
+                                {
+                                    "foundation_model": {
+                                        "ai_gateway_v2_supported": True,
+                                        "api_types": "openai/v1/responses",
+                                    }
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+        ],
+    )
+    def test_malformed_payload_records_are_skipped(self, monkeypatch, payload):
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_endpoints_with_api_type(WS, "token", "openai/v1/responses")
+
+        assert models == []
+        assert reason and ("malformed" in reason or "no valid" in reason)
+
+    def test_malformed_records_do_not_hide_valid_endpoint(self, monkeypatch):
+        payload = _foundation_models_payload(["databricks-gemini-3-5-flash"])
+        payload["endpoints"].insert(0, None)
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_endpoints_with_api_type(
+            WS, "token", "gemini/v1/generateContent"
+        )
+
+        assert models == ["databricks-gemini-3-5-flash"]
+        assert reason is None
+
+
 class TestDiscoverGeminiModels:
     def test_returns_newest_flash_first(self, monkeypatch):
         payload = _foundation_models_payload(
@@ -1301,6 +1384,77 @@ class TestDiscoverGeminiModels:
 
         assert reason is None
         assert models == ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
+
+
+def _mlflow_chat_payload(names, *, api_type="mlflow/v1/chat/completions", v2=True):
+    return {
+        "endpoints": [
+            {
+                "name": name,
+                "config": {
+                    "served_entities": [
+                        {
+                            "foundation_model": {
+                                "ai_gateway_v2_supported": v2,
+                                "api_types": [api_type],
+                            }
+                        }
+                    ]
+                },
+            }
+            for name in names
+        ]
+    }
+
+
+class TestDiscoverOssModels:
+    def test_finds_oss_endpoints_via_foundation_models(self, monkeypatch):
+        # Mirrors a workspace with no system.ai UC model-services: OSS models are
+        # plain databricks-* serving endpoints under the mlflow chat dialect.
+        payload = _mlflow_chat_payload(
+            [
+                "databricks-glm-5-2",
+                "databricks-kimi-k2-7-code",
+                "databricks-inkling",
+                "databricks-qwen35-122b-a10b",
+                "databricks-gemma-3-12b",
+            ]
+        )
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert reason is None
+        assert models == ["databricks-glm-5-2", "databricks-kimi-k2-7-code"]
+
+    def test_excludes_claude_and_gemini_sharing_the_mlflow_dialect(self, monkeypatch):
+        # On some workspaces every foundation model advertises the mlflow chat
+        # dialect, so the api_type filter alone is too broad — the OSS family
+        # filter must drop Claude/Gemini and keep only the OSS cohort.
+        payload = _mlflow_chat_payload(
+            [
+                "databricks-claude-opus-4-8",
+                "databricks-gemini-2-5-pro",
+                "databricks-glm-5-2",
+                "databricks-qwen3-embedding-0-6b",
+            ]
+        )
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert reason is None
+        assert models == ["databricks-glm-5-2"]
+
+    def test_reports_reason_when_no_oss_family_matches(self, monkeypatch):
+        payload = _mlflow_chat_payload(["databricks-claude-opus-4-8"])
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert models == []
+        assert reason is not None
+        assert "no OSS" in reason
 
 
 class TestResolvePatToken:
