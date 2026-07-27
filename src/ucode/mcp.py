@@ -1453,10 +1453,7 @@ def _join_with_and(items: list[str]) -> str:
     return ", ".join(items[:-1]) + " and " + items[-1]
 
 
-def _skills_tools_summary(locations: list[str]) -> str:
-    """One-liner describing the connection's tools. Names the tool *categories*,
-    not individual tools, so it never drifts when the backend changes its
-    offering; the per-schema skill tools are resolved live by the server."""
+def _skills_tools_description(locations: list[str]) -> str:
     if not locations:
         return "UC skill utility tools"
     return f"UC skill utility tools + skills tools in schema {_join_with_and(locations)}"
@@ -1469,13 +1466,13 @@ def _print_skills_summary(entry: dict) -> None:
         for client in (entry.get("clients") or [])
         if client in MCP_CLIENTS
     ]
-    print_heading("Skills MCP registered")
+    print_heading("✔ Skills MCP registered")
     print_kv("Server", str(entry.get("name") or SKILLS_MCP_SERVER_NAME))
     print_kv("URL", str(entry.get("url") or ""))
     print_kv("Configured", ", ".join(clients) if clients else "none")
-    print_kv("Tools", _skills_tools_summary(entry.get("skill_locations") or []))
+    print_kv("Tools", _skills_tools_description(entry.get("skill_locations") or []))
     print_note(
-        "Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+        "⚠ Run `ucode <agent>` to use the skills MCP. For existing sessions, "
         "restart the agent before skills become available."
     )
 

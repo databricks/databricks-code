@@ -1911,17 +1911,17 @@ class TestRegisterSchemalessSkillsConnection:
         assert _find_skills(state["mcp_servers"])[0]["skill_locations"] == ["X.x", "Y.y"]
 
 
-class TestSkillsToolsSummary:
+class TestSkillsToolsDescription:
     def test_bare_route_names_utility_tools_only(self):
-        assert mcp._skills_tools_summary([]) == "UC skill utility tools"
+        assert mcp._skills_tools_description([]) == "UC skill utility tools"
 
     def test_scoped_names_utility_plus_skills_tools(self):
-        assert mcp._skills_tools_summary(["main.default"]) == (
+        assert mcp._skills_tools_description(["main.default"]) == (
             "UC skill utility tools + skills tools in schema main.default"
         )
 
     def test_multiple_schemas_joined_with_and(self):
-        assert mcp._skills_tools_summary(["a.b", "c.d", "e.f"]) == (
+        assert mcp._skills_tools_description(["a.b", "c.d", "e.f"]) == (
             "UC skill utility tools + skills tools in schema a.b, c.d and e.f"
         )
 
@@ -1933,24 +1933,24 @@ class TestPrintSkillsSummary:
     def test_reports_scoped_connection(self, capsys):
         mcp._print_skills_summary(self._entry(["main.default"]))
         assert _unwrap(capsys.readouterr().out) == (
-            "Skills MCP registered "
+            "✔ Skills MCP registered "
             "Server: databricks-skill-registry "
             f"URL: {WS}/ai-gateway/skills/?schema=main.default "
             "Configured: Claude Code, Codex "
             "Tools: UC skill utility tools + skills tools in schema main.default "
-            "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+            "• ⚠ Run `ucode <agent>` to use the skills MCP. For existing sessions, "
             "restart the agent before skills become available."
         )
 
     def test_reports_schemaless_connection(self, capsys):
         mcp._print_skills_summary(self._entry([]))
         assert _unwrap(capsys.readouterr().out) == (
-            "Skills MCP registered "
+            "✔ Skills MCP registered "
             "Server: databricks-skill-registry "
             f"URL: {WS}/ai-gateway/skills/ "
             "Configured: Claude Code, Codex "
             "Tools: UC skill utility tools "
-            "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+            "• ⚠ Run `ucode <agent>` to use the skills MCP. For existing sessions, "
             "restart the agent before skills become available."
         )
 
