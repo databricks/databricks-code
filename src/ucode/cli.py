@@ -1454,7 +1454,7 @@ def configure_skills(
     When ``--location`` is provided: with ``--mcp``, sets the connection's scope to
     exactly the listed schemas (no download); otherwise, downloads every skill in
     each schema to disk (under ``--path``, or your home dir when omitted) and
-    registers the schema-less connection.
+    registers the MCP connection with utility tools only.
     """
     try:
         locations = _parse_skill_locations(location)
