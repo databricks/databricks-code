@@ -146,11 +146,12 @@ def _parse_agents_option(agents: str) -> list[str]:
     return tools
 
 
-def _parse_skill_locations(location: str) -> list[str]:
+def _parse_skill_locations(location: str | None) -> list[str]:
     """Parse a comma-separated `--location` into `<catalog>.<schema>` refs,
-    dropping duplicates while preserving order."""
+    dropping duplicates while preserving order. `None`/empty yields `[]` (the
+    schema-less, utility-tools-only connection)."""
     locations: list[str] = []
-    for raw in location.split(","):
+    for raw in (location or "").split(","):
         raw = raw.strip()
         if not raw:
             continue
@@ -159,11 +160,6 @@ def _parse_skill_locations(location: str) -> list[str]:
             raise RuntimeError(f"--location entries must be `<catalog>.<schema>`, got `{raw}`.")
         if raw not in locations:
             locations.append(raw)
-    if not locations:
-        raise RuntimeError(
-            "No schemas provided for --location. Use `<catalog>.<schema>`, "
-            "comma-separated for multiple."
-        )
     return locations
 
 
@@ -801,8 +797,8 @@ def status() -> int:
         "Use `ucode configure mcp` to add Databricks MCP servers to configured coding tools."
     )
     print_note(
-        "Use `ucode configure skills --location <catalog>.<schema> --mcp` to connect Unity "
-        "Catalog Skills."
+        "Use `ucode configure skills` to connect Unity Catalog Skills (add "
+        "`--location <catalog>.<schema>` to download a schema's skills)."
     )
     print_note("Use `ucode configure tracing` to log coding sessions to an MLflow experiment.")
     print_note("Use `ucode revert` to clear managed configs and restore prior files.")
@@ -1436,9 +1432,9 @@ def configure_mcp(
 @configure_app.command("skills")
 def configure_skills(
     location: Annotated[
-        str,
+        str | None,
         typer.Option("--location", help="Comma-separated `<catalog>.<schema>` skill scopes."),
-    ],
+    ] = None,
     mcp: Annotated[
         bool,
         typer.Option("--mcp", help="Mutate the skills MCP connection instead of downloading."),
@@ -1453,18 +1449,22 @@ def configure_skills(
 ) -> None:
     """Configure Databricks Skills for your coding tools.
 
-    By default, downloads every skill in each ``--location`` schema to disk
-    (under ``--path``, or your home dir when omitted) and registers a schema-less
-    MCP connection. With ``--mcp``, instead sets the skills MCP connection's scope
-    to exactly the listed schemas.
+    With no ``--location``, registers the schema-less skills MCP connection
+    (cross-schema utility tools only) without downloading anything. With
+    ``--location`` (and no ``--mcp``), also downloads every skill in each schema to
+    disk (under ``--path``, or your home dir when omitted). ``--mcp`` instead sets
+    the connection's scope to exactly the listed schemas without downloading.
     """
     try:
-        if mcp:
-            if path is not None:
-                raise RuntimeError("--path is not valid with --mcp.")
-            configure_skills_mcp_command(_parse_skill_locations(location))
+        locations = _parse_skill_locations(location)
+        if mcp and path is not None:
+            raise RuntimeError("--path is not valid with --mcp.")
+        if path is not None and not locations:
+            raise RuntimeError("--path only applies when downloading with --location.")
+        if mcp or not locations:
+            configure_skills_mcp_command(locations)
         else:
-            configure_skills_download_command(_parse_skill_locations(location), path=path)
+            configure_skills_download_command(locations, path=path)
     except (RuntimeError, ValueError) as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

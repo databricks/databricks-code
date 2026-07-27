@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from ucode import mcp
@@ -17,6 +18,11 @@ ALL_MCP_CLIENTS = ["claude", "codex", "gemini", "opencode", "copilot"]
 # is the resolved `ucode` binary path, so tests assert the tail (the stable part).
 GH_URL = f"{WS}/api/2.0/mcp/external/github"
 PROXY_TAIL = ["mcp-proxy", "--url", GH_URL, "--host", WS, "--profile", "p"]
+
+
+def _unwrap(text: str) -> str:
+    """Collapse rich's line-wrapping so assertions match regardless of terminal width."""
+    return " ".join(text.split())
 
 
 def _proxy_argv() -> list[str]:
@@ -1904,6 +1910,45 @@ class TestRegisterSchemalessSkillsConnection:
         mcp.register_schemaless_skills_connection(state, WS, None, ["claude"])
 
         assert _find_skills(state["mcp_servers"])[0]["skill_locations"] == ["X.x", "Y.y"]
+
+
+class TestSkillsToolsSummary:
+    def test_bare_route_names_utility_tools_only(self):
+        assert mcp._skills_tools_summary([]) == "UC skill utility tools"
+
+    def test_scoped_names_utility_plus_live_tools(self):
+        assert mcp._skills_tools_summary(["main.default"]) == (
+            "UC skill utility tools + live skills tools in schema main.default"
+        )
+
+    def test_multiple_schemas_joined_humanly(self):
+        assert mcp._skills_tools_summary(["a.b", "c.d", "e.f"]) == (
+            "UC skill utility tools + live skills tools in schema a.b, c.d and e.f"
+        )
+
+
+class TestPrintSkillsSummary:
+    def _entry(self, locations):
+        return mcp._resolve_skills_mcp_servers(WS, ["claude", "codex"], locations, [])[0]
+
+    def test_reports_server_url_agents_and_tools(self, capsys):
+        mcp._print_skills_summary(self._entry(["main.default"]))
+        out = _unwrap(capsys.readouterr().out)
+        assert "databricks-skill-registry" in out
+        assert f"{WS}/ai-gateway/skills/?schema=main.default" in out
+        assert "Claude Code, Codex" in out
+        assert "live skills tools in schema main.default" in out
+
+    def test_mcp_wording_prompts_launch_and_restart(self, capsys):
+        mcp._print_skills_summary(self._entry([]))
+        out = _unwrap(capsys.readouterr().out)
+        assert "ucode <agent>" in out
+        assert "restart the agent" in out
+        assert "already work" not in out
+
+    def test_download_wording_notes_files_already_work(self, capsys):
+        mcp._print_skills_summary(self._entry([]), download_roots=[Path("/tmp/x/.claude/skills")])
+        assert "already work" in _unwrap(capsys.readouterr().out)
 
 
 class TestRevertMcpConfigs:

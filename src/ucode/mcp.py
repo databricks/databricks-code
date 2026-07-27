@@ -8,6 +8,7 @@ import shutil
 import string
 import subprocess
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -43,6 +44,8 @@ from ucode.databricks import (
 )
 from ucode.state import load_full_state, load_state, save_state
 from ucode.ui import (
+    print_heading,
+    print_kv,
     print_note,
     print_section,
     print_success,
@@ -1445,10 +1448,61 @@ def _resolve_skills_mcp_servers(
     return [*kept, _build_skills_entry(workspace, locations, merged)]
 
 
+def _join_human(items: list[str]) -> str:
+    if len(items) <= 1:
+        return items[0] if items else ""
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _skills_tools_summary(locations: list[str]) -> str:
+    """One-liner describing the connection's tools. Names the tool *categories*,
+    not individual tools, so it never drifts when the backend changes its
+    offering; the per-schema skill tools are resolved live by the server."""
+    if not locations:
+        return "UC skill utility tools"
+    return f"UC skill utility tools + live skills tools in schema {_join_human(locations)}"
+
+
+def _print_skills_summary(entry: dict, *, download_roots: list[Path] | None = None) -> None:
+    """Report the registered skills connection: server, URL, agents, tools, and how
+    to start using it. ``download_roots`` (download mode) tweaks the closing line to
+    note that the on-disk files already work."""
+    locations = entry.get("skill_locations") or []
+    displays = [
+        str(MCP_CLIENTS[client]["display"])
+        for client in (entry.get("clients") or [])
+        if client in MCP_CLIENTS
+    ]
+    print_heading("Skills MCP registered")
+    print_kv("Server", str(entry.get("name") or SKILLS_MCP_SERVER_NAME))
+    print_kv("URL", str(entry.get("url") or ""))
+    print_kv("Configured", ", ".join(displays) if displays else "none")
+    print_kv("Tools", _skills_tools_summary(locations))
+
+    restart = (
+        "Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+        "restart the agent before skills become available."
+    )
+    if download_roots is not None:
+        restart += (
+            " Downloaded skill files already work — agents discover them from disk on next launch."
+        )
+    print_note(restart)
+
+
 def _update_skills_mcp(
-    state: dict, workspace: str, profile: str | None, clients: list[str], locations: list[str]
+    state: dict,
+    workspace: str,
+    profile: str | None,
+    clients: list[str],
+    locations: list[str],
+    *,
+    download_roots: list[Path] | None = None,
 ) -> None:
-    """Rebuild the single skills connection for ``locations`` and persist it."""
+    """Rebuild the single skills connection for ``locations``, persist it, and print
+    the registration summary. The summary always prints (so a no-op re-run still
+    reports what's registered and reminds the user to restart); only the save is
+    gated on an actual change."""
     original = list(state.get("mcp_servers") or [])
     working = _resolve_skills_mcp_servers(workspace, clients, locations, original)
     changed = apply_mcp_server_changes(original, working, clients, workspace, profile)
@@ -1456,6 +1510,8 @@ def _update_skills_mcp(
         state["mcp_servers"] = working
         save_state(state)
         print_success("Saved")
+    entry = next(s for s in working if s.get("kind") == SKILLS_MCP_KIND)
+    _print_skills_summary(entry, download_roots=download_roots)
 
 
 def configure_skills_mcp_command(locations: list[str]) -> int:
@@ -1474,11 +1530,24 @@ def _skill_mcp_locations(state: dict) -> list[str]:
 
 
 def register_schemaless_skills_connection(
-    state: dict, workspace: str, profile: str | None, clients: list[str]
+    state: dict,
+    workspace: str,
+    profile: str | None,
+    clients: list[str],
+    *,
+    download_roots: list[Path] | None = None,
 ) -> None:
     """Register/keep the skills MCP connection without changing its schema set.
 
     Download mode calls this after writing files: it preserves any prior
     ``--mcp`` ``skill_locations`` and otherwise registers the bare schema-less
-    route (utility tools only)."""
-    _update_skills_mcp(state, workspace, profile, clients, _skill_mcp_locations(state))
+    route (utility tools only). ``download_roots`` flows into the summary's closing
+    line."""
+    _update_skills_mcp(
+        state,
+        workspace,
+        profile,
+        clients,
+        _skill_mcp_locations(state),
+        download_roots=download_roots,
+    )
