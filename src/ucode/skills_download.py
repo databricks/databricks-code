@@ -15,7 +15,14 @@ from ucode.databricks import (
 )
 from ucode.mcp import register_schemaless_skills_connection, setup_mcp_clients
 from ucode.state import load_state
-from ucode.ui import print_note, print_success, print_warning, progress_bar, prompt_yes_no
+from ucode.ui import (
+    console,
+    print_note,
+    print_success,
+    print_warning,
+    progress_bar,
+    prompt_yes_no,
+)
 
 # `.claude/skills` (Claude) + `.agents/skills` (the alias other agents read).
 SKILL_BASE_DIR_NAMES = (".claude/skills", ".agents/skills")
@@ -268,6 +275,7 @@ def download_skills(workspace: str, token: str, locations: list[str], path: str 
                 continue
             if write_skill(roots, leaf, files, location=location):
                 written += 1
+        console.print()
         print_success(
             f"Downloaded {written}/{len(leaves)} skill(s) from `{location}` in {roots_display}."
         )

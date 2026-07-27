@@ -1466,7 +1466,7 @@ def _print_skills_summary(entry: dict) -> None:
         for client in (entry.get("clients") or [])
         if client in MCP_CLIENTS
     ]
-    print_heading("✔ Skills MCP registered")
+    print_heading("[green]✔[/green] Skills MCP registered")
     print_kv("Server", str(entry.get("name") or SKILLS_MCP_SERVER_NAME))
     print_kv("URL", str(entry.get("url") or ""))
     print_kv("Configured", ", ".join(clients) if clients else "none")
