@@ -1472,7 +1472,7 @@ def _print_skills_summary(entry: dict) -> None:
     print_kv("Configured", ", ".join(clients) if clients else "none")
     print_kv("Tools", _skills_tools_description(entry.get("skill_locations") or []))
     print_note(
-        "⚠ Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+        "Run `ucode <agent>` to use the skills MCP. For existing sessions, "
         "restart the agent before skills become available."
     )
 

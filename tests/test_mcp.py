@@ -1938,7 +1938,7 @@ class TestPrintSkillsSummary:
             f"URL: {WS}/ai-gateway/skills/?schema=main.default "
             "Configured: Claude Code, Codex "
             "Tools: UC skill utility tools + skills tools in schema main.default "
-            "• ⚠ Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+            "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
             "restart the agent before skills become available."
         )
 
@@ -1950,7 +1950,7 @@ class TestPrintSkillsSummary:
             f"URL: {WS}/ai-gateway/skills/ "
             "Configured: Claude Code, Codex "
             "Tools: UC skill utility tools "
-            "• ⚠ Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+            "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
             "restart the agent before skills become available."
         )
 
