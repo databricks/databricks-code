@@ -31,6 +31,7 @@ from ucode.config_io import restore_file
 from ucode.databricks import (
     apply_pat_environment,
     build_mcp_service_url,
+    build_skills_mcp_url,
     ensure_databricks_auth,
     get_databricks_token,
     list_all_mcp_services,
@@ -91,6 +92,8 @@ MCP_CLIENTS = {
         "list_command": "copilot mcp list",
     },
 }
+SKILLS_MCP_KIND = "skills"
+SKILLS_MCP_SERVER_NAME = "databricks-skill-registry"
 EXTERNAL_MCP_SELECTION_PREFIX = "external:"
 SQL_MCP_VALUE = "managed:sql"
 GENIE_SPACE_SELECTION_PREFIX = "genie-space:"
@@ -108,14 +111,17 @@ MCP_CONNECTION_MARKERS = (
 )
 
 
-def build_mcp_http_entry(url: str) -> dict:
-    return {
+def build_mcp_http_entry(url: str, *, always_load: bool = False) -> dict:
+    entry: dict[str, Any] = {
         "type": "http",
         "url": url,
         "headers": {
             "Authorization": f"Bearer ${{{MCP_AUTH_TOKEN_ENV_VAR}}}",
         },
     }
+    if always_load:
+        entry["alwaysLoad"] = True
+    return entry
 
 
 def add_claude_mcp_server(name: str, entry: dict, scope: str = MCP_USER_SCOPE) -> None:
@@ -1235,7 +1241,9 @@ def apply_mcp_server_changes(
         url = server.get("url")
         if not isinstance(url, str) or not url:
             continue
-        entry = build_mcp_http_entry(url)
+        # alwaysLoad (Claude-only) keeps the skills registry's utility tools
+        # discoverable without an explicit mention; other clients ignore it.
+        entry = build_mcp_http_entry(url, always_load=server.get("kind") == SKILLS_MCP_KIND)
         for client in clients:
             work[client].append(
                 lambda c=client, n=name, u=url, e=entry: configure_client_mcp_server(c, n, u, e)
@@ -1340,6 +1348,10 @@ def purge_cross_workspace_mcp_residue(state: dict, workspace: str) -> None:
         )
 
 
+def _skills_entries(servers: list[dict]) -> list[dict]:
+    return [s for s in servers if s.get("kind") == SKILLS_MCP_KIND]
+
+
 def _resolve_location_mcp_servers(
     workspace: str,
     profile: str | None,
@@ -1350,9 +1362,10 @@ def _resolve_location_mcp_servers(
 ) -> list[dict]:
     """Build the desired MCP server list for ``--location <cat>.<schema>``.
 
-    Strict replacement: the returned list is exactly the mcp-services
-    discovered at ``location``. Any previously-registered MCP entries outside
-    that location are removed by ``apply_mcp_server_changes``. Raises ``RuntimeError`` for an invalid
+    Strict replacement for mcp-services: the returned list is exactly the ones
+    discovered at ``location`` (any previously-registered mcp-service outside it
+    is removed by ``apply_mcp_server_changes``), plus any existing skills
+    connection, preserved untouched. Raises ``RuntimeError`` for an invalid
     location (HTTP 404 from the listing API) or any other listing failure.
 
     When ``services`` is given, the discovered set is narrowed to exactly that
@@ -1411,7 +1424,7 @@ def _resolve_location_mcp_servers(
             working_servers.append(original.copy())
         else:
             working_servers.append(candidate)
-    return working_servers
+    return [*working_servers, *_skills_entries(original_servers)]
 
 
 # The first wizard step lets the user choose which sources to search. Each is a
@@ -1446,25 +1459,12 @@ def prompt_for_mcp_search_sources() -> set[str] | None:
     return {str(value) for value in selection}
 
 
-def configure_mcp_command(location: str | None = None, services: set[str] | None = None) -> int:
-    if services is not None and location is None:
-        # `--services` works standalone with full names (`system.ai.github`): the
-        # `<catalog>.<schema>` to configure is derived from them. Bare short names
-        # (`github`) can't be located without `--location`.
-        schemas = {".".join(s.split(".")[:2]) for s in services if s.count(".") >= 2}
-        bare = sorted(s for s in services if s.count(".") < 2)
-        if bare:
-            raise RuntimeError(
-                "--services short names need --location (or pass full names like "
-                f"`system.ai.<name>`): {', '.join(bare)}"
-            )
-        if len(schemas) != 1:
-            raise RuntimeError(
-                "--services without --location must all share one `<catalog>.<schema>` "
-                f"(got: {', '.join(sorted(schemas)) or 'none'}); pass --location instead."
-            )
-        location = next(iter(schemas))
-    state = load_state()
+def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[str]]:
+    """Validate the workspace, resolve configured MCP clients, and prepare auth.
+
+    Returns ``(workspace, profile, clients)`` and prints the section header, the
+    "Configuring for" note, and a warning per configured-but-uninstalled client.
+    """
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError("Workspace is not configured. Run `ucode configure` first.")
@@ -1492,7 +1492,7 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
     apply_pat_environment(state)
     ensure_databricks_auth(workspace, profile)
 
-    print_section("MCP Servers")
+    print_section(section)
     client_names = ", ".join(str(MCP_CLIENTS[client]["display"]) for client in clients)
     print_note(f"Configuring for: {client_names}")
     for client in missing_clients:
@@ -1500,6 +1500,29 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
             f"{MCP_CLIENTS[client]['display']} is configured in ucode but not installed; "
             "skipping MCP config."
         )
+    return workspace, profile, clients
+
+
+def configure_mcp_command(location: str | None = None, services: set[str] | None = None) -> int:
+    if services is not None and location is None:
+        # `--services` works standalone with full names (`system.ai.github`): the
+        # `<catalog>.<schema>` to configure is derived from them. Bare short names
+        # (`github`) can't be located without `--location`.
+        schemas = {".".join(s.split(".")[:2]) for s in services if s.count(".") >= 2}
+        bare = sorted(s for s in services if s.count(".") < 2)
+        if bare:
+            raise RuntimeError(
+                "--services short names need --location (or pass full names like "
+                f"`system.ai.<name>`): {', '.join(bare)}"
+            )
+        if len(schemas) != 1:
+            raise RuntimeError(
+                "--services without --location must all share one `<catalog>.<schema>` "
+                f"(got: {', '.join(sorted(schemas)) or 'none'}); pass --location instead."
+            )
+        location = next(iter(schemas))
+    state = load_state()
+    workspace, profile, clients = setup_mcp_clients(state, "MCP Servers")
 
     original_mcp_servers_for_location: list[dict] = list(state.get("mcp_servers") or [])
     if location is not None:
@@ -1516,7 +1539,11 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
         return 0
 
     original_mcp_servers: list[dict] = list(state.get("mcp_servers") or [])
-    original_by_name = _servers_by_name(original_mcp_servers)
+    # Skills connections are managed by `configure skills`, so keep them out of
+    # the picker and carry them through untouched.
+    skills_servers = _skills_entries(original_mcp_servers)
+    picker_servers = [s for s in original_mcp_servers if s.get("kind") != SKILLS_MCP_KIND]
+    original_by_name = _servers_by_name(picker_servers)
 
     # Two-step wizard: (1) choose which sources to search, (2) pick servers from
     # the results. Pressing Left (←) in the picker returns to step 1, so the user
@@ -1531,7 +1558,7 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
             discovered["external"],
             discovered["genie"],
             discovered["apps"],
-            original_mcp_servers,
+            picker_servers,
             discovered["services"],
             discovered["vector_search"],
             discovered["uc_functions"],
@@ -1548,7 +1575,7 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
     available_vector_search_servers = discovered["vector_search"]
     available_uc_functions_servers = discovered["uc_functions"]
 
-    working_mcp_servers: list[dict] = []
+    working_mcp_servers: list[dict] = list(skills_servers)
     working_names: set[str] = set()
     add_selections: list[str] = []
     for selection in selections:
@@ -1614,3 +1641,83 @@ def _mcp_change_summary(added: list[str], removed: list[str], clients: list[str]
     noun = "MCP server" if total == 1 else "MCP servers"
     summary = ", ".join(parts).capitalize()
     return f"{summary} {noun} across {client_names}" if client_names else f"{summary} {noun}"
+
+
+def _merge_clients(prior: list[str] | None, new: list[str]) -> list[str]:
+    """Order-preserving union of a prior client list with newly-configured ones."""
+    prior = list(prior or [])
+    return prior + [c for c in new if c not in prior]
+
+
+def _build_skills_entry(workspace: str, locations: list[str], clients: list[str]) -> dict:
+    """Canonical single skills-registry entry. ``skill_locations`` is the source
+    of truth; the URL is always derived from it, never parsed back."""
+    return {
+        "name": SKILLS_MCP_SERVER_NAME,
+        "kind": SKILLS_MCP_KIND,
+        "skill_locations": list(locations),
+        "url": build_skills_mcp_url(workspace, locations),
+        "auth": f"env:{MCP_AUTH_TOKEN_ENV_VAR}",
+        "clients": clients,
+    }
+
+
+def _resolve_skills_mcp_servers(
+    workspace: str,
+    clients: list[str],
+    locations: list[str],
+    original_servers: list[dict],
+) -> list[dict]:
+    """Rebuild the MCP server list around exactly one skills entry.
+
+    Drops every prior ``kind=="skills"`` entry and any entry named
+    ``SKILLS_MCP_SERVER_NAME`` (single-connection invariant; also sweeps up a
+    stray old-named entry via ``apply_mcp_server_changes``), keeps everything
+    else, and appends one rebuilt entry whose clients merge the prior skills
+    entry's clients with ``clients``.
+    """
+    prior = next((s for s in original_servers if s.get("kind") == SKILLS_MCP_KIND), None)
+    merged = _merge_clients((prior or {}).get("clients"), clients)
+    kept = [
+        s
+        for s in original_servers
+        if s.get("kind") != SKILLS_MCP_KIND and _server_name(s) != SKILLS_MCP_SERVER_NAME
+    ]
+    return [*kept, _build_skills_entry(workspace, locations, merged)]
+
+
+def _update_skills_mcp(
+    state: dict, workspace: str, clients: list[str], locations: list[str]
+) -> None:
+    """Rebuild the single skills connection for ``locations`` and persist it."""
+    original = list(state.get("mcp_servers") or [])
+    working = _resolve_skills_mcp_servers(workspace, clients, locations, original)
+    changed = apply_mcp_server_changes(original, working, clients)
+    if changed or original != working:
+        state["mcp_servers"] = working
+        save_state(state)
+        print_success("Saved")
+
+
+def configure_skills_mcp_command(locations: list[str]) -> int:
+    """Set the skills MCP connection's ``skill_locations`` to exactly ``locations``,
+    replacing any previous set."""
+    state = load_state()
+    workspace, _profile, clients = setup_mcp_clients(state, "Skills MCP")
+    _update_skills_mcp(state, workspace, clients, locations)
+    return 0
+
+
+def _skill_mcp_locations(state: dict) -> list[str]:
+    """The skills MCP connection's ``skill_locations``, or ``[]`` if none exists."""
+    entry = next(iter(_skills_entries(list(state.get("mcp_servers") or []))), None)
+    return list((entry or {}).get("skill_locations") or [])
+
+
+def register_schemaless_skills_connection(state: dict, workspace: str, clients: list[str]) -> None:
+    """Register/keep the skills MCP connection without changing its schema set.
+
+    Download mode calls this after writing files: it preserves any prior
+    ``--mcp`` ``skill_locations`` and otherwise registers the bare schema-less
+    route (utility tools only)."""
+    _update_skills_mcp(state, workspace, clients, _skill_mcp_locations(state))

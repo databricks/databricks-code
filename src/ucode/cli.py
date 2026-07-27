@@ -53,10 +53,13 @@ from ucode.databricks import (
 )
 from ucode.mcp import (
     MCP_CLIENTS,
+    SKILLS_MCP_KIND,
     configure_mcp_command,
+    configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
     revert_mcp_configs,
 )
+from ucode.skills_download import configure_skills_download_command
 from ucode.state import (
     STATE_PATH,
     clear_state,
@@ -81,6 +84,7 @@ from ucode.ui import (
     prompt_for_tools,
     prompt_for_workspace,
     prompt_yes_no,
+    prompt_yes_no_default,
     set_verbosity,
     spinner,
     status_badge,
@@ -141,6 +145,27 @@ def _parse_agents_option(agents: str) -> list[str]:
             "No agents provided for --agents. Use a comma-separated list like `--agents claude,codex`."
         )
     return tools
+
+
+def _parse_skill_locations(location: str) -> list[str]:
+    """Parse a comma-separated `--location` into `<catalog>.<schema>` refs,
+    dropping duplicates while preserving order."""
+    locations: list[str] = []
+    for raw in location.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        parts = raw.split(".")
+        if len(parts) != 2 or not all(part.strip() for part in parts):
+            raise RuntimeError(f"--location entries must be `<catalog>.<schema>`, got `{raw}`.")
+        if raw not in locations:
+            locations.append(raw)
+    if not locations:
+        raise RuntimeError(
+            "No schemas provided for --location. Use `<catalog>.<schema>`, "
+            "comma-separated for multiple."
+        )
+    return locations
 
 
 def _parse_workspaces_option(workspaces: str) -> list[tuple[str, str | None]]:
@@ -219,6 +244,7 @@ def configure_shared_state(
     skip_model_discovery: bool = False,
     skip_preflight: bool = False,
     fable_enabled: bool | None = None,
+    databricks_ai_tools_enabled: bool | None = None,
 ) -> dict:
     """Log into Databricks, enforce AI Gateway v2, fetch model lists, persist state.
 
@@ -250,6 +276,14 @@ def configure_shared_state(
         use_pat = bool(prior_state.get("use_pat")) and previous_workspace == workspace
     if fable_enabled is None:
         fable_enabled = bool(prior_state.get("fable_enabled")) and previous_workspace == workspace
+    if databricks_ai_tools_enabled is None:
+        # Opt-out: on by default. With no flag, keep this workspace's prior
+        # choice but don't inherit another workspace's opt-out.
+        disabled = (
+            prior_state.get("databricks_ai_tools_enabled") is False
+            and previous_workspace == workspace
+        )
+        databricks_ai_tools_enabled = not disabled
     fetch_all = tools is None
 
     # Assemble the shared workspace state that doesn't depend on model discovery:
@@ -279,6 +313,7 @@ def configure_shared_state(
         state["fable_enabled"] = True
     else:
         state.pop("fable_enabled", None)
+    state["databricks_ai_tools_enabled"] = databricks_ai_tools_enabled
     state["base_urls"] = build_shared_base_urls(workspace)
 
     if skip_preflight:
@@ -437,6 +472,7 @@ def _configure_shared_workspace_states(
     force_login: bool,
     use_pat: bool = False,
     fable_enabled: bool | None = None,
+    databricks_ai_tools_enabled: bool | None = None,
 ) -> list[dict]:
     if not workspaces:
         raise RuntimeError("At least one workspace must be provided.")
@@ -450,6 +486,7 @@ def _configure_shared_workspace_states(
                 force_login=force_login,
                 use_pat=use_pat,
                 fable_enabled=fable_enabled,
+                databricks_ai_tools_enabled=databricks_ai_tools_enabled,
             )
         )
     return states
@@ -530,6 +567,7 @@ def configure_workspace_command(
     use_pat: bool = False,
     skip_validate: bool = False,
     fable_enabled: bool | None = None,
+    databricks_ai_tools_enabled: bool | None = None,
 ) -> int:
     if tool is not None and selected_tools is not None:
         raise RuntimeError("Use either --agent or --agents, not both.")
@@ -548,6 +586,7 @@ def configure_workspace_command(
             force_login=True,
             use_pat=use_pat,
             fable_enabled=fable_enabled,
+            databricks_ai_tools_enabled=databricks_ai_tools_enabled,
         )
         state = states[0]
         state = configure_single_tool(tool, state)
@@ -585,6 +624,7 @@ def configure_workspace_command(
         force_login=True,
         use_pat=use_pat,
         fable_enabled=fable_enabled,
+        databricks_ai_tools_enabled=databricks_ai_tools_enabled,
     )
     state = states[0]
     save_state(state)
@@ -632,6 +672,16 @@ def configure_workspace_command(
     if offer_provider:
         for tool_name in picked:
             state = _maybe_select_provider_service(tool_name, state)
+
+    # Last question in the interactive flow: opt out of AI Tools. When a flag
+    # already decided it, configure_shared_state persisted that; skip the prompt.
+    # The default is the resolved prior choice, so Enter won't undo a past opt-out.
+    if databricks_ai_tools_enabled is None and offer_provider:
+        state["databricks_ai_tools_enabled"] = prompt_yes_no_default(
+            "Install Databricks AI Tools for your coding agents? "
+            "This adds Databricks skills and plugins.",
+            default=state.get("databricks_ai_tools_enabled", True),
+        )
 
     state = configure_selected_tools(state, picked)
 
@@ -698,7 +748,9 @@ def status() -> int:
             tool_mcp_servers = [
                 str(server.get("name"))
                 for server in mcp_servers
-                if tool in (server.get("clients") or []) and server.get("name")
+                if tool in (server.get("clients") or [])
+                and server.get("name")
+                and server.get("kind") != SKILLS_MCP_KIND
             ]
             print_kv("MCP list command", str(MCP_CLIENTS[tool]["list_command"]))
             print_kv(
@@ -707,6 +759,23 @@ def status() -> int:
             )
         print_kv("Config file", str(config_path) if config_path.exists() else "missing")
         console.print()
+
+    print_heading("Skills")
+    skill_mcp_entry = next((s for s in mcp_servers if s.get("kind") == SKILLS_MCP_KIND), None)
+    if not skill_mcp_entry:
+        print_kv("Skills", "not configured")
+    else:
+        locations = skill_mcp_entry.get("skill_locations") or []
+        print_kv(
+            "Skill MCP Locations",
+            ", ".join(locations) if locations else "none — utility tools only",
+        )
+        configured_agents = [
+            str(MCP_CLIENTS[client]["display"])
+            for client in (skill_mcp_entry.get("clients") or [])
+            if client in MCP_CLIENTS
+        ]
+        print_kv("Configured", ", ".join(configured_agents) if configured_agents else "none")
 
     print_heading("Tracing")
     tracing = state.get("tracing") or {}
@@ -731,6 +800,10 @@ def status() -> int:
     print_note("Use `ucode configure` to update workspace settings or configure new tools.")
     print_note(
         "Use `ucode configure mcp` to add Databricks MCP servers to configured coding tools."
+    )
+    print_note(
+        "Use `ucode configure skills --location <catalog>.<schema> --mcp` to connect Unity "
+        "Catalog Skills."
     )
     print_note("Use `ucode configure tracing` to log coding sessions to an MLflow experiment.")
     print_note("Use `ucode revert` to clear managed configs and restore prior files.")
@@ -1103,6 +1176,26 @@ def configure(
             "it configures Claude Code directly since Fable is Claude-only.",
         ),
     ] = None,
+    enable_databricks_ai_tools: Annotated[
+        bool | None,
+        typer.Option(
+            "--enable-databricks-ai-tools/--disable-databricks-ai-tools",
+            help="Install Databricks AI Tools (skills + plugins that teach agents to use "
+            "Databricks) for the configured agents. Installed by default; pass "
+            "--disable-databricks-ai-tools to opt out.",
+        ),
+    ] = None,
+    mcp: Annotated[
+        str | None,
+        typer.Option(
+            "--mcp",
+            help="Also register the given Databricks MCP service(s) for the configured "
+            "coding agents, in one command. Pass a comma-separated list of fully-qualified "
+            "names like `system.ai.slack`. Combine with --agents to set up an agent and its "
+            "MCP servers together (e.g. `--agents claude --mcp system.ai.slack`); use without "
+            "--agents for MCP-only clients such as Cursor.",
+        ),
+    ] = None,
     tracing: Annotated[
         bool,
         typer.Option(
@@ -1168,6 +1261,8 @@ def configure(
         # target claude instead of dropping into the interactive agent picker.
         if enable_fable is not None and agent is None and agents is None:
             agent = "claude"
+        if enable_databricks_ai_tools is not None:
+            skip_kwargs["databricks_ai_tools_enabled"] = enable_databricks_ai_tools
         # Set True only in the fully-interactive branch below; gates the optional
         # MCP setup prompt so flag-driven / scripted runs are never interrupted.
         fully_interactive = False
@@ -1202,6 +1297,19 @@ def configure(
                     prompt_optional_updates=prompt_optional_updates,
                     **skip_kwargs,
                 )
+        elif mcp is not None:
+            # MCP-only: `--mcp` without --agent(s) (e.g. Cursor, which isn't a
+            # model agent, or adding MCP servers to an already-configured setup).
+            # Configure just the workspace — no interactive agent picker — so the
+            # `--mcp` registration below has a current workspace to target.
+            if workspace_entries is None:
+                workspace_entries = [_prompt_for_configuration(None)]
+            _configure_shared_workspace_states(
+                workspace_entries,
+                tools=[],
+                force_login=not use_pat,
+                use_pat=use_pat,
+            )
         else:
             # Tool binaries are installed after the user picks which agents
             # they want, in configure_workspace_command.
@@ -1230,6 +1338,26 @@ def configure(
                 tracing_workspaces = [(current, None)] if current else None
             if tracing_workspaces:
                 configure_tracing_command(workspaces=tracing_workspaces)
+        if mcp is not None:
+            # The workspace + agents were just configured above, so the current
+            # workspace state now lists the agents whose MCP configs we should
+            # write. `--mcp` takes fully-qualified service names, which
+            # `configure_mcp_command` locates and registers without a picker
+            # (bare short names would need --location, which we don't accept here).
+            services = {name.strip() for name in mcp.split(",") if name.strip()}
+            if not services:
+                raise RuntimeError(
+                    "--mcp needs at least one fully-qualified MCP service name, e.g. "
+                    "`--mcp system.ai.slack`."
+                )
+            bare = sorted(name for name in services if name.count(".") < 2)
+            if bare:
+                raise RuntimeError(
+                    "--mcp names must be fully qualified `<catalog>.<schema>.<name>` "
+                    f"(got: {', '.join(bare)}). Use `ucode configure mcp` for the "
+                    "interactive picker."
+                )
+            configure_mcp_command(services=services)
         # Offer MCP setup as the natural next step of interactive configuration,
         # so users discover it without needing to know `configure mcp` exists.
         # Skipped in dry-run and non-interactive/flag-driven runs (which stay
@@ -1275,6 +1403,46 @@ def configure_mcp(
     try:
         configure_mcp_command(location=location, services=selected)
     except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+
+
+@configure_app.command("skills")
+def configure_skills(
+    location: Annotated[
+        str,
+        typer.Option("--location", help="Comma-separated `<catalog>.<schema>` skill scopes."),
+    ],
+    mcp: Annotated[
+        bool,
+        typer.Option("--mcp", help="Mutate the skills MCP connection instead of downloading."),
+    ] = False,
+    path: Annotated[
+        str | None,
+        typer.Option(
+            "--path",
+            help="(download) Existing absolute dir to download into; defaults to your home dir.",
+        ),
+    ] = None,
+) -> None:
+    """Configure Databricks Skills for your coding tools.
+
+    By default, downloads every skill in each ``--location`` schema to disk
+    (under ``--path``, or your home dir when omitted) and registers a schema-less
+    MCP connection. With ``--mcp``, instead sets the skills MCP connection's scope
+    to exactly the listed schemas.
+    """
+    try:
+        if mcp:
+            if path is not None:
+                raise RuntimeError("--path is not valid with --mcp.")
+            configure_skills_mcp_command(_parse_skill_locations(location))
+        else:
+            configure_skills_download_command(_parse_skill_locations(location), path=path)
+    except (RuntimeError, ValueError) as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
     except KeyboardInterrupt:

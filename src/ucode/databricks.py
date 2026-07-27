@@ -50,7 +50,8 @@ WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
 AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
-MIN_DATABRICKS_CLI_VERSION = (0, 298, 0)
+# v1.0.0 is the release that ships `databricks aitools`.
+MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 
 
@@ -299,6 +300,35 @@ def _http_post_json(
         # URLError, and would otherwise escape the caller's error handling.
         _debug(f"POST {url}", f"OSError: {exc}")
         return None, f"network error: {exc}"
+
+
+def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes | None, str | None]:
+    """GET raw bytes. Returns (body, None) on success, (None, reason) on failure.
+
+    Like `_http_get_json` but leaves the body undecoded, since skill bundles can
+    contain binary files.
+    """
+    request = urllib_request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib_request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+        _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
+        return body, None
+    except urllib_error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        except Exception:
+            detail = ""
+        _debug(f"GET {url}", f"HTTP {exc.code} {exc.reason}")
+        reason = f"HTTP {exc.code} {exc.reason}"
+        excerpt = detail.strip()[:200]
+        if excerpt:
+            reason = f"{reason}: {excerpt}"
+        return None, reason
+    except urllib_error.URLError as exc:
+        _debug(f"GET {url}", f"URLError: {exc.reason}")
+        return None, f"network error: {exc.reason}"
 
 
 def get_current_user_name(workspace: str, token: str) -> str | None:
@@ -558,6 +588,41 @@ def install_databricks_cli() -> None:
             "Databricks CLI install completed, but `databricks` is still not on PATH."
         )
     ensure_databricks_cli_version()
+
+
+def install_ai_tools(agent_tokens: list[str], profile: str | None = None) -> None:
+    """Install Databricks AI Tools for the given agents (e.g. ``claude-code``).
+
+    Databricks AI Tools is the set of skills and plugins that teach coding
+    agents how to work with Databricks (installed via ``databricks aitools``).
+    Idempotent and best-effort: any failure only warns (surfacing the CLI's
+    own error), since AI Tools aren't required to launch an agent."""
+    if not agent_tokens:
+        return
+
+    agents_arg = ",".join(agent_tokens)
+    try:
+        with spinner(f"Installing Databricks AI Tools for {agents_arg}..."):
+            run(
+                ["databricks", "aitools", "install", "--agents", agents_arg, "--scope", "global"]
+                + _profile_args(profile),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # The CLI version is already guaranteed by ensure_databricks_cli_version,
+        # so any failure here is something else (e.g. an agent binary missing
+        # from PATH). Surface the CLI's own error rather than guessing a cause.
+        detail = getattr(exc, "stderr", None) or ""
+        if isinstance(detail, bytes):  # TimeoutExpired.stderr is bytes even with text=True
+            detail = detail.decode(errors="replace")
+        detail = detail.strip()
+        reason = detail.splitlines()[-1] if detail else str(exc)
+        print_warning(f"Could not install Databricks AI Tools: {reason}")
+    else:
+        print_success("Databricks AI Tools installed")
 
 
 def _profile_args(profile: str | None) -> list[str]:
@@ -1339,6 +1404,19 @@ def list_mcp_services(
 
 def build_mcp_service_url(workspace: str, full_name: str) -> str:
     return f"{workspace}/ai-gateway/mcp-services/{full_name}"
+
+
+def build_skills_mcp_url(workspace: str, locations: list[str]) -> str:
+    """Skills route with one ``?schema=`` scope per location. The trailing slash
+    is required by the Envoy prefix even with no query params.
+
+        []                        -> ``.../ai-gateway/skills/``
+        ["main.default", "ml.a"]  -> ``.../ai-gateway/skills/?schema=main.default&schema=ml.a``
+    """
+    base = f"{workspace}/ai-gateway/skills/"
+    if not locations:
+        return base
+    return base + "?" + urlencode([("schema", loc) for loc in locations])
 
 
 # Maps the gateway routing dialect a coding tool speaks to the Model Provider

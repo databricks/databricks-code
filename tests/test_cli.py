@@ -42,6 +42,15 @@ def no_state_writes():
         yield
 
 
+@pytest.fixture(autouse=True)
+def no_blocking_ai_tools_prompt():
+    """The interactive configure flow prompts for AI Tools; default it to yes so
+    tests that drive that path don't block reading stdin. Tests that assert on the
+    prompt override this with their own patch."""
+    with patch("ucode.cli.prompt_yes_no_default", lambda msg, *, default: default):
+        yield
+
+
 MINIMAL_STATE = {
     "workspace": "https://example.databricks.com",
     "base_urls": {
@@ -342,6 +351,146 @@ class TestStatus:
         assert "https://example.databricks.com/ai-gateway/gemini" not in result.output
 
 
+class TestConfigureSkillsCommand:
+    def test_mcp_flag_dispatches_location_set(self):
+        with patch("ucode.cli.configure_skills_mcp_command") as mock_mcp:
+            result = runner.invoke(app, ["configure", "skills", "--location", "a.b", "--mcp"])
+        assert result.exit_code == 0, result.output
+        mock_mcp.assert_called_once_with(["a.b"])
+
+    def test_comma_location_yields_multiple_schemas(self):
+        with patch("ucode.cli.configure_skills_mcp_command") as mock_mcp:
+            result = runner.invoke(app, ["configure", "skills", "--location", "a.b, c.d", "--mcp"])
+        assert result.exit_code == 0, result.output
+        mock_mcp.assert_called_once_with(["a.b", "c.d"])
+
+    def test_default_mode_dispatches_download_with_path(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(
+                app, ["configure", "skills", "--location", "a.b", "--path", "/tmp/skills"]
+            )
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path="/tmp/skills")
+
+    def test_default_mode_without_path_dispatches_download(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["configure", "skills", "--location", "a.b"])
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path=None)
+
+    def test_path_with_mcp_exit_1(self):
+        with (
+            patch("ucode.cli.configure_skills_mcp_command") as mock_mcp,
+            patch("ucode.cli.configure_skills_download_command") as mock_download,
+        ):
+            result = runner.invoke(
+                app, ["configure", "skills", "--location", "a.b", "--mcp", "--path", "/tmp/skills"]
+            )
+        assert result.exit_code == 1
+        assert "--path" in _strip_ansi(result.output)
+        mock_mcp.assert_not_called()
+        mock_download.assert_not_called()
+
+    def test_three_part_location_exit_1(self):
+        with patch("ucode.cli.configure_skills_mcp_command") as mock_mcp:
+            result = runner.invoke(app, ["configure", "skills", "--location", "a.b.c", "--mcp"])
+        assert result.exit_code == 1
+        mock_mcp.assert_not_called()
+
+    def test_malformed_location_exit_1_names_location(self):
+        with patch("ucode.cli.configure_skills_mcp_command") as mock_mcp:
+            result = runner.invoke(app, ["configure", "skills", "--location", "justone", "--mcp"])
+        assert result.exit_code == 1
+        assert "--location" in _strip_ansi(result.output)
+        mock_mcp.assert_not_called()
+
+    def test_missing_location_is_typer_usage_error(self):
+        result = runner.invoke(app, ["configure", "skills"])
+        assert result.exit_code == 2
+
+
+class TestStatusSkillsSection:
+    def _run(self, state):
+        with patch("ucode.cli.load_state", return_value=state):
+            return runner.invoke(app, ["status"])
+
+    def test_not_configured_when_no_skills_entry(self):
+        result = self._run(MINIMAL_STATE)
+        assert result.exit_code == 0, result.output
+        out = _strip_ansi(result.output)
+        assert "Skills" in out
+        assert "not configured" in out
+
+    def test_renders_locations_and_configured_agents(self):
+        state = {
+            **MINIMAL_STATE,
+            "mcp_servers": [
+                {
+                    "name": "databricks-skill-registry",
+                    "kind": "skills",
+                    "skill_locations": ["main.default", "ml.prod"],
+                    "url": "https://example.databricks.com/ai-gateway/skills/?schema=main.default&schema=ml.prod",
+                    "auth": "env:OAUTH_TOKEN",
+                    "clients": ["claude", "codex"],
+                }
+            ],
+        }
+        result = self._run(state)
+        assert result.exit_code == 0, result.output
+        out = _strip_ansi(result.output)
+        assert "Skill MCP Locations: main.default, ml.prod" in out
+        assert "Configured: Claude Code, Codex" in out
+
+    def test_renders_placeholder_when_no_locations(self):
+        state = {
+            **MINIMAL_STATE,
+            "mcp_servers": [
+                {
+                    "name": "databricks-skill-registry",
+                    "kind": "skills",
+                    "skill_locations": [],
+                    "url": "https://example.databricks.com/ai-gateway/skills/",
+                    "auth": "env:OAUTH_TOKEN",
+                    "clients": ["claude"],
+                }
+            ],
+        }
+        result = self._run(state)
+        assert result.exit_code == 0, result.output
+        out = _strip_ansi(result.output)
+        assert "Skill MCP Locations: none — utility tools only" in out
+
+    def test_skills_entry_absent_from_per_client_mcp_lines(self):
+        state = {
+            **MINIMAL_STATE,
+            "mcp_servers": [
+                {
+                    "name": "github-mcp",
+                    "url": "https://example.databricks.com/api/2.0/mcp/external/github-mcp",
+                    "auth": "env:OAUTH_TOKEN",
+                    "clients": ["claude"],
+                },
+                {
+                    "name": "databricks-skill-registry",
+                    "kind": "skills",
+                    "skill_locations": ["main.default"],
+                    "url": "https://example.databricks.com/ai-gateway/skills/?schema=main.default",
+                    "auth": "env:OAUTH_TOKEN",
+                    "clients": ["claude"],
+                },
+            ],
+        }
+        result = self._run(state)
+        assert result.exit_code == 0, result.output
+        out = _strip_ansi(result.output)
+        # The skills registry is managed in the Skills section, never listed on
+        # a per-client "MCP servers:" line.
+        for line in out.splitlines():
+            if "MCP servers:" in line:
+                assert "databricks-skill-registry" not in line
+        assert "Skill MCP Locations: main.default" in out
+
+
 class TestRevert:
     def test_reverts_mcp_configs_before_clearing_state(self):
         state = {
@@ -497,6 +646,8 @@ class TestConfigureAgentFlag:
             patch("ucode.cli.prompt_yes_no", return_value=False) as mock_mcp_prompt,
             patch("ucode.cli.configure_mcp_command") as mock_mcp,
         ):
+            # No flag: the AI Tools prompt happens later, inside
+            # configure_workspace_command, so nothing is forwarded here.
             result = runner.invoke(app, ["configure"])
         assert result.exit_code == 0, result.output
         mock_cfg.assert_called_once_with(prompt_optional_updates=True)
@@ -682,6 +833,85 @@ class TestConfigureAgentFlag:
         assert result.exit_code == 0, result.output
         mock_cfg.assert_called_once_with(prompt_optional_updates=False)
 
+    def test_disable_databricks_ai_tools_forwards_false_and_skips_prompt(self):
+        # An explicit flag suppresses the interactive prompt and forwards the choice.
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.install_tool_binary"),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+            patch("ucode.cli.prompt_yes_no_default") as mock_prompt,
+            # Fully-interactive configure ends by offering the MCP step; decline it.
+            patch("ucode.cli.prompt_yes_no", return_value=False),
+            patch("ucode.cli.configure_mcp_command"),
+        ):
+            result = runner.invoke(app, ["configure", "--disable-databricks-ai-tools"])
+        assert result.exit_code == 0, result.output
+        mock_prompt.assert_not_called()
+        mock_cfg.assert_called_once_with(
+            prompt_optional_updates=True, databricks_ai_tools_enabled=False
+        )
+
+    def test_enable_databricks_ai_tools_with_agents_forwards_true(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.install_tool_binary"),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            result = runner.invoke(
+                app, ["configure", "--enable-databricks-ai-tools", "--agents", "claude,codex"]
+            )
+        assert result.exit_code == 0, result.output
+        mock_cfg.assert_called_once_with(
+            selected_tools=["claude", "codex"],
+            prompt_optional_updates=True,
+            databricks_ai_tools_enabled=True,
+        )
+
+    def _stub_interactive_configure(self, monkeypatch, shared_state):
+        """Wire configure_workspace_command's interactive path; return captured info."""
+        import ucode.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "configure_shared_state", lambda *a, **k: shared_state)
+        monkeypatch.setattr(cli_mod, "check_gateway_endpoint", lambda s, t: t == "claude")
+        monkeypatch.setattr(cli_mod, "install_tool_binary", lambda *a, **k: True)
+        monkeypatch.setattr(cli_mod, "_maybe_select_provider_service", lambda tool, s: s)
+        monkeypatch.setattr(cli_mod, "validate_all_tools", lambda s: None)
+        monkeypatch.setattr(cli_mod, "validate_tool", lambda t: (True, None))
+        monkeypatch.setattr(
+            cli_mod, "_prompt_for_configuration", lambda tool=None: ("https://w", None)
+        )
+        monkeypatch.setattr(cli_mod, "prompt_for_tools", lambda options: ["claude"])
+        captured = {}
+        monkeypatch.setattr(
+            cli_mod,
+            "configure_selected_tools",
+            lambda s, tools: captured.update(state=dict(s)) or s,
+        )
+        prompt_calls = []
+        monkeypatch.setattr(
+            cli_mod,
+            "prompt_yes_no_default",
+            lambda msg, *, default: prompt_calls.append(default) or default,
+        )
+        return cli_mod, captured, prompt_calls
+
+    def test_interactive_prompt_default_yes_when_no_prior_optout(self, monkeypatch):
+        # No prior opt-out -> prompt defaults to yes; state carries True into install.
+        state = {**MINIMAL_STATE, "available_tools": [], "databricks_ai_tools_enabled": True}
+        cli_mod, captured, prompt_calls = self._stub_interactive_configure(monkeypatch, state)
+        cli_mod.configure_workspace_command()
+        assert prompt_calls == [True]  # default derived from resolved prior choice
+        assert captured["state"]["databricks_ai_tools_enabled"] is True
+
+    def test_interactive_prompt_defaults_to_prior_optout(self, monkeypatch):
+        # configure_shared_state resolved a prior --disable to False; the prompt must
+        # default to no so Enter doesn't silently re-enable it.
+        state = {**MINIMAL_STATE, "available_tools": [], "databricks_ai_tools_enabled": False}
+        cli_mod, captured, prompt_calls = self._stub_interactive_configure(monkeypatch, state)
+        cli_mod.configure_workspace_command()
+        assert prompt_calls == [False]
+        assert captured["state"]["databricks_ai_tools_enabled"] is False
+
     def test_skip_upgrade_flag_with_agent_skips_optional_update(self):
         with (
             patch("ucode.cli.install_databricks_cli"),
@@ -784,6 +1014,68 @@ class TestConfigureAgentFlag:
             result = runner.invoke(app, ["configure", "--workspaces", ","])
         assert result.exit_code != 0
         mock_cfg.assert_not_called()
+
+
+class TestConfigureMcpFlag:
+    def test_mcp_with_agents_configures_then_registers_services(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.install_tool_binary"),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+            patch("ucode.cli.configure_mcp_command") as mock_mcp,
+        ):
+            result = runner.invoke(
+                app,
+                ["configure", "--agents", "claude", "--mcp", "system.ai.slack,system.ai.github"],
+            )
+        assert result.exit_code == 0, result.output
+        mock_cfg.assert_called_once_with(
+            selected_tools=["claude"],
+            prompt_optional_updates=True,
+        )
+        mock_mcp.assert_called_once_with(services={"system.ai.slack", "system.ai.github"})
+
+    def test_mcp_only_configures_workspace_without_agent_picker(self):
+        # `--mcp` with no --agents (e.g. Cursor): configure the workspace directly,
+        # never the interactive agent picker, then register the MCP service.
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+            patch("ucode.cli._configure_shared_workspace_states") as mock_shared,
+            patch("ucode.cli.configure_mcp_command") as mock_mcp,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "--workspaces",
+                    "https://ws.databricks.com",
+                    "--mcp",
+                    "system.ai.slack",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        # Never the model-agent picker path.
+        mock_cfg.assert_not_called()
+        mock_shared.assert_called_once()
+        # Workspace-only: no model tools fetched.
+        assert (
+            mock_shared.call_args.kwargs.get("tools") == [] or mock_shared.call_args.args[1] == []
+        )
+        mock_mcp.assert_called_once_with(services={"system.ai.slack"})
+
+    def test_mcp_rejects_bare_short_name(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.configure_workspace_command"),
+            patch("ucode.cli._configure_shared_workspace_states"),
+            patch("ucode.cli.configure_mcp_command") as mock_mcp,
+        ):
+            result = runner.invoke(
+                app, ["configure", "--workspaces", "https://ws.databricks.com", "--mcp", "slack"]
+            )
+        assert result.exit_code != 0
+        mock_mcp.assert_not_called()
 
 
 class TestConfigureAgentsSelection:
@@ -894,6 +1186,7 @@ class TestConfigureAgentsSelection:
             force_login=False,
             use_pat=False,
             fable_enabled=None,
+            databricks_ai_tools_enabled=None,
         ):
             configured_shared.append(
                 (workspace, profile, tuple(tools) if tools is not None else None, force_login)
@@ -1287,6 +1580,50 @@ class TestConfigureSharedStateUsePat:
 
         assert "fable_enabled" not in state
         assert "fable" not in state["claude_models"]
+
+    def test_ai_tools_disable_persists(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        state = cli_mod.configure_shared_state(
+            self.WS, profile="DEFAULT", databricks_ai_tools_enabled=False
+        )
+        assert state["databricks_ai_tools_enabled"] is False
+
+    def test_ai_tools_enable_persists_explicit_true(self, monkeypatch):
+        # We ask explicitly, so store the on choice too (not just absent-default).
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        state = cli_mod.configure_shared_state(
+            self.WS, profile="DEFAULT", databricks_ai_tools_enabled=True
+        )
+        assert state["databricks_ai_tools_enabled"] is True
+
+    def test_ai_tools_disable_inherited_same_workspace(self, monkeypatch):
+        # No flag on a re-configure of the same workspace keeps the prior opt-out.
+        cli_mod, *_ = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": self.WS,
+                "profile": "DEFAULT",
+                "databricks_ai_tools_enabled": False,
+            },
+        )
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+        assert state["databricks_ai_tools_enabled"] is False
+
+    def test_ai_tools_disable_does_not_leak_across_workspaces(self, monkeypatch):
+        # A different workspace's opt-out must NOT carry into this one; no flag
+        # here resolves to the default (install=True), matching use_pat/fable scoping.
+        cli_mod, *_ = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": "https://other.databricks.com",
+                "profile": "DEFAULT",
+                "databricks_ai_tools_enabled": False,
+            },
+        )
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+        assert state["databricks_ai_tools_enabled"] is True
 
     def test_falls_back_to_legacy_when_uc_empty(self, monkeypatch):
         # No UC model-services: each family falls back to the legacy listing.

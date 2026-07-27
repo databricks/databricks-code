@@ -7,13 +7,14 @@ import sys
 import textwrap
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 
 import questionary
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 
 console = Console(highlight=False)
 err_console = Console(stderr=True, highlight=False)
@@ -125,6 +126,27 @@ def spinner(message: str | Callable[[], str]):
     finally:
         stop_event.set()
         thread.join(timeout=1)
+
+
+@contextmanager
+def progress_bar(description: str, total: int) -> Iterator[Callable[[], None]]:
+    """Yield an ``advance()`` callback that drives a ``k/n`` progress bar.
+
+    Falls back to no live bar off a tty (e.g. CI), so logs stay single-line.
+    """
+    if total <= 0 or not sys.stdout.isatty():
+        yield lambda: None
+        return
+
+    with Progress(
+        TextColumn("[dim]{task.description}[/dim]"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task(description, total=total)
+        yield lambda: progress.advance(task)
 
 
 def render_box_table(
@@ -309,6 +331,23 @@ def prompt_for_selection(prompt: str, options: list[tuple[str, str]]) -> str | N
 def prompt_yes_no(prompt: str) -> bool:
     while True:
         response = console.input(f"{label(prompt)} {muted('(y/n)')} {muted('›')} ").strip().lower()
+        if response in {"y", "yes"}:
+            return True
+        if response in {"n", "no"}:
+            return False
+        print_err("Please answer yes or no.")
+
+
+def prompt_yes_no_default(prompt: str, *, default: bool) -> bool:
+    """Empty answer or closed stdin (EOF) takes ``default`` (no abort on piped runs)."""
+    hint = "(Y/n)" if default else "(y/N)"
+    while True:
+        try:
+            response = console.input(f"{label(prompt)} {muted(hint)} {muted('›')} ").strip().lower()
+        except EOFError:
+            return default
+        if not response:
+            return default
         if response in {"y", "yes"}:
             return True
         if response in {"n", "no"}:

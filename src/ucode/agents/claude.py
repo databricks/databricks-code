@@ -93,6 +93,9 @@ CLAUDE_MANAGED_MODEL_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
 )
+# Env keys ucode used to write but no longer does; stripped from the managed
+# settings file on every launch so stale values never linger.
+CLAUDE_REMOVED_ENV_KEYS = ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",)
 CLAUDE_TRACING_STOP_HOOK_SUFFIX = " autolog claude stop-hook"
 # Tracing is driven by an `mlflow autolog claude stop-hook` Stop hook, run by
 # the `mlflow` CLI on each session end. Pin to 3.11.x: 3.12 dropped the Unity
@@ -166,8 +169,13 @@ def render_overlay(
     env: dict[str, str] = {
         "ANTHROPIC_BASE_URL": base_url,
         "ANTHROPIC_CUSTOM_HEADERS": custom_headers,
-        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
+        # 1h prompt caching needs the extended-cache-ttl beta header, which
+        # Claude Code only sends when experimental betas are enabled — so we must
+        # not set CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS (see CLAUDE_REMOVED_ENV_KEYS).
+        "ENABLE_PROMPT_CACHING_1H": "1",
+        "ENABLE_TOOL_SEARCH": "1",
+        "CLAUDE_CODE_USE_GATEWAY": "1",
     }
     # Intentionally NOT setting ANTHROPIC_MODEL. Setting it produces a duplicate
     # catalog row in Claude Code's /model picker (e.g. "Opus 4.8 (1M context) ✓")
@@ -343,6 +351,11 @@ def write_tool_config(
         for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
             if key not in overlay_env:
                 merged_env.pop(key, None)
+    # deep_merge_dict keeps keys already in the file, so drop the ones ucode no
+    # longer writes.
+    if isinstance(merged_env, dict):
+        for key in CLAUDE_REMOVED_ENV_KEYS:
+            merged_env.pop(key, None)
     write_json_file(CLAUDE_SETTINGS_PATH, merged)
 
     if web_search_model:

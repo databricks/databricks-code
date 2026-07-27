@@ -504,7 +504,6 @@ class TestClaudeLaunch:
                 "ANTHROPIC_MODEL": model_id,
                 "ANTHROPIC_BASE_URL": base_url,
                 "ANTHROPIC_API_KEY": e2e_token,
-                "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
             }
             cmd = claude.validate_cmd("claude")
             result = _run_agent(cmd, env=env, timeout=90)
@@ -571,7 +570,6 @@ class TestModelProviderLaunch:
             "CLAUDE_CONFIG_DIR": str(config_dir),
             "ANTHROPIC_BASE_URL": build_tool_base_url("claude", e2e_workspace),
             "ANTHROPIC_API_KEY": e2e_token,
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         }
         result = _run_agent(claude.validate_cmd("claude"), env=env, timeout=90)
         combined = (result.stdout + result.stderr).strip()
@@ -711,7 +709,9 @@ class TestOpencodeLaunch:
     # no stderr beyond the initial `> build · <model>` line, while every
     # other configured model returns in ~3s. Backend-side latency we can't
     # influence from this repo; skip rather than block CI.
-    SKIP_MODELS: frozenset[str] = frozenset({"databricks-gemini-3-1-flash-lite"})
+    SKIP_MODELS: frozenset[str] = frozenset(
+        {"databricks-gemini-3-1-flash-lite", "databricks-gemini-3-1-flash-lite-image"}
+    )
 
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
         """Return [(provider, model_id), ...] for all opencode models."""

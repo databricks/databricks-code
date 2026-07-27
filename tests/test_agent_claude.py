@@ -80,9 +80,22 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert "x-databricks-use-coding-agent-mode" in overlay["env"]["ANTHROPIC_CUSTOM_HEADERS"]
 
-    def test_disables_experimental_betas(self):
+    def test_does_not_disable_experimental_betas(self):
+        # Would suppress the beta header 1h prompt caching needs.
         overlay, _ = claude.render_overlay(WS, "s4")
-        assert overlay["env"]["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
+        assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in overlay["env"]
+
+    def test_enables_prompt_caching_1h(self):
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["ENABLE_PROMPT_CACHING_1H"] == "1"
+
+    def test_enables_tool_search(self):
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["ENABLE_TOOL_SEARCH"] == "1"
+
+    def test_enables_use_gateway(self):
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
     def test_sets_api_key_helper(self):
         overlay, _ = claude.render_overlay(WS, "s4")
@@ -364,6 +377,30 @@ class TestWriteToolConfigMcpRegistration:
         }
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
         assert calls == [("register", WS, "explicit-model")]
+
+
+class TestWriteToolConfigStripsRemovedEnvKeys:
+    """Stale keys ucode no longer writes are dropped from the merged settings."""
+
+    def _patch(self, monkeypatch, existing, written):
+        monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        monkeypatch.setattr(claude, "read_json_safe", lambda path: existing)
+        monkeypatch.setattr(
+            claude, "write_json_file", lambda path, payload: written.append(payload)
+        )
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
+
+    def test_strips_stale_disable_experimental_betas(self, monkeypatch):
+        existing = {"env": {"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"}}
+        written: list = []
+        self._patch(monkeypatch, existing, written)
+        state = {"workspace": WS, "codex_models": []}
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in written[0]["env"]
+        assert written[0]["env"]["ENABLE_PROMPT_CACHING_1H"] == "1"
+        assert written[0]["env"]["ENABLE_TOOL_SEARCH"] == "1"
+        assert written[0]["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
 
 class TestRegisterWebSearchMcp:
