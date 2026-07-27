@@ -1487,7 +1487,6 @@ def _update_skills_mcp(
     if changed or original != working:
         state["mcp_servers"] = working
         save_state(state)
-        print_success("Saved")
     entry = next(s for s in working if s.get("kind") == SKILLS_MCP_KIND)
     _print_skills_summary(entry)
 
