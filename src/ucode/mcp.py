@@ -43,7 +43,7 @@ from ucode.databricks import (
 )
 from ucode.state import load_full_state, load_state, save_state
 from ucode.ui import (
-    print_heading,
+    console,
     print_kv,
     print_note,
     print_section,
@@ -1466,7 +1466,8 @@ def _print_skills_summary(entry: dict) -> None:
         for client in (entry.get("clients") or [])
         if client in MCP_CLIENTS
     ]
-    print_heading("[green]✔[/green] Skills MCP registered")
+    console.print()
+    print_success("Skills MCP registered")
     print_kv("Server", str(entry.get("name") or SKILLS_MCP_SERVER_NAME))
     print_kv("URL", str(entry.get("url") or ""))
     print_kv("Configured", ", ".join(clients) if clients else "none")
