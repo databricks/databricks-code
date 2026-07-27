@@ -1939,7 +1939,7 @@ class TestPrintSkillsSummary:
             "Configured: Claude Code, Codex "
             "Tools: UC skill utility tools + skills tools in schema main.default "
             "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
-            "restart the agent before skills become available."
+            "restart the agent for the skills to take effect."
         )
 
     def test_reports_schemaless_connection(self, capsys):
@@ -1951,7 +1951,7 @@ class TestPrintSkillsSummary:
             "Configured: Claude Code, Codex "
             "Tools: UC skill utility tools "
             "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
-            "restart the agent before skills become available."
+            "restart the agent for the skills to take effect."
         )
 
 

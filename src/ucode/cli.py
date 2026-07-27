@@ -1448,11 +1448,13 @@ def configure_skills(
 ) -> None:
     """Configure Databricks Skills for your coding tools.
 
-    With no ``--location``, registers the schema-less skills MCP connection
-    (cross-schema utility tools only) without downloading anything. With
-    ``--location`` (and no ``--mcp``), also downloads every skill in each schema to
-    disk (under ``--path``, or your home dir when omitted). ``--mcp`` instead sets
-    the connection's scope to exactly the listed schemas without downloading.
+    When ``--location`` is not provided, registers the skills MCP connection with
+    utility tools only.
+
+    When ``--location`` is provided: with ``--mcp``, sets the connection's scope to
+    exactly the listed schemas (no download); otherwise, downloads every skill in
+    each schema to disk (under ``--path``, or your home dir when omitted) and
+    registers the schema-less connection.
     """
     try:
         locations = _parse_skill_locations(location)

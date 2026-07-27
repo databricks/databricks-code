@@ -1473,7 +1473,7 @@ def _print_skills_summary(entry: dict) -> None:
     print_kv("Tools", _skills_tools_description(entry.get("skill_locations") or []))
     print_note(
         "Run `ucode <agent>` to use the skills MCP. For existing sessions, "
-        "restart the agent before skills become available."
+        "restart the agent for the skills to take effect."
     )
 
 
