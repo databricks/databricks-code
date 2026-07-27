@@ -1632,9 +1632,10 @@ _UC_LIST_HTTP_TIMEOUT = 10
 _UC_FUNCTION_PROBE_TIMEOUT = 5
 _VECTOR_SEARCH_DEADLINE_SECONDS = 15.0
 _UC_FUNCTIONS_DEADLINE_SECONDS = 20.0
-# This walk runs on every `configure mcp` (not opt-in), so keep the budget tight:
-# a slow workspace degrades to partial/instant results instead of a long wait.
-_MCP_SERVICES_WALK_DEADLINE_SECONDS = 8.0
+# Most MCP services live outside `system.ai`, so this workspace-wide walk needs
+# enough time to enumerate them; a slow workspace still degrades to partial
+# results once the budget is exceeded instead of hanging indefinitely.
+_MCP_SERVICES_WALK_DEADLINE_SECONDS = 30.0
 # Skip UC catalogs whose schemas almost never carry user-callable functions
 # you'd want to expose as agent tools.
 _UC_FUNCTIONS_SKIP_CATALOGS = frozenset(
