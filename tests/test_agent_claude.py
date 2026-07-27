@@ -102,6 +102,42 @@ class TestRenderOverlay:
         assert "apiKeyHelper" in overlay
         assert WS in overlay["apiKeyHelper"]
 
+    def test_relayed_omits_api_key_helper(self):
+        # Claude Code's own subscription OAuth must own Authorization; an
+        # apiKeyHelper would outrank it.
+        overlay, _ = claude.render_overlay(
+            WS,
+            None,
+            provider="c.s.mps",
+            relayed=True,
+            relayed_base_url="http://127.0.0.1:9",
+        )
+        assert "apiKeyHelper" not in overlay
+
+    def test_relayed_points_base_url_at_proxy(self):
+        overlay, _ = claude.render_overlay(
+            WS,
+            None,
+            provider="c.s.mps",
+            relayed=True,
+            relayed_base_url="http://127.0.0.1:9",
+        )
+        assert overlay["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9"
+
+    def test_relayed_sends_mps_header_but_not_swap_token(self):
+        # The MPS header selects the service; the swap token is injected by the
+        # proxy, never written into settings.
+        overlay, _ = claude.render_overlay(
+            WS,
+            None,
+            provider="c.s.mps",
+            relayed=True,
+            relayed_base_url="http://127.0.0.1:9",
+        )
+        headers = overlay["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+        assert "Databricks-Model-Provider-Service: c.s.mps" in headers
+        assert "X-Databricks-AI-Gateway-Token" not in headers
+
     def test_model_overrides_when_all_provided(self):
         models = {
             "sonnet": "databricks-claude-sonnet-4-6",
@@ -603,6 +639,34 @@ class TestBuildClaudeArgv:
         monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
         argv = claude._build_claude_argv("claude", ["-p", "hi"])
         assert argv == ["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "-p", "hi"]
+
+    def test_non_relayed_does_not_set_setting_sources(self, monkeypatch):
+        # Normal launches must keep loading user settings (hooks/permissions) —
+        # no --setting-sources so nothing changes for the stored-key path.
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
+        argv = claude._build_claude_argv("claude", ["-p", "hi"], relayed=False)
+        assert "--setting-sources" not in argv
+
+    def test_relayed_excludes_user_scope_via_setting_sources(self, monkeypatch):
+        # Relayed must drop the user scope so a stale ~/.claude/settings.json
+        # apiKeyHelper can't merge through and shadow the subscription OAuth.
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"env": {}})
+        argv = claude._build_claude_argv("claude", ["-p", "hi"], relayed=True)
+        assert "--setting-sources" in argv
+        src = argv[argv.index("--setting-sources") + 1]
+        assert src == claude._RELAYED_SETTING_SOURCES
+        assert "user" not in src
+        # ucode's own settings file is still passed.
+        assert "--settings" in argv
+        assert str(claude.CLAUDE_SETTINGS_PATH) in argv
+
+    def test_relayed_with_caller_settings_keeps_setting_sources(self, monkeypatch):
+        # Even when composing a caller --settings, relayed still excludes user scope.
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"env": {}})
+        caller = json.dumps({"statusLine": {"type": "command", "command": "sl"}})
+        argv = claude._build_claude_argv("claude", ["--settings", caller], relayed=True)
+        assert argv[:3] == ["claude", "--setting-sources", claude._RELAYED_SETTING_SOURCES]
+        assert argv.count("--settings") == 1
 
     def test_inline_caller_settings_merged_into_single_flag(self, monkeypatch):
         ucode_settings = {

@@ -1400,9 +1400,11 @@ def list_model_provider_services(workspace: str, token: str) -> tuple[list[dict]
 
     Returns ``(services, reason)`` where each service is
     ``{"name": "<catalog>.<schema>.<service>", "provider_type": "anthropic"|...,
-    "targets": [model_id, ...], "allow_all_targets": bool}``. ``targets`` is the
-    provider-side model ids the service exposes (used to pin Bedrock model
-    names). A non-None ``reason`` means the listing call itself failed.
+    "targets": [model_id, ...], "allow_all_targets": bool, "relayed": bool}``.
+    ``targets`` is the provider-side model ids the service exposes (used to pin
+    Bedrock model names). ``relayed`` is True for a credential-less Anthropic
+    service (Claude Max/Team/Enterprise subscription relay). A non-None
+    ``reason`` means the listing call itself failed.
     """
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}/api/2.1/unity-catalog/model-provider-services"
@@ -1425,12 +1427,18 @@ def list_model_provider_services(workspace: str, token: str) -> tuple[list[dict]
             model_id = target.get("model") if isinstance(target, dict) else None
             if isinstance(model_id, str) and model_id:
                 targets.append(model_id)
+        # Relayed = credential-less Anthropic (subscription relay). Only whether
+        # it's relayed matters here; the tier (Max vs Team/Enterprise) is governed
+        # server-side, so both launch identically.
+        anthropic_cfg = config.get("anthropic")
+        relayed = isinstance(anthropic_cfg, dict) and "relayed" in anthropic_cfg
         services.append(
             {
                 "name": full_name,
                 "provider_type": _provider_type_tag(config.get("provider_type")),
                 "targets": targets,
                 "allow_all_targets": bool(config.get("allow_all_targets")),
+                "relayed": relayed,
             }
         )
     services.sort(key=lambda s: s["name"])

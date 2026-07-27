@@ -64,6 +64,7 @@ from ucode.state import (
     load_full_state,
     load_state,
     save_state,
+    set_current_workspace,
     set_provider_service,
 )
 from ucode.tracing import configure_tracing_command
@@ -913,9 +914,15 @@ def _launch_tool(
     ctx: typer.Context,
     provider: str | None = None,
     skip_preflight: bool = False,
+    workspace: str | None = None,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        # An explicit --workspace targets that workspace for this launch (and
+        # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
+        # works without a prior `ucode configure`.
+        if workspace:
+            set_current_workspace(normalize_workspace_url(workspace))
         existing = load_state()
         # Workspaces configured with --use-pat export the profile's PAT as
         # DATABRICKS_BEARER up front so every auth check below (and the
@@ -937,8 +944,9 @@ def _launch_tool(
         # Surfaces a clear error up front instead of a cryptic gateway failure
         # mid-session. For a Bedrock service this also returns the model ids.
         provider_models = None
+        relayed = False
         if provider:
-            provider_models, error = resolve_provider_models(tool, state, provider)
+            provider_models, error, relayed = resolve_provider_models(tool, state, provider)
             if error:
                 raise RuntimeError(error)
         # Re-fetch model lists on every launch so newly-added Databricks
@@ -961,9 +969,7 @@ def _launch_tool(
             resolved_model = None
         else:
             state, resolved_model = resolve_launch_model(tool, state, None)
-        state = configure_tool(
-            tool, state, resolved_model, provider=provider, provider_models=provider_models
-        )
+        state = configure_tool(tool, state, resolved_model, provider=provider, provider_models=provider_models, relayed=relayed)
         print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
         if provider:
             print_kv("Provider", provider)
@@ -997,6 +1003,17 @@ SkipPreflightOption = Annotated[
     ),
 ]
 
+# Target this launch at a specific workspace, auto-configuring (and logging in)
+# if it hasn't been set up yet — so a launch needs no prior `ucode configure`.
+WorkspaceOption = Annotated[
+    str | None,
+    typer.Option(
+        "--workspace",
+        help="Databricks workspace URL to launch against; sets up and authenticates it "
+        "if not already configured.",
+    ),
+]
+
 
 @app.command("codex", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def codex_cmd(
@@ -1011,9 +1028,10 @@ def codex_cmd(
         ),
     ] = None,
     skip_preflight: SkipPreflightOption = False,
+    workspace: WorkspaceOption = None,
 ) -> None:
     """Launch Codex via Databricks."""
-    _launch_tool("codex", ctx, provider=provider, skip_preflight=skip_preflight)
+    _launch_tool("codex", ctx, provider=provider, skip_preflight=skip_preflight, workspace=workspace)
 
 
 @app.command("claude", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -1029,9 +1047,10 @@ def claude_cmd(
         ),
     ] = None,
     skip_preflight: SkipPreflightOption = False,
+    workspace: WorkspaceOption = None,
 ) -> None:
     """Launch Claude Code via Databricks."""
-    _launch_tool("claude", ctx, provider=provider, skip_preflight=skip_preflight)
+    _launch_tool("claude", ctx, provider=provider, skip_preflight=skip_preflight, workspace=workspace)
 
 
 @app.command("gemini", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})

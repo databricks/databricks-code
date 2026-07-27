@@ -278,25 +278,27 @@ def resolve_launch_model(
 
 def resolve_provider_models(
     tool: str, state: dict, provider: str | None
-) -> tuple[dict | None, str | None]:
+) -> tuple[dict | None, str | None, bool]:
     """Validate ``provider`` for ``tool`` and return the model ids to pin.
 
-    Returns ``(provider_models, error)``. ``provider_models`` is a
+    Returns ``(provider_models, error, relayed)``. ``provider_models`` is a
     ``{family: model_id}`` dict for a Bedrock-backed claude service (whose
     provider-side ids must be pinned explicitly), or None for an Anthropic/
-    canonical service or when ``provider`` is None. A non-None ``error`` means
-    the provider is invalid for the tool (wrong type, missing, feature off, or a
-    Bedrock service with no Claude models) and the caller should not launch.
+    canonical service or when ``provider`` is None. ``relayed`` is True for a
+    credential-less Anthropic subscription relay, which the launch path wires
+    with the relayed overlay + refresh proxy. A non-None ``error`` means the
+    provider is invalid for the tool and the caller should not launch.
     """
     if not provider:
-        return None, None
+        return None, None, False
     token = get_databricks_token(state["workspace"], state.get("profile"))
     service, error = resolve_provider_service(tool, provider, state["workspace"], token)
     if error or service is None:
-        return None, error
+        return None, error, False
+    relayed = bool(service.get("relayed"))
     if service["provider_type"] in BEDROCK_PROVIDER_TYPES:
-        return map_bedrock_claude_models(service.get("targets") or []), None
-    return None, None
+        return map_bedrock_claude_models(service.get("targets") or []), None, relayed
+    return None, None, relayed
 
 
 def configure_tool(
@@ -305,6 +307,7 @@ def configure_tool(
     model: str | None = None,
     provider: str | None = None,
     provider_models: dict[str, str] | None = None,
+    relayed: bool = False,
 ) -> dict:
     result: dict | tuple[dict, str]
     if tool == "codex":
@@ -315,7 +318,7 @@ def configure_tool(
         if not model and not provider:
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         result = claude.write_tool_config(
-            state, model, provider=provider, provider_models=provider_models
+            state, model, provider=provider, provider_models=provider_models, relayed=relayed
         )
     else:
         # provider routing is claude/codex-only; every other tool needs a model.
@@ -405,10 +408,12 @@ def configure_single_tool(tool: str, state: dict) -> dict:
 def _configure_one(tool: str, state: dict, provider: str | None) -> dict:
     """Write one tool's config, routing through ``provider`` when set."""
     if provider:
-        provider_models, error = resolve_provider_models(tool, state, provider)
+        provider_models, error, relayed = resolve_provider_models(tool, state, provider)
         if error:
             raise RuntimeError(error)
-        return configure_tool(tool, state, None, provider=provider, provider_models=provider_models)
+        return configure_tool(
+            tool, state, None, provider=provider, provider_models=provider_models, relayed=relayed
+        )
     if tool == "codex":
         return configure_tool("codex", state)
     state, model = resolve_launch_model(tool, state, None)
@@ -477,6 +482,10 @@ def validate_tool(tool: str) -> tuple[bool, str]:
     spec = TOOL_SPECS[tool]
     binary = spec["binary"]
     module = _MODULES[tool]
+    # Some configs (e.g. claude relayed) can't be probed with a live message —
+    # the proxy + subscription login only exist at launch. Trust the written config.
+    if hasattr(module, "skip_validation") and module.skip_validation(load_state()):
+        return True, ""
     cmd = module.validate_cmd(binary)
     env = None
     if hasattr(module, "validate_env"):

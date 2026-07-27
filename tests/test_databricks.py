@@ -281,7 +281,7 @@ class TestDiscoverModelServices:
         payload = {
             "model_services": [
                 _model_service("system.ai.gpt-5"),
-                _model_service("main.svenwb.gpt-5-5"),
+                _model_service("main.schema3.gpt-5-5"),
                 _model_service("temp.erni.kimi-k2-7-code"),
                 _model_service("temp.erni.claude-opus-4-8"),
                 _model_service("dnasi_agent_cuj.default.dnasi-gpt55-test"),
@@ -339,15 +339,22 @@ class TestListModelProviderServices:
     _PAYLOAD = {
         "model_provider_services": [
             {
-                "name": "model-provider-services/main.aarushi.anthropic-svc",
+                "name": "model-provider-services/main.schema1.anthropic-svc",
                 "config": {"provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_ANTHROPIC"},
             },
             {
-                "name": "model-provider-services/main.aarushi.openai-svc",
+                "name": "model-provider-services/main.schema1.claude-max-svc",
+                "config": {
+                    "provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_ANTHROPIC",
+                    "anthropic": {"relayed": {}},
+                },
+            },
+            {
+                "name": "model-provider-services/main.schema1.openai-svc",
                 "config": {"provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_OPENAI"},
             },
             {
-                "name": "model-provider-services/main.bob.bedrock-svc",
+                "name": "model-provider-services/main.schema2.bedrock-svc",
                 "config": {
                     "provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_AMAZON_BEDROCK",
                     "allow_all_targets": False,
@@ -361,7 +368,7 @@ class TestListModelProviderServices:
                 },
             },
             {
-                "name": "model-provider-services/main.bob.bedrock-titan-svc",
+                "name": "model-provider-services/main.schema2.bedrock-titan-svc",
                 "config": {
                     "provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_AMAZON_BEDROCK",
                     "targets": [{"model": "amazon.titan-text-express-v1"}],
@@ -377,10 +384,11 @@ class TestListModelProviderServices:
         services, reason = db_mod.list_model_provider_services(WS, "token")
         assert reason is None
         assert services[0] == {
-            "name": "main.aarushi.anthropic-svc",
+            "name": "main.schema1.anthropic-svc",
             "provider_type": "anthropic",
             "targets": [],
             "allow_all_targets": False,
+            "relayed": False,
         }
         assert {s["provider_type"] for s in services} == {
             "anthropic",
@@ -388,12 +396,21 @@ class TestListModelProviderServices:
             "amazon_bedrock",
         }
 
+    def test_flags_relayed_anthropic(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (self._PAYLOAD, None)
+        )
+        services, _ = db_mod.list_model_provider_services(WS, "token")
+        by_name = {s["name"]: s for s in services}
+        assert by_name["main.schema1.claude-max-svc"]["relayed"] is True
+        assert by_name["main.schema1.anthropic-svc"]["relayed"] is False
+
     def test_extracts_targets(self, monkeypatch):
         monkeypatch.setattr(
             db_mod, "_http_get_json", lambda url, token, timeout=30: (self._PAYLOAD, None)
         )
         services, _ = db_mod.list_model_provider_services(WS, "token")
-        bedrock = next(s for s in services if s["name"] == "main.bob.bedrock-svc")
+        bedrock = next(s for s in services if s["name"] == "main.schema2.bedrock-svc")
         assert bedrock["targets"] == [
             "us.anthropic.claude-sonnet-4-6",
             "global.anthropic.claude-opus-4-8",
@@ -413,16 +430,21 @@ class TestListModelProviderServices:
         )
         names, reason = db_mod.list_tool_provider_services("claude", WS, "token")
         assert reason is None
-        # Anthropic + the Bedrock service with Claude targets; the Bedrock service
-        # exposing only Titan is hidden (no Claude models to pin).
-        assert names == ["main.aarushi.anthropic-svc", "main.bob.bedrock-svc"]
+        # Anthropic (stored-key + relayed) + the Bedrock service with Claude
+        # targets; the Bedrock service exposing only Titan is hidden (no Claude
+        # models to pin).
+        assert names == [
+            "main.schema1.anthropic-svc",
+            "main.schema1.claude-max-svc",
+            "main.schema2.bedrock-svc",
+        ]
 
     def test_codex_filters_to_openai(self, monkeypatch):
         monkeypatch.setattr(
             db_mod, "_http_get_json", lambda url, token, timeout=30: (self._PAYLOAD, None)
         )
         names, _ = db_mod.list_tool_provider_services("codex", WS, "token")
-        assert names == ["main.aarushi.openai-svc"]
+        assert names == ["main.schema1.openai-svc"]
 
 
 class TestMapBedrockClaudeModels:
@@ -472,7 +494,7 @@ class TestResolveProviderService:
     def test_anthropic_ok(self, monkeypatch):
         self._patch(monkeypatch)
         service, error = db_mod.resolve_provider_service(
-            "claude", "main.aarushi.anthropic-svc", WS, "token"
+            "claude", "main.schema1.anthropic-svc", WS, "token"
         )
         assert error is None
         assert service["provider_type"] == "anthropic"
@@ -480,7 +502,7 @@ class TestResolveProviderService:
     def test_bedrock_with_claude_ok(self, monkeypatch):
         self._patch(monkeypatch)
         service, error = db_mod.resolve_provider_service(
-            "claude", "main.bob.bedrock-svc", WS, "token"
+            "claude", "main.schema2.bedrock-svc", WS, "token"
         )
         assert error is None
         assert service["provider_type"] == "amazon_bedrock"
@@ -488,7 +510,7 @@ class TestResolveProviderService:
     def test_wrong_type_rejected(self, monkeypatch):
         self._patch(monkeypatch)
         service, error = db_mod.resolve_provider_service(
-            "claude", "main.aarushi.openai-svc", WS, "token"
+            "claude", "main.schema1.openai-svc", WS, "token"
         )
         assert service is None
         assert "can't route to" in error
@@ -496,7 +518,7 @@ class TestResolveProviderService:
     def test_bedrock_without_claude_rejected(self, monkeypatch):
         self._patch(monkeypatch)
         service, error = db_mod.resolve_provider_service(
-            "claude", "main.bob.bedrock-titan-svc", WS, "token"
+            "claude", "main.schema2.bedrock-titan-svc", WS, "token"
         )
         assert service is None
         assert "no Claude models" in error
@@ -506,7 +528,7 @@ class TestResolveProviderService:
         service, error = db_mod.resolve_provider_service("claude", "main.x.missing", WS, "token")
         assert service is None
         assert "was not found" in error
-        assert "main.aarushi.anthropic-svc" in error
+        assert "main.schema1.anthropic-svc" in error
 
     def test_feature_unavailable(self, monkeypatch):
         reason = "HTTP 400 Bad Request: ModelProviderService feature is not available"
@@ -600,7 +622,7 @@ class TestListMcpServices:
         payload = {
             "mcp_services": [
                 {"name": "mcp-services/system.ai.github"},
-                {"name": "mcp-services/main.svenwb.github_mcp"},
+                {"name": "mcp-services/main.schema3.github_mcp"},
                 {"name": "mcp-services/temp.erni.github_mcp"},
             ]
         }
@@ -643,15 +665,15 @@ class TestListMcpServices:
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        db_mod.list_mcp_services(WS, "token", parent="main.svenwb")
+        db_mod.list_mcp_services(WS, "token", parent="main.schema3")
 
-        assert "parent=schemas%2Fmain.svenwb" in captured["url"]
+        assert "parent=schemas%2Fmain.schema3" in captured["url"]
 
     def test_custom_parent_filters_to_namespace(self, monkeypatch):
         payload = {
             "mcp_services": [
-                {"name": "mcp-services/main.svenwb.github"},
-                {"name": "mcp-services/main.svenwb.slack"},
+                {"name": "mcp-services/main.schema3.github"},
+                {"name": "mcp-services/main.schema3.slack"},
                 {"name": "mcp-services/system.ai.github"},
             ]
         }
@@ -659,10 +681,10 @@ class TestListMcpServices:
             db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
         )
 
-        names, reason = db_mod.list_mcp_services(WS, "token", parent="main.svenwb")
+        names, reason = db_mod.list_mcp_services(WS, "token", parent="main.schema3")
 
         assert reason is None
-        assert names == ["main.svenwb.github", "main.svenwb.slack"]
+        assert names == ["main.schema3.github", "main.schema3.slack"]
 
     def test_http_404_reason_surfaces_for_invalid_parent(self, monkeypatch):
         monkeypatch.setattr(
@@ -1625,7 +1647,7 @@ class TestIsUsageTableAccessError:
     def test_unrelated_catalog_denial_falls_through(self):
         msg = (
             "[INSUFFICIENT_PERMISSIONS] Insufficient privileges: "
-            "User does not have USE CATALOG on Catalog 'aarushi'. "
+            "User does not have USE CATALOG on Catalog 'schema1'. "
             "SQLSTATE: 42501"
         )
         assert db_mod._is_usage_table_access_error(self._err(msg)) is False
@@ -1692,11 +1714,11 @@ class TestRunUsageQuery:
 
         original = ServerOperationError(
             "[INSUFFICIENT_PERMISSIONS] Insufficient privileges: "
-            "User does not have USE CATALOG on Catalog 'aarushi'. SQLSTATE: 42501"
+            "User does not have USE CATALOG on Catalog 'schema1'. SQLSTATE: 42501"
         )
         self._patch_connect_to_raise(monkeypatch, original)
 
-        with pytest.raises(RuntimeError, match="aarushi") as exc_info:
+        with pytest.raises(RuntimeError, match="schema1") as exc_info:
             db_mod.run_usage_query(WS, "/sql/1.0/warehouses/abc", "tok", "SELECT 1")
         assert "Ask your workspace admin" not in str(exc_info.value)
         assert str(exc_info.value).startswith("Usage query failed:")
