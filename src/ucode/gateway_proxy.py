@@ -33,8 +33,18 @@ _SWAP_HEADER = "X-Databricks-AI-Gateway-Token"
 # Hop-by-hop headers must not be forwarded across the proxy.
 _HOP_BY_HOP = frozenset(
     h.lower()
-    for h in ("connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-        "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length")
+    for h in (
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+    )
 )
 _STREAM_CHUNK = 8192
 

@@ -157,7 +157,13 @@ class TestSubcommandRouting:
         """--workspace targets that workspace (normalized) before launch."""
         patches = _patch_launch("claude")
         with (
-            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6],
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
             patch("ucode.cli.set_current_workspace") as mock_set,
         ):
             result = runner.invoke(
@@ -171,7 +177,13 @@ class TestSubcommandRouting:
         """Without --workspace, launch never reassigns the current workspace."""
         patches = _patch_launch("claude")
         with (
-            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6],
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+            patches[6],
             patch("ucode.cli.set_current_workspace") as mock_set,
         ):
             result = runner.invoke(app, ["claude"])

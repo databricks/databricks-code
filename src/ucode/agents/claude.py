@@ -716,7 +716,13 @@ def _build_claude_argv(binary: str, tool_args: list[str], relayed: bool = False)
     # ucode wins over the caller for conflicting keys (protects gateway auth);
     # hooks from both sides survive.
     merged = _merge_claude_settings(caller_settings, read_json_safe(CLAUDE_SETTINGS_PATH))
-    return [binary, *source_args, "--settings", json.dumps(merged, separators=(",", ":")), *remaining]
+    return [
+        binary,
+        *source_args,
+        "--settings",
+        json.dumps(merged, separators=(",", ":")),
+        *remaining,
+    ]
 
 
 def _has_subscription_login() -> bool:

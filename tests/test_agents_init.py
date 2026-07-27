@@ -282,14 +282,20 @@ class TestResolveProviderModels:
 
     def test_anthropic_returns_no_models(self, monkeypatch):
         self._patch(monkeypatch, {"provider_type": "anthropic", "targets": []}, None)
-        models, error, relayed = agents_mod.resolve_provider_models("claude", self._STATE, "main.a.svc")
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.a.svc"
+        )
         assert error is None
         assert models is None
         assert relayed is False
 
     def test_relayed_anthropic_flagged(self, monkeypatch):
-        self._patch(monkeypatch, {"provider_type": "anthropic", "targets": [], "relayed": True}, None)
-        models, error, relayed = agents_mod.resolve_provider_models("claude", self._STATE, "main.a.relayed")
+        self._patch(
+            monkeypatch, {"provider_type": "anthropic", "targets": [], "relayed": True}, None
+        )
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.a.relayed"
+        )
         assert error is None
         assert models is None
         assert relayed is True
@@ -300,7 +306,9 @@ class TestResolveProviderModels:
             "targets": ["us.anthropic.claude-sonnet-4-6", "global.anthropic.claude-opus-4-8"],
         }
         self._patch(monkeypatch, service, None)
-        models, error, relayed = agents_mod.resolve_provider_models("claude", self._STATE, "main.b.svc")
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.b.svc"
+        )
         assert error is None
         assert relayed is False
         assert models == {
@@ -310,7 +318,9 @@ class TestResolveProviderModels:
 
     def test_invalid_provider_returns_error(self, monkeypatch):
         self._patch(monkeypatch, None, "boom")
-        models, error, relayed = agents_mod.resolve_provider_models("claude", self._STATE, "main.x.svc")
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.x.svc"
+        )
         assert models is None
         assert error == "boom"
         assert relayed is False

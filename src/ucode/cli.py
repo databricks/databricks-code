@@ -969,7 +969,14 @@ def _launch_tool(
             resolved_model = None
         else:
             state, resolved_model = resolve_launch_model(tool, state, None)
-        state = configure_tool(tool, state, resolved_model, provider=provider, provider_models=provider_models, relayed=relayed)
+        state = configure_tool(
+            tool,
+            state,
+            resolved_model,
+            provider=provider,
+            provider_models=provider_models,
+            relayed=relayed,
+        )
         print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
         if provider:
             print_kv("Provider", provider)
@@ -1031,7 +1038,9 @@ def codex_cmd(
     workspace: WorkspaceOption = None,
 ) -> None:
     """Launch Codex via Databricks."""
-    _launch_tool("codex", ctx, provider=provider, skip_preflight=skip_preflight, workspace=workspace)
+    _launch_tool(
+        "codex", ctx, provider=provider, skip_preflight=skip_preflight, workspace=workspace
+    )
 
 
 @app.command("claude", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -1050,7 +1059,9 @@ def claude_cmd(
     workspace: WorkspaceOption = None,
 ) -> None:
     """Launch Claude Code via Databricks."""
-    _launch_tool("claude", ctx, provider=provider, skip_preflight=skip_preflight, workspace=workspace)
+    _launch_tool(
+        "claude", ctx, provider=provider, skip_preflight=skip_preflight, workspace=workspace
+    )
 
 
 @app.command("gemini", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
