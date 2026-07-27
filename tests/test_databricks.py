@@ -21,6 +21,7 @@ from ucode.databricks import (
     build_databricks_cli_env,
     build_opencode_base_urls,
     build_shared_base_urls,
+    build_skills_mcp_url,
     build_tool_base_url,
     ensure_databricks_cli_version,
     ensure_pat_bearer,
@@ -117,6 +118,21 @@ class TestBuildSharedBaseUrls:
     def test_codex_url_format(self):
         urls = build_shared_base_urls(WS)
         assert urls["codex"] == f"{WS}/ai-gateway/codex/v1"
+
+
+class TestBuildSkillsMcpUrl:
+    def test_empty_locations_returns_bare_route(self):
+        assert build_skills_mcp_url(WS, []) == f"{WS}/ai-gateway/skills/"
+
+    def test_single_location_appends_schema_query(self):
+        assert build_skills_mcp_url(WS, ["main.default"]) == (
+            f"{WS}/ai-gateway/skills/?schema=main.default"
+        )
+
+    def test_multiple_locations_preserve_order(self):
+        assert build_skills_mcp_url(WS, ["a.b", "c.d"]) == (
+            f"{WS}/ai-gateway/skills/?schema=a.b&schema=c.d"
+        )
 
 
 class TestDiscoverClaudeModels:

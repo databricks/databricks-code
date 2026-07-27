@@ -53,10 +53,13 @@ from ucode.databricks import (
 )
 from ucode.mcp import (
     MCP_CLIENTS,
+    SKILLS_MCP_KIND,
     configure_mcp_command,
+    configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
     revert_mcp_configs,
 )
+from ucode.skills_download import configure_skills_download_command
 from ucode.state import (
     STATE_PATH,
     clear_state,
@@ -142,6 +145,27 @@ def _parse_agents_option(agents: str) -> list[str]:
             "No agents provided for --agents. Use a comma-separated list like `--agents claude,codex`."
         )
     return tools
+
+
+def _parse_skill_locations(location: str) -> list[str]:
+    """Parse a comma-separated `--location` into `<catalog>.<schema>` refs,
+    dropping duplicates while preserving order."""
+    locations: list[str] = []
+    for raw in location.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        parts = raw.split(".")
+        if len(parts) != 2 or not all(part.strip() for part in parts):
+            raise RuntimeError(f"--location entries must be `<catalog>.<schema>`, got `{raw}`.")
+        if raw not in locations:
+            locations.append(raw)
+    if not locations:
+        raise RuntimeError(
+            "No schemas provided for --location. Use `<catalog>.<schema>`, "
+            "comma-separated for multiple."
+        )
+    return locations
 
 
 def _parse_workspaces_option(workspaces: str) -> list[tuple[str, str | None]]:
@@ -724,7 +748,9 @@ def status() -> int:
             tool_mcp_servers = [
                 str(server.get("name"))
                 for server in mcp_servers
-                if tool in (server.get("clients") or []) and server.get("name")
+                if tool in (server.get("clients") or [])
+                and server.get("name")
+                and server.get("kind") != SKILLS_MCP_KIND
             ]
             print_kv("MCP list command", str(MCP_CLIENTS[tool]["list_command"]))
             print_kv(
@@ -733,6 +759,23 @@ def status() -> int:
             )
         print_kv("Config file", str(config_path) if config_path.exists() else "missing")
         console.print()
+
+    print_heading("Skills")
+    skill_mcp_entry = next((s for s in mcp_servers if s.get("kind") == SKILLS_MCP_KIND), None)
+    if not skill_mcp_entry:
+        print_kv("Skills", "not configured")
+    else:
+        locations = skill_mcp_entry.get("skill_locations") or []
+        print_kv(
+            "Skill MCP Locations",
+            ", ".join(locations) if locations else "none — utility tools only",
+        )
+        configured_agents = [
+            str(MCP_CLIENTS[client]["display"])
+            for client in (skill_mcp_entry.get("clients") or [])
+            if client in MCP_CLIENTS
+        ]
+        print_kv("Configured", ", ".join(configured_agents) if configured_agents else "none")
 
     print_heading("Tracing")
     tracing = state.get("tracing") or {}
@@ -757,6 +800,10 @@ def status() -> int:
     print_note("Use `ucode configure` to update workspace settings or configure new tools.")
     print_note(
         "Use `ucode configure mcp` to add Databricks MCP servers to configured coding tools."
+    )
+    print_note(
+        "Use `ucode configure skills --location <catalog>.<schema> --mcp` to connect Unity "
+        "Catalog Skills."
     )
     print_note("Use `ucode configure tracing` to log coding sessions to an MLflow experiment.")
     print_note("Use `ucode revert` to clear managed configs and restore prior files.")
@@ -1372,6 +1419,46 @@ def configure_mcp(
     try:
         configure_mcp_command(location=location, services=selected)
     except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+
+
+@configure_app.command("skills")
+def configure_skills(
+    location: Annotated[
+        str,
+        typer.Option("--location", help="Comma-separated `<catalog>.<schema>` skill scopes."),
+    ],
+    mcp: Annotated[
+        bool,
+        typer.Option("--mcp", help="Mutate the skills MCP connection instead of downloading."),
+    ] = False,
+    path: Annotated[
+        str | None,
+        typer.Option(
+            "--path",
+            help="(download) Existing absolute dir to download into; defaults to your home dir.",
+        ),
+    ] = None,
+) -> None:
+    """Configure Databricks Skills for your coding tools.
+
+    By default, downloads every skill in each ``--location`` schema to disk
+    (under ``--path``, or your home dir when omitted) and registers a schema-less
+    MCP connection. With ``--mcp``, instead sets the skills MCP connection's scope
+    to exactly the listed schemas.
+    """
+    try:
+        if mcp:
+            if path is not None:
+                raise RuntimeError("--path is not valid with --mcp.")
+            configure_skills_mcp_command(_parse_skill_locations(location))
+        else:
+            configure_skills_download_command(_parse_skill_locations(location), path=path)
+    except (RuntimeError, ValueError) as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
     except KeyboardInterrupt:

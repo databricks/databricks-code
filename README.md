@@ -102,6 +102,28 @@ ucode configure --agents claude --mcp system.ai.slack
 `--mcp` also works without `--agents` for MCP-only clients (it configures just the workspace,
 then registers the servers); pass a comma-separated list to register several at once.
 
+### Skills (optional)
+
+Configure Unity Catalog Skills for your coding tools with `ucode configure skills`. It has two
+mutually-exclusive modes, both scoped by `--location <catalog>.<schema>` (comma-separated for
+multiple schemas):
+
+```bash
+# Download mode (default): fetch every skill in the schema to disk.
+ucode configure skills --location main.default --path /abs/project/dir
+
+# MCP mode: expose the schema's skills as MCP tools instead of downloading.
+ucode configure skills --location main.default,ml.prod --mcp
+```
+
+- **Download mode** writes each skill flat as `<leaf>/SKILL.md` (plus its bundled files) into both
+  `.claude/skills/` and `.agents/skills/`. `--path` (an existing absolute directory) is optional;
+  when omitted, skills are written under your home directory. Any pre-existing skill dir prompts
+  before it's overwritten. It then registers a schema-less skills MCP connection (utility tools
+  only), leaving any prior `--mcp` scope untouched.
+- **MCP mode** sets the connection's location set to exactly `<list>` (override-only) and rebuilds
+  its `?schema=` URL; no files are downloaded and `--path` is rejected.
+
 ---
 
 ## Other Commands
@@ -118,6 +140,8 @@ then registers the servers); pass a comma-separated list to register several at 
 | `ucode configure --profiles DEFAULT --use-pat` | Authenticate with the profile's personal access token — no browser login |
 | `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
 | `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
+| `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
+| `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
 
 ## Managed Local Files
 
