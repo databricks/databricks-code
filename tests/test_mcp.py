@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-from pathlib import Path
 from unittest.mock import MagicMock
 
 from ucode import mcp
@@ -1916,14 +1915,14 @@ class TestSkillsToolsSummary:
     def test_bare_route_names_utility_tools_only(self):
         assert mcp._skills_tools_summary([]) == "UC skill utility tools"
 
-    def test_scoped_names_utility_plus_live_tools(self):
+    def test_scoped_names_utility_plus_skills_tools(self):
         assert mcp._skills_tools_summary(["main.default"]) == (
-            "UC skill utility tools + live skills tools in schema main.default"
+            "UC skill utility tools + skills tools in schema main.default"
         )
 
-    def test_multiple_schemas_joined_humanly(self):
+    def test_multiple_schemas_joined_with_and(self):
         assert mcp._skills_tools_summary(["a.b", "c.d", "e.f"]) == (
-            "UC skill utility tools + live skills tools in schema a.b, c.d and e.f"
+            "UC skill utility tools + skills tools in schema a.b, c.d and e.f"
         )
 
 
@@ -1931,24 +1930,29 @@ class TestPrintSkillsSummary:
     def _entry(self, locations):
         return mcp._resolve_skills_mcp_servers(WS, ["claude", "codex"], locations, [])[0]
 
-    def test_reports_server_url_agents_and_tools(self, capsys):
+    def test_reports_scoped_connection(self, capsys):
         mcp._print_skills_summary(self._entry(["main.default"]))
-        out = _unwrap(capsys.readouterr().out)
-        assert "databricks-skill-registry" in out
-        assert f"{WS}/ai-gateway/skills/?schema=main.default" in out
-        assert "Claude Code, Codex" in out
-        assert "live skills tools in schema main.default" in out
+        assert _unwrap(capsys.readouterr().out) == (
+            "Skills MCP registered "
+            "Server: databricks-skill-registry "
+            f"URL: {WS}/ai-gateway/skills/?schema=main.default "
+            "Configured: Claude Code, Codex "
+            "Tools: UC skill utility tools + skills tools in schema main.default "
+            "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+            "restart the agent before skills become available."
+        )
 
-    def test_mcp_wording_prompts_launch_and_restart(self, capsys):
+    def test_reports_schemaless_connection(self, capsys):
         mcp._print_skills_summary(self._entry([]))
-        out = _unwrap(capsys.readouterr().out)
-        assert "ucode <agent>" in out
-        assert "restart the agent" in out
-        assert "already work" not in out
-
-    def test_download_wording_notes_files_already_work(self, capsys):
-        mcp._print_skills_summary(self._entry([]), download_roots=[Path("/tmp/x/.claude/skills")])
-        assert "already work" in _unwrap(capsys.readouterr().out)
+        assert _unwrap(capsys.readouterr().out) == (
+            "Skills MCP registered "
+            "Server: databricks-skill-registry "
+            f"URL: {WS}/ai-gateway/skills/ "
+            "Configured: Claude Code, Codex "
+            "Tools: UC skill utility tools "
+            "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+            "restart the agent before skills become available."
+        )
 
 
 class TestRevertMcpConfigs:

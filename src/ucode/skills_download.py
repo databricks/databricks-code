@@ -240,15 +240,15 @@ def _fetch_bundles(
     return results
 
 
-def download_skills(workspace: str, token: str, locations: list[str], roots: list[Path]) -> int:
-    """Download every skill in each ``<catalog>.<schema>`` location into ``roots``.
+def download_skills(workspace: str, token: str, locations: list[str], path: str | None) -> None:
+    """Download every skill in each ``<catalog>.<schema>`` location to disk.
 
     Bundles are fetched concurrently (with a progress bar) per schema, then
     written sequentially so overwrite prompts don't interleave. A failure on one
-    skill warns and skips it without aborting the batch. Returns the total number
-    of skills written across all locations.
+    skill warns and skips it without aborting the batch.
     """
-    total_written = 0
+    roots = skill_dir_roots(path)
+    roots_display = " and ".join(str(root) for root in roots)
     for location in locations:
         catalog, schema = location.split(".")
         leaves, reason = list_schema_skills(workspace, token, catalog, schema)
@@ -268,9 +268,9 @@ def download_skills(workspace: str, token: str, locations: list[str], roots: lis
                 continue
             if write_skill(roots, leaf, files, location=location):
                 written += 1
-        total_written += written
-        print_success(f"Downloaded {written}/{len(leaves)} skill(s) from `{location}`.")
-    return total_written
+        print_success(
+            f"Downloaded {written}/{len(leaves)} skill(s) from `{location}` in {roots_display}."
+        )
 
 
 def configure_skills_download_command(locations: list[str], *, path: str | None) -> int:
@@ -283,10 +283,7 @@ def configure_skills_download_command(locations: list[str], *, path: str | None)
     workspace, profile, clients = setup_mcp_clients(state, "Skills")
     token = get_databricks_token(workspace, profile)
 
-    roots = skill_dir_roots(path)
-    written = download_skills(workspace, token, locations, roots)
-    if written:
-        print_note(f"Skill files written under {' and '.join(str(root) for root in roots)}")
+    download_skills(workspace, token, locations, path)
 
-    register_schemaless_skills_connection(state, workspace, profile, clients, download_roots=roots)
+    register_schemaless_skills_connection(state, workspace, profile, clients)
     return 0

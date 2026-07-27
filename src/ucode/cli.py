@@ -797,8 +797,7 @@ def status() -> int:
         "Use `ucode configure mcp` to add Databricks MCP servers to configured coding tools."
     )
     print_note(
-        "Use `ucode configure skills` to connect Unity Catalog Skills (add "
-        "`--location <catalog>.<schema>` to download a schema's skills)."
+        "Use `ucode configure skills` to set up Unity Catalog Skills for configured coding tools."
     )
     print_note("Use `ucode configure tracing` to log coding sessions to an MLflow experiment.")
     print_note("Use `ucode revert` to clear managed configs and restore prior files.")

@@ -306,7 +306,7 @@ class TestDownloadSkills:
             sd, "fetch_skill_bundle", lambda ws, tok, c, s, leaf: (bundles[leaf], None)
         )
 
-        sd.download_skills(WS, "token", ["main.default"], sd.skill_dir_roots(str(tmp_path)))
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
         assert (tmp_path / ".claude/skills/pii-handling/SKILL.md").read_bytes() == b"pii"
         assert (tmp_path / ".agents/skills/triage/SKILL.md").read_bytes() == b"triage"
@@ -318,7 +318,7 @@ class TestDownloadSkills:
             sd, "fetch_skill_bundle", lambda *a, **k: called.append(1) or (None, None)
         )
 
-        sd.download_skills(WS, "token", ["main.default"], sd.skill_dir_roots(str(tmp_path)))
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
         assert called == []
 
@@ -332,18 +332,22 @@ class TestDownloadSkills:
             ),
         )
 
-        sd.download_skills(WS, "token", ["main.default"], sd.skill_dir_roots(str(tmp_path)))
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
         assert (tmp_path / ".claude/skills/good/SKILL.md").read_bytes() == b"ok"
         assert not (tmp_path / ".claude/skills/bad").exists()
 
-    def test_prints_downloaded_count_summary(self, tmp_path, monkeypatch, capsys):
+    def test_prints_downloaded_count_and_roots_summary(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["a", "b", "c"], None))
         monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
 
-        sd.download_skills(WS, "token", ["main.default"], sd.skill_dir_roots(str(tmp_path)))
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
-        assert "Downloaded 3/3 skill(s) from `main.default`" in capsys.readouterr().out
+        # Rich wraps long paths across lines; strip all whitespace from both sides to compare.
+        roots = sd.skill_dir_roots(str(tmp_path))
+        expected = f"Downloaded 3/3 skill(s) from `main.default` in {roots[0]} and {roots[1]}."
+        printed = "".join(capsys.readouterr().out.split())
+        assert "".join(expected.split()) in printed
 
     def test_summary_counts_only_written_skills(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["good", "bad"], None))
@@ -355,9 +359,9 @@ class TestDownloadSkills:
             ),
         )
 
-        sd.download_skills(WS, "token", ["main.default"], sd.skill_dir_roots(str(tmp_path)))
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
-        assert "Downloaded 1/2 skill(s) from `main.default`" in capsys.readouterr().out
+        assert "Downloaded 1/2 skill(s) from `main.default` in" in capsys.readouterr().out
 
 
 class TestConfigureSkillsDownloadCommand:
@@ -371,47 +375,27 @@ class TestConfigureSkillsDownloadCommand:
         monkeypatch.setattr(
             sd,
             "download_skills",
-            lambda ws, tok, locations, roots: (
-                calls.update(download=(ws, tok, locations, roots)) or 1
-            ),
+            lambda ws, tok, locations, path: calls.update(download=(ws, tok, locations, path)),
         )
         monkeypatch.setattr(
             sd,
             "register_schemaless_skills_connection",
-            lambda state, ws, profile, clients, *, download_roots: calls.update(
-                register=(ws, profile, clients, download_roots)
-            ),
+            lambda state, ws, profile, clients: calls.update(register=(ws, profile, clients)),
         )
         return calls
 
-    def test_downloads_then_registers_connection(self, tmp_path, monkeypatch):
+    def test_downloads_then_registers_connection(self, monkeypatch):
         calls = self._stub(monkeypatch)
 
-        assert sd.configure_skills_download_command(["a.b"], path=str(tmp_path)) == 0
+        assert sd.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
 
-        roots = sd.skill_dir_roots(str(tmp_path))
-        assert calls["download"] == (WS, "token", ["a.b"], roots)
-        assert calls["register"] == (WS, "profile", ["claude"], roots)
+        assert calls["download"] == (WS, "token", ["a.b"], "/tmp/skills")
+        assert calls["register"] == (WS, "profile", ["claude"])
 
-    def test_none_path_defaults_to_home_roots(self, monkeypatch):
+    def test_none_path_threads_through(self, monkeypatch):
         calls = self._stub(monkeypatch)
 
         assert sd.configure_skills_download_command(["a.b"], path=None) == 0
 
-        assert calls["download"] == (WS, "token", ["a.b"], sd.skill_dir_roots(None))
-        assert calls["register"] == (WS, "profile", ["claude"], sd.skill_dir_roots(None))
-
-    def test_prints_written_roots_when_skills_downloaded(self, tmp_path, monkeypatch, capsys):
-        self._stub(monkeypatch)
-
-        sd.configure_skills_download_command(["a.b"], path=str(tmp_path))
-
-        assert "Skill files written under" in capsys.readouterr().out
-
-    def test_omits_written_roots_when_nothing_downloaded(self, tmp_path, monkeypatch, capsys):
-        self._stub(monkeypatch)
-        monkeypatch.setattr(sd, "download_skills", lambda *a, **k: 0)
-
-        sd.configure_skills_download_command(["a.b"], path=str(tmp_path))
-
-        assert "written under" not in capsys.readouterr().out
+        assert calls["download"] == (WS, "token", ["a.b"], None)
+        assert calls["register"] == (WS, "profile", ["claude"])
