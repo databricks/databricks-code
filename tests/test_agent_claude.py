@@ -126,6 +126,31 @@ class TestRenderOverlay:
         env = overlay["env"]
         assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in env
 
+    def test_custom_model_sets_anthropic_model_and_keeps_family_aliases(self):
+        # `--model` pins the custom UC id as ANTHROPIC_MODEL (the active default)
+        # AND retains the discovered system.ai family aliases so those picker
+        # rows still populate.
+        models = {
+            "opus": "system.ai.claude-opus-4-8",
+            "sonnet": "system.ai.claude-sonnet-4-6",
+        }
+        overlay, _ = claude.render_overlay(
+            WS, "s4", claude_models=models, custom_model="cat.schema.my-model"
+        )
+        env = overlay["env"]
+        assert env["ANTHROPIC_MODEL"] == "cat.schema.my-model"
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-4-6[1m]"
+
+    def test_custom_model_ignored_under_provider(self):
+        # `--model` and `--provider` are mutually exclusive upstream; if both
+        # somehow reach the overlay, the provider header wins and ANTHROPIC_MODEL
+        # is not pinned (the custom id isn't routable through the header path).
+        overlay, _ = claude.render_overlay(
+            WS, "s4", provider="cat.schema.prov", custom_model="cat.schema.my-model"
+        )
+        assert "ANTHROPIC_MODEL" not in overlay["env"]
+
     def test_fable_not_pinned_by_default(self):
         # Fable is opt-in: even when the workspace advertises it, the env var is
         # absent unless fable_enabled is passed.

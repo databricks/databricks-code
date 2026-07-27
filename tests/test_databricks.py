@@ -332,6 +332,24 @@ class TestDiscoverModelServices:
         assert reason is None
         assert all("page_size=" in u for u in urls)
 
+    def test_scopes_listing_to_system_ai_schema(self, monkeypatch):
+        # The listing is scoped to the system.ai schema so the server returns
+        # only foundation models instead of every schema's services.
+        urls: list[str] = []
+
+        def fake_get(url, token, timeout=10):
+            urls.append(url)
+            return {"model_services": [_model_service("system.ai.gpt-5")]}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        ids, reason = db_mod.list_model_services(WS, "token")
+
+        assert ids == ["system.ai.gpt-5"]
+        assert reason is None
+        # parent=schemas/system.ai, url-encoded, present on every request.
+        assert all("parent=schemas%2Fsystem.ai" in u for u in urls)
+
     def test_retries_page_before_giving_up(self, monkeypatch):
         payload = {"model_services": [_model_service("system.ai.gpt-5")]}
         calls = {"n": 0}
@@ -349,6 +367,69 @@ class TestDiscoverModelServices:
         assert reason is None
         assert ids == ["system.ai.gpt-5"]
         assert calls["n"] == 3  # two failures, third succeeds
+
+
+class TestGetModelService:
+    FULL = "cat.schema.my-model"
+
+    def test_singular_get_returns_routable_id(self, monkeypatch):
+        # The singular GET is tried first; a 200 with a name resolves it.
+        seen: list[str] = []
+
+        def fake_get(url, token, timeout=10):
+            seen.append(url)
+            return {"name": f"model-services/{self.FULL}"}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        routable, reason = db_mod.get_model_service(WS, "token", self.FULL)
+
+        assert reason is None
+        assert routable == self.FULL
+        # Only the singular endpoint was hit — no fallback listing.
+        assert len(seen) == 1
+        assert seen[0].endswith(f"/model-services/{self.FULL}")
+
+    def test_falls_back_to_scoped_listing_when_no_singular_get(self, monkeypatch):
+        # Singular GET 404s (endpoint not served); the schema-scoped listing
+        # fallback finds the service by exact name.
+        def fake_get(url, token, timeout=10):
+            if "?" not in url:  # singular GET
+                return None, "HTTP 404 Not Found"
+            # listing
+            return {
+                "model_services": [
+                    _model_service("cat.schema.other"),
+                    _model_service(self.FULL),
+                ]
+            }, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        routable, reason = db_mod.get_model_service(WS, "token", self.FULL)
+
+        assert reason is None
+        assert routable == self.FULL
+
+    def test_not_found_returns_actionable_reason(self, monkeypatch):
+        # Singular GET 404s and the scoped listing doesn't contain the name.
+        def fake_get(url, token, timeout=10):
+            if "?" not in url:
+                return None, "HTTP 404 Not Found"
+            return {"model_services": [_model_service("cat.schema.other")]}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        routable, reason = db_mod.get_model_service(WS, "token", self.FULL)
+
+        assert routable is None
+        assert reason is not None
+        assert self.FULL in reason and "not found" in reason.lower()
+
+    def test_empty_name_is_rejected(self):
+        routable, reason = db_mod.get_model_service(WS, "token", "  ")
+        assert routable is None
+        assert reason is not None
 
 
 class TestListModelProviderServices:

@@ -1864,3 +1864,72 @@ class TestSkipPreflightFlag:
             result = runner.invoke(app, [tool])
         assert result.exit_code == 0, result.output
         assert cfg.call_args.kwargs["skip_preflight"] is False
+
+
+class TestModelFlag:
+    """`--model` on claude/codex validates a custom UC model-service via
+    get_model_service and threads the resolved id into configure_tool as
+    custom_model, while keeping normal system.ai discovery running."""
+
+    @staticmethod
+    def _patches(configure_tool, get_model_service):
+        return [
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli._auto_configure_tool"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.get_databricks_token", return_value="tok"),
+            patch("ucode.cli.get_model_service", get_model_service),
+            # If reached, discovery-default resolution would run — but --model
+            # skips it. Make it explode so the test fails loudly if it's hit.
+            patch(
+                "ucode.cli.resolve_launch_model",
+                side_effect=AssertionError("resolve_launch_model must be skipped for --model"),
+            ),
+            patch("ucode.cli.configure_tool", configure_tool),
+            patch("ucode.cli.launch_agent"),
+        ]
+
+    @pytest.mark.parametrize("tool", ["claude", "codex"])
+    def test_validates_and_threads_custom_model(self, tool):
+        configure_tool = MagicMock(return_value=MINIMAL_STATE)
+        # get_model_service echoes back the routable id on success.
+        get_model_service = MagicMock(return_value=("cat.schema.my-model", None))
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(configure_tool, get_model_service):
+                stack.enter_context(p)
+            result = runner.invoke(app, [tool, "--model", "cat.schema.my-model"])
+        assert result.exit_code == 0, result.output
+        # Existence validated against the passed full name.
+        assert get_model_service.call_args.args[-1] == "cat.schema.my-model"
+        # Resolved id threaded as custom_model; provider stays None.
+        assert configure_tool.call_args.kwargs["custom_model"] == "cat.schema.my-model"
+        assert configure_tool.call_args.kwargs["provider"] is None
+
+    @pytest.mark.parametrize("tool", ["claude", "codex"])
+    def test_lookup_failure_aborts_launch(self, tool):
+        configure_tool = MagicMock(return_value=MINIMAL_STATE)
+        get_model_service = MagicMock(return_value=(None, "Model-service 'x' was not found."))
+        launch_agent = MagicMock()
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(configure_tool, get_model_service):
+                stack.enter_context(p)
+            stack.enter_context(patch("ucode.cli.launch_agent", launch_agent))
+            result = runner.invoke(app, [tool, "--model", "x"])
+        assert result.exit_code == 1
+        assert "was not found" in _strip_ansi(result.output)
+        configure_tool.assert_not_called()
+        launch_agent.assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["claude", "codex"])
+    def test_model_and_provider_are_mutually_exclusive(self, tool):
+        # Mutual exclusion is checked before any state/auth work, so no patches
+        # beyond load_state are needed — the error must surface first.
+        with patch("ucode.cli.load_state", return_value=MINIMAL_STATE):
+            result = runner.invoke(
+                app, [tool, "--model", "cat.schema.m", "--provider", "cat.schema.p"]
+            )
+        assert result.exit_code == 1
+        out = _strip_ansi(result.output)
+        assert "--model" in out and "--provider" in out

@@ -43,6 +43,7 @@ from ucode.databricks import (
     find_profile_name_for_host,
     get_databricks_profiles,
     get_databricks_token,
+    get_model_service,
     install_databricks_cli,
     is_model_provider_feature_unavailable,
     list_profile_entries,
@@ -996,10 +997,20 @@ def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
     provider: str | None = None,
+    model: str | None = None,
     skip_preflight: bool = False,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        # `--model` (a custom UC model-service pinned as the default) and
+        # `--provider` (routing through a Model Provider Service via a header)
+        # are two different routing modes; picking both is ambiguous.
+        if model and provider:
+            raise RuntimeError(
+                "Pass only one of --model or --provider. --model pins a custom UC "
+                "model-service as the default; --provider routes through a Model "
+                "Provider Service. Choose one routing mode."
+            )
         existing = load_state()
         # Workspaces configured with --use-pat export the profile's PAT as
         # DATABRICKS_BEARER up front so every auth check below (and the
@@ -1025,6 +1036,17 @@ def _launch_tool(
             provider_models, error = resolve_provider_models(tool, state, provider)
             if error:
                 raise RuntimeError(error)
+        # A custom UC model-service (`--model`) pins that id as the default while
+        # KEEPING normal system.ai discovery so the family shortcuts still
+        # populate the picker/codex list. Validate existence only (compatibility
+        # is assumed per the user's explicit choice); abort with the reason on
+        # failure. Mutually exclusive with --provider (checked at the top).
+        custom_model = None
+        if model:
+            token = get_databricks_token(state["workspace"], state.get("profile"))
+            custom_model, error = get_model_service(state["workspace"], token, model)
+            if error:
+                raise RuntimeError(error)
         # Re-fetch model lists on every launch so newly-added Databricks
         # endpoints show up without a manual `ucode configure` (and so that
         # tools like pi which read multiple model bundles never run on
@@ -1037,20 +1059,29 @@ def _launch_tool(
             skip_model_discovery=bool(provider),
             skip_preflight=skip_preflight,
         )
-        if provider:
-            # Routing through a Model Provider Service pins no Databricks model;
-            # the agent uses its own canonical model names (header selects the
-            # provider). Skip model resolution, which would otherwise fail when
-            # the workspace has no matching Databricks models.
+        if provider or custom_model:
+            # A Model Provider Service pins no Databricks model (the header
+            # selects the provider). A custom `--model` pins its own id directly
+            # (ANTHROPIC_MODEL for claude / the `model` key for codex), so the
+            # discovery-default resolution below isn't needed — skipping it also
+            # avoids a spurious failure when the workspace has no matching
+            # Databricks models to fall back on.
             resolved_model = None
         else:
             state, resolved_model = resolve_launch_model(tool, state, None)
         state = configure_tool(
-            tool, state, resolved_model, provider=provider, provider_models=provider_models
+            tool,
+            state,
+            resolved_model,
+            provider=provider,
+            provider_models=provider_models,
+            custom_model=custom_model,
         )
         print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
         if provider:
             print_kv("Provider", provider)
+        elif custom_model:
+            print_kv("Model", custom_model)
         elif resolved_model:
             print_kv("Model", resolved_model)
         if tool in ("gemini", "opencode", "copilot", "pi"):
@@ -1094,10 +1125,19 @@ def codex_cmd(
             "before any `--` separator.",
         ),
     ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Pin a custom UC model-service as the default model (outside "
+            "system.ai). Assumes the service is compatible with this agent. Pass "
+            "before any `--` separator.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
 ) -> None:
     """Launch Codex via Databricks."""
-    _launch_tool("codex", ctx, provider=provider, skip_preflight=skip_preflight)
+    _launch_tool("codex", ctx, provider=provider, model=model, skip_preflight=skip_preflight)
 
 
 @app.command("claude", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -1112,10 +1152,19 @@ def claude_cmd(
             "before any `--` separator.",
         ),
     ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Pin a custom UC model-service as the default model (outside "
+            "system.ai). Assumes the service is compatible with this agent. Pass "
+            "before any `--` separator.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
 ) -> None:
     """Launch Claude Code via Databricks."""
-    _launch_tool("claude", ctx, provider=provider, skip_preflight=skip_preflight)
+    _launch_tool("claude", ctx, provider=provider, model=model, skip_preflight=skip_preflight)
 
 
 @app.command("gemini", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})

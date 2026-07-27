@@ -309,12 +309,25 @@ def _parse_gpt(model: str | None) -> tuple[int, int | None, int | None, str] | N
     )
 
 
-def write_tool_config(state: dict, model: str | None = None, provider: str | None = None) -> dict:
+def write_tool_config(
+    state: dict,
+    model: str | None = None,
+    provider: str | None = None,
+    custom_model: str | None = None,
+) -> dict:
     workspace = state["workspace"]
     # With a Model Provider Service the gateway routes by header and Codex sends
     # its own canonical model name (e.g. `gpt-5`) — leave `model` unset so no
-    # Databricks endpoint id is pinned.
-    chosen_model = None if provider else _codex_model_id(model or default_model(state))
+    # Databricks endpoint id is pinned. A custom UC model-service (`--model`) is
+    # pinned VERBATIM, bypassing the `_codex_model_id` OpenAI-id rewrite — the
+    # gateway routes it by name like a `system.ai.*` id. Mutually exclusive with
+    # `provider` (enforced upstream in cli.py).
+    if provider:
+        chosen_model = None
+    elif custom_model:
+        chosen_model = custom_model
+    else:
+        chosen_model = _codex_model_id(model or default_model(state))
     databricks_profile = state.get("profile")
 
     if _use_legacy_layout():

@@ -140,6 +140,7 @@ def render_overlay(
     provider: str | None = None,
     provider_models: dict[str, str] | None = None,
     fable_enabled: bool = False,
+    custom_model: str | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Claude settings.json.
 
@@ -153,7 +154,13 @@ def render_overlay(
     understands Claude Code's own canonical model names, so no model id is
     pinned. A Bedrock-backed provider exposes different model ids (e.g.
     `us.anthropic.claude-sonnet-4-6`), passed in `provider_models` by family —
-    those get pinned via the `ANTHROPIC_DEFAULT_*_MODEL` env vars."""
+    those get pinned via the `ANTHROPIC_DEFAULT_*_MODEL` env vars.
+
+    When `custom_model` is set (from `ucode claude --model`), it pins a custom
+    UC model-service id (outside `system.ai`) as `ANTHROPIC_MODEL` — the active
+    default — *alongside* the discovered `system.ai` family aliases, so the
+    system.ai rows still populate the /model picker while the custom model
+    becomes the default. Mutually exclusive with `provider`."""
     base_url = build_tool_base_url("claude", workspace)
     # ANTHROPIC_CUSTOM_HEADERS is parsed as `key: value` pairs separated by
     # newlines (Anthropic SDK convention). Setting User-Agent here overrides
@@ -184,6 +191,14 @@ def render_overlay(
     # only one row per model. `ucode claude -- --model X` still overrides for a
     # single session via Claude Code's own --model flag.
     _ = model  # API stability; no longer pinned via env.
+    # A custom UC model-service (`--model`) pins ANTHROPIC_MODEL as the active
+    # default. This is the one case we DO set ANTHROPIC_MODEL: the family aliases
+    # below still populate the picker's system.ai rows, and the custom id becomes
+    # the resolved default on top of them. ANTHROPIC_MODEL is in
+    # CLAUDE_MANAGED_MODEL_ENV_KEYS, so it's pruned again when no `--model` is
+    # passed. Mutually exclusive with `provider` (enforced upstream in cli.py).
+    if custom_model and not provider:
+        env["ANTHROPIC_MODEL"] = custom_model
     # A Bedrock-backed provider needs its provider-side ids pinned verbatim
     # (Claude Code's canonical names aren't routable there). These come from the
     # service's targets, already de-duped to one id per family upstream.
@@ -303,6 +318,7 @@ def write_tool_config(
     model: str | None,
     provider: str | None = None,
     provider_models: dict[str, str] | None = None,
+    custom_model: str | None = None,
 ) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
     web_search_model = _resolve_web_search_model(state)
@@ -316,6 +332,7 @@ def write_tool_config(
         provider=provider,
         provider_models=provider_models,
         fable_enabled=bool(state.get("fable_enabled")),
+        custom_model=custom_model,
     )
     tracing_env_vars = tracing_env(state, "claude")
     stop_hook_command = claude_tracing_stop_hook_command() if tracing_env_vars else None

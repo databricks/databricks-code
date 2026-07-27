@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Literal, cast, overload
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from databricks.sql.exc import ServerOperationError
 
@@ -1269,11 +1269,14 @@ def list_model_services(
 ) -> tuple[list[str], str | None]:
     """List all `system.ai.*` model ids via the UC model-services API.
 
-    Pages through ``/api/2.1/unity-catalog/model-services`` (metastore scope)
-    with a bounded ``page_size`` (the endpoint 499s without one) and returns the
-    de-duplicated, sorted list of ``system.ai.<model-name>`` ids. Returns
-    (ids, reason); reason is None on success, otherwise it describes why the
-    list is empty (HTTP/network error or no services).
+    Pages through ``/api/2.1/unity-catalog/model-services`` scoped to the
+    ``system.ai`` schema (``parent=schemas/system.ai``) with a bounded
+    ``page_size`` (the endpoint 499s without one) and returns the
+    de-duplicated, sorted list of ``system.ai.<model-name>`` ids. The
+    ``system.ai.`` client-side filter is kept as a safety net in case the
+    ``parent`` scope isn't honored on some workspaces. Returns (ids, reason);
+    reason is None on success, otherwise it describes why the list is empty
+    (HTTP/network error or no services).
     """
     hostname = workspace_hostname(workspace)
     ids: list[str] = []
@@ -1281,7 +1284,14 @@ def list_model_services(
     seen_tokens: set[str] = set()
     last_reason: str | None = None
     for _ in range(max_pages):
-        params: dict[str, str] = {"page_size": str(page_size)}
+        # Scope the listing to the system.ai schema so the server returns only
+        # foundation models instead of every schema's services — much less to
+        # page through. The client-side `system.ai.` filter below stays as a
+        # safety net.
+        params: dict[str, str] = {
+            "page_size": str(page_size),
+            "parent": "schemas/system.ai",
+        }
         if page_token:
             params["page_token"] = page_token
         url = f"https://{hostname}/api/2.1/unity-catalog/model-services?{urlencode(params)}"
@@ -1309,6 +1319,85 @@ def list_model_services(
     if deduped:
         return deduped, None
     return [], last_reason or "model-services listing returned no models"
+
+
+def get_model_service(workspace: str, token: str, full_name: str) -> tuple[str | None, str | None]:
+    """Look up a single UC model-service by its ``<catalog>.<schema>.<name>``.
+
+    Returns ``(routable_id, None)`` when the service exists, where
+    ``routable_id`` is the ``name`` with the ``model-services/`` prefix stripped
+    (i.e. the ``<catalog>.<schema>.<name>`` the gateway routes by). Returns
+    ``(None, reason)`` with an actionable message when the service can't be
+    found or the API call fails.
+
+    Validates existence only — it does NOT check the provider type or model
+    family, since a custom ``--model`` service is assumed compatible with the
+    agent per the caller's explicit choice.
+
+    The single-resource endpoint (``GET .../model-services/<full_name>``) is
+    tried first; if that path isn't served (404-style) we fall back to a
+    schema-scoped listing filtered to the exact name, so the lookup works
+    regardless of which shape the workspace's API exposes.
+    """
+    full_name = (full_name or "").strip()
+    if not full_name:
+        return None, "No model-service name was provided."
+    hostname = workspace_hostname(workspace)
+
+    # 1. Try the singular GET first.
+    encoded = quote(full_name, safe="")
+    url = f"https://{hostname}/api/2.1/unity-catalog/model-services/{encoded}"
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if isinstance(payload, dict):
+        routable = _model_service_routable_id(payload)
+        if routable:
+            return routable, None
+        # A 200 without a usable name is unexpected; fall through to listing.
+    not_found = bool(reason) and "HTTP 404" in reason
+
+    # 2. Fall back to a schema-scoped listing filtered to the exact name.
+    parts = full_name.split(".")
+    if len(parts) >= 2:
+        schema_parent = ".".join(parts[:2])  # <catalog>.<schema>
+        params = {
+            "page_size": str(_MODEL_SERVICES_PAGE_SIZE),
+            "parent": f"schemas/{schema_parent}",
+        }
+        list_url = f"https://{hostname}/api/2.1/unity-catalog/model-services?{urlencode(params)}"
+        list_payload, list_reason = _get_model_services_page(list_url, token)
+        if isinstance(list_payload, dict):
+            for service in list_payload.get("model_services", []):
+                if not isinstance(service, dict):
+                    continue
+                routable = _model_service_routable_id(service)
+                if routable == full_name:
+                    return routable, None
+            return None, (
+                f"Model-service '{full_name}' was not found in schema "
+                f"'{schema_parent}'. Pass a <catalog>.<schema>.<name> that exists "
+                f"on this workspace."
+            )
+        # Listing itself failed; prefer the more specific failure to report.
+        reason = list_reason or reason
+
+    if not_found or (reason and "HTTP 404" in reason):
+        return None, (
+            f"Model-service '{full_name}' was not found. Pass a "
+            f"<catalog>.<schema>.<name> that exists on this workspace."
+        )
+    return None, f"Could not look up model-service '{full_name}': {reason}"
+
+
+def _model_service_routable_id(service: dict) -> str | None:
+    """Return the ``<catalog>.<schema>.<name>`` routable id from a model-service
+    entry, stripping the ``model-services/`` prefix. None if there's no name."""
+    name = service.get("name")
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if name.startswith(_MODEL_SERVICE_NAME_PREFIX):
+        name = name[len(_MODEL_SERVICE_NAME_PREFIX) :]
+    return name or None
 
 
 def discover_model_services(

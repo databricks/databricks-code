@@ -305,17 +305,23 @@ def configure_tool(
     model: str | None = None,
     provider: str | None = None,
     provider_models: dict[str, str] | None = None,
+    custom_model: str | None = None,
 ) -> dict:
     result: dict | tuple[dict, str]
     if tool == "codex":
-        result = codex.write_tool_config(state, model, provider=provider)
+        result = codex.write_tool_config(state, model, provider=provider, custom_model=custom_model)
     elif tool == "claude":
         # A Model Provider Service routes by header and pins no Databricks
         # model, so the usual "model required" guard doesn't apply to claude.
-        if not model and not provider:
+        # A custom UC model-service (`--model`) likewise satisfies the guard.
+        if not model and not provider and not custom_model:
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         result = claude.write_tool_config(
-            state, model, provider=provider, provider_models=provider_models
+            state,
+            model,
+            provider=provider,
+            provider_models=provider_models,
+            custom_model=custom_model,
         )
     else:
         # provider routing is claude/codex-only; every other tool needs a model.

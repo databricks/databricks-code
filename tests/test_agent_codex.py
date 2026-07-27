@@ -141,6 +141,45 @@ class TestCodexWriteConfig:
         doc = read_toml_safe(config_path)
         assert doc["model"] == "databricks-gpt-5-2-codex"
 
+    def test_custom_model_pinned_verbatim_not_rewritten(self, tmp_path, monkeypatch):
+        # A custom UC model-service (`--model`) is pinned verbatim, bypassing the
+        # `_openai_model_id` rewrite that would otherwise turn a gpt-shaped id
+        # into an OpenAI id. The gateway routes it by name.
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        backup_path = tmp_path / "codex-ucode-config.backup.toml"
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", backup_path)
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+
+        codex.write_tool_config(
+            {"workspace": WS, "codex_models": ["databricks-gpt-5"]},
+            custom_model="cat.schema.my-gpt-5",
+        )
+
+        doc = read_toml_safe(config_path)
+        # Verbatim — NOT rewritten to `gpt-5`.
+        assert doc["model"] == "cat.schema.my-gpt-5"
+
+    def test_provider_wins_over_custom_model(self, tmp_path, monkeypatch):
+        # `--model` and `--provider` are mutually exclusive upstream; if both
+        # reach write_tool_config, the provider path wins and no model is pinned.
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        backup_path = tmp_path / "codex-ucode-config.backup.toml"
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", backup_path)
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+
+        codex.write_tool_config(
+            {"workspace": WS, "codex_models": ["gpt-5"]},
+            provider="main.aarushi.aarushi-openai",
+            custom_model="cat.schema.my-gpt-5",
+        )
+
+        doc = read_toml_safe(config_path)
+        assert "model" not in doc
+
     def test_provider_writes_header_and_drops_stale_model(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
         backup_path = tmp_path / "codex-ucode-config.backup.toml"
