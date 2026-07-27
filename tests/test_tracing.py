@@ -59,9 +59,8 @@ class TestAgentTracing:
         assert entry["experiment_id"] == "111"
 
     def test_none_for_non_tracing_agents(self):
-        # Claude is the only tracing-capable agent now.
         state = _enabled_state()
-        for tool in ("codex", "opencode", "gemini"):
+        for tool in ("opencode", "gemini"):
             assert tracing.agent_tracing(state, tool) is None
 
     def test_none_when_disabled(self):
@@ -85,10 +84,21 @@ class TestTracingEnv:
             "MLFLOW_ENABLE_ASYNC_TRACE_LOGGING": "false",
         }
 
-    def test_empty_for_non_claude_agents(self):
-        # Only Claude is tracing-capable; codex/opencode get nothing.
+    def test_codex_uses_bare_databricks_and_trace_location(self):
+        state = _enabled_state("p")
+        env = tracing.tracing_env(state, "codex")
+        assert env == {
+            "MLFLOW_TRACKING_URI": "databricks",
+            "MLFLOW_EXPERIMENT_ID": "111",
+            "MLFLOW_TRACE_LOCATION": "main.default.ucode_traces",
+        }
+
+        del state["tracing"]["uc_destination"]
+        with pytest.raises(KeyError, match="uc_destination"):
+            tracing.tracing_env(state, "codex")
+
+    def test_empty_for_non_tracing_agents(self):
         state = _enabled_state()
-        assert tracing.tracing_env(state, "codex") == {}
         assert tracing.tracing_env(state, "opencode") == {}
 
     def test_includes_sql_warehouse_id(self):
@@ -351,17 +361,17 @@ class TestSelectTracingWorkspace:
             "workspaces": {
                 "https://a.databricks.com": {"available_tools": ["claude"], "profile": "pa"},
                 "https://b.databricks.com": {"available_tools": ["claude"], "profile": "pb"},
-                # codex/gemini aren't tracing-capable agents → excluded from candidates
+                # Codex is tracing-capable; Gemini is not.
                 "https://c.databricks.com": {"available_tools": ["codex", "gemini"]},
             },
         }
 
     def test_raises_when_none_configured(self):
         with patch.object(tracing, "load_full_state", return_value={"workspaces": {}}):
-            with pytest.raises(RuntimeError, match="Claude Code is not configured"):
+            with pytest.raises(RuntimeError, match="No tracing-capable agent is configured"):
                 tracing._select_tracing_workspace()
 
-    def test_lists_current_first_and_excludes_non_tracing(self):
+    def test_lists_current_first_and_includes_codex(self):
         captured: dict = {}
 
         def fake_prompt(desc, profiles):
@@ -376,7 +386,7 @@ class TestSelectTracingWorkspace:
 
         hosts = [host for host, _ in captured["profiles"]]
         assert hosts[0] == "https://a.databricks.com"
-        assert "https://c.databricks.com" not in hosts
+        assert "https://c.databricks.com" in hosts
         assert state["workspace"] == "https://a.databricks.com"
 
     def test_returns_picked_workspace_state(self):
@@ -580,22 +590,72 @@ class TestEnableTracingForWorkspaces:
         assert rc == 1
 
 
+class TestEnableTracingForState:
+    @pytest.mark.parametrize(
+        ("available_tools", "warehouse_id", "expected_warehouse_calls"),
+        [
+            pytest.param(["codex"], None, 0, id="codex-only"),
+            pytest.param(["claude", "codex"], "wh123", 1, id="claude-and-codex"),
+        ],
+    )
+    def test_sql_warehouse_resolution(
+        self,
+        available_tools: list[str],
+        warehouse_id: str | None,
+        expected_warehouse_calls: int,
+    ):
+        experiment = {
+            "experiment_id": "111",
+            "experiment_name": "/Shared/ucode-traces",
+            "uc_destination": "main.default.ucode_traces",
+        }
+        state = {"workspace": WS, "available_tools": available_tools}
+        with (
+            patch.object(tracing, "apply_pat_environment"),
+            patch.object(tracing, "ensure_databricks_auth"),
+            patch.object(tracing, "get_databricks_token", return_value="tok"),
+            patch.object(tracing, "find_uc_backed_experiment", return_value=(experiment, None)),
+            patch.object(
+                tracing,
+                "resolve_sql_warehouse_id",
+                return_value=(warehouse_id, None),
+            ) as resolve_warehouse,
+            patch.object(tracing, "save_state"),
+            patch.object(tracing, "_install_agent_tracing_deps"),
+            patch.object(tracing, "_rewrite_agent_configs", side_effect=lambda s: s),
+        ):
+            out = tracing._enable_tracing_for_state(state)
+
+        assert resolve_warehouse.call_count == expected_warehouse_calls
+        assert out["tracing"]["uc_destination"] == "main.default.ucode_traces"
+        assert out["tracing"].get("sql_warehouse_id") == warehouse_id
+
+
 class TestInstallAgentTracingDeps:
-    """Only Claude has a tracing runtime; it installs when Claude is configured
-    with tracing on, and is skipped otherwise."""
+    """Tracing runtimes install for configured tracing-capable agents."""
 
-    def test_installs_claude_runtime_when_configured(self):
-        state = {**_enabled_state(), "available_tools": ["claude"]}
-        with patch("ucode.agents.claude.ensure_tracing_runtime") as claude_dep:
+    @pytest.mark.parametrize(
+        ("available_tools", "expected_claude_calls", "expected_codex_calls"),
+        [
+            pytest.param(["claude"], 1, 0, id="claude-only"),
+            pytest.param(["codex"], 0, 1, id="codex-only"),
+            pytest.param(["claude", "codex"], 1, 1, id="claude-and-codex"),
+        ],
+    )
+    def test_installs_configured_runtimes(
+        self,
+        available_tools: list[str],
+        expected_claude_calls: int,
+        expected_codex_calls: int,
+    ):
+        state = {**_enabled_state(), "available_tools": available_tools}
+        with (
+            patch("ucode.agents.claude.ensure_tracing_runtime") as claude_dep,
+            patch("ucode.agents.codex.ensure_tracing_runtime") as codex_dep,
+        ):
             tracing._install_agent_tracing_deps(state)
-        claude_dep.assert_called_once()
-
-    def test_skips_when_claude_not_configured(self):
-        # Claude isn't configured on this workspace, so its runtime is skipped.
-        state = {**_enabled_state(), "available_tools": ["codex"]}
-        with patch("ucode.agents.claude.ensure_tracing_runtime") as claude_dep:
-            tracing._install_agent_tracing_deps(state)
-        claude_dep.assert_not_called()
+        assert claude_dep.call_count == expected_claude_calls
+        assert codex_dep.call_count == expected_codex_calls
 
 
 class TestDisableTracing:

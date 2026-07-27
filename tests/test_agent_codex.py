@@ -3,11 +3,30 @@
 from __future__ import annotations
 
 import os
+import subprocess
+from unittest.mock import patch
+
+import pytest
 
 from ucode.agents import codex
 from ucode.config_io import read_toml_safe
 
 WS = "https://example.databricks.com"
+
+
+def _enabled_state() -> dict:
+    return {
+        "workspace": WS,
+        "profile": "profile-a",
+        "codex_models": ["gpt-5"],
+        "tracing": {
+            "enabled": True,
+            "tracking_uri": "databricks://profile-a",
+            "experiment_id": "111",
+            "experiment_name": "/Shared/ucode-traces",
+            "uc_destination": "main.default.ucode_traces",
+        },
+    }
 
 
 class TestCodexSpec:
@@ -241,6 +260,86 @@ class TestCodexWriteConfig:
         assert doc["profiles"]["other"]["model_provider"] == "keep"
         assert doc["profiles"]["ucode"]["model_provider"] == "ucode-databricks"
 
+    @pytest.mark.parametrize(
+        "version,provider,legacy",
+        [
+            ("0.134.0", None, False),
+            ("0.133.0", None, True),
+            ("0.134.0", "main.default.openai", False),
+        ],
+    )
+    def test_writes_tracing_notify_when_enabled(
+        self, tmp_path, monkeypatch, version, provider, legacy
+    ):
+        config_dir = tmp_path / ".codex"
+        legacy_path = config_dir / "config.toml"
+        profile_path = config_dir / "ucode.config.toml"
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", profile_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "profile.backup.toml")
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
+        monkeypatch.setattr(codex, "LEGACY_CODEX_BACKUP_PATH", tmp_path / "legacy.backup.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: version)
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+
+        codex.write_tool_config(_enabled_state(), provider=provider)
+
+        doc = read_toml_safe(legacy_path if legacy else profile_path)
+        assert list(doc["notify"]) == codex.CODEX_TRACING_NOTIFY
+        if provider:
+            assert "model" not in doc
+
+    @pytest.mark.parametrize(
+        "existing_notify,should_warn",
+        [(["custom", "hook"], True), (codex.CODEX_TRACING_NOTIFY, False)],
+    )
+    def test_updates_existing_notify_when_enabled(
+        self, tmp_path, monkeypatch, existing_notify, should_warn
+    ):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            f'notify = ["{existing_notify[0]}", "{existing_notify[1]}"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+
+        with patch("ucode.agents.codex.print_warning") as warning:
+            codex.write_tool_config(_enabled_state())
+
+        doc = read_toml_safe(config_path)
+        assert list(doc["notify"]) == codex.CODEX_TRACING_NOTIFY
+        assert warning.call_count == should_warn
+
+    @pytest.mark.parametrize(
+        "existing_notify,expected_notify",
+        [
+            (codex.CODEX_TRACING_NOTIFY, None),
+            (["custom", "hook"], ["custom", "hook"]),
+        ],
+    )
+    def test_updates_notify_when_tracing_disabled(
+        self, tmp_path, monkeypatch, existing_notify, expected_notify
+    ):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            f'notify = ["{existing_notify[0]}", "{existing_notify[1]}"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+
+        codex.write_tool_config({"workspace": WS, "codex_models": ["gpt-5"]})
+
+        doc = read_toml_safe(config_path)
+        actual_notify = list(doc["notify"]) if "notify" in doc else None
+        assert actual_notify == expected_notify
+
 
 class TestCodexLegacyLayoutDetection:
     def test_new_codex_uses_modern_layout(self, monkeypatch):
@@ -436,3 +535,155 @@ class TestCodexLaunch:
 
         assert os.environ["OAUTH_TOKEN"] == "fresh-token"
         assert exec_calls == [("codex", ["codex", "--profile", "ucode", "--search"])]
+
+    def test_injects_tracing_env_before_exec(self, monkeypatch):
+        exec_calls: list[list[str]] = []
+        for key in codex.CODEX_TRACING_ENV_KEYS:
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setattr(
+            codex, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
+        )
+        monkeypatch.setattr(codex.shutil, "which", lambda binary: f"/bin/{binary}")
+        monkeypatch.setattr(codex, "exec_or_spawn", lambda args: exec_calls.append(args))
+
+        codex.launch(_enabled_state(), ["exec", "say hi"])
+
+        assert os.environ["OAUTH_TOKEN"] == "fresh-token"
+        assert os.environ["DATABRICKS_HOST"] == WS
+        assert os.environ["DATABRICKS_TOKEN"] == "fresh-token"
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-a"
+        assert os.environ["MLFLOW_TRACKING_URI"] == "databricks"
+        assert os.environ["MLFLOW_EXPERIMENT_ID"] == "111"
+        assert os.environ["MLFLOW_TRACE_LOCATION"] == "main.default.ucode_traces"
+        assert exec_calls == [["codex", "--profile", "ucode", "exec", "say hi"]]
+
+    def test_errors_when_tracing_runtime_missing(self, monkeypatch):
+        exec_calls: list[list[str]] = []
+        monkeypatch.setattr(
+            codex, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
+        )
+        monkeypatch.setattr(codex.shutil, "which", lambda binary: None)
+        monkeypatch.setattr(codex, "exec_or_spawn", lambda args: exec_calls.append(args))
+
+        with pytest.raises(RuntimeError, match="mlflow-codex.*not on PATH"):
+            codex.launch(_enabled_state(), ["exec", "say hi"])
+
+        assert exec_calls == []
+
+    def test_clears_stale_tracing_env_when_disabled(self, monkeypatch):
+        exec_calls: list[list[str]] = []
+        for key in codex.CODEX_TRACING_ENV_KEYS:
+            monkeypatch.setenv(key, "stale")
+        monkeypatch.setenv("DATABRICKS_HOST", "https://external.example.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "external-token")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "external-profile")
+        monkeypatch.setattr(
+            codex, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
+        )
+        monkeypatch.setattr(codex, "exec_or_spawn", lambda args: exec_calls.append(args))
+
+        codex.launch({"workspace": WS}, ["exec", "say hi"])
+
+        for key in codex.CODEX_TRACING_ENV_KEYS:
+            assert key not in os.environ
+        assert os.environ["DATABRICKS_HOST"] == "https://external.example.com"
+        assert os.environ["DATABRICKS_TOKEN"] == "external-token"
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "external-profile"
+        assert os.environ["OAUTH_TOKEN"] == "fresh-token"
+        assert exec_calls == [["codex", "--profile", "ucode", "exec", "say hi"]]
+
+
+class TestCodexTracingRuntime:
+    @pytest.mark.parametrize(
+        "installed_version,binary_ready,should_install",
+        [
+            (None, False, True),
+            ((0, 2, 0), True, True),
+            ((0, 3, 0), False, True),
+            ((0, 3, 0), True, False),
+        ],
+    )
+    def test_enforces_runtime_version_and_binary(
+        self, monkeypatch, installed_version, binary_ready, should_install
+    ):
+        installed_versions = iter(
+            [installed_version, (0, 3, 0)] if should_install else [installed_version]
+        )
+        monkeypatch.setattr(
+            codex, "_installed_mlflow_codex_version", lambda: next(installed_versions)
+        )
+        if installed_version == (0, 3, 0) and not binary_ready:
+            paths = iter([None, "/bin/mlflow-codex"])
+
+            def which(binary):
+                return "/bin/npm" if binary == "npm" else next(paths)
+
+            monkeypatch.setattr(codex.shutil, "which", which)
+        else:
+            monkeypatch.setattr(codex.shutil, "which", lambda binary: f"/bin/{binary}")
+
+        with patch.object(codex.subprocess, "run") as run:
+            assert codex.ensure_tracing_runtime() is True
+
+        if should_install:
+            assert run.call_args[0][0] == [
+                "npm",
+                "install",
+                "-g",
+                "@mlflow/codex@^0.3.0",
+            ]
+        else:
+            run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "npm_path,install_error,expected_calls",
+        [
+            (None, None, 0),
+            ("/bin/npm", subprocess.CalledProcessError(1, "npm"), 1),
+        ],
+    )
+    def test_warns_when_npm_setup_fails(self, monkeypatch, npm_path, install_error, expected_calls):
+        monkeypatch.setattr(codex, "_installed_mlflow_codex_version", lambda: None)
+        monkeypatch.setattr(codex.shutil, "which", lambda binary: npm_path)
+
+        with (
+            patch.object(codex.subprocess, "run", side_effect=install_error) as run,
+            patch("ucode.agents.codex.print_warning") as warning,
+        ):
+            assert codex.ensure_tracing_runtime() is False
+
+        assert run.call_count == expected_calls
+        warning.assert_called_once()
+
+    def test_reads_installed_runtime_version(self, monkeypatch):
+        payload = '{"dependencies":{"@mlflow/codex":{"version":"0.3.0"}}}'
+        monkeypatch.setattr(codex.shutil, "which", lambda binary: f"/bin/{binary}")
+        monkeypatch.setattr(
+            codex.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout=payload),
+        )
+
+        assert codex._installed_mlflow_codex_version() == (0, 3, 0)
+
+    @pytest.mark.parametrize(
+        "installed_version,binary_exists", [((0, 2, 0), True), ((0, 3, 0), False)]
+    )
+    def test_runtime_fails_when_install_is_incomplete(
+        self, monkeypatch, installed_version, binary_exists
+    ):
+        versions = iter([None, installed_version])
+        monkeypatch.setattr(codex, "_installed_mlflow_codex_version", lambda: next(versions))
+        monkeypatch.setattr(
+            codex.shutil,
+            "which",
+            lambda binary: f"/bin/{binary}" if binary_exists else None,
+        )
+
+        with (
+            patch.object(codex.subprocess, "run"),
+            patch("ucode.agents.codex.print_warning") as warning,
+        ):
+            assert codex.ensure_tracing_runtime() is False
+
+        warning.assert_called_once()
