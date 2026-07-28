@@ -154,31 +154,21 @@ def _managed_relayed_conflicts() -> tuple[Path, list[str]] | None:
     return (path, conflicts) if conflicts else None
 
 
-# Default-model env keys the enterprise managed settings can pin. Unlike the
-# conflict keys above these don't break relayed auth, but a pinned (possibly
-# deprecated) model id silently overrides ucode's picker, so we surface them.
-_MANAGED_DEFAULT_MODEL_ENV_KEYS = (
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    "ANTHROPIC_DEFAULT_FABLE_MODEL",
-)
-
-
-def _managed_default_model_keys() -> tuple[Path, list[tuple[str, str]]] | None:
-    """Default Anthropic model env vars pinned in enterprise managed settings, if
-    any. Returns (path, [(key, value), ...]) or None when the file is absent or
-    none of the model keys are set."""
+def _managed_pinned_model() -> tuple[Path, str] | None:
+    """Model that enterprise managed settings force Claude Code to launch with,
+    if any. Only `ANTHROPIC_MODEL` sets the launch model — the
+    `ANTHROPIC_DEFAULT_*` family aliases just remap what each tier resolves to
+    when selected, so they don't change the default. Doesn't break relayed auth,
+    but silently overrides Claude Code's model, so we surface it. Returns
+    (path, model_id) or None when the file is absent or `ANTHROPIC_MODEL` is unset."""
     path = _managed_settings_path()
     if path is None or not path.is_file():
         return None
     settings = read_json_safe(path)
     env = settings.get("env")
-    if not isinstance(env, dict):
+    if not isinstance(env, dict) or not env.get("ANTHROPIC_MODEL"):
         return None
-    pinned = [(key, str(env[key])) for key in _MANAGED_DEFAULT_MODEL_ENV_KEYS if env.get(key)]
-    return (path, pinned) if pinned else None
+    return (path, str(env["ANTHROPIC_MODEL"]))
 
 
 def relayed_proxy_base_url(state: dict) -> str:
@@ -843,19 +833,19 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     if conflict is not None:
         managed_path, keys = conflict
         print_err(
-            "Enterprise managed settings is present, which Claude Code always "
+            "Enterprise managed settings are present, which Claude Code always "
             "applies over relayed (Claude Max/Enterprise) auth. Remove "
             f"{', '.join(keys)} from {managed_path} file before running relayed auth."
         )
         raise SystemExit(1)
 
-    pinned_models = _managed_default_model_keys()
-    if pinned_models is not None:
-        managed_path, pairs = pinned_models
-        models = ", ".join(f"{key}: {value}" for key, value in pairs)
+    pinned_model = _managed_pinned_model()
+    if pinned_model is not None:
+        managed_path, model_id = pinned_model
         print_warning(
-            f"Default models {models} are set in your enterprise managed settings "
-            f"({managed_path}). Remove those keys if the default models are deprecated."
+            f"Default model ANTHROPIC_MODEL: {model_id} is set in your "
+            f"enterprise-managed settings ({managed_path}) and may override ucode "
+            "settings. Remove this entry if you encounter issues."
         )
 
     _ensure_subscription_login()
