@@ -235,6 +235,50 @@ class TestExternalMcpConnectionNames:
         ) == ["github-mcp"]
 
 
+class TestCursorMcpClient:
+    def test_cursor_registered_as_mcp_only_client(self):
+        assert "cursor" in mcp.MCP_CLIENTS
+        assert mcp.MCP_CLIENTS["cursor"]["binary"] == "cursor-agent"
+        assert "cursor" in mcp.MCP_ONLY_CLIENTS
+
+    def test_configure_dispatches_proxy_argv_to_cursor_writer(self, monkeypatch):
+        calls: list[tuple[str, list[str]]] = []
+        monkeypatch.setattr(
+            mcp.cursor,
+            "write_mcp_server_config",
+            lambda name, argv: calls.append((name, argv)) or False,
+        )
+
+        removed_scopes = mcp.configure_client_mcp_server("cursor", "github", GH_URL, WS, "p")
+
+        assert removed_scopes == []
+        assert calls == [("github", _proxy_argv())]
+
+    def test_configure_reports_user_scope_on_replace(self, monkeypatch):
+        monkeypatch.setattr(mcp.cursor, "write_mcp_server_config", lambda name, argv: True)
+        assert mcp.configure_client_mcp_server("cursor", "github", GH_URL, WS, "p") == [
+            mcp.MCP_USER_SCOPE
+        ]
+
+    def test_remove_dispatches_to_cursor_remover(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(
+            mcp.cursor, "remove_mcp_server_config", lambda name: calls.append(name) or True
+        )
+        assert mcp.remove_client_mcp_server("cursor", "github-mcp") == [mcp.MCP_USER_SCOPE]
+        assert calls == ["github-mcp"]
+
+    def test_eligible_when_installed_even_without_configured_tools(self):
+        # Cursor is MCP-only: it never appears in available_tools, so eligibility
+        # rests on the binary being installed (MCP_ONLY_CLIENTS).
+        clients = mcp.configured_mcp_clients({"available_tools": ["claude"]}, ["claude", "cursor"])
+        assert "cursor" in clients
+
+    def test_skipped_when_binary_not_installed(self):
+        clients = mcp.configured_mcp_clients({"available_tools": ["claude"]}, ["claude"])
+        assert "cursor" not in clients
+
+
 class TestConfigureClientMcpServer:
     def test_configures_copilot_with_proxy_argv(self, monkeypatch):
         calls: list[tuple[str, list[str]]] = []

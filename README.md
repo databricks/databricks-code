@@ -26,6 +26,7 @@ ucode gemini     # Gemini CLI
 ucode opencode   # OpenCode
 ucode copilot    # GitHub Copilot CLI
 ucode pi         # Pi
+ucode cursor     # Cursor Agent (MCP only — see below)
 ```
 
 On first launch, `ucode` will prompt for your Databricks workspace URL, authenticate, and configure that tool automatically. Subsequent launches go straight to the agent.
@@ -51,7 +52,7 @@ To configure specific tools without the picker, pass a comma-separated list:
 ucode configure --agents claude,codex
 ```
 
-Available agent names are `codex`, `claude`, `gemini`, `opencode`, `copilot`, and `pi`.
+Available agent names are `codex`, `claude`, `gemini`, `opencode`, `copilot`, and `pi`. `cursor` is also accepted (MCP-only — it registers Databricks MCP servers but configures no models).
 
 To configure without the workspace picker, pass a comma-separated list of workspaces:
 
@@ -81,7 +82,7 @@ ucode configure --profiles DEFAULT --agents claude,codex --use-pat --skip-valida
 ucode configure mcp
 ```
 
-Add Databricks MCP servers to installed MCP-capable tools: Codex, Claude Code, Gemini CLI, OpenCode, and GitHub Copilot CLI.
+Add Databricks MCP servers to installed MCP-capable tools: Codex, Claude Code, Gemini CLI, OpenCode, GitHub Copilot CLI, and Cursor Agent.
 Options are shown in this order:
 
 - Discovered external MCP connections
@@ -96,6 +97,11 @@ Every Databricks MCP server is registered as a local **stdio** server that runs 
 streamable-HTTP MCP endpoint. The proxy mints a fresh OAuth token from your Databricks CLI profile
 on every request, so MCP auth is handled uniformly for every client and never expires mid-session.
 The coding tool starts and stops the proxy as a child process; there's nothing extra to run.
+
+**Cursor** is MCP-only: `cursor-agent` runs models on your own Cursor account, so `ucode`
+configures no models for it — it only registers Databricks MCP servers in `~/.cursor/mcp.json`
+(via the same proxy). Include it with `ucode configure --agents cursor` or pick it in
+`ucode configure mcp`, then launch with `ucode cursor`.
 
 To set up an agent and its MCP server(s) in one command, pass `--mcp` with fully-qualified
 service name(s) to `ucode configure`:
@@ -168,6 +174,7 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 | `~/.config/opencode/opencode.json` | OpenCode |
 | `~/.copilot/.env` | GitHub Copilot CLI |
 | `~/.pi/agent/models.json` | Pi |
+| `~/.cursor/mcp.json` | Cursor Agent (MCP servers only) |
 
 Existing files are backed up before being overwritten. `ucode revert` restores backups.
 
