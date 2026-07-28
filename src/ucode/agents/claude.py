@@ -10,6 +10,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import cast
@@ -32,7 +33,7 @@ from ucode.launcher import exec_or_spawn
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
-from ucode.ui import print_note, print_success, print_warning
+from ucode.ui import print_err, print_note, print_success, print_warning
 
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
@@ -116,6 +117,29 @@ MAXIMUM_MLFLOW_VERSION = (3, 12)
 # Relayed drops the user scope to deliberately omit the stale apiKeyHelper. Only applied to relayed
 # launches — normal launches keep loading user settings (hooks/permissions) as before.
 _RELAYED_SETTING_SOURCES = "project,local"
+
+
+def _managed_settings_path() -> Path | None:
+    """OS-specific location of Claude Code's enterprise managed-settings.json.
+    Returns None on unsupported platforms."""
+    if sys.platform.startswith("linux"):
+        return Path("/etc/claude-code/managed-settings.json")
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support/ClaudeCode/managed-settings.json")
+    return None
+
+
+def _managed_api_key_helper_path() -> Path | None:
+    """Path to the enterprise managed-settings.json when it sets an apiKeyHelper,
+    else None. The managed scope always wins over --settings and subscription
+    OAuth, so a managed apiKeyHelper silently shadows relayed auth."""
+    path = _managed_settings_path()
+    if path is None or not path.is_file():
+        return None
+    settings = read_json_safe(path)
+    if isinstance(settings, dict) and settings.get("apiKeyHelper"):
+        return path
+    return None
 
 
 def relayed_proxy_base_url(state: dict) -> str:
@@ -775,6 +799,17 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     refresh proxy, then run Claude Code alongside it (the proxy must outlive the
     exec, so we spawn-and-wait rather than replacing the process)."""
     from ucode.gateway_proxy import start_proxy
+
+    managed_path = _managed_api_key_helper_path()
+    if managed_path is not None:
+        print_err(
+            f"Enterprise managed settings ({managed_path}) set an 'apiKeyHelper', "
+            "which Claude Code always applies over relayed (Claude Max/Enterprise) "
+            "auth — you'd be billed for API usage instead of using your subscription. "
+            "Remove the 'apiKeyHelper' from that file (or ask your admin to) before "
+            "running relayed auth. Not starting Claude Code."
+        )
+        raise SystemExit(1)
 
     _ensure_subscription_login()
     workspace = state["workspace"]
