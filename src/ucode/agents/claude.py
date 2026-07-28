@@ -129,17 +129,56 @@ def _managed_settings_path() -> Path | None:
     return None
 
 
-def _managed_api_key_helper_path() -> Path | None:
-    """Path to the enterprise managed-settings.json when it sets an apiKeyHelper,
-    else None. The managed scope always wins over --settings and subscription
-    OAuth, so a managed apiKeyHelper silently shadows relayed auth."""
+def _managed_relayed_conflicts() -> tuple[Path, list[str]] | None:
+    """Enterprise managed-settings keys that would break relayed auth, if any.
+    The managed scope always wins (per key) over the --settings file and
+    subscription OAuth, so a managed value here overrides what ucode writes:
+    'apiKeyHelper' shadows the subscription login, 'env.ANTHROPIC_BASE_URL'
+    clobbers our loopback proxy URL, and 'env.ANTHROPIC_CUSTOM_HEADERS' drops
+    the Databricks-Model-Provider-Service routing headers — each sends traffic
+    somewhere the relayed token swap can't reach or route correctly.
+    Returns (path, conflicting-key-labels) or None when there's no conflict."""
     path = _managed_settings_path()
     if path is None or not path.is_file():
         return None
     settings = read_json_safe(path)
-    if isinstance(settings, dict) and settings.get("apiKeyHelper"):
-        return path
-    return None
+    conflicts: list[str] = []
+    if settings.get("apiKeyHelper"):
+        conflicts.append("apiKeyHelper")
+    env = settings.get("env")
+    if isinstance(env, dict):
+        if env.get("ANTHROPIC_BASE_URL"):
+            conflicts.append("env.ANTHROPIC_BASE_URL")
+        if env.get("ANTHROPIC_CUSTOM_HEADERS"):
+            conflicts.append("env.ANTHROPIC_CUSTOM_HEADERS")
+    return (path, conflicts) if conflicts else None
+
+
+# Default-model env keys the enterprise managed settings can pin. Unlike the
+# conflict keys above these don't break relayed auth, but a pinned (possibly
+# deprecated) model id silently overrides ucode's picker, so we surface them.
+_MANAGED_DEFAULT_MODEL_ENV_KEYS = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+)
+
+
+def _managed_default_model_keys() -> tuple[Path, list[tuple[str, str]]] | None:
+    """Default Anthropic model env vars pinned in enterprise managed settings, if
+    any. Returns (path, [(key, value), ...]) or None when the file is absent or
+    none of the model keys are set."""
+    path = _managed_settings_path()
+    if path is None or not path.is_file():
+        return None
+    settings = read_json_safe(path)
+    env = settings.get("env")
+    if not isinstance(env, dict):
+        return None
+    pinned = [(key, str(env[key])) for key in _MANAGED_DEFAULT_MODEL_ENV_KEYS if env.get(key)]
+    return (path, pinned) if pinned else None
 
 
 def relayed_proxy_base_url(state: dict) -> str:
@@ -800,16 +839,24 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     exec, so we spawn-and-wait rather than replacing the process)."""
     from ucode.gateway_proxy import start_proxy
 
-    managed_path = _managed_api_key_helper_path()
-    if managed_path is not None:
+    conflict = _managed_relayed_conflicts()
+    if conflict is not None:
+        managed_path, keys = conflict
         print_err(
-            f"Enterprise managed settings ({managed_path}) set an 'apiKeyHelper', "
-            "which Claude Code always applies over relayed (Claude Max/Enterprise) "
-            "auth — you'd be billed for API usage instead of using your subscription. "
-            "Remove the 'apiKeyHelper' from that file (or ask your admin to) before "
-            "running relayed auth. Not starting Claude Code."
+            "Enterprise managed settings is present, which Claude Code always "
+            "applies over relayed (Claude Max/Enterprise) auth. Remove "
+            f"{', '.join(keys)} from {managed_path} file before running relayed auth."
         )
         raise SystemExit(1)
+
+    pinned_models = _managed_default_model_keys()
+    if pinned_models is not None:
+        managed_path, pairs = pinned_models
+        models = ", ".join(f"{key}: {value}" for key, value in pairs)
+        print_warning(
+            f"Default models {models} are set in your enterprise managed settings "
+            f"({managed_path}). Remove those keys if the default models are deprecated."
+        )
 
     _ensure_subscription_login()
     workspace = state["workspace"]
