@@ -24,10 +24,11 @@ from questionary.prompts.common import InquirerControl
 from questionary.question import Question
 from questionary.styles import merge_styles_default
 
-from ucode.agents import copilot, gemini, opencode
+from ucode.agents import copilot, cursor, gemini, opencode
 from ucode.config_io import restore_file
 from ucode.databricks import (
     apply_pat_environment,
+    build_mcp_proxy_argv,
     build_mcp_service_url,
     build_skills_mcp_url,
     ensure_databricks_auth,
@@ -49,7 +50,6 @@ from ucode.ui import (
     spinner,
 )
 
-MCP_AUTH_TOKEN_ENV_VAR = "OAUTH_TOKEN"
 MCP_USER_SCOPE = "user"
 MCP_CLEANUP_SCOPES = ("local", "project", MCP_USER_SCOPE)
 MCP_PICKER_VISIBLE_ROWS = 10
@@ -79,9 +79,17 @@ MCP_CLIENTS = {
         "display": "GitHub Copilot CLI",
         "list_command": "copilot mcp list",
     },
+    "cursor": {
+        "binary": "cursor-agent",
+        "display": "Cursor",
+        "list_command": "cursor-agent mcp list",
+    },
 }
 SKILLS_MCP_KIND = "skills"
 SKILLS_MCP_SERVER_NAME = "databricks-skill-registry"
+# MCP-only clients ucode never launches for model routing, so they never land in
+# `available_tools`; they're eligible for MCP config purely on being installed.
+MCP_ONLY_CLIENTS = ("cursor",)
 EXTERNAL_MCP_SELECTION_PREFIX = "external:"
 SQL_MCP_VALUE = "managed:sql"
 GENIE_SPACE_SELECTION_PREFIX = "genie-space:"
@@ -99,23 +107,35 @@ MCP_CONNECTION_MARKERS = (
 )
 
 
-def build_mcp_http_entry(url: str, *, always_load: bool = False) -> dict:
-    entry: dict[str, Any] = {
-        "type": "http",
-        "url": url,
-        "headers": {
-            "Authorization": f"Bearer ${{{MCP_AUTH_TOKEN_ENV_VAR}}}",
-        },
-    }
-    if always_load:
-        entry["alwaysLoad"] = True
-    return entry
-
-
-def add_claude_mcp_server(name: str, entry: dict, scope: str = MCP_USER_SCOPE) -> None:
+def add_claude_mcp_server(
+    name: str,
+    server: list[str] | dict,
+    scope: str = MCP_USER_SCOPE,
+    *,
+    always_load: bool = False,
+) -> None:
+    # Three registration shapes share this helper. The plain proxy path passes an
+    # argv list (`ucode mcp-proxy ...`), registered via `claude mcp add ... -- <argv>`
+    # where `--` fences the proxy's own flags off from claude's parser. The
+    # web_search server (agents/claude.py) passes a full stdio entry dict with its
+    # own env, which only `add-json` can express — so a dict routes there. Finally,
+    # `always_load` (the skills registry) needs `alwaysLoad: true`, which plain
+    # `mcp add` can't set, so build a stdio entry dict and route it to add-json too.
+    if isinstance(server, dict):
+        cmd = ["claude", "mcp", "add-json", name, json.dumps(server), "-s", scope]
+    elif always_load:
+        entry = {
+            "type": "stdio",
+            "command": server[0],
+            "args": list(server[1:]),
+            "alwaysLoad": True,
+        }
+        cmd = ["claude", "mcp", "add-json", name, json.dumps(entry), "-s", scope]
+    else:
+        cmd = ["claude", "mcp", "add", name, "-s", scope, "--", *server]
     try:
         subprocess.run(
-            ["claude", "mcp", "add-json", name, json.dumps(entry), "-s", scope],
+            cmd,
             check=True,
             capture_output=True,
             text=True,
@@ -152,19 +172,12 @@ def remove_claude_mcp_server(name: str, scope: str) -> bool:
         raise RuntimeError(f"Failed to remove MCP server '{name}' via claude CLI.") from exc
 
 
-def add_codex_mcp_server(name: str, url: str) -> None:
+def add_codex_mcp_server(name: str, argv: list[str]) -> None:
+    # `--` fences the proxy argv off from codex's own flag parser, registering
+    # it as a stdio server (codex spawns the command and speaks MCP over it).
     try:
         subprocess.run(
-            [
-                "codex",
-                "mcp",
-                "add",
-                name,
-                "--url",
-                url,
-                "--bearer-token-env-var",
-                MCP_AUTH_TOKEN_ENV_VAR,
-            ],
+            ["codex", "mcp", "add", name, "--", *argv],
             check=True,
             capture_output=True,
             text=True,
@@ -201,7 +214,9 @@ def _gemini_cli_env() -> dict[str, str]:
     return env
 
 
-def add_gemini_mcp_server(name: str, url: str) -> None:
+def add_gemini_mcp_server(name: str, argv: list[str]) -> None:
+    # Register the proxy as a stdio server: `gemini mcp add <name> <cmd> <args…>
+    # --type stdio`. The scope/type flags trail the captured command + args.
     try:
         subprocess.run(
             [
@@ -209,13 +224,11 @@ def add_gemini_mcp_server(name: str, url: str) -> None:
                 "mcp",
                 "add",
                 name,
-                url,
+                *argv,
                 "--type",
-                "http",
+                "stdio",
                 "--scope",
                 MCP_USER_SCOPE,
-                "--header",
-                f"Authorization: Bearer ${{{MCP_AUTH_TOKEN_ENV_VAR}}}",
             ],
             check=True,
             capture_output=True,
@@ -258,30 +271,50 @@ def configured_mcp_clients(state: dict, installed_clients: list[str]) -> list[st
         configured_tools = []
     configured = set(configured_tools)
     return [
-        client for client in MCP_CLIENTS if client in configured and client in installed_clients
+        client
+        for client in MCP_CLIENTS
+        if client in installed_clients and (client in configured or client in MCP_ONLY_CLIENTS)
     ]
 
 
-def configure_client_mcp_server(client: str, name: str, url: str, entry: dict) -> list[str]:
+def configure_client_mcp_server(
+    client: str,
+    name: str,
+    url: str,
+    workspace: str,
+    profile: str | None = None,
+    *,
+    use_pat: bool = False,
+    always_load: bool = False,
+) -> list[str]:
+    # Every client registers the same `ucode mcp-proxy ...` stdio command; the
+    # proxy forwards to `url` and refreshes the Databricks token itself. Only the
+    # per-client registration syntax differs. `always_load` (skills registry) is
+    # a Claude-only hint to load the server's tools at session start; other
+    # clients don't support it and ignore it.
+    argv = build_mcp_proxy_argv(url, workspace, profile, use_pat=use_pat)
     if client == "claude":
         removed_scopes = [
             scope for scope in MCP_CLEANUP_SCOPES if remove_claude_mcp_server(name, scope)
         ]
-        add_claude_mcp_server(name, entry, MCP_USER_SCOPE)
+        add_claude_mcp_server(name, argv, MCP_USER_SCOPE, always_load=always_load)
         return removed_scopes
     if client == "codex":
         removed = remove_codex_mcp_server(name)
-        add_codex_mcp_server(name, url)
+        add_codex_mcp_server(name, argv)
         return [MCP_USER_SCOPE] if removed else []
     if client == "gemini":
         removed = remove_gemini_mcp_server(name)
-        add_gemini_mcp_server(name, url)
+        add_gemini_mcp_server(name, argv)
         return [MCP_USER_SCOPE] if removed else []
     if client == "opencode":
-        removed = opencode.write_mcp_server_config(name, url)
+        removed = opencode.write_mcp_server_config(name, argv)
         return [MCP_USER_SCOPE] if removed else []
     if client == "copilot":
-        removed = copilot.write_mcp_server_config(name, url)
+        removed = copilot.write_mcp_server_config(name, argv)
+        return [MCP_USER_SCOPE] if removed else []
+    if client == "cursor":
+        removed = cursor.write_mcp_server_config(name, argv)
         return [MCP_USER_SCOPE] if removed else []
     raise RuntimeError(f"Unsupported MCP client '{client}'.")
 
@@ -297,6 +330,8 @@ def remove_client_mcp_server(client: str, name: str) -> list[str]:
         return [MCP_USER_SCOPE] if opencode.remove_mcp_server_config(name) else []
     if client == "copilot":
         return [MCP_USER_SCOPE] if copilot.remove_mcp_server_config(name) else []
+    if client == "cursor":
+        return [MCP_USER_SCOPE] if cursor.remove_mcp_server_config(name) else []
     raise RuntimeError(f"Unsupported MCP client '{client}'.")
 
 
@@ -1025,6 +1060,10 @@ def apply_mcp_server_changes(
     original_servers: list[dict],
     working_servers: list[dict],
     clients: list[str],
+    workspace: str,
+    profile: str | None = None,
+    *,
+    use_pat: bool = False,
 ) -> bool:
     original_by_name = _servers_by_name(original_servers)
     working_by_name = _servers_by_name(working_servers)
@@ -1045,9 +1084,11 @@ def apply_mcp_server_changes(
             continue
         # alwaysLoad (Claude-only) keeps the skills registry's utility tools
         # discoverable without an explicit mention; other clients ignore it.
-        entry = build_mcp_http_entry(url, always_load=server.get("kind") == SKILLS_MCP_KIND)
+        always_load = server.get("kind") == SKILLS_MCP_KIND
         for client in clients:
-            configure_client_mcp_server(client, name, url, entry)
+            configure_client_mcp_server(
+                client, name, url, workspace, profile, use_pat=use_pat, always_load=always_load
+            )
         changed = True
 
     return changed
@@ -1180,7 +1221,7 @@ def _resolve_location_mcp_servers(
         candidate = {
             "name": entry_name,
             "url": build_mcp_service_url(workspace, full_name),
-            "auth": f"env:{MCP_AUTH_TOKEN_ENV_VAR}",
+            "auth": "proxy",
             "clients": merged_clients,
         }
         if original is not None and original == candidate:
@@ -1261,7 +1302,12 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
             workspace, profile, clients, location, original_mcp_servers_for_location, services
         )
         changed = apply_mcp_server_changes(
-            original_mcp_servers_for_location, working_mcp_servers, clients
+            original_mcp_servers_for_location,
+            working_mcp_servers,
+            clients,
+            workspace,
+            profile,
+            use_pat=bool(state.get("use_pat")),
         )
         if changed or original_mcp_servers_for_location != working_mcp_servers:
             state["mcp_servers"] = working_mcp_servers
@@ -1347,13 +1393,20 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
             {
                 "name": entry_name,
                 "url": url,
-                "auth": f"env:{MCP_AUTH_TOKEN_ENV_VAR}",
+                "auth": "proxy",
                 "clients": clients,
             }
         )
         working_names.add(entry_name)
 
-    changed = apply_mcp_server_changes(original_mcp_servers, working_mcp_servers, clients)
+    changed = apply_mcp_server_changes(
+        original_mcp_servers,
+        working_mcp_servers,
+        clients,
+        workspace,
+        profile,
+        use_pat=bool(state.get("use_pat")),
+    )
     if changed or original_mcp_servers != working_mcp_servers:
         state["mcp_servers"] = working_mcp_servers
         save_state(state)
@@ -1378,7 +1431,7 @@ def _build_skills_entry(workspace: str, locations: list[str], clients: list[str]
         "kind": SKILLS_MCP_KIND,
         "skill_locations": list(locations),
         "url": build_skills_mcp_url(workspace, locations),
-        "auth": f"env:{MCP_AUTH_TOKEN_ENV_VAR}",
+        "auth": "proxy",
         "clients": clients,
     }
 
@@ -1408,12 +1461,12 @@ def _resolve_skills_mcp_servers(
 
 
 def _update_skills_mcp(
-    state: dict, workspace: str, clients: list[str], locations: list[str]
+    state: dict, workspace: str, profile: str | None, clients: list[str], locations: list[str]
 ) -> None:
     """Rebuild the single skills connection for ``locations`` and persist it."""
     original = list(state.get("mcp_servers") or [])
     working = _resolve_skills_mcp_servers(workspace, clients, locations, original)
-    changed = apply_mcp_server_changes(original, working, clients)
+    changed = apply_mcp_server_changes(original, working, clients, workspace, profile)
     if changed or original != working:
         state["mcp_servers"] = working
         save_state(state)
@@ -1424,8 +1477,8 @@ def configure_skills_mcp_command(locations: list[str]) -> int:
     """Set the skills MCP connection's ``skill_locations`` to exactly ``locations``,
     replacing any previous set."""
     state = load_state()
-    workspace, _profile, clients = setup_mcp_clients(state, "Skills MCP")
-    _update_skills_mcp(state, workspace, clients, locations)
+    workspace, profile, clients = setup_mcp_clients(state, "Skills MCP")
+    _update_skills_mcp(state, workspace, profile, clients, locations)
     return 0
 
 
@@ -1435,10 +1488,12 @@ def _skill_mcp_locations(state: dict) -> list[str]:
     return list((entry or {}).get("skill_locations") or [])
 
 
-def register_schemaless_skills_connection(state: dict, workspace: str, clients: list[str]) -> None:
+def register_schemaless_skills_connection(
+    state: dict, workspace: str, profile: str | None, clients: list[str]
+) -> None:
     """Register/keep the skills MCP connection without changing its schema set.
 
     Download mode calls this after writing files: it preserves any prior
     ``--mcp`` ``skill_locations`` and otherwise registers the bare schema-less
     route (utility tools only)."""
-    _update_skills_mcp(state, workspace, clients, _skill_mcp_locations(state))
+    _update_skills_mcp(state, workspace, profile, clients, _skill_mcp_locations(state))

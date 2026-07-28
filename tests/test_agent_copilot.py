@@ -61,13 +61,17 @@ class TestBuildRuntimeEnv:
 
 
 class TestMcpServerConfig:
-    def test_builds_http_server_entry_with_oauth_token_env_header(self):
-        entry = copilot.build_mcp_server_entry(f"{WS}/api/2.0/mcp/external/github")
+    # ucode registers the `ucode mcp-proxy ...` bridge as a `local` (stdio) MCP
+    # server; the proxy refreshes the token, so no URL/bearer header here.
+    PROXY_ARGV = ["ucode", "mcp-proxy", "--url", f"{WS}/api/2.0/mcp/functions/system/ai"]
+
+    def test_builds_local_server_entry_from_proxy_argv(self):
+        entry = copilot.build_mcp_server_entry(self.PROXY_ARGV)
 
         assert entry == {
-            "type": "http",
-            "url": f"{WS}/api/2.0/mcp/external/github",
-            "headers": {"Authorization": "Bearer ${OAUTH_TOKEN}"},
+            "type": "local",
+            "command": self.PROXY_ARGV[0],
+            "args": self.PROXY_ARGV[1:],
             "tools": ["*"],
         }
 
@@ -91,19 +95,16 @@ class TestMcpServerConfig:
             encoding="utf-8",
         )
 
-        removed = cp_mod.write_mcp_server_config(
-            "github",
-            f"{WS}/api/2.0/mcp/external/github",
-        )
+        removed = cp_mod.write_mcp_server_config("github", self.PROXY_ARGV)
 
         written = json.loads(config_file.read_text())
         assert removed is False
         assert written["other"] is True
         assert written["mcpServers"]["old-server"] == {"type": "stdio", "command": "old"}
         assert written["mcpServers"]["github"] == {
-            "type": "http",
-            "url": f"{WS}/api/2.0/mcp/external/github",
-            "headers": {"Authorization": "Bearer ${OAUTH_TOKEN}"},
+            "type": "local",
+            "command": self.PROXY_ARGV[0],
+            "args": self.PROXY_ARGV[1:],
             "tools": ["*"],
         }
 
@@ -122,14 +123,11 @@ class TestMcpServerConfig:
             encoding="utf-8",
         )
 
-        removed = cp_mod.write_mcp_server_config(
-            "github",
-            f"{WS}/api/2.0/mcp/external/github",
-        )
+        removed = cp_mod.write_mcp_server_config("github", self.PROXY_ARGV)
 
         assert removed is True
         written = json.loads(config_file.read_text())
-        assert written["mcpServers"]["github"]["url"] == f"{WS}/api/2.0/mcp/external/github"
+        assert written["mcpServers"]["github"]["command"] == self.PROXY_ARGV[0]
 
     def test_removes_mcp_server_without_clobbering_others(self, tmp_path, monkeypatch):
         import ucode.agents.copilot as cp_mod

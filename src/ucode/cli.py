@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import shutil
 from typing import Annotated
 
 import typer
@@ -869,6 +870,43 @@ def mcp_web_search_cmd() -> None:
     serve()
 
 
+@app.command("mcp-proxy", hidden=True)
+def mcp_proxy_cmd(
+    url: Annotated[
+        str,
+        typer.Option("--url", help="Databricks streamable-HTTP MCP endpoint to forward to."),
+    ],
+    host: Annotated[
+        str | None,
+        typer.Option(
+            "--host", help="Workspace URL for token minting. Defaults to the saved workspace."
+        ),
+    ] = None,
+    profile: Annotated[
+        str | None, typer.Option("--profile", help="Databricks CLI profile.")
+    ] = None,
+    use_pat: Annotated[
+        bool, typer.Option("--use-pat", help="Use the profile's static PAT instead of OAuth.")
+    ] = False,
+) -> None:
+    """Bridge a coding agent's stdio MCP transport to a Databricks MCP endpoint.
+
+    Each configured client spawns this as a local stdio MCP server (see
+    `ucode configure mcp`); it forwards messages to ``--url`` and injects a
+    freshly-minted OAuth bearer on every upstream request, so the token never
+    expires mid-session. Not meant for interactive use — the agent manages this
+    process's lifecycle."""
+    from ucode.mcp_proxy import serve
+
+    state = load_state()
+    workspace = host or state.get("workspace")
+    if not workspace:
+        print_err("No workspace configured. Run `ucode configure` first.")
+        raise typer.Exit(1)
+    profile = profile or state.get("profile")
+    serve(url, workspace, profile, use_pat=use_pat or bool(state.get("use_pat")))
+
+
 @app.command("auth-token", hidden=True)
 def auth_token_cmd(
     host: Annotated[
@@ -1137,6 +1175,39 @@ def pi_cmd(ctx: typer.Context, skip_preflight: SkipPreflightOption = False) -> N
     _launch_tool("pi", ctx, skip_preflight=skip_preflight)
 
 
+@app.command("cursor", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def cursor_cmd(ctx: typer.Context) -> None:
+    """Launch Cursor Agent.
+
+    Cursor is MCP-only: `cursor-agent` runs models on your own Cursor account, so
+    ucode configures no models for it. Its Databricks MCP servers (added via
+    `ucode configure mcp`) run `ucode mcp-proxy`, which authenticates itself — so
+    this command is a thin convenience wrapper over `cursor-agent`, kept for
+    symmetry with the other `ucode <agent>` launchers.
+    """
+    from ucode.agents import cursor
+
+    try:
+        if not shutil.which(cursor.CURSOR_BINARY):
+            raise RuntimeError(
+                f"`{cursor.CURSOR_BINARY}` was not found on PATH. Install Cursor Agent "
+                "(https://cursor.com/cli), then re-run `ucode cursor`."
+            )
+        print_section("ucode with Cursor")
+        print_note(
+            "Cursor runs models on your Cursor account; its Databricks MCP servers "
+            "authenticate through `ucode mcp-proxy`."
+        )
+        print_success("Starting Cursor Agent")
+        cursor.launch(load_state(), ctx.args)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+
+
 @configure_app.callback(invoke_without_command=True)
 def configure(
     ctx: typer.Context,
@@ -1309,20 +1380,42 @@ def configure(
                     **skip_kwargs,
                 )
         elif agents is not None:
-            selected_tools = _parse_agents_option(agents)
-            if workspace_entries is None:
-                configure_workspace_command(
-                    selected_tools=selected_tools,
-                    prompt_optional_updates=prompt_optional_updates,
-                    **skip_kwargs,
+            # Cursor is MCP-only (no model routing), so it can't go through the
+            # model-agent configure path. Split it out: model agents configure
+            # normally; cursor only needs workspace state established here, and
+            # its MCP servers are added separately via `ucode configure mcp`
+            # (which picks cursor up through MCP_ONLY_CLIENTS). If cursor is the
+            # only agent, do a workspace-only configure so that later `configure
+            # mcp` run has a current workspace to target.
+            requested = [a.strip().lower() for a in agents.split(",") if a.strip()]
+            wants_cursor = "cursor" in requested
+            model_agent_names = ",".join(a for a in requested if a != "cursor")
+            if model_agent_names:
+                selected_tools = _parse_agents_option(model_agent_names)
+                if workspace_entries is None:
+                    configure_workspace_command(
+                        selected_tools=selected_tools,
+                        prompt_optional_updates=prompt_optional_updates,
+                        **skip_kwargs,
+                    )
+                else:
+                    configure_workspace_command(
+                        selected_tools=selected_tools,
+                        workspaces=workspace_entries,
+                        prompt_optional_updates=prompt_optional_updates,
+                        **skip_kwargs,
+                    )
+            elif wants_cursor:
+                # Cursor-only: establish workspace state without the model picker.
+                _configure_shared_workspace_states(
+                    workspace_entries or [_prompt_for_configuration(None)],
+                    tools=[],
+                    force_login=not use_pat,
+                    use_pat=use_pat,
                 )
             else:
-                configure_workspace_command(
-                    selected_tools=selected_tools,
-                    workspaces=workspace_entries,
-                    prompt_optional_updates=prompt_optional_updates,
-                    **skip_kwargs,
-                )
+                # Neither model agents nor cursor -> empty/invalid --agents list.
+                _parse_agents_option(agents)
         elif mcp is not None:
             # MCP-only: `--mcp` without --agent(s) (e.g. Cursor, which isn't a
             # model agent, or adding MCP servers to an already-configured setup).

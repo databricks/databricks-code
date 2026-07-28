@@ -376,7 +376,7 @@ class TestConfigureSkillsDownloadCommand:
         monkeypatch.setattr(
             sd,
             "register_schemaless_skills_connection",
-            lambda state, ws, clients: calls.update(register=(ws, clients)),
+            lambda state, ws, profile, clients: calls.update(register=(ws, profile, clients)),
         )
         return calls
 
@@ -386,7 +386,7 @@ class TestConfigureSkillsDownloadCommand:
         assert sd.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
 
         assert calls["download"] == (WS, "token", ["a.b"], "/tmp/skills")
-        assert calls["register"] == (WS, ["claude"])
+        assert calls["register"] == (WS, "profile", ["claude"])
 
     def test_none_path_threads_through(self, monkeypatch):
         calls = self._stub(monkeypatch)
