@@ -12,14 +12,23 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # uv.lock pins packages to Databricks' internal pypi-proxy, which hosted
+      # GitHub runners can't reach (downloads time out). Re-resolve against
+      # public PyPI at CI time: UV_INDEX_URL + a `uv lock` before install.
+      UV_INDEX_URL: https://pypi.org/simple
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+      - run: uv lock
       - run: uv run pytest --ignore=tests/test_e2e.py --ignore=tests/test_e2e_tracing.py
 
   e2e:
     runs-on: ubuntu-latest
     env:
+      # See the test job: hosted runners can't reach the internal pypi-proxy,
+      # so resolve against public PyPI (paired with the `uv lock` step below).
+      UV_INDEX_URL: https://pypi.org/simple
       UCODE_TEST_WORKSPACE: ${{ secrets.UCODE_TEST_WORKSPACE }}
       DATABRICKS_HOST: ${{ secrets.UCODE_TEST_WORKSPACE }}
       # DATABRICKS_BEARER is the CI escape hatch: `databricks auth token`
@@ -47,6 +56,7 @@ jobs:
           opencode-ai
           @github/copilot
           @earendil-works/pi-coding-agent
+      - run: uv lock
       - run: uv tool install .
       # Redirect stdin so any interactive `databricks auth login --no-browser`
       # fallback EOFs instead of hanging the runner. With DATABRICKS_BEARER

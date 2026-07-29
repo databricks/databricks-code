@@ -33,29 +33,41 @@ class TestMcpChangeSummary:
         assert mcp._mcp_change_summary([], [], ["claude"]) == "Saved"
 
 
-class TestBuildMcpHttpEntry:
-    def test_uses_http_url(self):
-        entry = mcp.build_mcp_http_entry(f"{WS}/api/2.0/mcp/external/github")
-        assert entry["type"] == "http"
-        assert entry["url"] == f"{WS}/api/2.0/mcp/external/github"
+# The proxy argv every client registers as a stdio command. The leading element
+# is the resolved `ucode` binary path, so tests assert the tail (the stable part).
+GH_URL = f"{WS}/api/2.0/mcp/external/github"
+PROXY_TAIL = ["mcp-proxy", "--url", GH_URL, "--host", WS, "--profile", "p"]
 
-    def test_uses_oauth_token_header_reference(self):
-        entry = mcp.build_mcp_http_entry(f"{WS}/api/2.0/mcp/external/github")
-        assert entry["headers"]["Authorization"] == "Bearer ${OAUTH_TOKEN}"
-        assert "oauth" not in entry
-        assert "headersHelper" not in entry
 
-    def test_omits_always_load_by_default(self):
-        entry = mcp.build_mcp_http_entry(f"{WS}/ai-gateway/skills/")
-        assert "alwaysLoad" not in entry
+def _unwrap(text: str) -> str:
+    """Collapse rich's line-wrapping so assertions match regardless of terminal width."""
+    return " ".join(text.split())
 
-    def test_sets_always_load_when_requested(self):
-        entry = mcp.build_mcp_http_entry(f"{WS}/ai-gateway/skills/", always_load=True)
-        assert entry["alwaysLoad"] is True
+
+def _proxy_argv() -> list[str]:
+    from ucode.databricks import build_mcp_proxy_argv
+
+    return build_mcp_proxy_argv(GH_URL, WS, "p")
+
+
+class TestBuildMcpProxyArgv:
+    def test_argv_is_ucode_mcp_proxy_command(self):
+        argv = _proxy_argv()
+        # First element is the resolved ucode binary; the rest is stable.
+        assert argv[1:] == PROXY_TAIL
+        assert argv[0].endswith("ucode") or argv[0] == "ucode"
+
+    def test_use_pat_appends_flag_and_profile_optional(self):
+        from ucode.databricks import build_mcp_proxy_argv
+
+        with_pat = build_mcp_proxy_argv(GH_URL, WS, "p", use_pat=True)
+        assert with_pat[-1] == "--use-pat"
+        no_profile = build_mcp_proxy_argv(GH_URL, WS, None)
+        assert "--profile" not in no_profile
 
 
 class TestAddClaudeMcpServer:
-    def test_adds_user_scoped_json(self, monkeypatch):
+    def test_registers_stdio_proxy_command(self, monkeypatch):
         calls: list[dict] = []
 
         def fake_run(args, **kwargs):
@@ -64,20 +76,63 @@ class TestAddClaudeMcpServer:
 
         monkeypatch.setattr(mcp.subprocess, "run", fake_run)
 
-        entry = mcp.build_mcp_http_entry(f"{WS}/api/2.0/mcp/external/github")
-        mcp.add_claude_mcp_server("github", entry)
+        mcp.add_claude_mcp_server("github", _proxy_argv())
 
-        assert calls
         args = calls[0]["args"]
-        assert args[:4] == ["claude", "mcp", "add-json", "github"]
+        assert args[:4] == ["claude", "mcp", "add", "github"]
+        assert args[4:6] == ["-s", "user"]
+        # `--` fences the proxy argv; everything after it is the stdio command.
+        assert args[6] == "--"
+        assert args[7:] == _proxy_argv()
+
+    def test_always_load_routes_through_add_json_stdio_entry(self, monkeypatch):
+        # The skills registry needs `alwaysLoad: true`, which plain `mcp add`
+        # can't set — so the proxy argv is wrapped in a stdio entry dict and
+        # registered via add-json instead.
+        calls: list[dict] = []
+
+        def fake_run(args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(mcp.subprocess, "run", fake_run)
+
+        mcp.add_claude_mcp_server("skills", _proxy_argv(), always_load=True)
+
+        args = calls[0]["args"]
+        assert args[:4] == ["claude", "mcp", "add-json", "skills"]
+        entry = json.loads(args[4])
+        assert entry == {
+            "type": "stdio",
+            "command": _proxy_argv()[0],
+            "args": _proxy_argv()[1:],
+            "alwaysLoad": True,
+        }
+        assert args[5:] == ["-s", "user"]
+
+    def test_dict_entry_routes_through_add_json(self, monkeypatch):
+        # The web_search server (agents/claude.py) registers a full stdio entry
+        # dict with its own env, which only `add-json` can express — a dict must
+        # route there rather than through the proxy `mcp add -- <argv>` path.
+        calls: list[dict] = []
+
+        def fake_run(args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(mcp.subprocess, "run", fake_run)
+
+        entry = {"type": "stdio", "command": "ucode", "args": ["mcp", "web-search"]}
+        mcp.add_claude_mcp_server("web_search", entry)
+
+        args = calls[0]["args"]
+        assert args[:4] == ["claude", "mcp", "add-json", "web_search"]
         assert json.loads(args[4]) == entry
         assert args[5:] == ["-s", "user"]
-        assert "--client-secret" not in args
-        assert "env" not in calls[0]["kwargs"]
 
 
 class TestAddCodexMcpServer:
-    def test_adds_http_server_with_bearer_token_env(self, monkeypatch):
+    def test_registers_stdio_proxy_command(self, monkeypatch):
         calls: list[dict] = []
 
         def fake_run(args, **kwargs):
@@ -86,32 +141,16 @@ class TestAddCodexMcpServer:
 
         monkeypatch.setattr(mcp.subprocess, "run", fake_run)
 
-        mcp.add_codex_mcp_server("github", f"{WS}/api/2.0/mcp/external/github")
+        mcp.add_codex_mcp_server("github", _proxy_argv())
 
-        assert calls == [
-            {
-                "args": [
-                    "codex",
-                    "mcp",
-                    "add",
-                    "github",
-                    "--url",
-                    f"{WS}/api/2.0/mcp/external/github",
-                    "--bearer-token-env-var",
-                    "OAUTH_TOKEN",
-                ],
-                "kwargs": {
-                    "check": True,
-                    "capture_output": True,
-                    "text": True,
-                    "timeout": 30,
-                },
-            }
-        ]
+        args = calls[0]["args"]
+        assert args[:4] == ["codex", "mcp", "add", "github"]
+        assert args[4] == "--"
+        assert args[5:] == _proxy_argv()
 
 
 class TestAddGeminiMcpServer:
-    def test_adds_user_scoped_http_server_with_auth_header(self, monkeypatch):
+    def test_registers_stdio_proxy_command(self, monkeypatch):
         calls: list[dict] = []
 
         def fake_run(args, **kwargs):
@@ -120,31 +159,17 @@ class TestAddGeminiMcpServer:
 
         monkeypatch.setattr(mcp.subprocess, "run", fake_run)
 
-        mcp.add_gemini_mcp_server("github", f"{WS}/api/2.0/mcp/external/github")
+        mcp.add_gemini_mcp_server("github", _proxy_argv())
 
-        assert len(calls) == 1
         call = calls[0]
-        assert call["args"] == [
-            "gemini",
-            "mcp",
-            "add",
-            "github",
-            f"{WS}/api/2.0/mcp/external/github",
-            "--type",
-            "http",
-            "--scope",
-            "user",
-            "--header",
-            "Authorization: Bearer ${OAUTH_TOKEN}",
-        ]
-        kwargs = call["kwargs"]
-        assert kwargs["check"] is True
-        assert kwargs["capture_output"] is True
-        assert kwargs["text"] is True
-        assert kwargs["timeout"] == 30
-        # GEMINI_CLI_HOME must point at the launcher's home so `gemini mcp
-        # add` writes the same settings.json the ucode session reads from.
-        assert kwargs["env"]["GEMINI_CLI_HOME"] == str(mcp.gemini.GEMINI_HOME_DIR)
+        args = call["args"]
+        assert args[:4] == ["gemini", "mcp", "add", "github"]
+        # command + args, then the transport/scope flags.
+        assert args[4 : 4 + len(_proxy_argv())] == _proxy_argv()
+        assert args[-4:] == ["--type", "stdio", "--scope", "user"]
+        # GEMINI_CLI_HOME must point at the launcher's home so `gemini mcp add`
+        # writes the same settings.json the ucode session reads from.
+        assert call["kwargs"]["env"]["GEMINI_CLI_HOME"] == str(mcp.gemini.GEMINI_HOME_DIR)
 
 
 class TestRemoveClaudeMcpServer:
@@ -230,25 +255,65 @@ class TestExternalMcpConnectionNames:
         ) == ["github-mcp"]
 
 
+class TestCursorMcpClient:
+    def test_cursor_registered_as_mcp_only_client(self):
+        assert "cursor" in mcp.MCP_CLIENTS
+        assert mcp.MCP_CLIENTS["cursor"]["binary"] == "cursor-agent"
+        assert "cursor" in mcp.MCP_ONLY_CLIENTS
+
+    def test_configure_dispatches_proxy_argv_to_cursor_writer(self, monkeypatch):
+        calls: list[tuple[str, list[str]]] = []
+        monkeypatch.setattr(
+            mcp.cursor,
+            "write_mcp_server_config",
+            lambda name, argv: calls.append((name, argv)) or False,
+        )
+
+        removed_scopes = mcp.configure_client_mcp_server("cursor", "github", GH_URL, WS, "p")
+
+        assert removed_scopes == []
+        assert calls == [("github", _proxy_argv())]
+
+    def test_configure_reports_user_scope_on_replace(self, monkeypatch):
+        monkeypatch.setattr(mcp.cursor, "write_mcp_server_config", lambda name, argv: True)
+        assert mcp.configure_client_mcp_server("cursor", "github", GH_URL, WS, "p") == [
+            mcp.MCP_USER_SCOPE
+        ]
+
+    def test_remove_dispatches_to_cursor_remover(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(
+            mcp.cursor, "remove_mcp_server_config", lambda name: calls.append(name) or True
+        )
+        assert mcp.remove_client_mcp_server("cursor", "github-mcp") == [mcp.MCP_USER_SCOPE]
+        assert calls == ["github-mcp"]
+
+    def test_eligible_when_installed_even_without_configured_tools(self):
+        # Cursor is MCP-only: it never appears in available_tools, so eligibility
+        # rests on the binary being installed (MCP_ONLY_CLIENTS).
+        clients = mcp.configured_mcp_clients({"available_tools": ["claude"]}, ["claude", "cursor"])
+        assert "cursor" in clients
+
+    def test_skipped_when_binary_not_installed(self):
+        clients = mcp.configured_mcp_clients({"available_tools": ["claude"]}, ["claude"])
+        assert "cursor" not in clients
+
+
 class TestConfigureClientMcpServer:
-    def test_configures_copilot_mcp_server(self, monkeypatch):
-        calls: list[tuple[str, str]] = []
+    def test_configures_copilot_with_proxy_argv(self, monkeypatch):
+        calls: list[tuple[str, list[str]]] = []
 
         monkeypatch.setattr(
             mcp.copilot,
             "write_mcp_server_config",
-            lambda name, url: calls.append((name, url)) or False,
+            lambda name, argv: calls.append((name, argv)) or False,
         )
 
-        removed_scopes = mcp.configure_client_mcp_server(
-            "copilot",
-            "github",
-            f"{WS}/api/2.0/mcp/external/github",
-            mcp.build_mcp_http_entry(f"{WS}/api/2.0/mcp/external/github"),
-        )
+        removed_scopes = mcp.configure_client_mcp_server("copilot", "github", GH_URL, WS, "p")
 
         assert removed_scopes == []
-        assert calls == [("github", f"{WS}/api/2.0/mcp/external/github")]
+        # Copilot receives the proxy argv, not a URL/bearer entry.
+        assert calls == [("github", _proxy_argv())]
 
 
 class TestMcpPicker:
@@ -538,7 +603,7 @@ class TestApplyMcpServerChanges:
         recorded: list[tuple[str, str]] = []
         lock = threading.Lock()
 
-        def fake_configure(client, name, url, entry):
+        def fake_configure(client, name, url, *a, **kw):
             with lock:
                 recorded.append((client, name))
             return []
@@ -551,7 +616,7 @@ class TestApplyMcpServerChanges:
             self._server("c", ["claude", "codex"]),
         ]
 
-        changed = mcp.apply_mcp_server_changes([], working, ["claude", "codex"])
+        changed = mcp.apply_mcp_server_changes([], working, ["claude", "codex"], WS)
 
         assert changed is True
         # 3 servers x 2 clients = 6 operations.
@@ -571,7 +636,7 @@ class TestApplyMcpServerChanges:
 
         original = [self._server("gone", ["claude"])]
 
-        changed = mcp.apply_mcp_server_changes(original, [], ["claude"])
+        changed = mcp.apply_mcp_server_changes(original, [], ["claude"], WS)
 
         assert changed is True
         assert removed == [("claude", "gone")]
@@ -585,7 +650,7 @@ class TestApplyMcpServerChanges:
         )
         servers = [self._server("a", ["claude"])]
 
-        assert mcp.apply_mcp_server_changes(servers, servers, ["claude"]) is False
+        assert mcp.apply_mcp_server_changes(servers, servers, ["claude"], WS) is False
 
 
 class TestConfigureMcpWizardNavigation:
@@ -706,8 +771,8 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(mcp, "discover_app_mcp_servers", lambda workspace, profile=None: [])
         _patch_mcp_choices(monkeypatch, f"{mcp.MCP_ADD_PREFIX}external:github-mcp")
 
-        def fake_configure_client_mcp_server(client, name, url, entry):
-            configured.append((client, name, url, entry))
+        def fake_configure_client_mcp_server(client, name, url, *a, **kw):
+            configured.append((client, name, url))
             return []
 
         monkeypatch.setattr(mcp, "configure_client_mcp_server", fake_configure_client_mcp_server)
@@ -715,28 +780,18 @@ class TestConfigureMcpCommand:
 
         assert mcp.configure_mcp_command() == 0
 
-        expected_entry = {
-            "type": "http",
-            "url": f"{WS}/api/2.0/mcp/external/github-mcp",
-            "headers": {"Authorization": "Bearer ${OAUTH_TOKEN}"},
-        }
         assert configured == [
-            (
-                "claude",
-                "github-mcp",
-                f"{WS}/api/2.0/mcp/external/github-mcp",
-                expected_entry,
-            ),
-            ("codex", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp", expected_entry),
-            ("gemini", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp", expected_entry),
-            ("opencode", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp", expected_entry),
-            ("copilot", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp", expected_entry),
+            ("claude", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
+            ("codex", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
+            ("gemini", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
+            ("opencode", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
+            ("copilot", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
         ]
         assert saved_states[-1]["mcp_servers"] == [
             {
                 "name": "github-mcp",
                 "url": f"{WS}/api/2.0/mcp/external/github-mcp",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude", "codex", "gemini", "opencode", "copilot"],
             }
         ]
@@ -770,7 +825,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -781,18 +836,13 @@ class TestConfigureMcpCommand:
                 "claude",
                 "databricks-genie-space-123",
                 f"{WS}/api/2.0/mcp/genie/space-123",
-                {
-                    "type": "http",
-                    "url": f"{WS}/api/2.0/mcp/genie/space-123",
-                    "headers": {"Authorization": "Bearer ${OAUTH_TOKEN}"},
-                },
             )
         ]
         assert saved_states[-1]["mcp_servers"] == [
             {
                 "name": "databricks-genie-space-123",
                 "url": f"{WS}/api/2.0/mcp/genie/space-123",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude"],
             }
         ]
@@ -825,7 +875,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -836,18 +886,13 @@ class TestConfigureMcpCommand:
                 "claude",
                 "databricks-vector-search-main-search",
                 f"{WS}/api/2.0/mcp/vector-search/main/search",
-                {
-                    "type": "http",
-                    "url": f"{WS}/api/2.0/mcp/vector-search/main/search",
-                    "headers": {"Authorization": "Bearer ${OAUTH_TOKEN}"},
-                },
             )
         ]
         assert saved_states[-1]["mcp_servers"] == [
             {
                 "name": "databricks-vector-search-main-search",
                 "url": f"{WS}/api/2.0/mcp/vector-search/main/search",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude"],
             }
         ]
@@ -880,7 +925,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -891,18 +936,13 @@ class TestConfigureMcpCommand:
                 "claude",
                 "databricks-functions-analytics-tools",
                 f"{WS}/api/2.0/mcp/functions/analytics/tools",
-                {
-                    "type": "http",
-                    "url": f"{WS}/api/2.0/mcp/functions/analytics/tools",
-                    "headers": {"Authorization": "Bearer ${OAUTH_TOKEN}"},
-                },
             )
         ]
         assert saved_states[-1]["mcp_servers"] == [
             {
                 "name": "databricks-functions-analytics-tools",
                 "url": f"{WS}/api/2.0/mcp/functions/analytics/tools",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude"],
             }
         ]
@@ -911,7 +951,7 @@ class TestConfigureMcpCommand:
         """The workspace-wide walk runs by default and folds its services into
         the picker via the same mcp-service path as the curated system.ai list."""
         saved_states: list[dict] = []
-        configured: list[tuple[str, str, str, dict]] = []
+        configured: list[tuple[str, str, str]] = []
         walk_calls: list[str] = []
 
         monkeypatch.setattr(mcp, "load_state", lambda: {**CLAUDE_STATE})
@@ -936,7 +976,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -948,18 +988,13 @@ class TestConfigureMcpCommand:
                 "claude",
                 "mycat-myschema-weather",
                 f"{WS}/ai-gateway/mcp-services/mycat.myschema.weather",
-                {
-                    "type": "http",
-                    "url": f"{WS}/ai-gateway/mcp-services/mycat.myschema.weather",
-                    "headers": {"Authorization": "Bearer ${OAUTH_TOKEN}"},
-                },
             )
         ]
         assert saved_states[-1]["mcp_servers"] == [
             {
                 "name": "mycat-myschema-weather",
                 "url": f"{WS}/ai-gateway/mcp-services/mycat.myschema.weather",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude"],
             }
         ]
@@ -1024,7 +1059,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -1035,18 +1070,13 @@ class TestConfigureMcpCommand:
                 "claude",
                 "databricks-app-mcp-my-app",
                 "https://mcp-my-app.example.databricksapps.com/mcp",
-                {
-                    "type": "http",
-                    "url": "https://mcp-my-app.example.databricksapps.com/mcp",
-                    "headers": {"Authorization": "Bearer ${OAUTH_TOKEN}"},
-                },
             )
         ]
         assert saved_states[-1]["mcp_servers"] == [
             {
                 "name": "databricks-app-mcp-my-app",
                 "url": "https://mcp-my-app.example.databricksapps.com/mcp",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude"],
             }
         ]
@@ -1118,7 +1148,7 @@ class TestConfigureMcpCommand:
                 picker_servers.append(servers) or [f"{mcp.MCP_ADD_PREFIX}{mcp.SQL_MCP_VALUE}"]
             ),
         )
-        monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a: [])
+        monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a, **kw: [])
         monkeypatch.setattr(
             mcp,
             "remove_client_mcp_server",
@@ -1139,13 +1169,13 @@ class TestConfigureMcpCommand:
         stale_entry = {
             "name": "databricks-genie-foreign",
             "url": f"{other_ws}/api/2.0/mcp/genie/foreign",
-            "auth": "env:OAUTH_TOKEN",
+            "auth": "proxy",
             "clients": ["claude", "codex"],
         }
         kept_entry = {
             "name": "databricks-sql",
             "url": f"{WS}/api/2.0/mcp/sql",
-            "auth": "env:OAUTH_TOKEN",
+            "auth": "proxy",
             "clients": ["claude"],
         }
 
@@ -1191,13 +1221,13 @@ class TestConfigureMcpCommand:
         current_entry = {
             "name": "databricks-sql",
             "url": f"{WS}/api/2.0/mcp/sql",
-            "auth": "env:OAUTH_TOKEN",
+            "auth": "proxy",
             "clients": ["claude"],
         }
         orphan_entry = {
             "name": "orphan-mcp",
             "url": f"{other_ws}/api/2.0/mcp/external/orphan-mcp",
-            "auth": "env:OAUTH_TOKEN",
+            "auth": "proxy",
             "clients": ["claude", "codex"],
         }
 
@@ -1253,7 +1283,7 @@ class TestConfigureMcpCommand:
         orphan_entry = {
             "name": "orphan-mcp",
             "url": f"{other_ws}/api/2.0/mcp/external/orphan-mcp",
-            "auth": "env:OAUTH_TOKEN",
+            "auth": "proxy",
             "clients": ["claude"],
         }
 
@@ -1314,7 +1344,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -1342,7 +1372,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -1386,7 +1416,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -1457,7 +1487,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -1470,7 +1500,7 @@ class TestConfigureMcpCommand:
             {
                 "name": "databricks-sql",
                 "url": f"{WS}/api/2.0/mcp/sql",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude", "codex"],
             }
         ]
@@ -1491,7 +1521,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -1502,18 +1532,13 @@ class TestConfigureMcpCommand:
                 "claude",
                 "databricks-sql",
                 f"{WS}/api/2.0/mcp/sql",
-                {
-                    "type": "http",
-                    "url": f"{WS}/api/2.0/mcp/sql",
-                    "headers": {"Authorization": "Bearer ${OAUTH_TOKEN}"},
-                },
             )
         ]
         assert saved_states[-1]["mcp_servers"] == [
             {
                 "name": "databricks-sql",
                 "url": f"{WS}/api/2.0/mcp/sql",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude"],
             }
         ]
@@ -1526,7 +1551,7 @@ class TestConfigureMcpCommand:
                 {
                     "name": "github-mcp",
                     "url": f"{WS}/api/2.0/mcp/external/github-mcp",
-                    "auth": "env:OAUTH_TOKEN",
+                    "auth": "proxy",
                     "clients": ["claude"],
                 }
             ],
@@ -1630,7 +1655,7 @@ class TestConfigureMcpFromLocation:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -1644,13 +1669,13 @@ class TestConfigureMcpFromLocation:
             {
                 "name": "system-ai-github",
                 "url": f"{WS}/ai-gateway/mcp-services/system.ai.github",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude"],
             },
             {
                 "name": "system-ai-slack",
                 "url": f"{WS}/ai-gateway/mcp-services/system.ai.slack",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude"],
             },
         ]
@@ -1662,7 +1687,7 @@ class TestConfigureMcpFromLocation:
         outside_entry = {
             "name": "databricks-sql",
             "url": f"{WS}/api/2.0/mcp/sql",
-            "auth": "env:OAUTH_TOKEN",
+            "auth": "proxy",
             "clients": ["claude"],
         }
         _stub_location_base(
@@ -1677,7 +1702,7 @@ class TestConfigureMcpFromLocation:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(
             mcp,
@@ -1694,7 +1719,7 @@ class TestConfigureMcpFromLocation:
             {
                 "name": "system-ai-github",
                 "url": f"{WS}/ai-gateway/mcp-services/system.ai.github",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude"],
             },
         ]
@@ -1721,7 +1746,7 @@ class TestConfigureMcpFromLocation:
             "list_mcp_services",
             lambda workspace, token, parent: (["system.ai.github"], None),
         )
-        monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a: [])
+        monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a, **kw: [])
         monkeypatch.setattr(
             mcp,
             "remove_client_mcp_server",
@@ -1742,7 +1767,7 @@ class TestConfigureMcpFromLocation:
         existing = {
             "name": "system-ai-github",
             "url": f"{WS}/ai-gateway/mcp-services/system.ai.github",
-            "auth": "env:OAUTH_TOKEN",
+            "auth": "proxy",
             "clients": ["claude"],
         }
         _stub_location_base(
@@ -1762,7 +1787,7 @@ class TestConfigureMcpFromLocation:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -1773,7 +1798,7 @@ class TestConfigureMcpFromLocation:
             {
                 "name": "system-ai-github",
                 "url": f"{WS}/ai-gateway/mcp-services/system.ai.github",
-                "auth": "env:OAUTH_TOKEN",
+                "auth": "proxy",
                 "clients": ["claude", "codex"],
             }
         ]
@@ -1797,7 +1822,7 @@ class TestConfigureMcpServicesSubset:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -1826,7 +1851,7 @@ class TestConfigureMcpServicesSubset:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: None)
 
@@ -1846,7 +1871,7 @@ class TestConfigureMcpServicesSubset:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: None)
         monkeypatch.setattr(mcp, "print_warning", lambda msg: warnings.append(msg))
@@ -1866,7 +1891,7 @@ class TestConfigureMcpServicesSubset:
         existing = {
             "name": "system-ai-github",
             "url": f"{WS}/ai-gateway/mcp-services/system.ai.github",
-            "auth": "env:OAUTH_TOKEN",
+            "auth": "proxy",
             "clients": ["claude"],
         }
         configured: list[tuple[str, str, str, dict]] = []
@@ -1881,7 +1906,7 @@ class TestConfigureMcpServicesSubset:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(
             mcp,
@@ -1902,13 +1927,13 @@ class TestConfigureMcpServicesSubset:
         github = {
             "name": "system-ai-github",
             "url": f"{WS}/ai-gateway/mcp-services/system.ai.github",
-            "auth": "env:OAUTH_TOKEN",
+            "auth": "proxy",
             "clients": ["claude"],
         }
         slack = {
             "name": "system-ai-slack",
             "url": f"{WS}/ai-gateway/mcp-services/system.ai.slack",
-            "auth": "env:OAUTH_TOKEN",
+            "auth": "proxy",
             "clients": ["claude"],
         }
         configured: list[tuple[str, str, str, dict]] = []
@@ -1926,7 +1951,7 @@ class TestConfigureMcpServicesSubset:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(
             mcp,
@@ -1963,7 +1988,7 @@ class TestConfigureMcpServicesSubset:
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: None)
 
@@ -2005,7 +2030,7 @@ class TestResolveSkillsMcpServers:
         assert entry["kind"] == mcp.SKILLS_MCP_KIND
         assert entry["skill_locations"] == ["main.default"]
         assert entry["url"] == f"{WS}/ai-gateway/skills/?schema=main.default"
-        assert entry["auth"] == "env:OAUTH_TOKEN"
+        assert entry["auth"] == "proxy"
         assert entry["clients"] == ["claude"]
 
     def test_keeps_other_entries_and_rebuilds_to_one_skills_entry(self):
@@ -2069,12 +2094,22 @@ def _skills_state(mcp_servers=None):
 class TestConfigureSkillsMcpCommand:
     def test_set_on_empty_registers_connection(self, monkeypatch):
         saved_states: list[dict] = []
-        configured: list[tuple[str, str, str, dict]] = []
+        configured: list[dict] = []
         _stub_location_base(monkeypatch, _skills_state())
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
-            lambda client, name, url, entry: configured.append((client, name, url, entry)) or [],
+            lambda client, name, url, *a, **kw: (
+                configured.append(
+                    {
+                        "client": client,
+                        "name": name,
+                        "url": url,
+                        "always_load": kw.get("always_load"),
+                    }
+                )
+                or []
+            ),
         )
         monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
@@ -2084,8 +2119,8 @@ class TestConfigureSkillsMcpCommand:
         assert len(skills) == 1
         assert skills[0]["skill_locations"] == ["a.b"]
         assert skills[0]["url"] == f"{WS}/ai-gateway/skills/?schema=a.b"
-        # alwaysLoad rides the per-entry apply (Claude-only).
-        assert configured[0][3]["alwaysLoad"] is True
+        # alwaysLoad is passed through the proxy registration (Claude-only hint).
+        assert configured[0]["always_load"] is True
 
     def test_location_replaces_prior_set(self, monkeypatch):
         saved_states: list[dict] = []
@@ -2151,7 +2186,7 @@ class TestRegisterSchemalessSkillsConnection:
         saved_states = self._stub(monkeypatch)
         state = _skills_state([])
 
-        mcp.register_schemaless_skills_connection(state, WS, ["claude"])
+        mcp.register_schemaless_skills_connection(state, WS, None, ["claude"])
 
         skills = _find_skills(saved_states[-1]["mcp_servers"])
         assert len(skills) == 1
@@ -2163,9 +2198,53 @@ class TestRegisterSchemalessSkillsConnection:
         prior = mcp._resolve_skills_mcp_servers(WS, ["claude"], ["X.x", "Y.y"], [])
         state = _skills_state(prior)
 
-        mcp.register_schemaless_skills_connection(state, WS, ["claude"])
+        mcp.register_schemaless_skills_connection(state, WS, None, ["claude"])
 
         assert _find_skills(state["mcp_servers"])[0]["skill_locations"] == ["X.x", "Y.y"]
+
+
+class TestSkillsToolsDescription:
+    def test_bare_route_names_utility_tools_only(self):
+        assert mcp._skills_tools_description([]) == "UC skill utility tools"
+
+    def test_scoped_names_utility_plus_skills_tools(self):
+        assert mcp._skills_tools_description(["main.default"]) == (
+            "UC skill utility tools + skills tools in schema main.default"
+        )
+
+    def test_multiple_schemas_joined_with_and(self):
+        assert mcp._skills_tools_description(["a.b", "c.d", "e.f"]) == (
+            "UC skill utility tools + skills tools in schema a.b, c.d and e.f"
+        )
+
+
+class TestPrintSkillsSummary:
+    def _entry(self, locations):
+        return mcp._resolve_skills_mcp_servers(WS, ["claude", "codex"], locations, [])[0]
+
+    def test_reports_scoped_connection(self, capsys):
+        mcp._print_skills_summary(self._entry(["main.default"]))
+        assert _unwrap(capsys.readouterr().out) == (
+            "✔ Skills MCP registered "
+            "Server: databricks-skill-registry "
+            f"URL: {WS}/ai-gateway/skills/?schema=main.default "
+            "Configured: Claude Code, Codex "
+            "Tools: UC skill utility tools + skills tools in schema main.default "
+            "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+            "restart the agent for the skills to take effect."
+        )
+
+    def test_reports_schemaless_connection(self, capsys):
+        mcp._print_skills_summary(self._entry([]))
+        assert _unwrap(capsys.readouterr().out) == (
+            "✔ Skills MCP registered "
+            "Server: databricks-skill-registry "
+            f"URL: {WS}/ai-gateway/skills/ "
+            "Configured: Claude Code, Codex "
+            "Tools: UC skill utility tools "
+            "• Run `ucode <agent>` to use the skills MCP. For existing sessions, "
+            "restart the agent for the skills to take effect."
+        )
 
 
 class TestRevertMcpConfigs:

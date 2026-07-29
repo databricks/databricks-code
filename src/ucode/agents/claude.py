@@ -7,7 +7,11 @@ import json
 import os
 import re
 import shutil
+import signal
+import socket
 import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import cast
 
@@ -29,7 +33,7 @@ from ucode.launcher import exec_or_spawn
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
-from ucode.ui import print_note, print_success, print_warning
+from ucode.ui import print_err, print_note, print_success, print_warning
 
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
@@ -110,6 +114,45 @@ MINIMUM_MLFLOW_VERSION = (3, 11)
 # must be replaced, not just left alone.
 MAXIMUM_MLFLOW_VERSION = (3, 12)
 
+# Relayed drops the user scope to deliberately omit the stale apiKeyHelper. Only applied to relayed
+# launches — normal launches keep loading user settings (hooks/permissions) as before.
+_RELAYED_SETTING_SOURCES = "project,local"
+
+
+def _managed_settings_path() -> Path | None:
+    """OS-specific location of Claude Code's enterprise managed-settings.json.
+    Returns None on unsupported platforms."""
+    if sys.platform.startswith("linux"):
+        return Path("/etc/claude-code/managed-settings.json")
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support/ClaudeCode/managed-settings.json")
+    return None
+
+
+def _managed_api_key_helper_path() -> Path | None:
+    """Path to the enterprise managed-settings.json when it sets an apiKeyHelper,
+    else None. The managed scope always wins over --settings and subscription
+    OAuth, so a managed apiKeyHelper silently shadows relayed auth."""
+    path = _managed_settings_path()
+    if path is None or not path.is_file():
+        return None
+    settings = read_json_safe(path)
+    if isinstance(settings, dict) and settings.get("apiKeyHelper"):
+        return path
+    return None
+
+
+def relayed_proxy_base_url(state: dict) -> str:
+    """Loopback base URL for the relayed refresh proxy, allocating a free port
+    on first call and caching it in state so config and launch agree."""
+    port = state.get("relayed_proxy_port")
+    if not isinstance(port, int):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        state["relayed_proxy_port"] = port
+    return f"http://127.0.0.1:{port}"
+
 
 def _web_search_mcp_entry(workspace: str, search_model: str, profile: str | None = None) -> dict:
     """Stdio MCP server entry pointing at `ucode mcp web-search`. Resolves
@@ -140,6 +183,8 @@ def render_overlay(
     provider: str | None = None,
     provider_models: dict[str, str] | None = None,
     fable_enabled: bool = False,
+    relayed: bool = False,
+    relayed_base_url: str | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Claude settings.json.
 
@@ -153,8 +198,20 @@ def render_overlay(
     understands Claude Code's own canonical model names, so no model id is
     pinned. A Bedrock-backed provider exposes different model ids (e.g.
     `us.anthropic.claude-sonnet-4-6`), passed in `provider_models` by family —
-    those get pinned via the `ANTHROPIC_DEFAULT_*_MODEL` env vars."""
-    base_url = build_tool_base_url("claude", workspace)
+    those get pinned via the `ANTHROPIC_DEFAULT_*_MODEL` env vars.
+
+    When `relayed` is set (a credential-less Anthropic subscription-relay MPS,
+    Claude Max/Team/Enterprise), Claude Code's own keychain OAuth must remain the
+    `Authorization` credential, so no `apiKeyHelper` is written (it would outrank
+    the subscription OAuth). The Databricks credential rides in the
+    `X-Databricks-AI-Gateway-Token` swap header, injected per request by a local
+    refresh proxy at `relayed_base_url` — not written here."""
+    if relayed:
+        if not relayed_base_url:
+            raise RuntimeError("Relayed launch requires a proxy base URL.")
+        base_url = relayed_base_url
+    else:
+        base_url = build_tool_base_url("claude", workspace)
     # ANTHROPIC_CUSTOM_HEADERS is parsed as `key: value` pairs separated by
     # newlines (Anthropic SDK convention). Setting User-Agent here overrides
     # the SDK's default UA on outbound requests so the gateway can attribute
@@ -165,6 +222,8 @@ def render_overlay(
     ]
     if provider:
         header_lines.append(f"Databricks-Model-Provider-Service: {provider}")
+    # Relayed: the X-Databricks-AI-Gateway-Token swap header is added per request
+    # by the refresh proxy, not here — a static value would go stale mid-session.
     custom_headers = "\n".join(header_lines)
     env: dict[str, str] = {
         "ANTHROPIC_BASE_URL": base_url,
@@ -217,11 +276,14 @@ def render_overlay(
             env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = _maybe_add_1m_suffix(claude_models["sonnet"])
         if claude_models.get("haiku"):
             env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = claude_models["haiku"]
-    overlay: dict = {
-        "apiKeyHelper": build_auth_shell_command(workspace, profile, use_pat=use_pat),
-        "env": env,
-    }
-    keys: list[list[str]] = [["apiKeyHelper"]] + [["env", k] for k in env]
+    # Relayed omits apiKeyHelper so Claude Code's subscription OAuth stays the
+    # Authorization credential; every other path uses it as the gateway auth.
+    overlay: dict = {"env": env}
+    if relayed:
+        keys = [["env", k] for k in env]
+    else:
+        overlay["apiKeyHelper"] = build_auth_shell_command(workspace, profile, use_pat=use_pat)
+        keys = [["apiKeyHelper"]] + [["env", k] for k in env]
 
     # Disable Claude Code's built-in WebSearch: it declares Anthropic's hosted
     # `web_search_20250305` server tool, which the Databricks gateway rejects
@@ -303,9 +365,13 @@ def write_tool_config(
     model: str | None,
     provider: str | None = None,
     provider_models: dict[str, str] | None = None,
+    relayed: bool = False,
 ) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
     web_search_model = _resolve_web_search_model(state)
+    # Relayed inference points at a local refresh proxy; its loopback base URL is
+    # recorded in state so launch starts the proxy on the matching port.
+    relayed_base_url = relayed_proxy_base_url(state) if relayed else None
     overlay, managed_keys = render_overlay(
         state["workspace"],
         model,
@@ -316,6 +382,8 @@ def write_tool_config(
         provider=provider,
         provider_models=provider_models,
         fable_enabled=bool(state.get("fable_enabled")),
+        relayed=relayed,
+        relayed_base_url=relayed_base_url,
     )
     tracing_env_vars = tracing_env(state, "claude")
     stop_hook_command = claude_tracing_stop_hook_command() if tracing_env_vars else None
@@ -334,6 +402,10 @@ def write_tool_config(
 
     existing = read_json_safe(CLAUDE_SETTINGS_PATH)
     merged = deep_merge_dict(existing, overlay)
+    # Drop any apiKeyHelper a prior non-relayed launch left in the file; relayed
+    # must not carry one (it would outrank the subscription OAuth).
+    if relayed:
+        merged.pop("apiKeyHelper", None)
     if tracing_env_vars and stop_hook_command:
         _upsert_tracing_stop_hook(merged, stop_hook_command)
     if not tracing_env_vars:
@@ -361,6 +433,13 @@ def write_tool_config(
     if web_search_model:
         _register_web_search_mcp(state["workspace"], web_search_model, state.get("profile"))
 
+    # Persist relayed mode + proxy port so launch() wires the refresh proxy and
+    # subscription login; cleared on a non-relayed launch.
+    if relayed:
+        state["claude_relayed"] = True
+    else:
+        state.pop("claude_relayed", None)
+        state.pop("relayed_proxy_port", None)
     state = mark_tool_managed(state, "claude", managed_keys)
     save_state(state)
     return state
@@ -628,7 +707,7 @@ def _merge_claude_settings(base: dict, overlay: dict) -> dict:
     return merged
 
 
-def _build_claude_argv(binary: str, tool_args: list[str]) -> list[str]:
+def _build_claude_argv(binary: str, tool_args: list[str], relayed: bool = False) -> list[str]:
     """Build the ``claude`` argv, composing any caller ``--settings`` with
     ucode's managed settings.
 
@@ -644,24 +723,129 @@ def _build_claude_argv(binary: str, tool_args: list[str]) -> list[str]:
     accumulate one another's hooks. A caller ``--settings`` value ucode cannot
     resolve raises (see :func:`_load_caller_settings`) rather than being passed
     through as a second, colliding flag.
+
+    ``relayed`` adds ``--setting-sources`` to exclude the user scope (see
+    :data:`_RELAYED_SETTING_SOURCES`), so a stale user-scope apiKeyHelper cannot
+    filter through and shadow the subscription OAuth.
     """
+    source_args = ["--setting-sources", _RELAYED_SETTING_SOURCES] if relayed else []
     caller_values, remaining = _extract_caller_settings(tool_args)
     if not caller_values:
         # No caller --settings: hand Claude ucode's settings file directly (the
         # common path; behavior unchanged).
-        return [binary, "--settings", str(CLAUDE_SETTINGS_PATH), *tool_args]
+        return [binary, *source_args, "--settings", str(CLAUDE_SETTINGS_PATH), *tool_args]
     caller_settings: dict = {}
     for value in caller_values:
         caller_settings = _merge_claude_settings(caller_settings, _load_caller_settings(value))
     # ucode wins over the caller for conflicting keys (protects gateway auth);
     # hooks from both sides survive.
     merged = _merge_claude_settings(caller_settings, read_json_safe(CLAUDE_SETTINGS_PATH))
-    return [binary, "--settings", json.dumps(merged, separators=(",", ":")), *remaining]
+    return [
+        binary,
+        *source_args,
+        "--settings",
+        json.dumps(merged, separators=(",", ":")),
+        *remaining,
+    ]
+
+
+def _has_subscription_login() -> bool:
+    """True when Claude Code already holds a subscription login (`claude auth
+    status` exits 0). Never inspects or captures the credential itself."""
+    try:
+        result = subprocess.run(
+            [SPEC["binary"], "auth", "status"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _ensure_subscription_login() -> None:
+    """Ensure Claude Code has a persisted subscription login, running the browser
+    flow via `claude auth login` if not. ucode never sees or stores the token —
+    Claude Code persists it to its own secure store and refreshes it natively."""
+    if _has_subscription_login():
+        return
+    print_note("Opening browser to sign in with your Claude subscription...")
+    try:
+        subprocess.run([SPEC["binary"], "auth", "login"], check=True, timeout=300)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError("`claude auth login` failed.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("`claude auth login` timed out.") from exc
+    print_success("Claude subscription authenticated")
+
+
+def _rewrite_relayed_port(state: dict, port: int) -> None:
+    """Point the persisted config + state at ``port`` after the proxy had to bind
+    a different port than the cached one. Keeps ANTHROPIC_BASE_URL (which Claude
+    Code reads) in sync with the live proxy so requests reach it."""
+    state["relayed_proxy_port"] = port
+    save_state(state)
+    settings = read_json_safe(CLAUDE_SETTINGS_PATH)
+    env = settings.get("env")
+    if isinstance(env, dict):
+        env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+        write_json_file(CLAUDE_SETTINGS_PATH, settings)
+
+
+def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
+    """Relayed launch: sign into the Claude subscription, start the loopback
+    refresh proxy, then run Claude Code alongside it (the proxy must outlive the
+    exec, so we spawn-and-wait rather than replacing the process)."""
+    from ucode.gateway_proxy import start_proxy
+
+    managed_path = _managed_api_key_helper_path()
+    if managed_path is not None:
+        print_err(
+            f"Enterprise managed settings ({managed_path}) set an 'apiKeyHelper', "
+            "which Claude Code always applies over relayed (Claude Max/Enterprise) "
+            "auth — you'd be billed for API usage instead of using your subscription. "
+            "Remove the 'apiKeyHelper' from that file (or ask your admin to) before "
+            "running relayed auth. Not starting Claude Code."
+        )
+        raise SystemExit(1)
+
+    _ensure_subscription_login()
+    workspace = state["workspace"]
+    port = state.get("relayed_proxy_port")
+    if not isinstance(port, int):
+        raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
+
+    server, cache = start_proxy(workspace, state.get("profile"), port)
+    # start_proxy falls back to an OS-assigned port when the cached one is taken
+    # (stale proxy from a killed session). Reconcile settings + state to whatever
+    # it actually bound, so Claude Code connects to the live port.
+    bound_port = server.server_address[1]
+    if bound_port != port:
+        _rewrite_relayed_port(state, bound_port)
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    proc = subprocess.Popen(_build_claude_argv(binary, tool_args, relayed=True))
+    try:
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        returncode = proc.wait()
+    finally:
+        cache.stop()
+        server.shutdown()
+    raise SystemExit(returncode)
 
 
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
+    if state.get("claude_relayed"):
+        _launch_relayed(state, binary, tool_args)
+        return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     exec_or_spawn(_build_claude_argv(binary, tool_args))
@@ -677,3 +861,10 @@ def validate_cmd(binary: str) -> list[str]:
         "--max-turns",
         "1",
     ]
+
+
+def skip_validation(state: dict) -> bool:
+    """Relayed configs can't be probed with a live message: the loopback proxy
+    and subscription login are only established at launch, so a validation-time
+    request has nothing listening and would hang (and burn subscription quota)."""
+    return bool(state.get("claude_relayed"))

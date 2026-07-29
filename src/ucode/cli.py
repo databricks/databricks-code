@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import shutil
 from typing import Annotated
 
 import typer
@@ -67,6 +68,7 @@ from ucode.state import (
     load_full_state,
     load_state,
     save_state,
+    set_current_workspace,
     set_provider_service,
 )
 from ucode.tracing import configure_tracing_command
@@ -147,11 +149,12 @@ def _parse_agents_option(agents: str) -> list[str]:
     return tools
 
 
-def _parse_skill_locations(location: str) -> list[str]:
+def _parse_skill_locations(location: str | None) -> list[str]:
     """Parse a comma-separated `--location` into `<catalog>.<schema>` refs,
-    dropping duplicates while preserving order."""
+    dropping duplicates while preserving order. `None`/empty yields `[]` (the
+    schema-less, utility-tools-only connection)."""
     locations: list[str] = []
-    for raw in location.split(","):
+    for raw in (location or "").split(","):
         raw = raw.strip()
         if not raw:
             continue
@@ -160,11 +163,6 @@ def _parse_skill_locations(location: str) -> list[str]:
             raise RuntimeError(f"--location entries must be `<catalog>.<schema>`, got `{raw}`.")
         if raw not in locations:
             locations.append(raw)
-    if not locations:
-        raise RuntimeError(
-            "No schemas provided for --location. Use `<catalog>.<schema>`, "
-            "comma-separated for multiple."
-        )
     return locations
 
 
@@ -802,8 +800,7 @@ def status() -> int:
         "Use `ucode configure mcp` to add Databricks MCP servers to configured coding tools."
     )
     print_note(
-        "Use `ucode configure skills --location <catalog>.<schema> --mcp` to connect Unity "
-        "Catalog Skills."
+        "Use `ucode configure skills` to set up Unity Catalog Skills for configured coding tools."
     )
     print_note("Use `ucode configure tracing` to log coding sessions to an MLflow experiment.")
     print_note("Use `ucode revert` to clear managed configs and restore prior files.")
@@ -867,6 +864,43 @@ def mcp_web_search_cmd() -> None:
     from ucode.mcp_web_search import serve
 
     serve()
+
+
+@app.command("mcp-proxy", hidden=True)
+def mcp_proxy_cmd(
+    url: Annotated[
+        str,
+        typer.Option("--url", help="Databricks streamable-HTTP MCP endpoint to forward to."),
+    ],
+    host: Annotated[
+        str | None,
+        typer.Option(
+            "--host", help="Workspace URL for token minting. Defaults to the saved workspace."
+        ),
+    ] = None,
+    profile: Annotated[
+        str | None, typer.Option("--profile", help="Databricks CLI profile.")
+    ] = None,
+    use_pat: Annotated[
+        bool, typer.Option("--use-pat", help="Use the profile's static PAT instead of OAuth.")
+    ] = False,
+) -> None:
+    """Bridge a coding agent's stdio MCP transport to a Databricks MCP endpoint.
+
+    Each configured client spawns this as a local stdio MCP server (see
+    `ucode configure mcp`); it forwards messages to ``--url`` and injects a
+    freshly-minted OAuth bearer on every upstream request, so the token never
+    expires mid-session. Not meant for interactive use — the agent manages this
+    process's lifecycle."""
+    from ucode.mcp_proxy import serve
+
+    state = load_state()
+    workspace = host or state.get("workspace")
+    if not workspace:
+        print_err("No workspace configured. Run `ucode configure` first.")
+        raise typer.Exit(1)
+    profile = profile or state.get("profile")
+    serve(url, workspace, profile, use_pat=use_pat or bool(state.get("use_pat")))
 
 
 @app.command("auth-token", hidden=True)
@@ -961,9 +995,15 @@ def _launch_tool(
     ctx: typer.Context,
     provider: str | None = None,
     skip_preflight: bool = False,
+    workspace: str | None = None,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        # An explicit --workspace targets that workspace for this launch (and
+        # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
+        # works without a prior `ucode configure`.
+        if workspace:
+            set_current_workspace(normalize_workspace_url(workspace))
         existing = load_state()
         # Workspaces configured with --use-pat export the profile's PAT as
         # DATABRICKS_BEARER up front so every auth check below (and the
@@ -985,8 +1025,9 @@ def _launch_tool(
         # Surfaces a clear error up front instead of a cryptic gateway failure
         # mid-session. For a Bedrock service this also returns the model ids.
         provider_models = None
+        relayed = False
         if provider:
-            provider_models, error = resolve_provider_models(tool, state, provider)
+            provider_models, error, relayed = resolve_provider_models(tool, state, provider)
             if error:
                 raise RuntimeError(error)
         # Re-fetch model lists on every launch so newly-added Databricks
@@ -1010,7 +1051,12 @@ def _launch_tool(
         else:
             state, resolved_model = resolve_launch_model(tool, state, None)
         state = configure_tool(
-            tool, state, resolved_model, provider=provider, provider_models=provider_models
+            tool,
+            state,
+            resolved_model,
+            provider=provider,
+            provider_models=provider_models,
+            relayed=relayed,
         )
         print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
         if provider:
@@ -1045,6 +1091,17 @@ SkipPreflightOption = Annotated[
     ),
 ]
 
+# Target this launch at a specific workspace, auto-configuring (and logging in)
+# if it hasn't been set up yet — so a launch needs no prior `ucode configure`.
+WorkspaceOption = Annotated[
+    str | None,
+    typer.Option(
+        "--workspace",
+        help="Databricks workspace URL to launch against; sets up and authenticates it "
+        "if not already configured.",
+    ),
+]
+
 
 @app.command("codex", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def codex_cmd(
@@ -1059,9 +1116,12 @@ def codex_cmd(
         ),
     ] = None,
     skip_preflight: SkipPreflightOption = False,
+    workspace: WorkspaceOption = None,
 ) -> None:
     """Launch Codex via Databricks."""
-    _launch_tool("codex", ctx, provider=provider, skip_preflight=skip_preflight)
+    _launch_tool(
+        "codex", ctx, provider=provider, skip_preflight=skip_preflight, workspace=workspace
+    )
 
 
 @app.command("claude", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -1077,9 +1137,12 @@ def claude_cmd(
         ),
     ] = None,
     skip_preflight: SkipPreflightOption = False,
+    workspace: WorkspaceOption = None,
 ) -> None:
     """Launch Claude Code via Databricks."""
-    _launch_tool("claude", ctx, provider=provider, skip_preflight=skip_preflight)
+    _launch_tool(
+        "claude", ctx, provider=provider, skip_preflight=skip_preflight, workspace=workspace
+    )
 
 
 @app.command("gemini", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -1106,6 +1169,39 @@ def copilot_cmd(ctx: typer.Context, skip_preflight: SkipPreflightOption = False)
 def pi_cmd(ctx: typer.Context, skip_preflight: SkipPreflightOption = False) -> None:
     """Launch Pi coding agent via Databricks."""
     _launch_tool("pi", ctx, skip_preflight=skip_preflight)
+
+
+@app.command("cursor", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def cursor_cmd(ctx: typer.Context) -> None:
+    """Launch Cursor Agent.
+
+    Cursor is MCP-only: `cursor-agent` runs models on your own Cursor account, so
+    ucode configures no models for it. Its Databricks MCP servers (added via
+    `ucode configure mcp`) run `ucode mcp-proxy`, which authenticates itself — so
+    this command is a thin convenience wrapper over `cursor-agent`, kept for
+    symmetry with the other `ucode <agent>` launchers.
+    """
+    from ucode.agents import cursor
+
+    try:
+        if not shutil.which(cursor.CURSOR_BINARY):
+            raise RuntimeError(
+                f"`{cursor.CURSOR_BINARY}` was not found on PATH. Install Cursor Agent "
+                "(https://cursor.com/cli), then re-run `ucode cursor`."
+            )
+        print_section("ucode with Cursor")
+        print_note(
+            "Cursor runs models on your Cursor account; its Databricks MCP servers "
+            "authenticate through `ucode mcp-proxy`."
+        )
+        print_success("Starting Cursor Agent")
+        cursor.launch(load_state(), ctx.args)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
 
 
 @configure_app.callback(invoke_without_command=True)
@@ -1283,20 +1379,42 @@ def configure(
                     **skip_kwargs,
                 )
         elif agents is not None:
-            selected_tools = _parse_agents_option(agents)
-            if workspace_entries is None:
-                configure_workspace_command(
-                    selected_tools=selected_tools,
-                    prompt_optional_updates=prompt_optional_updates,
-                    **skip_kwargs,
+            # Cursor is MCP-only (no model routing), so it can't go through the
+            # model-agent configure path. Split it out: model agents configure
+            # normally; cursor only needs workspace state established here, and
+            # its MCP servers are added separately via `ucode configure mcp`
+            # (which picks cursor up through MCP_ONLY_CLIENTS). If cursor is the
+            # only agent, do a workspace-only configure so that later `configure
+            # mcp` run has a current workspace to target.
+            requested = [a.strip().lower() for a in agents.split(",") if a.strip()]
+            wants_cursor = "cursor" in requested
+            model_agent_names = ",".join(a for a in requested if a != "cursor")
+            if model_agent_names:
+                selected_tools = _parse_agents_option(model_agent_names)
+                if workspace_entries is None:
+                    configure_workspace_command(
+                        selected_tools=selected_tools,
+                        prompt_optional_updates=prompt_optional_updates,
+                        **skip_kwargs,
+                    )
+                else:
+                    configure_workspace_command(
+                        selected_tools=selected_tools,
+                        workspaces=workspace_entries,
+                        prompt_optional_updates=prompt_optional_updates,
+                        **skip_kwargs,
+                    )
+            elif wants_cursor:
+                # Cursor-only: establish workspace state without the model picker.
+                _configure_shared_workspace_states(
+                    workspace_entries or [_prompt_for_configuration(None)],
+                    tools=[],
+                    force_login=not use_pat,
+                    use_pat=use_pat,
                 )
             else:
-                configure_workspace_command(
-                    selected_tools=selected_tools,
-                    workspaces=workspace_entries,
-                    prompt_optional_updates=prompt_optional_updates,
-                    **skip_kwargs,
-                )
+                # Neither model agents nor cursor -> empty/invalid --agents list.
+                _parse_agents_option(agents)
         elif mcp is not None:
             # MCP-only: `--mcp` without --agent(s) (e.g. Cursor, which isn't a
             # model agent, or adding MCP servers to an already-configured setup).
@@ -1413,9 +1531,9 @@ def configure_mcp(
 @configure_app.command("skills")
 def configure_skills(
     location: Annotated[
-        str,
+        str | None,
         typer.Option("--location", help="Comma-separated `<catalog>.<schema>` skill scopes."),
-    ],
+    ] = None,
     mcp: Annotated[
         bool,
         typer.Option("--mcp", help="Mutate the skills MCP connection instead of downloading."),
@@ -1430,18 +1548,24 @@ def configure_skills(
 ) -> None:
     """Configure Databricks Skills for your coding tools.
 
-    By default, downloads every skill in each ``--location`` schema to disk
-    (under ``--path``, or your home dir when omitted) and registers a schema-less
-    MCP connection. With ``--mcp``, instead sets the skills MCP connection's scope
-    to exactly the listed schemas.
+    When ``--location`` is not provided, registers the skills MCP connection with
+    utility tools only.
+
+    When ``--location`` is provided: with ``--mcp``, sets the connection's scope to
+    exactly the listed schemas (no download); otherwise, downloads every skill in
+    each schema to disk (under ``--path``, or your home dir when omitted) and
+    registers the MCP connection with utility tools only.
     """
     try:
-        if mcp:
-            if path is not None:
-                raise RuntimeError("--path is not valid with --mcp.")
-            configure_skills_mcp_command(_parse_skill_locations(location))
+        locations = _parse_skill_locations(location)
+        if mcp and path is not None:
+            raise RuntimeError("--path is not valid with --mcp.")
+        if path is not None and not locations:
+            raise RuntimeError("--path only applies when downloading with --location.")
+        if mcp or not locations:
+            configure_skills_mcp_command(locations)
         else:
-            configure_skills_download_command(_parse_skill_locations(location), path=path)
+            configure_skills_download_command(locations, path=path)
     except (RuntimeError, ValueError) as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

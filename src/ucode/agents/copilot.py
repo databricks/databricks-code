@@ -99,25 +99,27 @@ def build_runtime_env(workspace: str, model: str, token: str) -> dict[str, str]:
     return env
 
 
-def build_mcp_server_entry(url: str) -> dict:
+def build_mcp_server_entry(argv: list[str]) -> dict:
+    # A `local` MCP server runs a stdio command; `command`/`args` split the
+    # argv. ucode registers the `ucode mcp-proxy ...` bridge here so Copilot
+    # never speaks HTTP+bearer directly — the proxy handles token refresh. The
+    # OAUTH_TOKEN env Copilot still injects at launch is for MODEL auth, not MCP.
     return {
-        "type": "http",
-        "url": url,
-        "headers": {
-            "Authorization": "Bearer ${OAUTH_TOKEN}",
-        },
+        "type": "local",
+        "command": argv[0],
+        "args": list(argv[1:]),
         "tools": ["*"],
     }
 
 
-def write_mcp_server_config(name: str, url: str) -> bool:
+def write_mcp_server_config(name: str, argv: list[str]) -> bool:
     backup_existing_file(COPILOT_MCP_CONFIG_PATH, COPILOT_MCP_BACKUP_PATH)
     existing = read_json_safe(COPILOT_MCP_CONFIG_PATH)
     mcp_servers = existing.get("mcpServers")
     if not isinstance(mcp_servers, dict):
         mcp_servers = {}
     removed = name in mcp_servers
-    mcp_servers[name] = build_mcp_server_entry(url)
+    mcp_servers[name] = build_mcp_server_entry(argv)
     existing["mcpServers"] = mcp_servers
     write_json_file(COPILOT_MCP_CONFIG_PATH, existing)
     return removed

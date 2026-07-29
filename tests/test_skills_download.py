@@ -337,13 +337,17 @@ class TestDownloadSkills:
         assert (tmp_path / ".claude/skills/good/SKILL.md").read_bytes() == b"ok"
         assert not (tmp_path / ".claude/skills/bad").exists()
 
-    def test_prints_downloaded_count_summary(self, tmp_path, monkeypatch, capsys):
+    def test_prints_downloaded_count_and_roots_summary(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["a", "b", "c"], None))
         monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
 
         sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
-        assert "Downloaded 3/3 skill(s) from `main.default`" in capsys.readouterr().out
+        # Rich wraps long paths across lines; strip all whitespace from both sides to compare.
+        roots = sd.skill_dir_roots(str(tmp_path))
+        expected = f"Downloaded 3/3 skill(s) from `main.default` in {roots[0]} and {roots[1]}."
+        printed = "".join(capsys.readouterr().out.split())
+        assert "".join(expected.split()) in printed
 
     def test_summary_counts_only_written_skills(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["good", "bad"], None))
@@ -357,7 +361,7 @@ class TestDownloadSkills:
 
         sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
-        assert "Downloaded 1/2 skill(s) from `main.default`" in capsys.readouterr().out
+        assert "Downloaded 1/2 skill(s) from `main.default` in" in capsys.readouterr().out
 
 
 class TestConfigureSkillsDownloadCommand:
@@ -376,7 +380,7 @@ class TestConfigureSkillsDownloadCommand:
         monkeypatch.setattr(
             sd,
             "register_schemaless_skills_connection",
-            lambda state, ws, clients: calls.update(register=(ws, clients)),
+            lambda state, ws, profile, clients: calls.update(register=(ws, profile, clients)),
         )
         return calls
 
@@ -386,7 +390,7 @@ class TestConfigureSkillsDownloadCommand:
         assert sd.configure_skills_download_command(["a.b"], path="/tmp/skills") == 0
 
         assert calls["download"] == (WS, "token", ["a.b"], "/tmp/skills")
-        assert calls["register"] == (WS, ["claude"])
+        assert calls["register"] == (WS, "profile", ["claude"])
 
     def test_none_path_threads_through(self, monkeypatch):
         calls = self._stub(monkeypatch)
@@ -394,3 +398,4 @@ class TestConfigureSkillsDownloadCommand:
         assert sd.configure_skills_download_command(["a.b"], path=None) == 0
 
         assert calls["download"] == (WS, "token", ["a.b"], None)
+        assert calls["register"] == (WS, "profile", ["claude"])

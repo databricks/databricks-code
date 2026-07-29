@@ -10,6 +10,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "databricks-sql-connector>=3.6.0",
+  # `ucode mcp-proxy` bridges a client's stdio MCP transport to a Databricks
+  # streamable-HTTP MCP endpoint, injecting a freshly-minted OAuth bearer per
+  # request. Uses the official MCP SDK's stdio server + streamable-HTTP client.
+  "mcp>=1.28.0",
   "questionary>=2.0.0",
   "tomlkit>=0.13.0",
   "typer>=0.12.0",
