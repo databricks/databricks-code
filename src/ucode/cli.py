@@ -1545,6 +1545,15 @@ def configure_skills(
             help="(download) Existing absolute dir to download into; defaults to your home dir.",
         ),
     ] = None,
+    skill: Annotated[
+        str | None,
+        typer.Option(
+            "--skill",
+            help="(download) Download only this comma-separated subset of skills from each "
+            "--location schema (by leaf name, e.g. `my_skill`), instead of every skill. "
+            "Not valid with --mcp.",
+        ),
+    ] = None,
 ) -> None:
     """Configure Databricks Skills for your coding tools.
 
@@ -1554,18 +1563,28 @@ def configure_skills(
     When ``--location`` is provided: with ``--mcp``, sets the connection's scope to
     exactly the listed schemas (no download); otherwise, downloads every skill in
     each schema to disk (under ``--path``, or your home dir when omitted) and
-    registers the MCP connection with utility tools only.
+    registers the MCP connection with utility tools only. ``--skill`` narrows a
+    download to a named subset of each schema's skills.
     """
     try:
         locations = _parse_skill_locations(location)
+        # `--skill` absent -> None (whole schema); present (even empty) -> the
+        # explicit subset, so `--skill ""` downloads nothing.
+        selected_skills = (
+            None if skill is None else {s.strip() for s in skill.split(",") if s.strip()}
+        )
         if mcp and path is not None:
             raise RuntimeError("--path is not valid with --mcp.")
+        if mcp and selected_skills is not None:
+            raise RuntimeError("--skill is not valid with --mcp; it only applies when downloading.")
         if path is not None and not locations:
             raise RuntimeError("--path only applies when downloading with --location.")
+        if selected_skills is not None and not locations:
+            raise RuntimeError("--skill only applies when downloading with --location.")
         if mcp or not locations:
             configure_skills_mcp_command(locations)
         else:
-            configure_skills_download_command(locations, path=path)
+            configure_skills_download_command(locations, path=path, skills=selected_skills)
     except (RuntimeError, ValueError) as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

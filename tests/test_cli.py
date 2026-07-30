@@ -407,13 +407,53 @@ class TestConfigureSkillsCommand:
                 app, ["configure", "skills", "--location", "a.b", "--path", "/tmp/skills"]
             )
         assert result.exit_code == 0, result.output
-        mock_download.assert_called_once_with(["a.b"], path="/tmp/skills")
+        mock_download.assert_called_once_with(["a.b"], path="/tmp/skills", skills=None)
 
     def test_default_mode_without_path_dispatches_download(self):
         with patch("ucode.cli.configure_skills_download_command") as mock_download:
             result = runner.invoke(app, ["configure", "skills", "--location", "a.b"])
         assert result.exit_code == 0, result.output
-        mock_download.assert_called_once_with(["a.b"], path=None)
+        mock_download.assert_called_once_with(["a.b"], path=None, skills=None)
+
+    def test_skill_filter_dispatches_download_with_subset(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(
+                app, ["configure", "skills", "--location", "a.b", "--skill", "my_skill"]
+            )
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path=None, skills={"my_skill"})
+
+    def test_skill_filter_parses_comma_list(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(
+                app, ["configure", "skills", "--location", "a.b", "--skill", "s1, s2"]
+            )
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path=None, skills={"s1", "s2"})
+
+    def test_skill_with_mcp_exit_1(self):
+        with (
+            patch("ucode.cli.configure_skills_mcp_command") as mock_mcp,
+            patch("ucode.cli.configure_skills_download_command") as mock_download,
+        ):
+            result = runner.invoke(
+                app, ["configure", "skills", "--location", "a.b", "--mcp", "--skill", "my_skill"]
+            )
+        assert result.exit_code == 1
+        assert "--skill" in _strip_ansi(result.output)
+        mock_mcp.assert_not_called()
+        mock_download.assert_not_called()
+
+    def test_skill_without_location_exit_1(self):
+        with (
+            patch("ucode.cli.configure_skills_mcp_command") as mock_mcp,
+            patch("ucode.cli.configure_skills_download_command") as mock_download,
+        ):
+            result = runner.invoke(app, ["configure", "skills", "--skill", "my_skill"])
+        assert result.exit_code == 1
+        assert "--skill" in _strip_ansi(result.output)
+        mock_mcp.assert_not_called()
+        mock_download.assert_not_called()
 
     def test_path_with_mcp_exit_1(self):
         with (
