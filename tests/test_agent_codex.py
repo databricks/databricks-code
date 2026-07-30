@@ -217,6 +217,65 @@ class TestCodexWriteConfig:
         assert provider["base_url"] == f"{WS}/ai-gateway/codex/v1"
         assert provider["wire_api"] == "responses"
 
+    def test_intelligent_routing_writes_profile_scoped_hooks(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            "[[hooks.PreToolUse]]\n"
+            'matcher = "Bash"\n'
+            "[[hooks.PreToolUse.hooks]]\n"
+            'type = "command"\n'
+            'command = "user-policy"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.145.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+
+        codex.write_tool_config(
+            {
+                "workspace": WS,
+                "profile": "prod",
+                "codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"],
+                codex.INTELLIGENT_ROUTING_STATE_KEY: True,
+            }
+        )
+
+        doc = read_toml_safe(config_path)
+        assert set(doc["hooks"]) == {"PreToolUse", "SessionStart", "SubagentStart"}
+        pre_tool_commands = [
+            hook["command"] for group in doc["hooks"]["PreToolUse"] for hook in group["hooks"]
+        ]
+        assert "user-policy" in pre_tool_commands
+        route_command = next(
+            command for command in pre_tool_commands if "codex-router-hook" in command
+        )
+        assert "route-subagent" in route_command
+        assert "--host https://example.databricks.com" in route_command
+        assert "--profile prod" in route_command
+        assert "--model databricks-gpt-5-5" in route_command
+
+    def test_provider_launch_removes_routing_hooks(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        backup_path = tmp_path / "backup.toml"
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", backup_path)
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.145.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+        state = {
+            "workspace": WS,
+            "codex_models": ["databricks-gpt-5"],
+            codex.INTELLIGENT_ROUTING_STATE_KEY: True,
+        }
+
+        codex.write_tool_config(state)
+        assert "hooks" in read_toml_safe(config_path)
+
+        codex.write_tool_config(state, provider="main.schema.provider")
+
+        assert "hooks" not in read_toml_safe(config_path)
+
     def test_legacy_write_preserves_other_profiles_in_shared_config(self, tmp_path, monkeypatch):
         config_dir = tmp_path / ".codex"
         config_dir.mkdir()
@@ -257,6 +316,54 @@ class TestCodexLegacyLayoutDetection:
         monkeypatch.setattr(codex, "agent_version", lambda binary: "unknown")
 
         assert codex._use_legacy_layout() is False
+
+
+class TestCodexIntelligentRouting:
+    def test_enable_requires_supported_codex(self, monkeypatch):
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.144.0")
+
+        try:
+            codex.enable_intelligent_routing({})
+            assert False
+        except RuntimeError as exc:
+            assert "0.145.0 or newer" in str(exc)
+
+    def test_disable_removes_only_ucode_hooks(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        legacy_path = tmp_path / ".codex" / "config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            "[[hooks.PreToolUse]]\n"
+            'matcher = "Bash"\n'
+            "[[hooks.PreToolUse.hooks]]\n"
+            'type = "command"\n'
+            'command = "user-policy"\n\n'
+            "[[hooks.PreToolUse]]\n"
+            'matcher = "Agent"\n'
+            "[[hooks.PreToolUse.hooks]]\n"
+            'type = "command"\n'
+            'command = "ucode codex-router-hook route-subagent"\n\n'
+            "[[hooks.SessionStart]]\n"
+            "[[hooks.SessionStart.hooks]]\n"
+            'type = "command"\n'
+            'command = "ucode codex-router-hook session-start"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+        monkeypatch.setattr("ucode.codex_routing.clear_routing_artifacts", lambda: None)
+        state = {"workspace": WS, codex.INTELLIGENT_ROUTING_STATE_KEY: True}
+
+        assert codex.disable_intelligent_routing(state) is True
+
+        doc = read_toml_safe(config_path)
+        assert state.get(codex.INTELLIGENT_ROUTING_STATE_KEY) is None
+        assert list(doc["hooks"]) == ["PreToolUse"]
+        assert doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "user-policy"
+
+    def test_launch_task_uses_exec_prompt(self):
+        assert codex._launch_routing_task(["exec", "fix the parser"]) == "fix the parser"
 
 
 class TestCodexRemoveLegacyProfile:
