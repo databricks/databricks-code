@@ -1549,9 +1549,9 @@ def configure_skills(
         str | None,
         typer.Option(
             "--skill",
-            help="(download) Download only this comma-separated subset of skills from each "
-            "--location schema (by leaf name, e.g. `my_skill`), instead of every skill. "
-            "Not valid with --mcp.",
+            help="(download) Download only this comma-separated subset of skills (by leaf "
+            "name, e.g. `my_skill`) from the schema, instead of every skill. Requires a "
+            "single --location; not valid with --mcp.",
         ),
     ] = None,
 ) -> None:
@@ -1564,7 +1564,8 @@ def configure_skills(
     exactly the listed schemas (no download); otherwise, downloads every skill in
     each schema to disk (under ``--path``, or your home dir when omitted) and
     registers the MCP connection with utility tools only. ``--skill`` narrows a
-    download to a named subset of each schema's skills.
+    download to a named subset of a single schema's skills (requires exactly one
+    ``--location``).
     """
     try:
         locations = _parse_skill_locations(location)
@@ -1581,6 +1582,13 @@ def configure_skills(
             raise RuntimeError("--path only applies when downloading with --location.")
         if selected_skills is not None and not locations:
             raise RuntimeError("--skill only applies when downloading with --location.")
+        # A single skill-name set can't be meaningfully split across schemas, so
+        # require exactly one --location — mirroring `configure mcp`, whose
+        # --service filter likewise takes a single --location.
+        if selected_skills is not None and len(locations) != 1:
+            raise RuntimeError(
+                f"--skill requires a single --location (got: {', '.join(locations)})."
+            )
         if mcp or not locations:
             configure_skills_mcp_command(locations)
         else:

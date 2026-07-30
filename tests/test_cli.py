@@ -455,6 +455,16 @@ class TestConfigureSkillsCommand:
         mock_mcp.assert_not_called()
         mock_download.assert_not_called()
 
+    def test_skill_with_multiple_locations_exit_1(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(
+                app, ["configure", "skills", "--location", "a.b, c.d", "--skill", "my_skill"]
+            )
+        assert result.exit_code == 1
+        output = _strip_ansi(result.output)
+        assert "--skill requires a single --location" in output
+        mock_download.assert_not_called()
+
     def test_path_with_mcp_exit_1(self):
         with (
             patch("ucode.cli.configure_skills_mcp_command") as mock_mcp,

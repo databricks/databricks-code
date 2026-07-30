@@ -139,9 +139,9 @@ ucode configure skills --location main.default,ml.prod --mcp
   absolute directory) is optional; when omitted, skills are written under your home directory. Any
   pre-existing skill dir prompts before it's overwritten. It then registers a schema-less skills
   MCP connection, leaving any prior `--mcp` scope untouched. `--skill <name>[,<name>…]` narrows the
-  download to the named skills (by leaf name) from each `--location` schema instead of all of them;
-  requested names not found in a schema warn and are skipped. `--skill` is download-only and is
-  rejected with `--mcp`.
+  download to the named skills (by leaf name) from the schema instead of all of them; requested
+  names not found in the schema warn and are skipped. `--skill` requires a single `--location`, is
+  download-only, and is rejected with `--mcp`.
 - **MCP mode** (`--location … --mcp`) sets the connection's location set to exactly `<list>`
   (override-only) and rebuilds its `?schema=` URL; no files are downloaded and `--path` is rejected.
 
