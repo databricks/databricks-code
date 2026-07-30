@@ -715,6 +715,109 @@ class TestListMcpServices:
         assert reason and reason.startswith("HTTP 404")
 
 
+class TestListAllMcpServices:
+    """Workspace-wide walk: catalogs -> schemas -> per-schema mcp-services."""
+
+    def _fake_http(self, catalogs, schemas_by_catalog, services_by_schema):
+        """Route `_http_get_json` by URL to the right stubbed payload."""
+
+        def fake_get(url, token, timeout=30):
+            if "unity-catalog/catalogs" in url:
+                return {"catalogs": [{"name": c} for c in catalogs]}, None
+            if "unity-catalog/schemas" in url:
+                cat = url.split("catalog_name=")[1].split("&")[0]
+                return {"schemas": [{"name": s} for s in schemas_by_catalog.get(cat, [])]}, None
+            if "unity-catalog/mcp-services" in url:
+                # parent is url-encoded as `schemas%2F<cat>.<schema>`
+                parent = url.split("parent=")[1].split("&")[0]
+                schema_ref = parent.replace("schemas%2F", "").replace("schemas/", "")
+                return {
+                    "mcp_services": [
+                        {"name": f"mcp-services/{full}"}
+                        for full in services_by_schema.get(schema_ref, [])
+                    ]
+                }, None
+            return None, "unexpected url"
+
+        return fake_get
+
+    def test_aggregates_services_across_catalogs_and_schemas(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._fake_http(
+                catalogs=["mycat", "other"],
+                schemas_by_catalog={"mycat": ["myschema", "information_schema"], "other": ["ops"]},
+                services_by_schema={
+                    "mycat.myschema": ["mycat.myschema.weather", "mycat.myschema.news"],
+                    "other.ops": ["other.ops.pager"],
+                },
+            ),
+        )
+
+        names, reason = db_mod.list_all_mcp_services(WS, "token")
+
+        assert reason is None
+        # information_schema is skipped; results are sorted and de-duplicated.
+        assert names == [
+            "mycat.myschema.news",
+            "mycat.myschema.weather",
+            "other.ops.pager",
+        ]
+
+    def test_reports_progress_per_schema(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._fake_http(
+                catalogs=["mycat"],
+                schemas_by_catalog={"mycat": ["a", "b"]},
+                services_by_schema={"mycat.a": ["mycat.a.one"], "mycat.b": ["mycat.b.two"]},
+            ),
+        )
+        progress: list[tuple[int, int, int]] = []
+
+        names, reason = db_mod.list_all_mcp_services(
+            WS,
+            "token",
+            on_progress=lambda done, total, found: progress.append((done, total, found)),
+        )
+
+        assert reason is None
+        assert names == ["mycat.a.one", "mycat.b.two"]
+        # One callback per schema; the total is fixed and done/found climb.
+        assert len(progress) == 2
+        assert [p[1] for p in progress] == [2, 2]
+        assert progress[-1][0] == 2
+        assert progress[-1][2] == 2
+
+    def test_skips_internal_catalogs(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            self._fake_http(
+                catalogs=["system", "hive_metastore", "samples", "__databricks_internal"],
+                schemas_by_catalog={},
+                services_by_schema={},
+            ),
+        )
+
+        names, reason = db_mod.list_all_mcp_services(WS, "token")
+
+        assert names == []
+        assert reason == "no user UC catalogs found"
+
+    def test_returns_reason_when_no_catalogs(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: ({"catalogs": []}, None)
+        )
+
+        names, reason = db_mod.list_all_mcp_services(WS, "token")
+
+        assert names == []
+        assert reason == "no UC catalogs found"
+
+
 def _foundation_models_payload(names):
     return {
         "endpoints": [
@@ -1738,6 +1841,36 @@ class TestRunUsageQuery:
             db_mod.run_usage_query(WS, "/sql/1.0/warehouses/abc", "tok", "SELECT 1")
         assert "Ask your workspace admin" not in str(exc_info.value)
         assert str(exc_info.value).startswith("Usage query failed:")
+
+
+class TestHttpGetJsonTimeout:
+    """A socket read timeout raises a bare TimeoutError (an OSError), not a
+    URLError. It must be returned as a reason, not propagated — otherwise it
+    escapes the best-effort MCP discovery flow and crashes the command."""
+
+    def test_read_timeout_returns_reason_instead_of_raising(self, monkeypatch):
+        def raise_timeout(request, timeout=None):
+            raise TimeoutError("The read operation timed out")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", raise_timeout)
+
+        payload, reason = db_mod._http_get_json(f"{WS}/api/2.0/anything", "tok")
+
+        assert payload is None
+        assert reason is not None
+        assert "timed out" in reason
+
+    def test_post_read_timeout_returns_reason_instead_of_raising(self, monkeypatch):
+        def raise_timeout(request, timeout=None):
+            raise TimeoutError("The read operation timed out")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", raise_timeout)
+
+        payload, reason = db_mod._http_post_json(f"{WS}/api/2.0/anything", "tok", {"k": "v"})
+
+        assert payload is None
+        assert reason is not None
+        assert "timed out" in reason
 
 
 class TestInstallAiTools:

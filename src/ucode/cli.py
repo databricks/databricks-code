@@ -85,6 +85,7 @@ from ucode.ui import (
     prompt_for_selection,
     prompt_for_tools,
     prompt_for_workspace,
+    prompt_yes_no,
     prompt_yes_no_default,
     set_verbosity,
     spinner,
@@ -1358,6 +1359,9 @@ def configure(
             agent = "claude"
         if enable_databricks_ai_tools is not None:
             skip_kwargs["databricks_ai_tools_enabled"] = enable_databricks_ai_tools
+        # Set True only in the fully-interactive branch below; gates the optional
+        # MCP setup prompt so flag-driven / scripted runs are never interrupted.
+        fully_interactive = False
         if agent is not None:
             tool = normalize_tool(agent)
             install_tool_binary(
@@ -1438,6 +1442,10 @@ def configure(
                     prompt_optional_updates=prompt_optional_updates,
                     **skip_kwargs,
                 )
+            # Only the no-agent, no-workspace path is truly interactive (the user
+            # picked agents/workspace via prompts); that's where we offer the MCP
+            # step below. Flag-driven runs stay scriptable.
+            fully_interactive = workspace_entries is None
         if tracing:
             # The workspaces were just configured, so enable tracing for them
             # directly instead of re-prompting. Fall back to the workspace that
@@ -1468,6 +1476,12 @@ def configure(
                     "interactive picker."
                 )
             configure_mcp_command(services=services)
+        # Offer MCP setup as the natural next step of interactive configuration,
+        # so users discover it without needing to know `configure mcp` exists.
+        # Skipped in dry-run and non-interactive/flag-driven runs (which stay
+        # scriptable), and when --dry-run is set.
+        if fully_interactive and not dry_run and prompt_yes_no("Configure MCP servers now?"):
+            configure_mcp_command()
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

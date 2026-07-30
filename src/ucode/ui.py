@@ -89,10 +89,21 @@ def status_badge(text: str, kind: str) -> str:
 
 
 @contextmanager
-def spinner(message: str):
+def spinner(message: str | Callable[[], str]):
+    """Show a spinner while the block runs. `message` may be a callable, which
+    is re-evaluated on every frame so callers can render live progress (e.g. a
+    running count) during a long operation."""
     if not sys.stdout.isatty():
         yield
         return
+
+    if isinstance(message, str):
+        static_message = message
+
+        def current_message() -> str:
+            return static_message
+    else:
+        current_message = message
 
     stop_event = threading.Event()
 
@@ -100,10 +111,12 @@ def spinner(message: str):
         for frame in itertools.cycle("|/-\\"):
             if stop_event.is_set():
                 break
-            sys.stdout.write(f"\r\033[2m{frame}\033[0m {message}")
+            # `\033[K` erases to end of line so a shrinking dynamic message
+            # doesn't leave stale characters behind.
+            sys.stdout.write(f"\r\033[2m{frame}\033[0m {current_message()}\033[K")
             sys.stdout.flush()
             time.sleep(0.1)
-        sys.stdout.write("\r" + " " * (len(message) + 4) + "\r")
+        sys.stdout.write("\r\033[K")
         sys.stdout.flush()
 
     thread = threading.Thread(target=spin, daemon=True)
