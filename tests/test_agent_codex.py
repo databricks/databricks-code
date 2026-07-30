@@ -6,6 +6,7 @@ import os
 
 from ucode.agents import codex
 from ucode.config_io import read_toml_safe
+from ucode.intelligent_routing import codex_routing
 
 WS = "https://example.databricks.com"
 
@@ -352,7 +353,7 @@ class TestCodexIntelligentRouting:
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
         monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
         monkeypatch.setattr(codex, "save_state", lambda state: None)
-        monkeypatch.setattr("ucode.codex_routing.clear_routing_artifacts", lambda: None)
+        monkeypatch.setattr(codex_routing, "clear_routing_artifacts", lambda: None)
         state = {"workspace": WS, codex.INTELLIGENT_ROUTING_STATE_KEY: True}
 
         assert codex.disable_intelligent_routing(state) is True
@@ -363,7 +364,7 @@ class TestCodexIntelligentRouting:
         assert doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "user-policy"
 
     def test_launch_task_uses_exec_prompt(self):
-        assert codex._launch_routing_task(["exec", "fix the parser"]) == "fix the parser"
+        assert codex_routing._launch_routing_task(["exec", "fix the parser"]) == "fix the parser"
 
 
 class TestCodexRemoveLegacyProfile:

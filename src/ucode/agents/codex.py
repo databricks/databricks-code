@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
-import subprocess
 from pathlib import Path
 
 from ucode.agent_updates import available_npm_package_update
@@ -21,6 +19,10 @@ from ucode.databricks import (
     build_auth_token_argv,
     build_tool_base_url,
     get_databricks_token,
+)
+from ucode.intelligent_routing.codex_hooks import (
+    remove_intelligent_routing_hooks,
+    sync_intelligent_routing_hooks,
 )
 from ucode.launcher import exec_or_spawn
 from ucode.state import mark_tool_managed, save_state
@@ -38,7 +40,6 @@ MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
 MINIMUM_ROUTING_CODEX_VERSION = (0, 145, 0)
 MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
 INTELLIGENT_ROUTING_STATE_KEY = "codex_intelligent_routing_enabled"
-ROUTING_HOOK_COMMAND_MARKER = "codex-router-hook"
 
 
 SPEC: ToolSpec = {
@@ -369,7 +370,7 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         # deep_merge can't drop keys, so clear a `model` pinned by an earlier
         # non-provider run that the provider overlay omits.
         doc.pop("model", None)
-    _sync_intelligent_routing_hooks(
+    sync_intelligent_routing_hooks(
         doc,
         state,
         enabled=intelligent_routing_enabled(state) and provider is None,
@@ -443,150 +444,12 @@ def disable_intelligent_routing(state: dict) -> bool:
         if not path.exists():
             continue
         doc = read_toml_safe(path)
-        if _remove_intelligent_routing_hooks(doc):
+        if remove_intelligent_routing_hooks(doc):
             write_toml_file(path, doc)
             changed = True
-    from ucode.codex_routing import clear_routing_artifacts
+    from ucode.intelligent_routing.codex_routing import clear_routing_artifacts
 
     clear_routing_artifacts()
-    return changed
-
-
-def route_launch_model(state: dict, tool_args: list[str]):
-    """Route a root Codex launch before the Codex process starts."""
-    from ucode.codex_routing import request_routing_decision
-
-    workspace = state.get("workspace")
-    models = state.get("codex_models")
-    if not isinstance(workspace, str) or not isinstance(models, list):
-        return None, "workspace model metadata is unavailable"
-    try:
-        token = get_databricks_token(workspace, state.get("profile"))
-    except RuntimeError as exc:
-        return None, f"could not authenticate the routing request: {exc}"
-    task = _launch_routing_task(tool_args)
-    return request_routing_decision(workspace, token, task, models)
-
-
-def _launch_routing_task(tool_args: list[str]) -> str:
-    if "exec" in tool_args:
-        prompt_parts = tool_args[tool_args.index("exec") + 1 :]
-        if prompt_parts:
-            return " ".join(prompt_parts)
-    if tool_args:
-        return "Start a Codex session with options: " + " ".join(tool_args)
-    return f"Start an interactive Codex coding session in {Path.cwd().name}."
-
-
-def _sync_intelligent_routing_hooks(doc: dict, state: dict, *, enabled: bool) -> None:
-    _remove_intelligent_routing_hooks(doc)
-    if not enabled:
-        return
-    hooks = doc.setdefault("hooks", {})
-    for event, groups in _routing_hook_groups(state).items():
-        existing = hooks.get(event)
-        if not isinstance(existing, list):
-            existing = []
-        hooks[event] = [*existing, *groups]
-
-
-def _routing_hook_groups(state: dict) -> dict[str, list[dict]]:
-    route_argv = _routing_hook_argv(state, "route-subagent")
-    session_argv = _routing_hook_argv(state, "session-start")
-    subagent_argv = _routing_hook_argv(state, "record-subagent")
-    return {
-        "PreToolUse": [
-            {
-                "matcher": "Agent|.*spawn_agent$",
-                "hooks": [_routing_command_hook(route_argv, status="Routing subagent model")],
-            }
-        ],
-        "SessionStart": [
-            {
-                "matcher": "startup|resume|clear",
-                "hooks": [_routing_command_hook(session_argv)],
-            }
-        ],
-        "SubagentStart": [
-            {
-                "hooks": [_routing_command_hook(subagent_argv)],
-            }
-        ],
-    }
-
-
-def _routing_hook_argv(state: dict, event: str) -> list[str]:
-    workspace = str(state.get("workspace") or "")
-    argv = [
-        build_auth_token_argv(workspace, state.get("profile"), use_pat=bool(state.get("use_pat")))[
-            0
-        ],
-        ROUTING_HOOK_COMMAND_MARKER,
-        event,
-    ]
-    if event != "route-subagent":
-        return argv
-    argv += ["--host", workspace]
-    profile = state.get("profile")
-    if isinstance(profile, str) and profile:
-        argv += ["--profile", profile]
-    if state.get("use_pat"):
-        argv.append("--use-pat")
-    for model in state.get("codex_models") or []:
-        if isinstance(model, str) and model:
-            argv += ["--model", model]
-    return argv
-
-
-def _routing_command_hook(argv: list[str], *, status: str | None = None) -> dict:
-    hook = {
-        "type": "command",
-        "command": shlex.join(argv),
-        "command_windows": subprocess.list2cmdline(argv),
-        "timeout": 35,
-    }
-    if status:
-        hook["statusMessage"] = status
-    return hook
-
-
-def _remove_intelligent_routing_hooks(doc: dict) -> bool:
-    hooks = doc.get("hooks")
-    if not isinstance(hooks, dict):
-        return False
-    changed = False
-    for event in list(hooks):
-        groups = hooks.get(event)
-        if not isinstance(groups, list):
-            continue
-        kept_groups = []
-        for group in groups:
-            if not isinstance(group, dict):
-                kept_groups.append(group)
-                continue
-            handlers = group.get("hooks")
-            if not isinstance(handlers, list):
-                kept_groups.append(group)
-                continue
-            kept_handlers = [
-                handler
-                for handler in handlers
-                if not (
-                    isinstance(handler, dict)
-                    and ROUTING_HOOK_COMMAND_MARKER in str(handler.get("command") or "")
-                )
-            ]
-            if len(kept_handlers) != len(handlers):
-                changed = True
-            if kept_handlers:
-                group["hooks"] = kept_handlers
-                kept_groups.append(group)
-        if kept_groups:
-            hooks[event] = kept_groups
-        else:
-            hooks.pop(event, None)
-    if not hooks:
-        doc.pop("hooks", None)
     return changed
 
 

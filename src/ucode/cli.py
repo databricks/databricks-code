@@ -34,7 +34,6 @@ from ucode.agents.codex import (
     enable_intelligent_routing,
     intelligent_routing_enabled,
     revert_legacy_shared_config,
-    route_launch_model,
 )
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
 from ucode.config_io import restore_file, set_dry_run
@@ -59,6 +58,7 @@ from ucode.databricks import (
     resolve_pat_token,
     run_databricks_login,
 )
+from ucode.intelligent_routing.codex_routing import route_launch_model
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
@@ -972,7 +972,7 @@ def codex_router_hook_cmd(
     import json
     import sys
 
-    from ucode.codex_routing import (
+    from ucode.intelligent_routing.codex_routing import (
         record_session_start,
         record_subagent_start,
         route_pre_tool_use,

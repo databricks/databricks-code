@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ucode.config_io import APP_DIR
+from ucode.databricks import get_databricks_token
 
 ROUTER_NAME = "task_v1"
 ROUTING_PATH = "/ai-gateway/routing/v1/routes:select"
@@ -35,6 +36,30 @@ class RoutingDecision:
     model: str
     raw_model: str
     rationale: str = ""
+
+
+def route_launch_model(state: dict, tool_args: list[str]):
+    """Route a root Codex launch before the Codex process starts."""
+    workspace = state.get("workspace")
+    models = state.get("codex_models")
+    if not isinstance(workspace, str) or not isinstance(models, list):
+        return None, "workspace model metadata is unavailable"
+    try:
+        token = get_databricks_token(workspace, state.get("profile"))
+    except RuntimeError as exc:
+        return None, f"could not authenticate the routing request: {exc}"
+    task = _launch_routing_task(tool_args)
+    return request_routing_decision(workspace, token, task, models)
+
+
+def _launch_routing_task(tool_args: list[str]) -> str:
+    if "exec" in tool_args:
+        prompt_parts = tool_args[tool_args.index("exec") + 1 :]
+        if prompt_parts:
+            return " ".join(prompt_parts)
+    if tool_args:
+        return "Start a Codex session with options: " + " ".join(tool_args)
+    return f"Start an interactive Codex coding session in {Path.cwd().name}."
 
 
 def request_routing_decision(

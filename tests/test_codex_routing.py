@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import urllib.error
 
-from ucode import codex_routing
+from ucode.intelligent_routing import codex_routing
 
 WS = "https://example.databricks.com"
 
