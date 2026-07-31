@@ -312,6 +312,7 @@ def configure_tool(
     provider: str | None = None,
     provider_models: dict[str, str] | None = None,
     relayed: bool = False,
+    route_root_model: str | None = None,
 ) -> dict:
     result: dict | tuple[dict, str]
     if tool == "codex":
@@ -322,7 +323,12 @@ def configure_tool(
         if not model and not provider:
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         result = claude.write_tool_config(
-            state, model, provider=provider, provider_models=provider_models, relayed=relayed
+            state,
+            model,
+            provider=provider,
+            provider_models=provider_models,
+            relayed=relayed,
+            route_root_model=route_root_model,
         )
     else:
         # provider routing is claude/codex-only; every other tool needs a model.

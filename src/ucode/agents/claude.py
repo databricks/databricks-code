@@ -30,6 +30,10 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
+from ucode.smart_routing.claude_hooks import (
+    remove_smart_routing_hooks,
+    sync_smart_routing_hooks,
+)
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
@@ -46,6 +50,15 @@ SPEC: ToolSpec = {
     "config_path": CLAUDE_SETTINGS_PATH,
     "backup_path": CLAUDE_BACKUP_PATH,
 }
+
+# Per-workspace opt-in flag for Claude Code smart routing (state key).
+# Shared across agents: one opt-in enables smart routing for every routing-capable
+# tool (codex, claude), so a workspace turns it on once. Kept identical to
+# codex.SMART_ROUTING_STATE_KEY on purpose.
+SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
+# Claude Code settings.json hook events ucode manages when routing is enabled;
+# marked managed so they're tracked/reverted with the rest of ucode's config.
+CLAUDE_ROUTING_HOOK_EVENTS = ("PreToolUse", "SessionStart", "SubagentStart")
 
 
 def is_update_available() -> tuple[str, str] | None:
@@ -214,6 +227,7 @@ def render_overlay(
     fable_enabled: bool = False,
     relayed: bool = False,
     relayed_base_url: str | None = None,
+    route_root_model: str | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Claude settings.json.
 
@@ -265,13 +279,20 @@ def render_overlay(
         "ENABLE_TOOL_SEARCH": "1",
         "CLAUDE_CODE_USE_GATEWAY": "1",
     }
-    # Intentionally NOT setting ANTHROPIC_MODEL. Setting it produces a duplicate
-    # catalog row in Claude Code's /model picker (e.g. "Opus 4.8 (1M context) ✓")
-    # on top of the family-alias row from ANTHROPIC_DEFAULT_OPUS_MODEL. Without
-    # it, Default resolves through the pinned family alias and the picker shows
-    # only one row per model. `ucode claude -- --model X` still overrides for a
-    # single session via Claude Code's own --model flag.
+    # Intentionally NOT setting ANTHROPIC_MODEL by default. Setting it produces a
+    # duplicate catalog row in Claude Code's /model picker (e.g. "Opus 4.8 (1M
+    # context) ✓") on top of the family-alias row from ANTHROPIC_DEFAULT_OPUS_MODEL.
+    # Without it, Default resolves through the pinned family alias and the picker
+    # shows only one row per model. `ucode claude -- --model X` still overrides for
+    # a single session via Claude Code's own --model flag.
+    #
+    # The one exception is smart routing: `route_root_model` pins the
+    # router's per-launch pick for the root session as ANTHROPIC_MODEL. The
+    # duplicate-picker-row cost is acceptable because the whole point is to launch
+    # on the routed model rather than the family default.
     _ = model  # API stability; no longer pinned via env.
+    if route_root_model:
+        env["ANTHROPIC_MODEL"] = route_root_model
     # A Bedrock-backed provider needs its provider-side ids pinned verbatim
     # (Claude Code's canonical names aren't routable there). These come from the
     # service's targets, already de-duped to one id per family upstream.
@@ -389,12 +410,41 @@ def _unregister_web_search_mcp() -> None:
             pass
 
 
+def smart_routing_enabled(state: dict) -> bool:
+    """Return whether the current workspace opted into Claude Code routing."""
+    return state.get(SMART_ROUTING_STATE_KEY) is True
+
+
+def enable_smart_routing(state: dict) -> dict:
+    """Persist the current workspace's Claude Code smart-routing opt-in."""
+    state[SMART_ROUTING_STATE_KEY] = True
+    return state
+
+
+def disable_smart_routing(state: dict) -> bool:
+    """Disable routing and remove only ucode's Claude Code routing hooks."""
+    state.pop(SMART_ROUTING_STATE_KEY, None)
+    if state.get("workspace"):
+        save_state(state)
+    changed = False
+    if CLAUDE_SETTINGS_PATH.exists():
+        doc = read_json_safe(CLAUDE_SETTINGS_PATH)
+        if remove_smart_routing_hooks(doc):
+            write_json_file(CLAUDE_SETTINGS_PATH, doc)
+            changed = True
+    from ucode.smart_routing.claude_routing import clear_routing_artifacts
+
+    clear_routing_artifacts()
+    return changed
+
+
 def write_tool_config(
     state: dict,
     model: str | None,
     provider: str | None = None,
     provider_models: dict[str, str] | None = None,
     relayed: bool = False,
+    route_root_model: str | None = None,
 ) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
     web_search_model = _resolve_web_search_model(state)
@@ -413,6 +463,7 @@ def write_tool_config(
         fable_enabled=bool(state.get("fable_enabled")),
         relayed=relayed,
         relayed_base_url=relayed_base_url,
+        route_root_model=route_root_model,
     )
     tracing_env_vars = tracing_env(state, "claude")
     stop_hook_command = claude_tracing_stop_hook_command() if tracing_env_vars else None
@@ -457,6 +508,13 @@ def write_tool_config(
     if isinstance(merged_env, dict):
         for key in CLAUDE_REMOVED_ENV_KEYS:
             merged_env.pop(key, None)
+    # Smart-routing hooks: install ucode's PreToolUse/SessionStart/
+    # SubagentStart hooks when routing is enabled (and not under a provider,
+    # which pins no Databricks model), else surgically strip only ucode's own.
+    routing_enabled = smart_routing_enabled(state) and provider is None
+    sync_smart_routing_hooks(merged, state, enabled=routing_enabled)
+    if routing_enabled:
+        managed_keys = managed_keys + [["hooks", event] for event in CLAUDE_ROUTING_HOOK_EVENTS]
     write_json_file(CLAUDE_SETTINGS_PATH, merged)
 
     if web_search_model:

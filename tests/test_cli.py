@@ -196,13 +196,13 @@ class TestSubcommandRouting:
             result = runner.invoke(app, ["codex", "--enable-smart-routing"])
 
         assert result.exit_code == 0, result.output
-        assert mock_launch.call_args.kwargs["enable_codex_smart_routing"] is True
+        assert mock_launch.call_args.kwargs["enable_smart_routing_flag"] is True
         assert mock_launch.call_args.args[1].args == []
 
     def test_codex_disable_removes_hooks_without_launching(self):
         with (
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.disable_smart_routing") as mock_disable,
+            patch("ucode.cli.codex_agent.disable_smart_routing") as mock_disable,
             patch("ucode.cli._launch_tool") as mock_launch,
         ):
             result = runner.invoke(app, ["codex", "--disable-smart-routing"])
@@ -241,7 +241,10 @@ class TestSubcommandRouting:
                 "ucode.cli.resolve_launch_model",
                 return_value=(state, "databricks-gpt-5"),
             ),
-            patch("ucode.cli.route_launch_model", return_value=(decision, None)),
+            patch(
+                "ucode.cli.codex_routing.route_launch_model",
+                return_value=(decision, None),
+            ),
             patch("ucode.cli.configure_tool", return_value=state) as mock_configure,
             patch("ucode.cli.launch_agent"),
         ):

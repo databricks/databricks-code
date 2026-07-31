@@ -26,15 +26,12 @@ from ucode.agents import (
     validate_all_tools,
     validate_tool,
 )
+from ucode.agents import claude as claude_agent
+from ucode.agents import codex as codex_agent
 from ucode.agents import (
     launch as launch_agent,
 )
-from ucode.agents.codex import (
-    disable_smart_routing,
-    enable_smart_routing,
-    revert_legacy_shared_config,
-    smart_routing_enabled,
-)
+from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
 from ucode.config_io import restore_file, set_dry_run
 from ucode.databricks import (
@@ -67,7 +64,7 @@ from ucode.mcp import (
     revert_mcp_configs,
 )
 from ucode.skills_download import configure_skills_download_command
-from ucode.smart_routing.codex_routing import route_launch_model
+from ucode.smart_routing import claude_routing, codex_routing
 from ucode.state import (
     STATE_PATH,
     clear_state,
@@ -1031,6 +1028,77 @@ def codex_router_hook_cmd(
         sys.stdout.write(json.dumps(output))
 
 
+@app.command("claude-router-hook", hidden=True)
+def claude_router_hook_cmd(
+    event: str,
+    host: Annotated[str | None, typer.Option("--host")] = None,
+    profile: Annotated[str | None, typer.Option("--profile")] = None,
+    use_pat: Annotated[bool, typer.Option("--use-pat")] = False,
+    model: Annotated[list[str] | None, typer.Option("--model")] = None,
+) -> None:
+    """Run a Claude Code smart-routing lifecycle hook."""
+    import json
+    import sys
+
+    from ucode.smart_routing.claude_routing import (
+        record_session_start,
+        record_subagent_start,
+        route_pre_tool_use,
+    )
+
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return
+    if not isinstance(payload, dict):
+        return
+    if event == "session-start":
+        record_session_start(payload)
+        return
+    if event == "record-subagent":
+        record = record_subagent_start(payload)
+        matched = record.get("matches_router_decision")
+        if matched is True:
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "systemMessage": "Smart Routing verified. "
+                        f"Subagent is using {record.get('model')}."
+                    }
+                )
+            )
+        elif matched is False:
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "systemMessage": "Smart Routing mismatch: router requested "
+                        f"{record.get('requested_model')}, but Claude Code started "
+                        f"{record.get('model')}."
+                    }
+                )
+            )
+        return
+    if event != "route-subagent" or not host:
+        return
+    token = os.environ.get("OAUTH_TOKEN") or os.environ.get("DATABRICKS_BEARER")
+    if not token:
+        if use_pat and not ensure_pat_bearer(profile):
+            return
+        try:
+            token = get_databricks_token(host, profile)
+        except RuntimeError:
+            return
+    output = route_pre_tool_use(
+        payload,
+        workspace=host,
+        token=token,
+        available_models=model or [],
+        audit_decision=True,
+    )
+    if output is not None:
+        sys.stdout.write(json.dumps(output))
+
+
 def _auto_configure_tool(tool: str) -> None:
     """First-time setup for a single tool — mirrors configure_workspace_command."""
     existing = load_state()
@@ -1068,13 +1136,20 @@ def _auto_configure_tool(tool: str) -> None:
         raise RuntimeError(f"{spec['display']} validation failed — config reverted.")
 
 
+# Agent modules exposing the smart-routing opt-in surface (enable/disable/
+# enabled + launch-model routing), keyed by tool. Both share the identical
+# function names via their agent module and their routing module.
+_ROUTING_AGENTS = {"codex": codex_agent, "claude": claude_agent}
+_ROUTING_MODULES = {"codex": codex_routing, "claude": claude_routing}
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
     provider: str | None = None,
     skip_preflight: bool = False,
     workspace: str | None = None,
-    enable_codex_smart_routing: bool = False,
+    enable_smart_routing_flag: bool = False,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
@@ -1098,10 +1173,11 @@ def _launch_tool(
         # An explicit --provider overrides the persisted choice; otherwise fall
         # back to whatever `ucode configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
-        if tool == "codex" and enable_codex_smart_routing and provider:
+        routing_agent = _ROUTING_AGENTS.get(tool)
+        if routing_agent is not None and enable_smart_routing_flag and provider:
             raise RuntimeError(
-                "Codex smart routing cannot be enabled with --provider. "
-                "Launch without a Model Provider Service and try again."
+                f"{TOOL_SPECS[tool]['display']} smart routing cannot be enabled with "
+                "--provider. Launch without a Model Provider Service and try again."
             )
         # Validate the provider service before launching — it must exist, be a
         # provider type this tool can route to (e.g. claude can't use an OpenAI
@@ -1126,8 +1202,11 @@ def _launch_tool(
             skip_model_discovery=bool(provider),
             skip_preflight=skip_preflight,
         )
-        if tool == "codex" and enable_codex_smart_routing:
-            state = enable_smart_routing(state)
+        if routing_agent is not None and enable_smart_routing_flag:
+            state = routing_agent.enable_smart_routing(state)
+        # The router's per-launch pick for the root session. Codex pins it as the
+        # resolved model; claude pins it via ANTHROPIC_MODEL (route_root_model).
+        route_root_model = None
         if provider:
             # Routing through a Model Provider Service pins no Databricks model;
             # the agent uses its own canonical model names (header selects the
@@ -1136,12 +1215,18 @@ def _launch_tool(
             resolved_model = None
         else:
             state, resolved_model = resolve_launch_model(tool, state, None)
-            if tool == "codex" and smart_routing_enabled(state):
-                with spinner("Selecting a Codex model with smart routing..."):
-                    decision, routing_error = route_launch_model(state, ctx.args)
+            if routing_agent is not None and routing_agent.smart_routing_enabled(state):
+                display = TOOL_SPECS[tool]["display"]
+                with spinner(f"Selecting a {display} model with smart routing..."):
+                    decision, routing_error = _ROUTING_MODULES[tool].route_launch_model(
+                        state, ctx.args
+                    )
                 if decision is not None:
-                    resolved_model = decision.model
                     print_note(decision.display_message())
+                    if tool == "codex":
+                        resolved_model = decision.model
+                    else:
+                        route_root_model = decision.model
                 elif routing_error:
                     print_warning(
                         f"Smart routing was unavailable ({routing_error}); using {resolved_model}."
@@ -1153,18 +1238,25 @@ def _launch_tool(
             provider=provider,
             provider_models=provider_models,
             relayed=relayed,
+            route_root_model=route_root_model,
         )
         print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
         if provider:
             print_kv("Provider", provider)
+        elif route_root_model:
+            print_kv("Model", route_root_model)
         elif resolved_model:
             print_kv("Model", resolved_model)
-        if tool == "codex" and smart_routing_enabled(state) and not provider:
+        if (
+            routing_agent is not None
+            and routing_agent.smart_routing_enabled(state)
+            and not provider
+        ):
             print_kv("Smart routing", "enabled")
-            if enable_codex_smart_routing:
+            if enable_smart_routing_flag:
                 print_note(
-                    "Codex requires one-time hook review. Open `/hooks` and trust the "
-                    "ucode routing hooks if prompted."
+                    f"{TOOL_SPECS[tool]['display']} requires one-time hook review. Open "
+                    "`/hooks` and trust the ucode routing hooks if prompted."
                 )
         if tool in ("gemini", "opencode", "copilot", "pi"):
             print_note(
@@ -1240,7 +1332,7 @@ def codex_cmd(
         print_err("Use only one of --enable-smart-routing or --disable-smart-routing.")
         raise typer.Exit(1)
     if disable_smart_routing_flag:
-        disable_smart_routing(load_state())
+        codex_agent.disable_smart_routing(load_state())
         print_success("Codex smart routing disabled; ucode routing hooks removed")
         return
     _launch_tool(
@@ -1249,7 +1341,7 @@ def codex_cmd(
         provider=provider,
         skip_preflight=skip_preflight,
         workspace=workspace,
-        enable_codex_smart_routing=enable_smart_routing_flag,
+        enable_smart_routing_flag=enable_smart_routing_flag,
     )
 
 
@@ -1267,10 +1359,36 @@ def claude_cmd(
     ] = None,
     skip_preflight: SkipPreflightOption = False,
     workspace: WorkspaceOption = None,
+    enable_smart_routing_flag: Annotated[
+        bool,
+        typer.Option(
+            "--enable-smart-routing",
+            help="Enable AI Gateway model routing for Claude Code sessions and subagents.",
+        ),
+    ] = False,
+    disable_smart_routing_flag: Annotated[
+        bool,
+        typer.Option(
+            "--disable-smart-routing",
+            help="Disable smart routing and remove ucode's Claude Code routing hooks.",
+        ),
+    ] = False,
 ) -> None:
     """Launch Claude Code via Databricks."""
+    if enable_smart_routing_flag and disable_smart_routing_flag:
+        print_err("Use only one of --enable-smart-routing or --disable-smart-routing.")
+        raise typer.Exit(1)
+    if disable_smart_routing_flag:
+        claude_agent.disable_smart_routing(load_state())
+        print_success("Claude Code smart routing disabled; ucode routing hooks removed")
+        return
     _launch_tool(
-        "claude", ctx, provider=provider, skip_preflight=skip_preflight, workspace=workspace
+        "claude",
+        ctx,
+        provider=provider,
+        skip_preflight=skip_preflight,
+        workspace=workspace,
+        enable_smart_routing_flag=enable_smart_routing_flag,
     )
 
 
