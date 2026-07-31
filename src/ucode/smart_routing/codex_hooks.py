@@ -1,4 +1,4 @@
-"""Codex hook configuration for intelligent subagent routing."""
+"""Codex hook configuration for smart subagent routing."""
 
 from __future__ import annotations
 
@@ -6,62 +6,20 @@ import shlex
 import subprocess
 
 from ucode.databricks import build_auth_token_argv
+from ucode.smart_routing import hooks
 
 ROUTING_HOOK_COMMAND_MARKER = "codex-router-hook"
 
 
-def sync_intelligent_routing_hooks(doc: dict, state: dict, *, enabled: bool) -> None:
+def sync_smart_routing_hooks(doc: dict, state: dict, *, enabled: bool) -> None:
     """Synchronize ucode-managed routing hooks in a Codex config document."""
-    remove_intelligent_routing_hooks(doc)
-    if not enabled:
-        return
-    hooks = doc.setdefault("hooks", {})
-    for event, groups in _routing_hook_groups(state).items():
-        existing = hooks.get(event)
-        if not isinstance(existing, list):
-            existing = []
-        hooks[event] = [*existing, *groups]
+    groups = _routing_hook_groups(state) if enabled else {}
+    hooks.sync_managed_hooks(doc, ROUTING_HOOK_COMMAND_MARKER, groups)
 
 
-def remove_intelligent_routing_hooks(doc: dict) -> bool:
-    """Remove only ucode-managed intelligent-routing hooks."""
-    hooks = doc.get("hooks")
-    if not isinstance(hooks, dict):
-        return False
-    changed = False
-    for event in list(hooks):
-        groups = hooks.get(event)
-        if not isinstance(groups, list):
-            continue
-        kept_groups = []
-        for group in groups:
-            if not isinstance(group, dict):
-                kept_groups.append(group)
-                continue
-            handlers = group.get("hooks")
-            if not isinstance(handlers, list):
-                kept_groups.append(group)
-                continue
-            kept_handlers = [
-                handler
-                for handler in handlers
-                if not (
-                    isinstance(handler, dict)
-                    and ROUTING_HOOK_COMMAND_MARKER in str(handler.get("command") or "")
-                )
-            ]
-            if len(kept_handlers) != len(handlers):
-                changed = True
-            if kept_handlers:
-                group["hooks"] = kept_handlers
-                kept_groups.append(group)
-        if kept_groups:
-            hooks[event] = kept_groups
-        else:
-            hooks.pop(event, None)
-    if not hooks:
-        doc.pop("hooks", None)
-    return changed
+def remove_smart_routing_hooks(doc: dict) -> bool:
+    """Remove only ucode-managed smart-routing hooks."""
+    return hooks.remove_managed_hooks(doc, ROUTING_HOOK_COMMAND_MARKER)
 
 
 def _routing_hook_groups(state: dict) -> dict[str, list[dict]]:

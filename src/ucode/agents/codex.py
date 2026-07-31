@@ -20,11 +20,11 @@ from ucode.databricks import (
     build_tool_base_url,
     get_databricks_token,
 )
-from ucode.intelligent_routing.codex_hooks import (
-    remove_intelligent_routing_hooks,
-    sync_intelligent_routing_hooks,
-)
 from ucode.launcher import exec_or_spawn
+from ucode.smart_routing.codex_hooks import (
+    remove_smart_routing_hooks,
+    sync_smart_routing_hooks,
+)
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 
@@ -39,7 +39,9 @@ MINIMUM_CODEX_VERSION = (0, 134, 0)
 MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
 MINIMUM_ROUTING_CODEX_VERSION = (0, 145, 0)
 MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
-INTELLIGENT_ROUTING_STATE_KEY = "codex_intelligent_routing_enabled"
+# Shared across agents: one opt-in enables smart routing for every routing-capable
+# tool (codex, claude), so a workspace turns it on once.
+SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 
 
 SPEC: ToolSpec = {
@@ -325,10 +327,9 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     databricks_profile = state.get("profile")
 
     if _use_legacy_layout():
-        if intelligent_routing_enabled(state) and provider is None:
+        if smart_routing_enabled(state) and provider is None:
             raise RuntimeError(
-                "Codex intelligent routing requires Codex "
-                f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer."
+                f"Codex smart routing requires Codex {MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer."
             )
         # Codex < 0.134.0 only reads ~/.codex/config.toml. Write the shared
         # config with [profiles.ucode] + shared [model_providers.ucode-databricks]
@@ -370,10 +371,10 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         # deep_merge can't drop keys, so clear a `model` pinned by an earlier
         # non-provider run that the provider overlay omits.
         doc.pop("model", None)
-    sync_intelligent_routing_hooks(
+    sync_smart_routing_hooks(
         doc,
         state,
-        enabled=intelligent_routing_enabled(state) and provider is None,
+        enabled=smart_routing_enabled(state) and provider is None,
     )
     write_toml_file(CODEX_CONFIG_PATH, doc)
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
@@ -416,27 +417,27 @@ def launch(state: dict, tool_args: list[str]) -> None:
     exec_or_spawn([binary, "--profile", CODEX_PROFILE_NAME, *tool_args])
 
 
-def intelligent_routing_enabled(state: dict) -> bool:
+def smart_routing_enabled(state: dict) -> bool:
     """Return whether the current workspace opted into Codex routing."""
-    return state.get(INTELLIGENT_ROUTING_STATE_KEY) is True
+    return state.get(SMART_ROUTING_STATE_KEY) is True
 
 
-def enable_intelligent_routing(state: dict) -> dict:
-    """Persist the current workspace's Codex intelligent-routing opt-in."""
+def enable_smart_routing(state: dict) -> dict:
+    """Persist the current workspace's Codex smart-routing opt-in."""
     parsed = _parse_version(agent_version(SPEC["binary"]))
     if parsed is not None and parsed < MINIMUM_ROUTING_CODEX_VERSION:
         raise RuntimeError(
-            "Codex intelligent routing requires Codex "
+            "Codex smart routing requires Codex "
             f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found "
             f"{agent_version(SPEC['binary'])}."
         )
-    state[INTELLIGENT_ROUTING_STATE_KEY] = True
+    state[SMART_ROUTING_STATE_KEY] = True
     return state
 
 
-def disable_intelligent_routing(state: dict) -> bool:
+def disable_smart_routing(state: dict) -> bool:
     """Disable routing and remove only ucode's Codex routing hooks."""
-    state.pop(INTELLIGENT_ROUTING_STATE_KEY, None)
+    state.pop(SMART_ROUTING_STATE_KEY, None)
     if state.get("workspace"):
         save_state(state)
     changed = False
@@ -444,10 +445,10 @@ def disable_intelligent_routing(state: dict) -> bool:
         if not path.exists():
             continue
         doc = read_toml_safe(path)
-        if remove_intelligent_routing_hooks(doc):
+        if remove_smart_routing_hooks(doc):
             write_toml_file(path, doc)
             changed = True
-    from ucode.intelligent_routing.codex_routing import clear_routing_artifacts
+    from ucode.smart_routing.codex_routing import clear_routing_artifacts
 
     clear_routing_artifacts()
     return changed

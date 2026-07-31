@@ -30,10 +30,10 @@ from ucode.agents import (
     launch as launch_agent,
 )
 from ucode.agents.codex import (
-    disable_intelligent_routing,
-    enable_intelligent_routing,
-    intelligent_routing_enabled,
+    disable_smart_routing,
+    enable_smart_routing,
     revert_legacy_shared_config,
+    smart_routing_enabled,
 )
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
 from ucode.config_io import restore_file, set_dry_run
@@ -58,7 +58,6 @@ from ucode.databricks import (
     resolve_pat_token,
     run_databricks_login,
 )
-from ucode.intelligent_routing.codex_routing import route_launch_model
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
@@ -68,6 +67,7 @@ from ucode.mcp import (
     revert_mcp_configs,
 )
 from ucode.skills_download import configure_skills_download_command
+from ucode.smart_routing.codex_routing import route_launch_model
 from ucode.state import (
     STATE_PATH,
     clear_state,
@@ -968,11 +968,11 @@ def codex_router_hook_cmd(
     use_pat: Annotated[bool, typer.Option("--use-pat")] = False,
     model: Annotated[list[str] | None, typer.Option("--model")] = None,
 ) -> None:
-    """Run a Codex intelligent-routing lifecycle hook."""
+    """Run a Codex smart-routing lifecycle hook."""
     import json
     import sys
 
-    from ucode.intelligent_routing.codex_routing import (
+    from ucode.smart_routing.codex_routing import (
         record_session_start,
         record_subagent_start,
         route_pre_tool_use,
@@ -994,7 +994,7 @@ def codex_router_hook_cmd(
             sys.stdout.write(
                 json.dumps(
                     {
-                        "systemMessage": "Intelligent Routing verified. "
+                        "systemMessage": "Smart Routing verified. "
                         f"Subagent is using {record.get('model')}."
                     }
                 )
@@ -1003,7 +1003,7 @@ def codex_router_hook_cmd(
             sys.stdout.write(
                 json.dumps(
                     {
-                        "systemMessage": "Intelligent Routing mismatch: router requested "
+                        "systemMessage": "Smart Routing mismatch: router requested "
                         f"{record.get('requested_model')}, but Codex started "
                         f"{record.get('model')}."
                     }
@@ -1074,7 +1074,7 @@ def _launch_tool(
     provider: str | None = None,
     skip_preflight: bool = False,
     workspace: str | None = None,
-    enable_codex_intelligent_routing: bool = False,
+    enable_codex_smart_routing: bool = False,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
@@ -1098,9 +1098,9 @@ def _launch_tool(
         # An explicit --provider overrides the persisted choice; otherwise fall
         # back to whatever `ucode configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
-        if tool == "codex" and enable_codex_intelligent_routing and provider:
+        if tool == "codex" and enable_codex_smart_routing and provider:
             raise RuntimeError(
-                "Codex intelligent routing cannot be enabled with --provider. "
+                "Codex smart routing cannot be enabled with --provider. "
                 "Launch without a Model Provider Service and try again."
             )
         # Validate the provider service before launching — it must exist, be a
@@ -1126,8 +1126,8 @@ def _launch_tool(
             skip_model_discovery=bool(provider),
             skip_preflight=skip_preflight,
         )
-        if tool == "codex" and enable_codex_intelligent_routing:
-            state = enable_intelligent_routing(state)
+        if tool == "codex" and enable_codex_smart_routing:
+            state = enable_smart_routing(state)
         if provider:
             # Routing through a Model Provider Service pins no Databricks model;
             # the agent uses its own canonical model names (header selects the
@@ -1136,16 +1136,15 @@ def _launch_tool(
             resolved_model = None
         else:
             state, resolved_model = resolve_launch_model(tool, state, None)
-            if tool == "codex" and intelligent_routing_enabled(state):
-                with spinner("Selecting a Codex model with intelligent routing..."):
+            if tool == "codex" and smart_routing_enabled(state):
+                with spinner("Selecting a Codex model with smart routing..."):
                     decision, routing_error = route_launch_model(state, ctx.args)
                 if decision is not None:
                     resolved_model = decision.model
-                    print_note(f"Using Intelligent Routing. Routing to {resolved_model}.")
+                    print_note(f"Using Smart Routing. Routing to {resolved_model}.")
                 elif routing_error:
                     print_warning(
-                        f"Intelligent routing was unavailable ({routing_error}); "
-                        f"using {resolved_model}."
+                        f"Smart routing was unavailable ({routing_error}); using {resolved_model}."
                     )
         state = configure_tool(
             tool,
@@ -1160,9 +1159,9 @@ def _launch_tool(
             print_kv("Provider", provider)
         elif resolved_model:
             print_kv("Model", resolved_model)
-        if tool == "codex" and intelligent_routing_enabled(state) and not provider:
-            print_kv("Intelligent routing", "enabled")
-            if enable_codex_intelligent_routing:
+        if tool == "codex" and smart_routing_enabled(state) and not provider:
+            print_kv("Smart routing", "enabled")
+            if enable_codex_smart_routing:
                 print_note(
                     "Codex requires one-time hook review. Open `/hooks` and trust the "
                     "ucode routing hooks if prompted."
@@ -1221,28 +1220,28 @@ def codex_cmd(
     ] = None,
     skip_preflight: SkipPreflightOption = False,
     workspace: WorkspaceOption = None,
-    enable_intelligent_routing_flag: Annotated[
+    enable_smart_routing_flag: Annotated[
         bool,
         typer.Option(
-            "--enable-intelligent-routing",
+            "--enable-smart-routing",
             help="Enable AI Gateway model routing for Codex sessions and subagents.",
         ),
     ] = False,
-    disable_intelligent_routing_flag: Annotated[
+    disable_smart_routing_flag: Annotated[
         bool,
         typer.Option(
-            "--disable-intelligent-routing",
-            help="Disable intelligent routing and remove ucode's Codex routing hooks.",
+            "--disable-smart-routing",
+            help="Disable smart routing and remove ucode's Codex routing hooks.",
         ),
     ] = False,
 ) -> None:
     """Launch Codex via Databricks."""
-    if enable_intelligent_routing_flag and disable_intelligent_routing_flag:
-        print_err("Use only one of --enable-intelligent-routing or --disable-intelligent-routing.")
+    if enable_smart_routing_flag and disable_smart_routing_flag:
+        print_err("Use only one of --enable-smart-routing or --disable-smart-routing.")
         raise typer.Exit(1)
-    if disable_intelligent_routing_flag:
-        disable_intelligent_routing(load_state())
-        print_success("Codex intelligent routing disabled; ucode routing hooks removed")
+    if disable_smart_routing_flag:
+        disable_smart_routing(load_state())
+        print_success("Codex smart routing disabled; ucode routing hooks removed")
         return
     _launch_tool(
         "codex",
@@ -1250,7 +1249,7 @@ def codex_cmd(
         provider=provider,
         skip_preflight=skip_preflight,
         workspace=workspace,
-        enable_codex_intelligent_routing=enable_intelligent_routing_flag,
+        enable_codex_smart_routing=enable_smart_routing_flag,
     )
 
 

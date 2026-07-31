@@ -1,11 +1,11 @@
-"""Tests for Codex intelligent-routing hooks."""
+"""Tests for Codex smart-routing hooks."""
 
 from __future__ import annotations
 
 import json
 import urllib.error
 
-from ucode.intelligent_routing import codex_routing
+from ucode.smart_routing import codex_routing
 
 WS = "https://example.databricks.com"
 
@@ -143,7 +143,7 @@ def test_spawn_rewrite_preserves_original_input(monkeypatch):
     )
 
     hook = output["hookSpecificOutput"]
-    assert output["systemMessage"] == "Using Intelligent Routing. Routing to gpt-5.5."
+    assert output["systemMessage"] == "Using Smart Routing. Routing to gpt-5.5."
     assert hook["permissionDecision"] == "allow"
     assert hook["updatedInput"] == {
         "task_name": "reviewer",
@@ -152,7 +152,7 @@ def test_spawn_rewrite_preserves_original_input(monkeypatch):
         "model": "gpt-5.5",
     }
     assert hook["permissionDecisionReason"] == (
-        "Using Intelligent Routing. Routing to gpt-5.5. Review needs deeper reasoning."
+        "Using Smart Routing. Routing to gpt-5.5. Review needs deeper reasoning."
     )
 
 
@@ -179,7 +179,7 @@ def test_spawn_rewrite_uses_codex_model_id_for_uc_endpoint(monkeypatch):
         available_models=["system.ai.gpt-5-6-luna"],
     )
 
-    assert output["systemMessage"] == "Using Intelligent Routing. Routing to gpt-5.6-luna."
+    assert output["systemMessage"] == "Using Smart Routing. Routing to gpt-5.6-luna."
     assert output["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-5.6-luna"
 
 
@@ -208,7 +208,7 @@ def test_spawn_glm_decision_keeps_original_model(monkeypatch):
 
     assert output == {
         "systemMessage": (
-            "Intelligent Routing selected GLM 5.2, which is not enabled for Codex "
+            "Smart Routing selected GLM 5.2, which is not enabled for Codex "
             "subagents. Keeping the original subagent model."
         )
     }

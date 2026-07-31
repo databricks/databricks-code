@@ -6,7 +6,7 @@ import os
 
 from ucode.agents import codex
 from ucode.config_io import read_toml_safe
-from ucode.intelligent_routing import codex_routing
+from ucode.smart_routing import codex_routing
 
 WS = "https://example.databricks.com"
 
@@ -218,7 +218,7 @@ class TestCodexWriteConfig:
         assert provider["base_url"] == f"{WS}/ai-gateway/codex/v1"
         assert provider["wire_api"] == "responses"
 
-    def test_intelligent_routing_writes_profile_scoped_hooks(self, tmp_path, monkeypatch):
+    def test_smart_routing_writes_profile_scoped_hooks(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
         config_path.parent.mkdir()
         config_path.write_text(
@@ -239,7 +239,7 @@ class TestCodexWriteConfig:
                 "workspace": WS,
                 "profile": "prod",
                 "codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"],
-                codex.INTELLIGENT_ROUTING_STATE_KEY: True,
+                codex.SMART_ROUTING_STATE_KEY: True,
             }
         )
 
@@ -267,7 +267,7 @@ class TestCodexWriteConfig:
         state = {
             "workspace": WS,
             "codex_models": ["databricks-gpt-5"],
-            codex.INTELLIGENT_ROUTING_STATE_KEY: True,
+            codex.SMART_ROUTING_STATE_KEY: True,
         }
 
         codex.write_tool_config(state)
@@ -319,12 +319,12 @@ class TestCodexLegacyLayoutDetection:
         assert codex._use_legacy_layout() is False
 
 
-class TestCodexIntelligentRouting:
+class TestCodexSmartRouting:
     def test_enable_requires_supported_codex(self, monkeypatch):
         monkeypatch.setattr(codex, "agent_version", lambda binary: "0.144.0")
 
         try:
-            codex.enable_intelligent_routing({})
+            codex.enable_smart_routing({})
             assert False
         except RuntimeError as exc:
             assert "0.145.0 or newer" in str(exc)
@@ -354,12 +354,12 @@ class TestCodexIntelligentRouting:
         monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
         monkeypatch.setattr(codex, "save_state", lambda state: None)
         monkeypatch.setattr(codex_routing, "clear_routing_artifacts", lambda: None)
-        state = {"workspace": WS, codex.INTELLIGENT_ROUTING_STATE_KEY: True}
+        state = {"workspace": WS, codex.SMART_ROUTING_STATE_KEY: True}
 
-        assert codex.disable_intelligent_routing(state) is True
+        assert codex.disable_smart_routing(state) is True
 
         doc = read_toml_safe(config_path)
-        assert state.get(codex.INTELLIGENT_ROUTING_STATE_KEY) is None
+        assert state.get(codex.SMART_ROUTING_STATE_KEY) is None
         assert list(doc["hooks"]) == ["PreToolUse"]
         assert doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "user-policy"
 

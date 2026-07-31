@@ -190,21 +190,21 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         mock_set.assert_not_called()
 
-    def test_codex_enable_intelligent_routing_is_consumed_by_ucode(self):
+    def test_codex_enable_smart_routing_is_consumed_by_ucode(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
-            result = runner.invoke(app, ["codex", "--enable-intelligent-routing"])
+            result = runner.invoke(app, ["codex", "--enable-smart-routing"])
 
         assert result.exit_code == 0, result.output
-        assert mock_launch.call_args.kwargs["enable_codex_intelligent_routing"] is True
+        assert mock_launch.call_args.kwargs["enable_codex_smart_routing"] is True
         assert mock_launch.call_args.args[1].args == []
 
     def test_codex_disable_removes_hooks_without_launching(self):
         with (
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.disable_intelligent_routing") as mock_disable,
+            patch("ucode.cli.disable_smart_routing") as mock_disable,
             patch("ucode.cli._launch_tool") as mock_launch,
         ):
-            result = runner.invoke(app, ["codex", "--disable-intelligent-routing"])
+            result = runner.invoke(app, ["codex", "--disable-smart-routing"])
 
         assert result.exit_code == 0, result.output
         mock_disable.assert_called_once_with(MINIMAL_STATE)
@@ -214,7 +214,7 @@ class TestSubcommandRouting:
     def test_codex_routing_flags_are_mutually_exclusive(self):
         result = runner.invoke(
             app,
-            ["codex", "--enable-intelligent-routing", "--disable-intelligent-routing"],
+            ["codex", "--enable-smart-routing", "--disable-smart-routing"],
         )
 
         assert result.exit_code == 1
@@ -223,7 +223,7 @@ class TestSubcommandRouting:
     def test_enabled_codex_launch_uses_routed_root_model(self):
         state = {
             **MINIMAL_STATE,
-            "codex_intelligent_routing_enabled": True,
+            "smart_routing_enabled": True,
             "codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"],
         }
         decision = MagicMock(model="databricks-gpt-5-5")
@@ -244,9 +244,7 @@ class TestSubcommandRouting:
 
         assert result.exit_code == 0, result.output
         assert mock_configure.call_args.args[2] == "databricks-gpt-5-5"
-        assert "Using Intelligent Routing. Routing to databricks-gpt-5-5." in _strip_ansi(
-            result.output
-        )
+        assert "Using Smart Routing. Routing to databricks-gpt-5-5." in _strip_ansi(result.output)
 
 
 class TestMcpSubcommands:
