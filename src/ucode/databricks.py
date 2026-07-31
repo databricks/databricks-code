@@ -204,6 +204,52 @@ def _log_auth_diagnostics() -> None:
         _debug(f"databrickscfg ({cfg_path})", f"read error: {exc}")
 
 
+def _workspace_id_for_hostname(hostname: str) -> str | None:
+    """Return the ``workspace_id`` for the ~/.databrickscfg profile matching a host.
+
+    Databricks CLI writes a numeric ``workspace_id`` for workspace-scoped
+    profiles. It is absent (or the literal ``none``) for account-scoped
+    profiles, in which case there is nothing to disambiguate with."""
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or "~/.databrickscfg").expanduser()
+    parser = configparser.ConfigParser(default_section="@ucode-no-defaults@", interpolation=None)
+    try:
+        if not parser.read(cfg_path, encoding="utf-8"):
+            return None
+    except (configparser.Error, OSError):
+        return None
+    for section in parser.sections():
+        host = (parser.get(section, "host", fallback="") or "").strip()
+        if not host:
+            continue
+        try:
+            if urlparse(normalize_workspace_url(host)).hostname != hostname:
+                continue
+        except RuntimeError:
+            continue
+        wid = (parser.get(section, "workspace_id", fallback="") or "").strip()
+        if wid and wid.lower() != "none":
+            return wid
+    return None
+
+
+def _with_workspace_disambiguator(url: str) -> str:
+    """Append ``o=<workspace_id>`` to a workspace API URL when needed.
+
+    A host that serves multiple workspaces rejects an account-audience OAuth
+    token unless the request carries the workspace disambiguator: without it
+    the gateway/UC APIs 303-redirect to ``/login`` and discovery reads the
+    login page as "response was not valid JSON". A single-workspace host
+    ignores the extra param, so this is always safe."""
+    parsed = urlparse(url)
+    if not parsed.hostname or "o=" in (parsed.query or ""):
+        return url
+    workspace_id = _workspace_id_for_hostname(parsed.hostname)
+    if not workspace_id:
+        return url
+    separator = "&" if parsed.query else "?"
+    return f"{url}{separator}o={workspace_id}"
+
+
 def _http_get_json(
     url: str, token: str, *, timeout: int = 10
 ) -> tuple[dict | list | None, str | None]:
@@ -211,6 +257,7 @@ def _http_get_json(
 
     Honors UCODE_DEBUG=1 to append status + truncated body to ~/.ucode/debug.log.
     """
+    url = _with_workspace_disambiguator(url)
     request = urllib_request.Request(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -257,6 +304,7 @@ def _http_post_json(
 ) -> tuple[dict | list | None, str | None]:
     """POST a JSON body to an endpoint. Returns (payload, None) on success,
     (None, reason) on failure. Mirrors `_http_get_json`."""
+    url = _with_workspace_disambiguator(url)
     body_bytes = json.dumps(payload).encode("utf-8")
     request = urllib_request.Request(
         url,

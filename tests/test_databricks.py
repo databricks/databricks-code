@@ -16,6 +16,8 @@ from ucode.databricks import (
     _run_databricks_cli_installer,
     _scrub_databrickscfg,
     _scrub_json,
+    _with_workspace_disambiguator,
+    _workspace_id_for_hostname,
     build_auth_shell_command,
     build_auth_token_argv,
     build_databricks_cli_env,
@@ -1940,3 +1942,71 @@ class TestInstallAiTools:
         install_ai_tools(["copilot"])
         assert len(warnings) == 1
         assert "copilot: cli-not-on-path: could not resolve copilot" in warnings[0]
+
+
+DBCFG = """\
+[account-only]
+host = https://example.databricks.com
+workspace_id = none
+
+[workspace-scoped]
+host = https://example.databricks.com
+workspace_id = 1234567890123456
+
+[other]
+host = https://other.databricks.com
+workspace_id = 42
+"""
+
+
+class TestWorkspaceIdForHostname:
+    def _cfg(self, tmp_path, monkeypatch, contents=DBCFG):
+        cfg = tmp_path / "databrickscfg"
+        cfg.write_text(contents)
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+        return cfg
+
+    def test_resolves_workspace_id_ignoring_account_only_profile(self, tmp_path, monkeypatch):
+        self._cfg(tmp_path, monkeypatch)
+        # The account-only profile (workspace_id = none) for the same host must
+        # be skipped in favor of the workspace-scoped one.
+        assert _workspace_id_for_hostname("example.databricks.com") == "1234567890123456"
+
+    def test_matches_other_host(self, tmp_path, monkeypatch):
+        self._cfg(tmp_path, monkeypatch)
+        assert _workspace_id_for_hostname("other.databricks.com") == "42"
+
+    def test_unknown_host_returns_none(self, tmp_path, monkeypatch):
+        self._cfg(tmp_path, monkeypatch)
+        assert _workspace_id_for_hostname("unknown.databricks.com") is None
+
+    def test_missing_config_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "does-not-exist"))
+        assert _workspace_id_for_hostname("example.databricks.com") is None
+
+
+class TestWithWorkspaceDisambiguator:
+    def _cfg(self, tmp_path, monkeypatch, contents=DBCFG):
+        cfg = tmp_path / "databrickscfg"
+        cfg.write_text(contents)
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    def test_appends_o_param_when_no_query(self, tmp_path, monkeypatch):
+        self._cfg(tmp_path, monkeypatch)
+        url = "https://example.databricks.com/api/ai-gateway/v2/endpoints"
+        assert _with_workspace_disambiguator(url) == url + "?o=1234567890123456"
+
+    def test_appends_o_param_preserving_existing_query(self, tmp_path, monkeypatch):
+        self._cfg(tmp_path, monkeypatch)
+        url = "https://example.databricks.com/api/ai-gateway/v2/endpoints?page_size=1"
+        assert _with_workspace_disambiguator(url) == url + "&o=1234567890123456"
+
+    def test_leaves_url_untouched_when_o_already_present(self, tmp_path, monkeypatch):
+        self._cfg(tmp_path, monkeypatch)
+        url = "https://example.databricks.com/api/ai-gateway/v2/endpoints?o=999"
+        assert _with_workspace_disambiguator(url) == url
+
+    def test_leaves_url_untouched_when_host_unknown(self, tmp_path, monkeypatch):
+        self._cfg(tmp_path, monkeypatch)
+        url = "https://unknown.databricks.com/api/ai-gateway/v2/endpoints"
+        assert _with_workspace_disambiguator(url) == url
