@@ -260,9 +260,8 @@ def download_skills(
     written sequentially so overwrite prompts don't interleave. A failure on one
     skill warns and skips it without aborting the batch.
 
-    When ``skills`` is given, only those leaf names are downloaded from each
-    location; requested names absent from a schema warn and are skipped, so a
-    partial match still downloads the rest. ``None`` downloads the whole schema.
+    When ``skills`` is given, only those leaf names are downloaded; names absent
+    from a schema warn and are skipped. ``None`` downloads the whole schema.
     """
     roots = skill_dir_roots(path)
     roots_display = " and ".join(str(root) for root in roots)
@@ -306,8 +305,8 @@ def configure_skills_download_command(
 
     Downloads to ``path`` (or the home dir when None), then registers/keeps the
     schema-less MCP connection. ``skill_locations`` is never touched, so a prior
-    ``--mcp`` set survives a download run. ``skills`` narrows the download to a
-    named subset of each schema's skills; ``None`` downloads every skill."""
+    ``--mcp`` set survives a download run. ``skills`` narrows the download (see
+    ``download_skills``)."""
     state = load_state()
     workspace, profile, clients = setup_mcp_clients(state, "Skills")
     token = get_databricks_token(workspace, profile)
