@@ -1141,7 +1141,7 @@ def _launch_tool(
                     decision, routing_error = route_launch_model(state, ctx.args)
                 if decision is not None:
                     resolved_model = decision.model
-                    print_note(f"Using Smart Routing. Routing to {resolved_model}.")
+                    print_note(decision.display_message())
                 elif routing_error:
                     print_warning(
                         f"Smart routing was unavailable ({routing_error}); using {resolved_model}."

@@ -143,7 +143,11 @@ def test_spawn_rewrite_preserves_original_input(monkeypatch):
     )
 
     hook = output["hookSpecificOutput"]
-    assert output["systemMessage"] == "Using Smart Routing. Routing to gpt-5.5."
+    # The rationale is surfaced in BOTH the systemMessage (shown to the user) and
+    # permissionDecisionReason, so the "why" is visible, not just the "what".
+    assert output["systemMessage"] == (
+        "Using Smart Routing. Routing to gpt-5.5. Review needs deeper reasoning."
+    )
     assert hook["permissionDecision"] == "allow"
     assert hook["updatedInput"] == {
         "task_name": "reviewer",
@@ -276,3 +280,37 @@ def test_decision_is_reconciled_with_actual_subagent_model(tmp_path, monkeypatch
     assert record["router_model"] == "gpt-5-6-luna"
     assert record["requested_model"] == "gpt-5.6-luna"
     assert record["matches_router_decision"] is True
+
+
+def test_decision_record_persists_rationale(tmp_path, monkeypatch):
+    decisions = tmp_path / "decisions.jsonl"
+    monkeypatch.setattr(codex_routing, "DECISIONS_PATH", decisions)
+    monkeypatch.setattr(
+        codex_routing,
+        "request_routing_decision",
+        lambda *args, **kwargs: (
+            codex_routing.RoutingDecision(
+                model="system.ai.gpt-5-6-sol",
+                raw_model="gpt-5-6-sol",
+                rationale="Cross-cutting refactor needs the strongest model.",
+            ),
+            None,
+        ),
+    )
+
+    codex_routing.route_pre_tool_use(
+        {
+            "session_id": "s1",
+            "tool_name": "collaborationspawn_agent",
+            "tool_input": {"task_name": "refactor", "message": "encrypted"},
+        },
+        workspace=WS,
+        token="token",
+        available_models=["system.ai.gpt-5-6-sol", "system.ai.gpt-5-6-luna"],
+        audit_decision=True,
+    )
+
+    # The rationale is persisted so an empty value distinguishes "gateway
+    # returned none" from a display-placement bug.
+    record = json.loads(decisions.read_text().strip())
+    assert record["rationale"] == "Cross-cutting refactor needs the strongest model."

@@ -33,6 +33,19 @@ class RoutingDecision:
     raw_model: str
     rationale: str = ""
 
+    def display_message(self, model_label: str | None = None) -> str:
+        """User-facing "Using Smart Routing" line, with the router's rationale.
+
+        Used by both the launch-time notice and the subagent-routing hook so the
+        "what" (model) and the "why" (rationale) are surfaced consistently.
+        ``model_label`` overrides the shown model id (e.g. a harness-translated
+        id); defaults to ``model``. The rationale is appended when present.
+        """
+        message = f"Using Smart Routing. Routing to {model_label or self.model}."
+        if self.rationale:
+            message += f" {self.rationale}"
+        return message
+
 
 def normalize_model(model: str) -> str:
     """Strip provider prefixes so router arms and workspace ids compare equal.
@@ -199,15 +212,16 @@ def route_spawn_tool(
     routed_model = model_id_mapper(decision.model)
     if record_decision is not None:
         record_decision(payload, task, decision, routed_model)
-    routing_message = f"Using Smart Routing. Routing to {routed_model}."
+    # Surface the router's rationale in BOTH the systemMessage (the line the
+    # harness shows the user) and permissionDecisionReason — the "why", not just
+    # the "what". The shown model is the harness-translated id (routed_model).
+    routing_message = decision.display_message(model_label=routed_model)
     output: dict[str, Any] = {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
         "updatedInput": {**tool_input, "model": routed_model},
         "permissionDecisionReason": routing_message,
     }
-    if decision.rationale:
-        output["permissionDecisionReason"] += f" {decision.rationale}"
     return {"systemMessage": routing_message, "hookSpecificOutput": output}
 
 
@@ -271,6 +285,9 @@ def write_decision_record(
             "task_name": task_name,
             "router_model": decision.raw_model,
             "requested_model": requested_model,
+            # Persisted for diagnosis: an empty value means the gateway returned
+            # no rationale (vs. a placement bug in how we surface it).
+            "rationale": decision.rationale,
             "at": time.time(),
         },
     )

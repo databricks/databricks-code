@@ -11,6 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from ucode.cli import app
+from ucode.smart_routing.routing import RoutingDecision
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -226,7 +227,11 @@ class TestSubcommandRouting:
             "smart_routing_enabled": True,
             "codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"],
         }
-        decision = MagicMock(model="databricks-gpt-5-5")
+        decision = RoutingDecision(
+            model="databricks-gpt-5-5",
+            raw_model="gpt-5-6-sol",
+            rationale="Cross-cutting refactor.",
+        )
         with (
             patch("ucode.cli.ensure_bootstrap_dependencies"),
             patch("ucode.cli.load_state", return_value=state),
@@ -244,7 +249,11 @@ class TestSubcommandRouting:
 
         assert result.exit_code == 0, result.output
         assert mock_configure.call_args.args[2] == "databricks-gpt-5-5"
-        assert "Using Smart Routing. Routing to databricks-gpt-5-5." in _strip_ansi(result.output)
+        # The launch notice surfaces both the routed model and the rationale.
+        assert (
+            "Using Smart Routing. Routing to databricks-gpt-5-5. Cross-cutting refactor."
+            in _strip_ansi(result.output)
+        )
 
 
 class TestMcpSubcommands:
