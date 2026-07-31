@@ -280,8 +280,6 @@ def download_skills(
                 )
             leaves = [leaf for leaf in leaves if leaf in skills]
             if not leaves:
-                # Distinct from the empty-schema note below: the schema has
-                # skills, but the --skill filter selected none of them.
                 print_note(f"No requested skills to download from `{location}`.")
                 continue
         if not leaves:
