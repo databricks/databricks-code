@@ -28,6 +28,7 @@ from ucode.agents import (
 from ucode.agents import (
     launch as launch_agent,
 )
+from ucode.agents.codex import revert_app_config as revert_codex_app_config
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
 from ucode.config_io import restore_file, set_dry_run
@@ -824,6 +825,9 @@ def revert() -> int:
     # Older Codex (< 0.134.0) had ucode edit the shared ~/.codex/config.toml in
     # place; restoring the per-profile file above does not undo that.
     legacy_codex_stripped = revert_legacy_shared_config()
+    # `ucode codex-app` edits the desktop app's root ~/.codex/config.toml in
+    # place; restore it from ucode's backup.
+    codex_app_restored = revert_codex_app_config(bool(managed_configs.get("codex-app")))
     clear_state()
 
     print_heading("Revert")
@@ -832,6 +836,8 @@ def revert() -> int:
         print_kv(f"{spec['display']} config", "restored" if results[tool] else "unchanged")
     if legacy_codex_stripped:
         print_kv("Codex shared config", "ucode entries removed")
+    if codex_app_restored:
+        print_kv("Codex desktop app config", "restored")
     print_kv("Pi settings", "restored" if pi_settings_restored else "unchanged")
     for client, spec in MCP_CLIENTS.items():
         print_kv(
@@ -1101,6 +1107,105 @@ WorkspaceOption = Annotated[
         "if not already configured.",
     ),
 ]
+
+
+def _configure_codex_app(provider: str | None, skip_preflight: bool) -> None:
+    """Point the Codex desktop app at Databricks, then open/restart it.
+
+    Unlike `ucode codex` (which writes an isolated ~/.codex/ucode.config.toml and
+    passes --profile), the desktop app reads only the root ~/.codex/config.toml,
+    so we back that file up and edit it in place. `ucode codex-app --restore`
+    (or `ucode revert`) undoes it.
+    """
+    from ucode.agents import codex
+
+    existing = load_state()
+    apply_pat_environment(existing)
+    if not existing.get("workspace") or "codex" not in (existing.get("available_tools") or []):
+        _auto_configure_tool("codex")
+    state = ensure_provider_state("codex")
+    provider = provider or get_provider_service(state, "codex")
+    provider_models = None
+    if provider:
+        provider_models, error = resolve_provider_models("codex", state, provider)
+        if error:
+            raise RuntimeError(error)
+    # Refresh models (skipped under a provider) so newly-added endpoints appear.
+    state = configure_shared_state(
+        state["workspace"],
+        profile=state.get("profile"),
+        tools=["codex"],
+        skip_model_discovery=bool(provider),
+        skip_preflight=skip_preflight,
+    )
+    if provider:
+        resolved_model = None
+    else:
+        state, resolved_model = resolve_launch_model("codex", state, None)
+    state = codex.write_app_config(state, resolved_model, provider=provider)
+
+    print_section("Codex desktop app")
+    if provider:
+        print_kv("Provider", provider)
+    elif resolved_model:
+        print_kv("Model", resolved_model)
+    print_kv("Config file", str(codex.CODEX_APP_CONFIG_PATH))
+    codex.launch_app(state)
+
+
+def _restore_codex_app() -> None:
+    """Restore the Codex desktop app's root config from ucode's backup."""
+    from ucode.agents import codex
+
+    state = load_state()
+    managed = bool((state.get("managed_configs") or {}).get("codex-app"))
+    restored = codex.revert_app_config(managed)
+    if managed:
+        state["managed_configs"].pop("codex-app", None)
+        save_state(state)
+    print_section("Restore Codex desktop app")
+    print_kv("Config file", "restored" if restored else "unchanged")
+    if restored:
+        codex.restart_app_after_restore()
+    else:
+        print_note("No ucode backup found; nothing to restore.")
+
+
+@app.command(
+    "codex-app", context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
+)
+def codex_app_cmd(
+    ctx: typer.Context,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            help="Route through a Unity Catalog Model Provider Service "
+            "(<catalog>.<schema>.<name>). Skips Databricks model pinning.",
+        ),
+    ] = None,
+    restore: Annotated[
+        bool,
+        typer.Option(
+            "--restore",
+            help="Restore the Codex desktop app's config to what it was before "
+            "`ucode codex-app` last ran.",
+        ),
+    ] = False,
+    skip_preflight: SkipPreflightOption = False,
+) -> None:
+    """Configure the Codex desktop app to use Databricks, then open it."""
+    try:
+        if restore:
+            _restore_codex_app()
+        else:
+            _configure_codex_app(provider, skip_preflight)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
 
 
 @app.command("codex", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})

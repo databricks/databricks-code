@@ -436,3 +436,151 @@ class TestCodexLaunch:
 
         assert os.environ["OAUTH_TOKEN"] == "fresh-token"
         assert exec_calls == [("codex", ["codex", "--profile", "ucode", "--search"])]
+
+
+class TestCodexAppWriteConfig:
+    def _patch_paths(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "config.toml"
+        backup_path = tmp_path / "codex-app-config.backup.toml"
+        monkeypatch.setattr(codex, "CODEX_APP_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_APP_BACKUP_PATH", backup_path)
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+        return config_path, backup_path
+
+    def test_writes_root_config_with_app_provider(self, tmp_path, monkeypatch):
+        config_path, _ = self._patch_paths(tmp_path, monkeypatch)
+
+        codex.write_app_config({"workspace": WS, "codex_models": ["gpt-5"]})
+
+        doc = read_toml_safe(config_path)
+        # The app reads root-level keys, not a [profiles.*] table.
+        assert doc["model_provider"] == "ucode-databricks-app"
+        assert doc["model"] == "gpt-5"
+        assert "profiles" not in doc
+        provider = doc["model_providers"]["ucode-databricks-app"]
+        assert provider["base_url"] == f"{WS}/ai-gateway/codex/v1"
+        assert provider["wire_api"] == "responses"
+
+    def test_uses_distinct_provider_from_cli(self, tmp_path, monkeypatch):
+        # The app must not reuse the CLI provider name, so the two features can
+        # coexist on the same ~/.codex/config.toml without clobbering.
+        assert codex.CODEX_APP_MODEL_PROVIDER_NAME != codex.CODEX_MODEL_PROVIDER_NAME
+
+    def test_backs_up_existing_config_before_editing(self, tmp_path, monkeypatch):
+        config_path, backup_path = self._patch_paths(tmp_path, monkeypatch)
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text('model = "o1"\n[foo]\nbar = "baz"\n', encoding="utf-8")
+
+        codex.write_app_config({"workspace": WS, "codex_models": ["gpt-5"]})
+
+        # Backup captures the pristine original.
+        assert 'model = "o1"' in backup_path.read_text(encoding="utf-8")
+        # The user's unrelated section is preserved by the deep merge.
+        assert read_toml_safe(config_path)["foo"]["bar"] == "baz"
+
+    def test_marks_codex_app_managed(self, tmp_path, monkeypatch):
+        self._patch_paths(tmp_path, monkeypatch)
+
+        state = codex.write_app_config({"workspace": WS, "codex_models": ["gpt-5"]})
+
+        assert "codex-app" in state["managed_configs"]
+
+    def test_provider_drops_stale_model_and_adds_header(self, tmp_path, monkeypatch):
+        config_path, _ = self._patch_paths(tmp_path, monkeypatch)
+
+        codex.write_app_config({"workspace": WS, "codex_models": ["gpt-5"]})
+        assert read_toml_safe(config_path)["model"] == "gpt-5"
+
+        codex.write_app_config(
+            {"workspace": WS, "codex_models": ["gpt-5"]},
+            provider="main.aarushi.aarushi-openai",
+        )
+
+        doc = read_toml_safe(config_path)
+        assert "model" not in doc
+        headers = doc["model_providers"]["ucode-databricks-app"]["http_headers"]
+        assert headers["Databricks-Model-Provider-Service"] == "main.aarushi.aarushi-openai"
+
+
+class TestCodexAppRevert:
+    def test_restores_from_backup(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "config.toml"
+        backup_path = tmp_path / "codex-app-config.backup.toml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text('model = "ucode-wrote-this"\n', encoding="utf-8")
+        backup_path.write_text('model = "original"\n', encoding="utf-8")
+        monkeypatch.setattr(codex, "CODEX_APP_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_APP_BACKUP_PATH", backup_path)
+
+        assert codex.revert_app_config(managed=True) is True
+
+        assert 'model = "original"' in config_path.read_text(encoding="utf-8")
+        assert not backup_path.exists()
+
+    def test_removes_config_when_managed_and_no_backup(self, tmp_path, monkeypatch):
+        # ucode created config.toml (no prior file to back up), so revert deletes it.
+        config_path = tmp_path / ".codex" / "config.toml"
+        backup_path = tmp_path / "codex-app-config.backup.toml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text('model = "ucode-wrote-this"\n', encoding="utf-8")
+        monkeypatch.setattr(codex, "CODEX_APP_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_APP_BACKUP_PATH", backup_path)
+
+        assert codex.revert_app_config(managed=True) is True
+        assert not config_path.exists()
+
+    def test_unchanged_when_not_managed_and_no_backup(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "config.toml"
+        backup_path = tmp_path / "codex-app-config.backup.toml"
+        monkeypatch.setattr(codex, "CODEX_APP_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_APP_BACKUP_PATH", backup_path)
+
+        assert codex.revert_app_config(managed=False) is False
+
+
+class TestCodexAppLaunch:
+    def test_unsupported_platform_raises(self, monkeypatch):
+        monkeypatch.setattr(codex.platform, "system", lambda: "Linux")
+
+        try:
+            codex.launch_app({"workspace": WS})
+            raise AssertionError("expected RuntimeError")
+        except RuntimeError as exc:
+            assert "macOS and Windows" in str(exc)
+
+    def test_opens_app_in_cwd_when_not_running(self, tmp_path, monkeypatch):
+        opened: list[str | None] = []
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(codex.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(codex, "_app_is_running", lambda: False)
+        monkeypatch.setattr(codex, "_open_app", lambda workdir=None: opened.append(workdir) or True)
+
+        codex.launch_app({"workspace": WS})
+
+        # The app is opened in the directory ucode was run from, not its default.
+        assert opened == [str(tmp_path)]
+
+    def test_prompts_restart_when_running(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(codex.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(codex, "_app_is_running", lambda: True)
+        monkeypatch.setattr(codex, "prompt_yes_no", lambda prompt: True)
+        monkeypatch.setattr(codex, "_quit_app", lambda: calls.append("quit"))
+        monkeypatch.setattr(codex, "_wait_for_app_exit", lambda timeout: True)
+        monkeypatch.setattr(codex, "_open_app", lambda workdir=None: calls.append("open") or True)
+
+        codex.launch_app({"workspace": WS})
+
+        assert calls == ["quit", "open"]
+
+    def test_declining_restart_leaves_app_alone(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(codex.platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(codex, "_app_is_running", lambda: True)
+        monkeypatch.setattr(codex, "prompt_yes_no", lambda prompt: False)
+        monkeypatch.setattr(codex, "_quit_app", lambda: calls.append("quit"))
+        monkeypatch.setattr(codex, "_open_app", lambda workdir=None: calls.append("open") or True)
+
+        codex.launch_app({"workspace": WS})
+
+        assert calls == []

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
+import subprocess
+import time
 from pathlib import Path
 
 from ucode.agent_updates import available_npm_package_update
@@ -13,6 +16,7 @@ from ucode.config_io import (
     backup_existing_file,
     deep_merge_dict,
     read_toml_safe,
+    restore_file,
     write_toml_file,
 )
 from ucode.databricks import (
@@ -23,6 +27,7 @@ from ucode.databricks import (
 from ucode.launcher import exec_or_spawn
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
+from ucode.ui import print_note, print_success, print_warning, prompt_yes_no
 
 CODEX_CONFIG_DIR = Path.home() / ".codex"
 CODEX_PROFILE_NAME = "ucode"
@@ -33,6 +38,27 @@ LEGACY_CODEX_BACKUP_PATH = APP_DIR / "codex-config.backup.toml"
 CODEX_MODEL_PROVIDER_NAME = "ucode-databricks"
 MINIMUM_CODEX_VERSION = (0, 134, 0)
 MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
+
+# ── Codex desktop app ──────────────────────────────────────────────────────
+# The Codex desktop app has no `--profile`/`-c` command-line surface (unlike the
+# CLI), so the only way to steer it is the *root* `~/.codex/config.toml` it reads
+# on startup. `ucode codex-app` therefore edits that shared file in place —
+# backing it up first — instead of writing an isolated per-profile file. A
+# distinct provider name keeps the app's block from colliding with the CLI's
+# `ucode-databricks` provider on the same file.
+CODEX_APP_CONFIG_PATH = CODEX_CONFIG_DIR / "config.toml"
+CODEX_APP_BACKUP_PATH = APP_DIR / "codex-app-config.backup.toml"
+CODEX_APP_MODEL_PROVIDER_NAME = "ucode-databricks-app"
+CODEX_APP_BUNDLE_ID = "com.openai.codex"
+# Seconds to wait for the app to quit before reopening it (mirrors Ollama).
+CODEX_APP_QUIT_TIMEOUT = 5.0
+
+CODEX_APP_MANAGED_KEYS: list[list[str]] = [
+    ["model_provider"],
+    ["model"],
+    ["model_providers", CODEX_APP_MODEL_PROVIDER_NAME],
+    ["model_providers", CODEX_APP_MODEL_PROVIDER_NAME, "http_headers"],
+]
 
 
 SPEC: ToolSpec = {
@@ -139,14 +165,13 @@ def render_overlay(
     databricks_profile: str | None = None,
     use_pat: bool = False,
     provider: str | None = None,
+    provider_name: str = CODEX_MODEL_PROVIDER_NAME,
 ) -> dict:
-    overlay: dict = {"model_provider": CODEX_MODEL_PROVIDER_NAME}
+    overlay: dict = {"model_provider": provider_name}
     if model:
         overlay["model"] = model
     overlay["model_providers"] = {
-        CODEX_MODEL_PROVIDER_NAME: _provider_block(
-            workspace, databricks_profile, use_pat, provider
-        ),
+        provider_name: _provider_block(workspace, databricks_profile, use_pat, provider),
     }
     return overlay
 
@@ -408,3 +433,187 @@ def validate_cmd(binary: str) -> list[str]:
         "--skip-git-repo-check",
         "say hi in 5 words or less",
     ]
+
+
+# ── Codex desktop app config + launch ──────────────────────────────────────
+
+
+def write_app_config(state: dict, model: str | None = None, provider: str | None = None) -> dict:
+    """Point the Codex desktop app at the Databricks gateway via its root config.
+
+    The app reads only `~/.codex/config.toml`, so — unlike the CLI's isolated
+    per-profile file — we deep-merge ucode's provider block, `model_provider`,
+    and (unless routing through a provider) `model` into that shared file. The
+    file is backed up first so `ucode revert` / `ucode codex-app --restore` can
+    put the user's original config back.
+    """
+    workspace = state["workspace"]
+    # A Model Provider Service routes by header, so pin no Databricks model.
+    chosen_model = None if provider else _codex_model_id(model or default_model(state))
+    databricks_profile = state.get("profile")
+
+    backup_existing_file(CODEX_APP_CONFIG_PATH, CODEX_APP_BACKUP_PATH)
+    overlay = render_overlay(
+        workspace,
+        chosen_model,
+        databricks_profile,
+        use_pat=bool(state.get("use_pat")),
+        provider=provider,
+        provider_name=CODEX_APP_MODEL_PROVIDER_NAME,
+    )
+    doc = read_toml_safe(CODEX_APP_CONFIG_PATH)
+    deep_merge_dict(doc, overlay)
+    if provider:
+        # deep_merge can't drop keys, so clear a `model` pinned by an earlier
+        # non-provider run that the provider overlay omits.
+        doc.pop("model", None)
+    write_toml_file(CODEX_APP_CONFIG_PATH, doc)
+    state = mark_tool_managed(state, "codex-app", CODEX_APP_MANAGED_KEYS)
+    save_state(state)
+    return state
+
+
+def revert_app_config(managed: bool = True) -> bool:
+    """Restore the desktop app's root config from ucode's backup.
+
+    Returns True if the file was restored (or removed when ucode created it and
+    there was no prior config to back up). Mirrors how every other ucode tool
+    reverts — whole-file restore from the first-ever snapshot.
+    """
+    return restore_file(CODEX_APP_CONFIG_PATH, CODEX_APP_BACKUP_PATH, managed)
+
+
+def _app_is_running() -> bool:
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            result = subprocess.run(
+                ["osascript", "-e", 'tell application "System Events" to exists process "Codex"'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return result.stdout.strip() == "true"
+        if system == "Windows":
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq Codex.exe"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return "Codex.exe" in result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return False
+
+
+def _quit_app() -> None:
+    system = platform.system()
+    if system == "Darwin":
+        subprocess.run(
+            ["osascript", "-e", 'tell application "Codex" to quit'],
+            capture_output=True,
+            timeout=10,
+        )
+    elif system == "Windows":
+        subprocess.run(
+            ["taskkill", "/IM", "Codex.exe"],
+            capture_output=True,
+            timeout=10,
+        )
+
+
+def _open_app(workdir: str | None = None) -> bool:
+    """Open the Codex desktop app, in ``workdir`` when given.
+
+    A GUI app launched via ``open``/``start`` does not inherit the terminal's
+    working directory (the launch is handed to launchd / the shell), so Codex
+    would otherwise open its own default folder. Passing the directory as a
+    positional argument tells Codex which repo to open.
+    """
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            argv = ["open", "-b", CODEX_APP_BUNDLE_ID]
+            if workdir:
+                argv.append(workdir)
+            result = subprocess.run(argv, capture_output=True, timeout=15)
+            return result.returncode == 0
+        if system == "Windows":
+            # `start` is a cmd builtin; launch the Codex app by name, passing the
+            # directory as an argument so it opens there.
+            argv = ["cmd", "/c", "start", "", "Codex.exe"]
+            if workdir:
+                argv.append(workdir)
+            result = subprocess.run(argv, capture_output=True, timeout=15)
+            return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return False
+
+
+def _warn_app_not_found() -> None:
+    print_warning(
+        "Couldn't open the Codex desktop app — is it installed? Install it from "
+        "https://developers.openai.com/codex, then re-run `ucode codex-app`. "
+        "Your config was written, so it will take effect the next time Codex starts."
+    )
+
+
+def _wait_for_app_exit(timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _app_is_running():
+            return True
+        time.sleep(0.2)
+    return not _app_is_running()
+
+
+def _restart_app(prompt: str, workdir: str | None = None) -> None:
+    """Quit and reopen the app (with confirmation) so it re-reads config.toml."""
+    if not prompt_yes_no(prompt):
+        print_note("Quit and reopen Codex when you're ready for the change to take effect.")
+        return
+    _quit_app()
+    if not _wait_for_app_exit(CODEX_APP_QUIT_TIMEOUT):
+        print_warning("Codex did not quit; quit it manually, then reopen it to apply the change.")
+        return
+    if _open_app(workdir):
+        print_success("Codex restarted.")
+    else:
+        _warn_app_not_found()
+
+
+def _ensure_app_supported() -> None:
+    if platform.system() not in ("Darwin", "Windows"):
+        raise RuntimeError(
+            "`ucode codex-app` is only supported on macOS and Windows. On Linux, use "
+            "`ucode codex` for the CLI instead."
+        )
+
+
+def launch_app(state: dict) -> None:
+    """Open the Codex desktop app, restarting it if it's already running.
+
+    The app only re-reads `config.toml` on startup, so when it's already open we
+    prompt to quit + reopen; declining leaves the config written for next launch.
+    """
+    _ensure_app_supported()
+    workdir = os.getcwd()
+    if not _app_is_running():
+        if _open_app(workdir):
+            print_success("Codex is now configured to use Databricks. Opening the app...")
+        else:
+            _warn_app_not_found()
+        return
+    _restart_app("Codex is running. Restart it to use Databricks?", workdir)
+
+
+def restart_app_after_restore() -> None:
+    """Prompt to restart a running app so it picks up a just-restored config.
+
+    No-op when the app isn't running (it will read the restored config on its
+    next launch) or on unsupported platforms."""
+    if platform.system() not in ("Darwin", "Windows") or not _app_is_running():
+        return
+    _restart_app("Codex is running. Restart it to use your restored config?")
