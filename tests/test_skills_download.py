@@ -291,7 +291,9 @@ class TestWriteSkill:
     def test_path_traversal_is_rejected(self, tmp_path):
         roots = skill_dir_roots(str(tmp_path))
 
-        write_skill(roots, "triage", {"SKILL.md": b"ok", "../escape.md": b"nope", "/abs.md": b"nope"})
+        write_skill(
+            roots, "triage", {"SKILL.md": b"ok", "../escape.md": b"nope", "/abs.md": b"nope"}
+        )
 
         assert (roots[0] / "triage/SKILL.md").read_bytes() == b"ok"
         assert not (tmp_path / "escape.md").exists()
