@@ -1582,8 +1582,6 @@ def configure_skills(
             raise RuntimeError("--path only applies when downloading with --location.")
         if selected_skills is not None and not locations:
             raise RuntimeError("--skill only applies when downloading with --location.")
-        # A single skill-name set can't be split across schemas, so require one
-        # --location — mirroring `configure mcp`'s single-location --service filter.
         if selected_skills is not None and len(locations) != 1:
             raise RuntimeError(
                 f"--skill requires a single --location (got: {', '.join(locations)})."

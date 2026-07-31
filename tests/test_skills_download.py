@@ -381,7 +381,7 @@ class TestDownloadSkills:
         sd.download_skills(WS, "token", ["main.default"], str(tmp_path), {"triage", "ghost"})
 
         out = capsys.readouterr().out
-        assert "Ignoring requested skills not found in `main.default`: ghost" in out
+        assert "Skipping requested skill(s) not found in `main.default`: ghost" in out
         assert (tmp_path / ".claude/skills/triage/SKILL.md").read_bytes() == b"x"
 
     def test_empty_skill_filter_downloads_nothing(self, tmp_path, monkeypatch):

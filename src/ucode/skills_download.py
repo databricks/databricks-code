@@ -275,7 +275,7 @@ def download_skills(
             unknown = skills - set(leaves)
             if unknown:
                 print_warning(
-                    f"Ignoring requested skills not found in `{location}`: "
+                    f"Skipping requested skill(s) not found in `{location}`: "
                     f"{', '.join(sorted(unknown))}."
                 )
             leaves = [leaf for leaf in leaves if leaf in skills]
