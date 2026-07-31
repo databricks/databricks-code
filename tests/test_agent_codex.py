@@ -366,6 +366,46 @@ class TestCodexSmartRouting:
     def test_launch_task_uses_exec_prompt(self):
         assert codex_routing._launch_routing_task(["exec", "fix the parser"]) == "fix the parser"
 
+    def test_launch_task_uses_positional_interactive_prompt(self):
+        # `codex "fix the parser"` — the seed prompt is routed directly, not
+        # wrapped in a placeholder.
+        assert codex_routing._launch_routing_task(["fix the parser"]) == "fix the parser"
+
+    def test_launch_task_skips_value_option_before_prompt(self):
+        # `-m <model>` consumes its value; the model id must not be taken as the
+        # prompt.
+        assert (
+            codex_routing._launch_routing_task(["-m", "gpt-5", "refactor the parser"])
+            == "refactor the parser"
+        )
+
+    def test_launch_task_honors_double_dash(self):
+        assert (
+            codex_routing._launch_routing_task(["--", "--not-a-flag prompt"])
+            == "--not-a-flag prompt"
+        )
+
+    def test_launch_task_bare_launch_returns_none(self):
+        # No prompt on the command line → None, so the caller skips routing and
+        # keeps the user's default model (root model can't be re-routed once the
+        # TUI is up).
+        assert codex_routing._launch_routing_task([]) is None
+
+    def test_launch_task_flags_only_returns_none(self):
+        assert codex_routing._launch_routing_task(["--search", "-m", "gpt-5"]) is None
+
+    def test_route_launch_model_skips_routing_without_prompt(self, monkeypatch):
+        # Bare launch: no router call at all, no decision, no error.
+        def fail(*args, **kwargs):
+            raise AssertionError("router must not be called on a bare launch")
+
+        monkeypatch.setattr(codex_routing, "request_routing_decision", fail)
+        decision, error = codex_routing.route_launch_model(
+            {"workspace": WS, "codex_models": ["system.ai.gpt-5-6-sol"]}, []
+        )
+        assert decision is None
+        assert error is None
+
 
 class TestCodexRemoveLegacyProfile:
     def test_drops_provider_block_on_modern_path(self, tmp_path, monkeypatch):
