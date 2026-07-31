@@ -36,6 +36,27 @@ from ucode.databricks import (
 WS = "https://example.databricks.com"
 
 
+class TestDebugLogRotationConfig:
+    def test_uses_defaults_when_environment_is_unset(self, monkeypatch):
+        monkeypatch.delenv("UCODE_DEBUG_MAX_BYTES", raising=False)
+        monkeypatch.delenv("UCODE_DEBUG_BACKUP_COUNT", raising=False)
+
+        assert db_mod._debug_log_rotation_config() == (1_000_000, 3)
+
+    def test_reads_values_from_environment(self, monkeypatch):
+        monkeypatch.setenv("UCODE_DEBUG_MAX_BYTES", "25000000")
+        monkeypatch.setenv("UCODE_DEBUG_BACKUP_COUNT", "10")
+
+        assert db_mod._debug_log_rotation_config() == (25_000_000, 10)
+
+    @pytest.mark.parametrize("value", ["", "invalid", "-1"])
+    def test_invalid_values_fall_back_independently(self, monkeypatch, value):
+        monkeypatch.setenv("UCODE_DEBUG_MAX_BYTES", value)
+        monkeypatch.setenv("UCODE_DEBUG_BACKUP_COUNT", "8")
+
+        assert db_mod._debug_log_rotation_config() == (1_000_000, 8)
+
+
 class TestWorkspaceHostname:
     def test_extracts_hostname(self):
         assert workspace_hostname(WS) == "example.databricks.com"

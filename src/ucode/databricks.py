@@ -53,10 +53,28 @@ AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
+DEFAULT_DEBUG_LOG_MAX_BYTES = 1_000_000
+DEFAULT_DEBUG_LOG_BACKUP_COUNT = 3
 
 
 def _debug_enabled() -> bool:
     return os.environ.get("UCODE_DEBUG") == "1"
+
+
+def _debug_log_rotation_config() -> tuple[int, int]:
+    """Return debug log rotation settings, falling back for invalid values."""
+
+    def non_negative_int(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(name, ""))
+        except ValueError:
+            return default
+        return value if value >= 0 else default
+
+    return (
+        non_negative_int("UCODE_DEBUG_MAX_BYTES", DEFAULT_DEBUG_LOG_MAX_BYTES),
+        non_negative_int("UCODE_DEBUG_BACKUP_COUNT", DEFAULT_DEBUG_LOG_BACKUP_COUNT),
+    )
 
 
 _DEBUG_LOGGER: logging.Logger | None = None
@@ -73,12 +91,13 @@ def _get_debug_logger() -> logging.Logger | None:
         return _DEBUG_LOGGER
 
     log_path = APP_DIR / "debug.log"
+    max_bytes, backup_count = _debug_log_rotation_config()
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         handler = logging.handlers.RotatingFileHandler(
             log_path,
-            maxBytes=1_000_000,
-            backupCount=3,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
             encoding="utf-8",
         )
         handler.setFormatter(

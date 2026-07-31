@@ -162,6 +162,18 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
 
+### Debug logging
+
+Set `UCODE_DEBUG=1` to write diagnostic output to `~/.ucode/debug.log`. The log rotates at
+1,000,000 bytes and retains three backups by default. Long-running sessions can override those
+limits with `UCODE_DEBUG_MAX_BYTES` and `UCODE_DEBUG_BACKUP_COUNT`:
+
+```bash
+UCODE_DEBUG=1 UCODE_DEBUG_MAX_BYTES=25000000 UCODE_DEBUG_BACKUP_COUNT=10 ucode claude
+```
+
+Both rotation settings must be non-negative integers; unset or invalid values use the defaults.
+
 ## Managed Local Files
 
 `ucode` manages these files:
