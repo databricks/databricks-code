@@ -197,27 +197,36 @@ def _write_bundle(skill_dir: Path, leaf: str, files: dict[str, bytes]) -> None:
         destination.write_bytes(content)
 
 
-def write_skill(roots: list[Path], leaf: str, files: dict[str, bytes], *, location: str) -> bool:
-    """Write ``leaf``'s bundle (``{relpath: bytes}``) into every root.
+def existing_skill_on_disk(roots: list[Path], leaf: str) -> bool:
+    """Whether ``leaf`` already has a skill directory under any root."""
+    return any((root / leaf).exists() for root in roots)
 
-    Prompts before overwriting an existing skill dir. ``location`` is the source
-    ``<catalog>.<schema>``, shown in that prompt. Returns True if the skill was
-    written, False if it was skipped or kept.
+
+def should_download_skill(roots: list[Path], leaf: str, *, location: str) -> bool:
+    """Whether ``leaf`` should be fetched and written into ``roots``.
+
+    Applies the disk-only checks that need no bundle bytes, so a declined or
+    invalid skill is never downloaded: skips invalid leaf names, and prompts
+    before overwriting a skill already on disk (``location`` is the source
+    ``<catalog>.<schema>`` shown in that prompt).
     """
     if not _is_valid_leaf(leaf):
         print_warning(f"Skipping `{leaf}`: not a valid skill name (lowercase a-z, 0-9, -).")
         return False
 
-    already_on_disk = any((root / leaf).exists() for root in roots)
-    if already_on_disk and not prompt_yes_no(
+    if existing_skill_on_disk(roots, leaf) and not prompt_yes_no(
         f"A skill named `{leaf}` already exists. Overwrite it with `{location}.{leaf}`?"
     ):
         print_note(f"Kept existing `{leaf}`.")
         return False
 
+    return True
+
+
+def write_skill(roots: list[Path], leaf: str, files: dict[str, bytes]) -> None:
+    """Write ``leaf``'s bundle (``{relpath: bytes}``) into every root."""
     for root in roots:
         _write_bundle(root / leaf, leaf, files)
-    return True
 
 
 # --- Orchestration ---------------------------------------------------------
@@ -256,12 +265,21 @@ def download_skills(
 ) -> None:
     """Download every skill in each ``<catalog>.<schema>`` location to disk.
 
-    Bundles are fetched concurrently (with a progress bar) per schema, then
-    written sequentially so overwrite prompts don't interleave. A failure on one
-    skill warns and skips it without aborting the batch.
+    Locations are processed one at a time, and each runs three stages:
 
-    When ``skills`` is given, only those leaf names are downloaded; names absent
-    from a schema warn and are skipped. ``None`` downloads the whole schema.
+    1. **List** the schema's skill leaves. When ``skills`` is given, restrict to
+       those leaf names; names absent from the schema warn and are skipped, and
+       ``None`` keeps the whole schema.
+    2. **Decide** which to download via ``should_download_skill`` (skips invalid
+       names and prompts before overwriting a skill already on disk), so a
+       declined skill is never fetched.
+    3. **Fetch** the survivors' bundles concurrently (with a progress bar) and
+       **write** them.
+
+    Finishing one location before starting the next means a skill written for an
+    earlier location is already on disk when a same-named skill in a later
+    location reaches its decide stage, so the overwrite prompt still fires. A
+    failure on one skill warns and skips it without aborting the batch.
     """
     roots = skill_dir_roots(path)
     roots_display = " and ".join(str(root) for root in roots)
@@ -286,15 +304,18 @@ def download_skills(
             print_note(f"No skills found in `{location}`.")
             continue
 
-        bundles = _fetch_bundles(workspace, token, catalog, schema, leaves)
+        to_download = [
+            leaf for leaf in leaves if should_download_skill(roots, leaf, location=location)
+        ]
+        bundles = _fetch_bundles(workspace, token, catalog, schema, to_download)
         written = 0
-        for leaf in leaves:
+        for leaf in to_download:
             files, reason = bundles[leaf]
             if reason or files is None:
                 print_warning(f"Skipping `{location}.{leaf}`: {reason}.")
                 continue
-            if write_skill(roots, leaf, files, location=location):
-                written += 1
+            write_skill(roots, leaf, files)
+            written += 1
         console.print()
         print_success(
             f"Downloaded {written}/{len(leaves)} skill(s) from `{location}` in {roots_display}."

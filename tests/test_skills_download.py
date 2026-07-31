@@ -6,7 +6,12 @@ from __future__ import annotations
 import pytest
 
 import ucode.skills_download as sd
-from ucode.skills_download import skill_dir_roots, write_skill
+from ucode.skills_download import (
+    existing_skill_on_disk,
+    should_download_skill,
+    skill_dir_roots,
+    write_skill,
+)
 
 WS = "https://example.databricks.com"
 
@@ -237,8 +242,39 @@ class TestSkillDirRoots:
             skill_dir_roots(str(tmp_path / "nope"))
 
 
-def _write(roots, leaf, files, *, location="main.default"):
-    return write_skill(roots, leaf, files, location=location)
+class TestShouldDownloadSkill:
+    def test_new_skill_is_downloaded(self, tmp_path):
+        roots = skill_dir_roots(str(tmp_path))
+
+        assert should_download_skill(roots, "triage", location="main.default")
+
+    def test_existing_skill_prompt_keep(self, tmp_path, monkeypatch):
+        roots = skill_dir_roots(str(tmp_path))
+        write_skill(roots, "triage", {"SKILL.md": b"from-main"})
+
+        monkeypatch.setattr(sd, "prompt_yes_no", lambda _: False)
+
+        assert not should_download_skill(roots, "triage", location="ml.prod")
+
+    def test_existing_skill_prompt_overwrite(self, tmp_path, monkeypatch):
+        roots = skill_dir_roots(str(tmp_path))
+        write_skill(roots, "triage", {"SKILL.md": b"from-main"})
+
+        monkeypatch.setattr(sd, "prompt_yes_no", lambda _: True)
+
+        assert should_download_skill(roots, "triage", location="ml.prod")
+
+    def test_invalid_leaf_is_skipped(self, tmp_path):
+        roots = skill_dir_roots(str(tmp_path))
+
+        assert not should_download_skill(roots, "Bad_Name", location="main.default")
+
+    def test_existing_skill_on_disk_checks_every_root(self, tmp_path):
+        roots = skill_dir_roots(str(tmp_path))
+        assert not existing_skill_on_disk(roots, "triage")
+
+        (roots[1] / "triage").mkdir(parents=True)
+        assert existing_skill_on_disk(roots, "triage")
 
 
 class TestWriteSkill:
@@ -246,41 +282,16 @@ class TestWriteSkill:
         roots = skill_dir_roots(str(tmp_path))
         files = {"SKILL.md": b"# skill", "scripts/run.py": b"print(1)"}
 
-        _write(roots, "triage", files)
+        write_skill(roots, "triage", files)
 
         for root in roots:
             assert (root / "triage/SKILL.md").read_bytes() == b"# skill"
             assert (root / "triage/scripts/run.py").read_bytes() == b"print(1)"
 
-    def test_existing_skill_prompt_keep(self, tmp_path, monkeypatch):
-        roots = skill_dir_roots(str(tmp_path))
-        _write(roots, "triage", {"SKILL.md": b"from-main"}, location="main.default")
-
-        monkeypatch.setattr(sd, "prompt_yes_no", lambda _: False)
-        _write(roots, "triage", {"SKILL.md": b"from-ml"}, location="ml.prod")
-
-        assert (roots[0] / "triage/SKILL.md").read_bytes() == b"from-main"
-
-    def test_existing_skill_prompt_overwrite(self, tmp_path, monkeypatch):
-        roots = skill_dir_roots(str(tmp_path))
-        _write(roots, "triage", {"SKILL.md": b"from-main"}, location="main.default")
-
-        monkeypatch.setattr(sd, "prompt_yes_no", lambda _: True)
-        _write(roots, "triage", {"SKILL.md": b"from-ml"}, location="ml.prod")
-
-        assert (roots[0] / "triage/SKILL.md").read_bytes() == b"from-ml"
-
-    def test_invalid_leaf_is_skipped(self, tmp_path):
-        roots = skill_dir_roots(str(tmp_path))
-
-        _write(roots, "Bad_Name", {"SKILL.md": b"x"})
-
-        assert not (roots[0] / "Bad_Name").exists()
-
     def test_path_traversal_is_rejected(self, tmp_path):
         roots = skill_dir_roots(str(tmp_path))
 
-        _write(roots, "triage", {"SKILL.md": b"ok", "../escape.md": b"nope", "/abs.md": b"nope"})
+        write_skill(roots, "triage", {"SKILL.md": b"ok", "../escape.md": b"nope", "/abs.md": b"nope"})
 
         assert (roots[0] / "triage/SKILL.md").read_bytes() == b"ok"
         assert not (tmp_path / "escape.md").exists()
@@ -321,6 +332,23 @@ class TestDownloadSkills:
         sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
         assert called == []
+
+    def test_declined_skill_is_not_fetched(self, tmp_path, monkeypatch):
+        roots = skill_dir_roots(str(tmp_path))
+        write_skill(roots, "triage", {"SKILL.md": b"kept"})
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["triage"], None))
+        monkeypatch.setattr(sd, "prompt_yes_no", lambda _: False)
+        fetched = []
+        monkeypatch.setattr(
+            sd,
+            "fetch_skill_bundle",
+            lambda ws, tok, c, s, leaf: fetched.append(leaf) or ({"SKILL.md": b"new"}, None),
+        )
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
+
+        assert fetched == []
+        assert (roots[0] / "triage/SKILL.md").read_bytes() == b"kept"
 
     def test_bundle_failure_skips_that_skill_only(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["good", "bad"], None))
