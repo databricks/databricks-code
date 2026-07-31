@@ -125,7 +125,7 @@ ucode configure skills
 ucode configure skills --location main.default --path /abs/project/dir
 
 # Download a named subset of the schema's skills instead of all of them.
-ucode configure skills --location main.default --skill my_skill
+ucode configure skills --location main.default --skill my-skill
 
 # MCP mode: expose the schema's skills as MCP tools instead of downloading.
 ucode configure skills --location main.default,ml.prod --mcp
@@ -166,7 +166,7 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 | `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
 | `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
-| `ucode configure skills --location main.default --skill my_skill` | Download only the named skill(s) from a schema (comma-separated for several) |
+| `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
 
 ## Managed Local Files

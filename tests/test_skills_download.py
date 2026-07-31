@@ -384,7 +384,7 @@ class TestDownloadSkills:
         assert "Skipping requested skill(s) not found in `main.default`: ghost" in out
         assert (tmp_path / ".claude/skills/triage/SKILL.md").read_bytes() == b"x"
 
-    def test_empty_skill_filter_downloads_nothing(self, tmp_path, monkeypatch):
+    def test_empty_skill_filter_downloads_nothing(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["triage"], None))
         called = []
         monkeypatch.setattr(
@@ -395,6 +395,18 @@ class TestDownloadSkills:
 
         assert called == []
         assert not (tmp_path / ".claude/skills/triage").exists()
+        # The schema has skills; the filter selected none — distinct from the
+        # empty-schema note.
+        out = capsys.readouterr().out
+        assert "No requested skills to download from `main.default`." in out
+        assert "No skills found" not in out
+
+    def test_empty_schema_reports_no_skills_found(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([], None))
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path), None)
+
+        assert "No skills found in `main.default`." in capsys.readouterr().out
 
     def test_none_skill_filter_downloads_everything(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["a", "b"], None))
