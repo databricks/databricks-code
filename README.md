@@ -40,6 +40,21 @@ ucode codex --full-auto
 
 All agents route through Databricks AI Gateway using your workspace credentials — no API keys required.
 
+Codex intelligent routing is opt-in. Enabling it asks the AI Gateway router to select the
+root-session model before launch and installs profile-scoped hooks that route future
+`spawn_agent` calls. Codex may require one-time review of the installed hooks through `/hooks`.
+
+```bash
+ucode codex --enable-intelligent-routing
+```
+
+The setting persists for the current workspace. Disable it and remove only ucode's routing
+hooks with:
+
+```bash
+ucode codex --disable-intelligent-routing
+```
+
 To configure all tools at once:
 
 ```bash
@@ -124,6 +139,9 @@ ucode configure skills
 # Download mode: fetch every skill in the schema to disk (and register the connection).
 ucode configure skills --location main.default --path /abs/project/dir
 
+# Download a named subset of the schema's skills instead of all of them.
+ucode configure skills --location main.default --skill my-skill
+
 # MCP mode: expose the schema's skills as MCP tools instead of downloading.
 ucode configure skills --location main.default,ml.prod --mcp
 ```
@@ -135,7 +153,10 @@ ucode configure skills --location main.default,ml.prod --mcp
   (plus its bundled files) into both `.claude/skills/` and `.agents/skills/`. `--path` (an existing
   absolute directory) is optional; when omitted, skills are written under your home directory. Any
   pre-existing skill dir prompts before it's overwritten. It then registers a schema-less skills
-  MCP connection, leaving any prior `--mcp` scope untouched.
+  MCP connection, leaving any prior `--mcp` scope untouched. `--skill <name>[,<name>…]` narrows the
+  download to the named skills (by leaf name) from the schema instead of all of them; requested
+  names not found in the schema warn and are skipped. `--skill` requires a single `--location`, is
+  download-only, and is rejected with `--mcp`.
 - **MCP mode** (`--location … --mcp`) sets the connection's location set to exactly `<list>`
   (override-only) and rebuilds its `?schema=` URL; no files are downloaded and `--path` is rejected.
 
@@ -156,10 +177,13 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 | `ucode configure --workspaces https://first.databricks.com,https://second.databricks.com` | Configure workspaces without the interactive picker |
 | `ucode configure --profiles DEFAULT` | Configure using existing Databricks CLI profiles (hosts come from `~/.databrickscfg`) |
 | `ucode configure --profiles DEFAULT --use-pat` | Authenticate with the profile's personal access token — no browser login |
+| `ucode codex --enable-intelligent-routing` | Enable AI Gateway routing for Codex sessions and subagents |
+| `ucode codex --disable-intelligent-routing` | Disable routing and remove ucode's Codex routing hooks |
 | `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
 | `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
 | `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
+| `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
 
 ## Managed Local Files

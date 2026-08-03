@@ -21,6 +21,10 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
+from ucode.smart_routing.codex_hooks import (
+    remove_smart_routing_hooks,
+    sync_smart_routing_hooks,
+)
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 
@@ -33,6 +37,11 @@ LEGACY_CODEX_BACKUP_PATH = APP_DIR / "codex-config.backup.toml"
 CODEX_MODEL_PROVIDER_NAME = "ucode-databricks"
 MINIMUM_CODEX_VERSION = (0, 134, 0)
 MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
+MINIMUM_ROUTING_CODEX_VERSION = (0, 145, 0)
+MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
+# Shared across agents: one opt-in enables smart routing for every routing-capable
+# tool (codex, claude), so a workspace turns it on once.
+SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 
 
 SPEC: ToolSpec = {
@@ -318,6 +327,10 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     databricks_profile = state.get("profile")
 
     if _use_legacy_layout():
+        if smart_routing_enabled(state) and provider is None:
+            raise RuntimeError(
+                f"Codex smart routing requires Codex {MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer."
+            )
         # Codex < 0.134.0 only reads ~/.codex/config.toml. Write the shared
         # config with [profiles.ucode] + shared [model_providers.ucode-databricks]
         # and skip the per-profile-file cleanup that would normally strip
@@ -358,6 +371,11 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         # deep_merge can't drop keys, so clear a `model` pinned by an earlier
         # non-provider run that the provider overlay omits.
         doc.pop("model", None)
+    sync_smart_routing_hooks(
+        doc,
+        state,
+        enabled=smart_routing_enabled(state) and provider is None,
+    )
     write_toml_file(CODEX_CONFIG_PATH, doc)
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
@@ -397,6 +415,43 @@ def launch(state: dict, tool_args: list[str]) -> None:
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     exec_or_spawn([binary, "--profile", CODEX_PROFILE_NAME, *tool_args])
+
+
+def smart_routing_enabled(state: dict) -> bool:
+    """Return whether the current workspace opted into Codex routing."""
+    return state.get(SMART_ROUTING_STATE_KEY) is True
+
+
+def enable_smart_routing(state: dict) -> dict:
+    """Persist the current workspace's Codex smart-routing opt-in."""
+    parsed = _parse_version(agent_version(SPEC["binary"]))
+    if parsed is not None and parsed < MINIMUM_ROUTING_CODEX_VERSION:
+        raise RuntimeError(
+            "Codex smart routing requires Codex "
+            f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found "
+            f"{agent_version(SPEC['binary'])}."
+        )
+    state[SMART_ROUTING_STATE_KEY] = True
+    return state
+
+
+def disable_smart_routing(state: dict) -> bool:
+    """Disable routing and remove only ucode's Codex routing hooks."""
+    state.pop(SMART_ROUTING_STATE_KEY, None)
+    if state.get("workspace"):
+        save_state(state)
+    changed = False
+    for path in (CODEX_CONFIG_PATH, LEGACY_CODEX_CONFIG_PATH):
+        if not path.exists():
+            continue
+        doc = read_toml_safe(path)
+        if remove_smart_routing_hooks(doc):
+            write_toml_file(path, doc)
+            changed = True
+    from ucode.smart_routing.codex_routing import clear_routing_artifacts
+
+    clear_routing_artifacts()
+    return changed
 
 
 def validate_cmd(binary: str) -> list[str]:

@@ -8,6 +8,7 @@ import os
 import pytest
 
 from ucode.agents import claude
+from ucode.smart_routing import claude_routing
 
 WS = "https://example.databricks.com"
 
@@ -760,3 +761,106 @@ class TestBuildClaudeArgv:
         monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
         with pytest.raises(RuntimeError, match="not valid JSON"):
             claude._build_claude_argv("claude", ["--settings", str(bad_file)])
+
+
+class TestClaudeSmartRouting:
+    def _capture_write(self, monkeypatch, existing, written):
+        monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        monkeypatch.setattr(claude, "read_json_safe", lambda path: existing)
+        monkeypatch.setattr(
+            claude, "write_json_file", lambda path, payload: written.append(payload)
+        )
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
+
+    def test_enable_sets_state_key(self):
+        state = claude.enable_smart_routing({})
+        assert state[claude.SMART_ROUTING_STATE_KEY] is True
+
+    def test_enabled_reads_state_key(self):
+        assert claude.smart_routing_enabled({claude.SMART_ROUTING_STATE_KEY: True})
+        assert not claude.smart_routing_enabled({})
+
+    def test_write_config_installs_routing_hooks(self, monkeypatch):
+        written: list = []
+        self._capture_write(monkeypatch, {}, written)
+        state = {
+            "workspace": WS,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+            claude.SMART_ROUTING_STATE_KEY: True,
+        }
+        claude.write_tool_config(state, "system.ai.claude-opus-4-8", route_root_model=None)
+        hooks = written[0]["hooks"]
+        assert set(hooks) == {"PreToolUse", "SessionStart", "SubagentStart"}
+        commands = [hook["command"] for group in hooks["PreToolUse"] for hook in group["hooks"]]
+        assert any("claude-router-hook" in command for command in commands)
+
+    def test_root_model_pins_anthropic_model(self, monkeypatch):
+        written: list = []
+        self._capture_write(monkeypatch, {}, written)
+        state = {
+            "workspace": WS,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+            claude.SMART_ROUTING_STATE_KEY: True,
+        }
+        claude.write_tool_config(
+            state, "system.ai.claude-opus-4-8", route_root_model="system.ai.claude-sonnet-5"
+        )
+        assert written[0]["env"]["ANTHROPIC_MODEL"] == "system.ai.claude-sonnet-5"
+
+    def test_provider_suppresses_routing_hooks(self, monkeypatch):
+        written: list = []
+        self._capture_write(monkeypatch, {}, written)
+        state = {"workspace": WS, claude.SMART_ROUTING_STATE_KEY: True}
+        # Under a Model Provider Service no Databricks model is pinned, so routing
+        # is inapplicable — hooks must not be installed even when the flag is set.
+        claude.write_tool_config(state, None, provider="cat.sch.svc")
+        assert "hooks" not in written[0] or "PreToolUse" not in written[0]["hooks"]
+
+    def test_disable_removes_only_ucode_hooks(self, tmp_path, monkeypatch):
+        settings_path = tmp_path / "ucode-settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [
+                            {
+                                "matcher": "Bash",
+                                "hooks": [{"type": "command", "command": "user-policy"}],
+                            },
+                            {
+                                "matcher": "Agent|Task",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "ucode claude-router-hook route-subagent",
+                                    }
+                                ],
+                            },
+                        ],
+                        "SessionStart": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "ucode claude-router-hook session-start",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", settings_path)
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(claude_routing, "clear_routing_artifacts", lambda: None)
+        state = {"workspace": WS, claude.SMART_ROUTING_STATE_KEY: True}
+
+        assert claude.disable_smart_routing(state) is True
+
+        doc = json.loads(settings_path.read_text())
+        assert state.get(claude.SMART_ROUTING_STATE_KEY) is None
+        assert list(doc["hooks"]) == ["PreToolUse"]
+        assert doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "user-policy"

@@ -11,6 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from ucode.cli import app
+from ucode.smart_routing.routing import RoutingDecision
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -189,6 +190,73 @@ class TestSubcommandRouting:
             result = runner.invoke(app, ["claude"])
         assert result.exit_code == 0, result.output
         mock_set.assert_not_called()
+
+    def test_codex_enable_smart_routing_is_consumed_by_ucode(self):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, ["codex", "--enable-smart-routing"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.kwargs["enable_smart_routing_flag"] is True
+        assert mock_launch.call_args.args[1].args == []
+
+    def test_codex_disable_removes_hooks_without_launching(self):
+        with (
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.codex_agent.disable_smart_routing") as mock_disable,
+            patch("ucode.cli._launch_tool") as mock_launch,
+        ):
+            result = runner.invoke(app, ["codex", "--disable-smart-routing"])
+
+        assert result.exit_code == 0, result.output
+        mock_disable.assert_called_once_with(MINIMAL_STATE)
+        mock_launch.assert_not_called()
+        assert "routing hooks removed" in result.output
+
+    def test_codex_routing_flags_are_mutually_exclusive(self):
+        result = runner.invoke(
+            app,
+            ["codex", "--enable-smart-routing", "--disable-smart-routing"],
+        )
+
+        assert result.exit_code == 1
+        assert "Use only one" in result.output
+
+    def test_enabled_codex_launch_uses_routed_root_model(self):
+        state = {
+            **MINIMAL_STATE,
+            "smart_routing_enabled": True,
+            "codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"],
+        }
+        decision = RoutingDecision(
+            model="databricks-gpt-5-5",
+            raw_model="gpt-5-6-sol",
+            rationale="Cross-cutting refactor.",
+        )
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(state, "databricks-gpt-5"),
+            ),
+            patch(
+                "ucode.cli.codex_routing.route_launch_model",
+                return_value=(decision, None),
+            ),
+            patch("ucode.cli.configure_tool", return_value=state) as mock_configure,
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, ["codex"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.args[2] == "databricks-gpt-5-5"
+        # The launch notice surfaces both the routed model and the rationale.
+        assert (
+            "Using Smart Routing. Routing to databricks-gpt-5-5. Cross-cutting refactor."
+            in _strip_ansi(result.output)
+        )
 
 
 class TestMcpSubcommands:
@@ -407,13 +475,63 @@ class TestConfigureSkillsCommand:
                 app, ["configure", "skills", "--location", "a.b", "--path", "/tmp/skills"]
             )
         assert result.exit_code == 0, result.output
-        mock_download.assert_called_once_with(["a.b"], path="/tmp/skills")
+        mock_download.assert_called_once_with(["a.b"], path="/tmp/skills", skills=None)
 
     def test_default_mode_without_path_dispatches_download(self):
         with patch("ucode.cli.configure_skills_download_command") as mock_download:
             result = runner.invoke(app, ["configure", "skills", "--location", "a.b"])
         assert result.exit_code == 0, result.output
-        mock_download.assert_called_once_with(["a.b"], path=None)
+        mock_download.assert_called_once_with(["a.b"], path=None, skills=None)
+
+    def test_skill_filter_dispatches_download_with_subset(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(
+                app, ["configure", "skills", "--location", "a.b", "--skill", "my_skill"]
+            )
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path=None, skills={"my_skill"})
+
+    def test_skill_filter_parses_comma_list(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(
+                app, ["configure", "skills", "--location", "a.b", "--skill", "s1, s2"]
+            )
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path=None, skills={"s1", "s2"})
+
+    def test_skill_with_mcp_exit_1(self):
+        with (
+            patch("ucode.cli.configure_skills_mcp_command") as mock_mcp,
+            patch("ucode.cli.configure_skills_download_command") as mock_download,
+        ):
+            result = runner.invoke(
+                app, ["configure", "skills", "--location", "a.b", "--mcp", "--skill", "my_skill"]
+            )
+        assert result.exit_code == 1
+        assert "--skill" in _strip_ansi(result.output)
+        mock_mcp.assert_not_called()
+        mock_download.assert_not_called()
+
+    def test_skill_without_location_exit_1(self):
+        with (
+            patch("ucode.cli.configure_skills_mcp_command") as mock_mcp,
+            patch("ucode.cli.configure_skills_download_command") as mock_download,
+        ):
+            result = runner.invoke(app, ["configure", "skills", "--skill", "my_skill"])
+        assert result.exit_code == 1
+        assert "--skill" in _strip_ansi(result.output)
+        mock_mcp.assert_not_called()
+        mock_download.assert_not_called()
+
+    def test_skill_with_multiple_locations_exit_1(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(
+                app, ["configure", "skills", "--location", "a.b, c.d", "--skill", "my_skill"]
+            )
+        assert result.exit_code == 1
+        output = _strip_ansi(result.output)
+        assert "--skill requires a single --location" in output
+        mock_download.assert_not_called()
 
     def test_path_with_mcp_exit_1(self):
         with (

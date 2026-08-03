@@ -247,12 +247,21 @@ def _fetch_bundles(
     return results
 
 
-def download_skills(workspace: str, token: str, locations: list[str], path: str | None) -> None:
+def download_skills(
+    workspace: str,
+    token: str,
+    locations: list[str],
+    path: str | None,
+    skills: set[str] | None = None,
+) -> None:
     """Download every skill in each ``<catalog>.<schema>`` location to disk.
 
     Bundles are fetched concurrently (with a progress bar) per schema, then
     written sequentially so overwrite prompts don't interleave. A failure on one
     skill warns and skips it without aborting the batch.
+
+    When ``skills`` is given, only those leaf names are downloaded; names absent
+    from a schema warn and are skipped. ``None`` downloads the whole schema.
     """
     roots = skill_dir_roots(path)
     roots_display = " and ".join(str(root) for root in roots)
@@ -262,6 +271,17 @@ def download_skills(workspace: str, token: str, locations: list[str], path: str 
         if reason:
             print_warning(f"Skipping `{location}`: {reason}.")
             continue
+        if skills is not None:
+            unknown = skills - set(leaves)
+            if unknown:
+                print_warning(
+                    f"Skipping requested skill(s) not found in `{location}`: "
+                    f"{', '.join(sorted(unknown))}."
+                )
+            leaves = [leaf for leaf in leaves if leaf in skills]
+            if not leaves:
+                print_note(f"No requested skills to download from `{location}`.")
+                continue
         if not leaves:
             print_note(f"No skills found in `{location}`.")
             continue
@@ -281,17 +301,20 @@ def download_skills(workspace: str, token: str, locations: list[str], path: str 
         )
 
 
-def configure_skills_download_command(locations: list[str], *, path: str | None) -> int:
+def configure_skills_download_command(
+    locations: list[str], *, path: str | None, skills: set[str] | None = None
+) -> int:
     """Download every skill in each schema to disk and register the skills connection.
 
     Downloads to ``path`` (or the home dir when None), then registers/keeps the
     schema-less MCP connection. ``skill_locations`` is never touched, so a prior
-    ``--mcp`` set survives a download run."""
+    ``--mcp`` set survives a download run. ``skills`` narrows the download (see
+    ``download_skills``)."""
     state = load_state()
     workspace, profile, clients = setup_mcp_clients(state, "Skills")
     token = get_databricks_token(workspace, profile)
 
-    download_skills(workspace, token, locations, path)
+    download_skills(workspace, token, locations, path, skills)
 
     register_schemaless_skills_connection(state, workspace, profile, clients)
     return 0
