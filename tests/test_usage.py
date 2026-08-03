@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 import ucode.usage as usage_mod
+from ucode.ui import label, value
 from ucode.usage import (
     USAGE_BREAKDOWN_DAYS,
     USAGE_SUMMARY_DAYS,
@@ -20,6 +22,7 @@ from ucode.usage import (
     filter_records_for_tools,
     has_tool_usage_last_week,
     parse_usage_rows,
+    render_budget_lines,
     render_usage_summary,
     simplify_model_name,
     summarize_model_tokens,
@@ -301,6 +304,37 @@ class TestEmptyToolDay:
         assert row["models"] == "-"
 
 
+class TestRenderBudgetLines:
+    def test_no_lines_when_unavailable(self):
+        assert render_budget_lines(None) == []
+
+    def test_shows_spend_threshold_and_percent(self):
+        lines = render_budget_lines((Decimal("12.34"), Decimal("100")))
+        assert "$12.34" in lines[0]
+        assert "$100.00" in lines[0]
+        assert "12%" in lines[0]
+
+    def test_renders_meter(self):
+        lines = render_budget_lines((Decimal("50"), Decimal("100")))
+        assert len(lines) == 2
+        assert "█" in lines[1]
+        assert "░" in lines[1]
+
+    def test_zero_threshold_omits_percent_and_meter(self):
+        lines = render_budget_lines((Decimal("5"), Decimal("0")))
+        assert lines == [f"{label('Budget spend:')} {value('$5.00')}"]
+
+    def test_spend_over_threshold_clamps_meter(self):
+        lines = render_budget_lines((Decimal("250"), Decimal("100")))
+        assert "250%" in lines[0]
+        assert "░" not in lines[1]
+
+    def test_thousands_separator(self):
+        lines = render_budget_lines((Decimal("1234.5"), Decimal("10000")))
+        assert "$1,234.50" in lines[0]
+        assert "$10,000.00" in lines[0]
+
+
 class TestRenderUsageSummary:
     def _make_record(self, days_ago: int, tool: str, tokens: int, model: str = "") -> dict:
         d = date.today() - timedelta(days=days_ago)
@@ -340,6 +374,21 @@ class TestRenderUsageSummary:
         records = [self._make_record(0, "claude", 5000, "databricks-claude-sonnet-4")]
         result = render_usage_summary(records, "user", {"claude": "Claude Code"})
         assert "sonnet-4" in result
+
+    def test_includes_budget_spend_when_available(self):
+        records = [self._make_record(0, "claude", 1000)]
+        result = render_usage_summary(
+            records,
+            "user",
+            {"claude": "Claude Code"},
+            budget_spend=(Decimal("12.34"), Decimal("100")),
+        )
+        assert "$12.34 of $100.00" in result
+
+    def test_omits_budget_spend_by_default(self):
+        records = [self._make_record(0, "claude", 1000)]
+        result = render_usage_summary(records, "user", {"claude": "Claude Code"})
+        assert "Budget spend" not in result
 
     def test_top_models_uses_per_model_token_totals(self):
         records = [
@@ -470,6 +519,9 @@ class TestUsageCommand:
             lambda *args, **kwargs: "/sql/1.0/warehouses/abc",
         )
         monkeypatch.setattr(usage_mod, "run_usage_query", lambda *args, **kwargs: (columns, rows))
+        monkeypatch.setattr(
+            usage_mod, "resolve_current_budget_spend", lambda *args, **kwargs: (None, "disabled")
+        )
         monkeypatch.setattr(usage_mod, "console", DummyConsole())
         monkeypatch.setattr(usage_mod, "print_heading", headings.append)
         monkeypatch.setattr(usage_mod, "print_note", notes.append)

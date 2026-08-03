@@ -23,6 +23,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, cast, overload
 from urllib import error as urllib_error
@@ -2527,6 +2528,48 @@ def _looks_like_auth_failure(reason: str) -> bool:
     if "HTTP 400" in reason and "invalid token" in reason.lower():
         return True
     return False
+
+
+CODING_AGENT_BUDGET_SPEND_PATH = "/api/ai-gateway/v2/coding-agent-configs:resolveCurrentBudgetSpend"
+
+
+def resolve_current_budget_spend(
+    workspace: str,
+    token: str,
+    *,
+    timeout: int = 10,
+) -> tuple[tuple[Decimal, Decimal] | None, str | None]:
+    """Fetch the caller's coding-agent budget spend and alert threshold.
+
+    Returns `((spend, threshold), None)` or `(None, reason)`. Absence is
+    routine — the endpoint needs a per-org SAFE flag (default off) and a
+    coding-agent config — so it never raises.
+    """
+    url = f"https://{workspace_hostname(workspace)}{CODING_AGENT_BUDGET_SPEND_PATH}"
+    payload, reason = _http_post_json(url, token, {}, timeout=timeout)
+    if payload is None:
+        return None, reason or "unknown error"
+    if not isinstance(payload, dict):
+        return None, "response was not a JSON object"
+
+    # Per the server's BudgetSpend.fromProto, a spend with no threshold to
+    # measure against counts as no spend.
+    spend = _parse_decimal(payload.get("current_spend"))
+    threshold = _parse_decimal(payload.get("effective_threshold"))
+    if spend is None or threshold is None:
+        return None, "workspace reported no coding-agent budget spend"
+    return (spend, threshold), None
+
+
+def _parse_decimal(value: object) -> Decimal | None:
+    if isinstance(value, str) and value.strip():
+        try:
+            return Decimal(value.strip())
+        except InvalidOperation:
+            return None
+    if isinstance(value, int):
+        return Decimal(value)
+    return None
 
 
 def discover_sql_warehouse_http_path(

@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from decimal import Decimal
 
 import pytest
 
 import ucode.databricks as db_mod
 from ucode.databricks import (
     AI_GATEWAY_V2_DOCS_URL,
+    CODING_AGENT_BUDGET_SPEND_PATH,
     _format_subprocess_result,
     _parse_databricks_cli_version,
     _run_databricks_cli_installer,
@@ -31,6 +33,7 @@ from ucode.databricks import (
     list_databricks_apps,
     list_databricks_connections,
     list_genie_spaces,
+    resolve_current_budget_spend,
     workspace_hostname,
 )
 
@@ -2286,3 +2289,81 @@ class TestIsWorkspaceAdmin:
         # A well-formed `Me` for a user in no groups omits `groups` entirely.
         self._stub(monkeypatch, payload)
         assert db_mod.is_workspace_admin("https://w", "tok") is False
+
+
+class TestResolveCurrentBudgetSpend:
+    def test_parses_spend_and_threshold(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: (
+                {"current_spend": "12.34", "effective_threshold": "100"},
+                None,
+            ),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend == (Decimal("12.34"), Decimal("100"))
+        assert reason is None
+
+    def test_posts_empty_body_to_coding_agent_path(self, monkeypatch):
+        captured = {}
+
+        def fake_post(url, token, payload, timeout=10):
+            captured["url"] = url
+            captured["payload"] = payload
+            return {"current_spend": "1", "effective_threshold": "2"}, None
+
+        monkeypatch.setattr(db_mod, "_http_post_json", fake_post)
+        resolve_current_budget_spend("https://ws.example.com", "token")
+        assert captured["url"] == (f"https://ws.example.com{CODING_AGENT_BUDGET_SPEND_PATH}")
+        assert captured["payload"] == {}
+
+    def test_feature_disabled_returns_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: (
+                None,
+                "HTTP 400 Bad Request: FEATURE_DISABLED",
+            ),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+        assert "FEATURE_DISABLED" in reason
+
+    def test_unset_fields_treated_as_no_spend(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_post_json", lambda url, token, payload, timeout=10: ({}, None)
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+        assert "no coding-agent budget spend" in reason
+
+    def test_spend_without_threshold_is_no_spend(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: ({"current_spend": "12.34"}, None),
+        )
+        spend, _ = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+
+    def test_malformed_decimal_is_no_spend(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: (
+                {"current_spend": "not-a-number", "effective_threshold": "100"},
+                None,
+            ),
+        )
+        spend, _ = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+
+    def test_non_object_payload_is_no_spend(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_post_json", lambda url, token, payload, timeout=10: ([], None)
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+        assert "not a JSON object" in reason

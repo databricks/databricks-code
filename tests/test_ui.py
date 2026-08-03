@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from datetime import timedelta
+from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
@@ -11,7 +12,9 @@ from rich.console import Console
 
 from ucode.ui import (
     format_duration,
+    format_meter,
     format_token_count,
+    format_usd,
     normalize_workspace_url,
     prompt_for_percentage,
     prompt_for_text,
@@ -296,3 +299,42 @@ class TestPromptForWorkspace:
             url, profile = prompt_for_workspace("desc", profiles=None)
         assert url == "https://example.databricks.com"
         assert profile is None
+
+
+class TestFormatUsd:
+    def test_rounds_to_cents(self):
+        assert format_usd(Decimal("12.345")) == "$12.35"
+        assert format_usd(Decimal("12.344")) == "$12.34"
+
+    def test_pads_to_two_decimals(self):
+        assert format_usd(Decimal("5")) == "$5.00"
+
+    def test_thousands_separator(self):
+        assert format_usd(Decimal("1234567.5")) == "$1,234,567.50"
+
+    def test_zero(self):
+        assert format_usd(Decimal("0")) == "$0.00"
+
+
+class TestFormatMeter:
+    def test_empty(self):
+        assert format_meter(0.0, width=10) == "[" + "\u2591" * 10 + "]"
+
+    def test_full(self):
+        assert format_meter(1.0, width=10) == "[" + "\u2588" * 10 + "]"
+
+    def test_half(self):
+        assert format_meter(0.5, width=10) == "[" + "\u2588" * 5 + "\u2591" * 5 + "]"
+
+    def test_tiny_nonzero_fills_one_cell(self):
+        assert format_meter(0.001, width=10) == "[\u2588" + "\u2591" * 9 + "]"
+
+    def test_clamps_above_one(self):
+        assert format_meter(2.5, width=10) == "[" + "\u2588" * 10 + "]"
+
+    def test_clamps_below_zero(self):
+        assert format_meter(-1.0, width=10) == "[" + "\u2591" * 10 + "]"
+
+    def test_width_is_constant(self):
+        for fraction in (0.0, 0.13, 0.5, 0.99, 1.0):
+            assert len(format_meter(fraction)) == 32
