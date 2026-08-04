@@ -1495,7 +1495,15 @@ def _provider_type_tag(provider_type: str | None) -> str:
     return tag.lower()
 
 
-def list_model_provider_services(workspace: str, token: str) -> tuple[list[dict], str | None]:
+# The listing is paginated; a metastore with more services than one page silently truncated before
+# this was honored, making services on later pages look nonexistent.
+_PROVIDER_SERVICES_PAGE_SIZE = 100
+_PROVIDER_SERVICES_MAX_PAGES = 50
+
+
+def list_model_provider_services(
+    workspace: str, token: str, *, parent: str | None = None
+) -> tuple[list[dict], str | None]:
     """List Unity Catalog Model Provider Services on the workspace.
 
     Returns ``(services, reason)`` where each service is
@@ -1505,44 +1513,105 @@ def list_model_provider_services(workspace: str, token: str) -> tuple[list[dict]
     Bedrock model names). ``relayed`` is True for a credential-less Anthropic
     service (Claude Max/Team/Enterprise subscription relay). A non-None
     ``reason`` means the listing call itself failed.
+
+    Pages through the endpoint: a metastore with more services than fit on one page used to have the
+    remainder silently dropped, so a service that plainly existed looked absent. ``parent`` scopes
+    the listing to one ``catalog.schema`` — the metastore-wide default is documented as an internal,
+    likely-to-be-deprecated scope, so prefer passing it when the schema is known.
     """
     hostname = workspace_hostname(workspace)
-    url = f"https://{hostname}/api/2.1/unity-catalog/model-provider-services"
-    payload, reason = _http_get_json(url, token, timeout=30)
-    if payload is None:
-        return [], reason
-    data = cast(dict, payload) if isinstance(payload, dict) else {}
     services: list[dict] = []
-    for service in data.get("model_provider_services") or []:
-        if not isinstance(service, dict):
-            continue
-        raw_name = service.get("name")
-        if not isinstance(raw_name, str) or not raw_name:
-            continue
-        # The API returns `model-provider-services/<catalog>.<schema>.<name>`.
-        full_name = raw_name.split("/", 1)[1] if "/" in raw_name else raw_name
-        config = service.get("config") if isinstance(service.get("config"), dict) else {}
-        targets = []
-        for target in config.get("targets") or []:
-            model_id = target.get("model") if isinstance(target, dict) else None
-            if isinstance(model_id, str) and model_id:
-                targets.append(model_id)
-        # Relayed = credential-less Anthropic (subscription relay). Only whether
-        # it's relayed matters here; the tier (Max vs Team/Enterprise) is governed
-        # server-side, so both launch identically.
-        anthropic_cfg = config.get("anthropic")
-        relayed = isinstance(anthropic_cfg, dict) and "relayed" in anthropic_cfg
-        services.append(
-            {
-                "name": full_name,
-                "provider_type": _provider_type_tag(config.get("provider_type")),
-                "targets": targets,
-                "allow_all_targets": bool(config.get("allow_all_targets")),
-                "relayed": relayed,
-            }
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    last_reason: str | None = None
+    for _ in range(_PROVIDER_SERVICES_MAX_PAGES):
+        params: dict[str, str] = {"page_size": str(_PROVIDER_SERVICES_PAGE_SIZE)}
+        if parent:
+            params["parent"] = f"schemas/{parent}"
+        if page_token:
+            params["page_token"] = page_token
+        url = (
+            f"https://{hostname}/api/2.1/unity-catalog/model-provider-services?{urlencode(params)}"
         )
+        payload, reason = _http_get_json(url, token, timeout=30)
+        if payload is None:
+            # Surface the failure only if we have nothing yet; a mid-pagination blip still
+            # returns whatever was collected.
+            last_reason = reason
+            break
+        data = cast(dict, payload) if isinstance(payload, dict) else {}
+        for service in data.get("model_provider_services") or []:
+            entry = _provider_service_entry(service)
+            if entry is not None:
+                services.append(entry)
+        page_token = data.get("next_page_token") or None
+        if not page_token:
+            last_reason = None
+            break
+        if page_token in seen_tokens:
+            break
+        seen_tokens.add(page_token)
+
+    if not services and last_reason is not None:
+        return [], last_reason
     services.sort(key=lambda s: s["name"])
     return services, None
+
+
+def _provider_service_entry(raw_service: object) -> dict | None:
+    """Normalize one listing entry, or None when it isn't usable."""
+    if not isinstance(raw_service, dict):
+        return None
+    # A bare isinstance narrows to dict[Never, Never], which rejects string keys.
+    service = cast("dict[str, object]", raw_service)
+    raw_name = service.get("name")
+    if not isinstance(raw_name, str) or not raw_name:
+        return None
+    # The API returns `model-provider-services/<catalog>.<schema>.<name>`.
+    full_name = raw_name.split("/", 1)[1] if "/" in raw_name else raw_name
+    raw_config = service.get("config")
+    config = cast("dict[str, object]", raw_config) if isinstance(raw_config, dict) else {}
+    targets: list[str] = []
+    raw_targets = config.get("targets")
+    for target in raw_targets if isinstance(raw_targets, list) else []:
+        if not isinstance(target, dict):
+            continue
+        model_id = cast("dict[str, object]", target).get("model")
+        if isinstance(model_id, str) and model_id:
+            targets.append(model_id)
+    # Relayed = credential-less Anthropic (subscription relay). Only whether
+    # it's relayed matters here; the tier (Max vs Team/Enterprise) is governed
+    # server-side, so both launch identically.
+    anthropic_cfg = config.get("anthropic")
+    relayed = isinstance(anthropic_cfg, dict) and "relayed" in anthropic_cfg
+    raw_type = config.get("provider_type")
+    return {
+        "name": full_name,
+        "provider_type": _provider_type_tag(raw_type if isinstance(raw_type, str) else None),
+        "targets": targets,
+        "allow_all_targets": bool(config.get("allow_all_targets")),
+        "relayed": relayed,
+    }
+
+
+def get_model_provider_service(
+    service_name: str, workspace: str, token: str
+) -> tuple[dict | None, str | None]:
+    """Fetch one provider service by its full `catalog.schema.name`, bypassing the listing.
+
+    The listing is paginated and metastore-wide, so any gap in it (a page we failed to fetch, a
+    server-side filter) makes a service that plainly exists look absent. Addressing it directly
+    removes that whole class of false negative.
+    """
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}/api/2.1/unity-catalog/model-provider-services/{service_name}"
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if payload is None:
+        return None, reason
+    entry = _provider_service_entry(payload)
+    if entry is None:
+        return None, "model-provider-service response had an unexpected shape"
+    return entry, None
 
 
 def is_model_provider_feature_unavailable(reason: str | None) -> bool:
@@ -1603,11 +1672,16 @@ def resolve_provider_service(
         return None, f"Could not list model provider services: {reason}"
     match = next((s for s in services if s["name"] == service_name), None)
     if match is None:
-        usable = [
-            s["name"] for s in services if tool_supports_provider_type(tool, s["provider_type"])
-        ]
-        suffix = f" Available for {tool}: {', '.join(usable)}." if usable else ""
-        return None, f"Model provider service '{service_name}' was not found.{suffix}"
+        # Don't conclude "not found" from a listing that may be incomplete — a named service can be
+        # fetched directly. Only when that 404s is it really absent.
+        match, get_reason = get_model_provider_service(service_name, workspace, token)
+        if match is None:
+            usable = [
+                s["name"] for s in services if tool_supports_provider_type(tool, s["provider_type"])
+            ]
+            suffix = f" Available for {tool}: {', '.join(usable)}." if usable else ""
+            detail = f" ({get_reason})" if get_reason and "404" not in get_reason else ""
+            return None, f"Model provider service '{service_name}' was not found.{detail}{suffix}"
     provider_type = match["provider_type"]
     if not tool_supports_provider_type(tool, provider_type):
         supported = ", ".join(_TOOL_PROVIDER_TYPES.get(tool, ())) or "none"

@@ -499,6 +499,136 @@ class TestMapBedrockClaudeModels:
         assert db_mod.map_bedrock_claude_models(["amazon.titan-text-express-v1"]) == {}
 
 
+class TestProviderServicePagination:
+    """The listing is paginated; ignoring next_page_token hid services on later pages entirely."""
+
+    @staticmethod
+    def _page(names, next_token=None):
+        payload = {
+            "model_provider_services": [
+                {
+                    "name": f"model-provider-services/{n}",
+                    "config": {"provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_OPENAI"},
+                }
+                for n in names
+            ]
+        }
+        if next_token:
+            payload["next_page_token"] = next_token
+        return payload
+
+    def test_follows_next_page_token(self, monkeypatch):
+        pages = [
+            self._page(["main.s.one"], next_token="tok2"),
+            self._page(["main.s.two"]),
+        ]
+        seen: list[str] = []
+
+        def fake_get(url, token, **kwargs):
+            seen.append(url)
+            return pages[len(seen) - 1], None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        services, reason = db_mod.list_model_provider_services("https://ws", "tok")
+
+        assert reason is None
+        assert [s["name"] for s in services] == ["main.s.one", "main.s.two"]
+        assert "page_token=tok2" in seen[1]
+
+    def test_stops_on_a_repeated_token(self, monkeypatch):
+        # A server that echoes the same token would otherwise spin forever.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, **kw: (self._page(["main.s.one"], next_token="same"), None),
+        )
+        services, reason = db_mod.list_model_provider_services("https://ws", "tok")
+        assert reason is None
+        assert len(services) >= 1
+
+    def test_keeps_earlier_pages_when_a_later_one_fails(self, monkeypatch):
+        calls = {"n": 0}
+
+        def fake_get(url, token, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return self._page(["main.s.one"], next_token="tok2"), None
+            return None, "HTTP 500 Server Error"
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        services, reason = db_mod.list_model_provider_services("https://ws", "tok")
+
+        # A mid-pagination blip should degrade to partial results, not to an error.
+        assert reason is None
+        assert [s["name"] for s in services] == ["main.s.one"]
+
+    def test_reports_the_failure_when_nothing_was_collected(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, **kw: (None, "HTTP 403 Forbidden")
+        )
+        services, reason = db_mod.list_model_provider_services("https://ws", "tok")
+        assert services == []
+        assert reason == "HTTP 403 Forbidden"
+
+    def test_parent_scopes_the_listing(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_get(url, token, **kwargs):
+            seen["url"] = url
+            return self._page(["main.tien_le.openai"]), None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        db_mod.list_model_provider_services("https://ws", "tok", parent="main.tien_le")
+
+        assert "parent=schemas%2Fmain.tien_le" in seen["url"]
+
+    def test_page_size_is_always_sent(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_get(url, token, **kwargs):
+            seen["url"] = url
+            return self._page(["main.s.one"]), None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        db_mod.list_model_provider_services("https://ws", "tok")
+
+        assert "page_size=" in seen["url"]
+
+
+class TestGetModelProviderService:
+    def test_addresses_the_service_directly(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_get(url, token, **kwargs):
+            seen["url"] = url
+            return {
+                "name": "model-provider-services/main.tien_le.openai_all",
+                "config": {
+                    "provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_OPENAI",
+                    "allow_all_targets": True,
+                },
+            }, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        service, reason = db_mod.get_model_provider_service(
+            "main.tien_le.openai_all", "https://ws", "tok"
+        )
+
+        assert reason is None
+        assert service is not None
+        assert service["name"] == "main.tien_le.openai_all"
+        assert service["allow_all_targets"] is True
+        assert seen["url"].endswith("/model-provider-services/main.tien_le.openai_all")
+
+    def test_missing_service_returns_the_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, **kw: (None, "HTTP 404 Not Found")
+        )
+        service, reason = db_mod.get_model_provider_service("main.a.b", "https://ws", "tok")
+        assert service is None
+        assert "404" in (reason or "")
+
+
 class TestResolveProviderService:
     _PAYLOAD = TestListModelProviderServices._PAYLOAD
 
