@@ -1374,6 +1374,31 @@ def discover_model_services(
     return claude_models, codex_models, gemini_models, oss_models, None
 
 
+# --- Managed coding-agent config (admin-authored, developer-read) -----------
+
+# The workspace-admin authors a CodingAgentConfig via the AI Gateway; developers read it
+# (non-admin) through the List endpoint and apply it locally.
+_CODING_AGENT_CONFIGS_API_PATH = "/api/ai-gateway/v2/coding-agent-configs"
+
+
+def fetch_managed_coding_agent_configs(workspace: str, token: str) -> tuple[list[dict], str | None]:
+    """List the workspace's managed CodingAgentConfig(s) via the AI Gateway."""
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}{_CODING_AGENT_CONFIGS_API_PATH}"
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if reason is not None:
+        return [], reason
+    if isinstance(payload, dict):
+        configs = payload.get("coding_agent_configs") or []
+    elif isinstance(payload, list):
+        configs = payload
+    else:
+        return [], "coding-agent-configs listing returned an unexpected response shape"
+    if not isinstance(configs, list):
+        return [], "coding-agent-configs listing returned an unexpected response shape"
+    return [c for c in configs if isinstance(c, dict)], None
+
+
 # --- MCP services (parallel to model services) -----------------------------
 
 
