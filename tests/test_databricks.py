@@ -12,7 +12,7 @@ import pytest
 import ucode.databricks as db_mod
 from ucode.databricks import (
     AI_GATEWAY_V2_DOCS_URL,
-    CODING_AGENT_BUDGET_SPEND_PATH,
+    CODING_AGENT_RECOMMEND_MODEL_PATH,
     _format_subprocess_result,
     _parse_databricks_cli_version,
     _run_databricks_cli_installer,
@@ -2305,7 +2305,7 @@ class TestResolveCurrentBudgetSpend:
         assert spend == (Decimal("12.34"), Decimal("100"))
         assert reason is None
 
-    def test_posts_empty_body_to_coding_agent_path(self, monkeypatch):
+    def test_posts_to_recommend_model_with_no_available_models(self, monkeypatch):
         captured = {}
 
         def fake_post(url, token, payload, timeout=10):
@@ -2315,8 +2315,41 @@ class TestResolveCurrentBudgetSpend:
 
         monkeypatch.setattr(db_mod, "_http_post_json", fake_post)
         resolve_current_budget_spend("https://ws.example.com", "token")
-        assert captured["url"] == (f"https://ws.example.com{CODING_AGENT_BUDGET_SPEND_PATH}")
-        assert captured["payload"] == {}
+        assert captured["url"] == (f"https://ws.example.com{CODING_AGENT_RECOMMEND_MODEL_PATH}")
+        # Empty list applies no availability filter; we want the spend only.
+        assert captured["payload"] == {"available_models": []}
+
+    def test_ignores_recommended_models(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: (
+                {
+                    "recommended_models": ["system.ai.claude-sonnet-4-5"],
+                    "current_spend": "12.34",
+                    "effective_threshold": "100",
+                },
+                None,
+            ),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend == (Decimal("12.34"), Decimal("100"))
+        assert reason is None
+
+    def test_recommendation_without_spend_is_no_spend(self, monkeypatch):
+        # A config with no matching budget still recommends models, but both
+        # spend fields come back unset.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: (
+                {"recommended_models": ["system.ai.claude-sonnet-4-5"]},
+                None,
+            ),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend is None
+        assert "no coding-agent budget spend" in reason
 
     def test_feature_disabled_returns_reason(self, monkeypatch):
         monkeypatch.setattr(

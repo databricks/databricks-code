@@ -2530,7 +2530,7 @@ def _looks_like_auth_failure(reason: str) -> bool:
     return False
 
 
-CODING_AGENT_BUDGET_SPEND_PATH = "/api/ai-gateway/v2/coding-agent-configs:resolveCurrentBudgetSpend"
+CODING_AGENT_RECOMMEND_MODEL_PATH = "/api/ai-gateway/v2/coding-agent-configs:recommendModel"
 
 
 def resolve_current_budget_spend(
@@ -2541,12 +2541,16 @@ def resolve_current_budget_spend(
 ) -> tuple[tuple[Decimal, Decimal] | None, str | None]:
     """Fetch the caller's coding-agent budget spend and alert threshold.
 
+    Reads them off `recommendModel`, which returns the spend its model
+    recommendation was based on. `available_models` is empty since we want the
+    spend, not the recommendation.
+
     Returns `((spend, threshold), None)` or `(None, reason)`. Absence is
     routine — the endpoint needs a per-org SAFE flag (default off) and a
     coding-agent config — so it never raises.
     """
-    url = f"https://{workspace_hostname(workspace)}{CODING_AGENT_BUDGET_SPEND_PATH}"
-    payload, reason = _http_post_json(url, token, {}, timeout=timeout)
+    url = f"https://{workspace_hostname(workspace)}{CODING_AGENT_RECOMMEND_MODEL_PATH}"
+    payload, reason = _http_post_json(url, token, {"available_models": []}, timeout=timeout)
     if payload is None:
         return None, reason or "unknown error"
     if not isinstance(payload, dict):
