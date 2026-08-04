@@ -1,0 +1,674 @@
+"""Tests for the admin-write half of the managed coding-agent config.
+
+The most valuable case here is the round-trip: ``serialize_managed_config`` followed by
+``managed_config.normalize_managed_config`` must return the manifest it started from. That single
+property pins the write side to the read side, so the two cannot drift as the proto grows.
+"""
+
+from __future__ import annotations
+
+import json
+import stat
+
+import pytest
+
+import ucode.config_io as config_io_mod
+import ucode.managed_setup as managed_setup_mod
+from ucode.managed_config import (
+    AGENT_ENUM_TO_TOOL,
+    MCP_TYPE_ENUM_TO_TAG,
+    normalize_managed_config,
+)
+from ucode.managed_setup import (
+    AGENT_TOOL_TO_ENUM,
+    MCP_TAG_TO_TYPE_ENUM,
+    claude_family_for_model,
+    claude_model_slots,
+    load_managed_settings,
+    managed_settings_workspace,
+    model_families_for_agent,
+    model_options_for_agent,
+    save_managed_settings,
+    serialize_managed_config,
+    supports_provider_service,
+    validate_manifest,
+)
+
+WORKSPACE = "https://ws.example.com"
+
+# A workspace state shaped like `configure_shared_state` produces.
+STATE = {
+    "workspace": WORKSPACE,
+    "claude_models": {
+        "opus": "system.ai.claude-opus-4-8",
+        "sonnet": "system.ai.claude-sonnet-4-6",
+        "haiku": "system.ai.claude-haiku-4-5",
+    },
+    "codex_models": ["system.ai.gpt-5-6"],
+    "gemini_models": ["system.ai.gemini-3-flash"],
+    "oss_models": ["system.ai.kimi-k2-6"],
+}
+
+
+def _minimal_manifest() -> dict:
+    """The smallest manifest that passes validation: one agent, which is the default."""
+    return {
+        "default_agent": "claude",
+        "enabled_agents": {
+            "claude": {
+                "model_config": {"default_model": "system.ai.claude-opus-4-8"},
+            }
+        },
+    }
+
+
+def _full_manifest() -> dict:
+    """A manifest exercising every field the read side normalizes."""
+    return {
+        "default_agent": "claude",
+        "enabled_agents": {
+            "claude": {
+                "use_as_global_settings": True,
+                "custom_headers": {"x-databricks-workspace": "eng-ml-inference"},
+                "tracing_table": "main.default.claude-traces",
+                "model_config": {
+                    "default_model": "system.ai.claude-opus-4-8",
+                    "models": {
+                        "default_opus_model": "system.ai.claude-opus-4-8",
+                        "default_sonnet_model": "system.ai.claude-sonnet-4-6",
+                    },
+                },
+            },
+            "codex": {
+                "use_as_global_settings": False,
+                "model_config": {"default_model": "system.ai.gpt-5-6"},
+            },
+            "opencode": {
+                "model_config": {
+                    "default_model": "system.ai.claude-opus-4-8",
+                    "models": ["system.ai.claude-opus-4-8", "system.ai.kimi-k2-6"],
+                },
+            },
+        },
+        "mcp_servers": [
+            {"name": "system.ai.github", "type": "mcp-service"},
+            {"name": "genie-space-id", "type": "genie-space"},
+        ],
+        "skills": {"names": ["system.ai.pdf-extraction"]},
+        "tracing_table": "main.default.ucode-traces",
+        "budget_policy": {
+            "display_name": "eng-tiered-routing",
+            "budget_id": "c6563b45-df9a-4b19-afb2-d42dc2b52576",
+            "tiers": [
+                {
+                    "spending_percentage": 0.8,
+                    "default_agent": "claude",
+                    "default_model": "system.ai.claude-sonnet-4-6",
+                },
+                {
+                    "spending_percentage": 1.0,
+                    "default_agent": "opencode",
+                    "default_model": "system.ai.kimi-k2-6",
+                },
+            ],
+        },
+    }
+
+
+class TestEnumMaps:
+    def test_agent_map_is_the_inverse_of_the_read_side(self):
+        assert AGENT_TOOL_TO_ENUM == {tool: enum for enum, tool in AGENT_ENUM_TO_TOOL.items()}
+
+    def test_mcp_map_is_the_inverse_of_the_read_side(self):
+        assert MCP_TAG_TO_TYPE_ENUM == {tag: enum for enum, tag in MCP_TYPE_ENUM_TO_TAG.items()}
+
+    def test_agent_map_round_trips(self):
+        for tool, enum in AGENT_TOOL_TO_ENUM.items():
+            assert AGENT_ENUM_TO_TOOL[enum] == tool
+
+    def test_inversion_is_lossless(self):
+        # A duplicated tool name on the read side would silently collapse an entry here.
+        assert len(AGENT_TOOL_TO_ENUM) == len(AGENT_ENUM_TO_TOOL)
+        assert len(MCP_TAG_TO_TYPE_ENUM) == len(MCP_TYPE_ENUM_TO_TAG)
+
+
+class TestRoundTrip:
+    """serialize -> normalize must be the identity on a ucode-native manifest."""
+
+    def test_full_manifest_round_trips(self):
+        manifest = _full_manifest()
+        assert normalize_managed_config(serialize_managed_config(manifest)) == manifest
+
+    def test_minimal_manifest_round_trips(self):
+        manifest = _minimal_manifest()
+        assert normalize_managed_config(serialize_managed_config(manifest)) == manifest
+
+    def test_every_known_agent_round_trips(self):
+        # Each agent's oneof variant must survive a round trip, including the flat-list agents and
+        # codex (which has no model list at all).
+        for tool in AGENT_TOOL_TO_ENUM:
+            model_config: dict = {"default_model": "system.ai.some-model"}
+            if tool == "claude":
+                model_config["models"] = {"default_opus_model": "system.ai.claude-opus-4-8"}
+            elif tool != "codex":
+                model_config["models"] = ["system.ai.some-model"]
+            manifest = {
+                "default_agent": tool,
+                "enabled_agents": {tool: {"model_config": model_config}},
+            }
+            assert normalize_managed_config(serialize_managed_config(manifest)) == manifest, tool
+
+    def test_every_mcp_type_round_trips(self):
+        for tag in MCP_TAG_TO_TYPE_ENUM:
+            manifest = {"mcp_servers": [{"name": "some-server", "type": tag}]}
+            assert normalize_managed_config(serialize_managed_config(manifest)) == manifest, tag
+
+
+class TestSerialize:
+    def test_maps_tool_names_to_proto_enums(self):
+        payload = serialize_managed_config(_minimal_manifest())
+        assert payload["default_agent"] == "CODING_AGENT_CLAUDE_CODE"
+        assert payload["enabled_agents"][0]["agent"] == "CODING_AGENT_CLAUDE_CODE"
+
+    def test_claude_model_config_uses_family_slots(self):
+        payload = serialize_managed_config(_full_manifest())
+        claude = next(
+            entry
+            for entry in payload["enabled_agents"]
+            if entry["agent"] == "CODING_AGENT_CLAUDE_CODE"
+        )
+        variant = claude["config"]["model_config"]
+        assert set(variant) == {"claude"}
+        assert variant["claude"]["models"] == {
+            "default_opus_model": "system.ai.claude-opus-4-8",
+            "default_sonnet_model": "system.ai.claude-sonnet-4-6",
+        }
+
+    def test_codex_model_config_has_no_model_list(self):
+        # CodexModelConfig carries only model_provider_service + default_model.
+        manifest = {
+            "default_agent": "codex",
+            "enabled_agents": {
+                "codex": {
+                    "model_config": {
+                        "default_model": "system.ai.gpt-5-6",
+                        # Even if a caller passes a list, it must not be serialized.
+                        "models": ["system.ai.gpt-5-6"],
+                    }
+                }
+            },
+        }
+        payload = serialize_managed_config(manifest)
+        variant = payload["enabled_agents"][0]["config"]["model_config"]["codex"]
+        assert "models" not in variant
+        assert variant["default_model"] == "system.ai.gpt-5-6"
+
+    def test_flat_list_agents_use_repeated_models(self):
+        payload = serialize_managed_config(_full_manifest())
+        opencode = next(
+            entry
+            for entry in payload["enabled_agents"]
+            if entry["agent"] == "CODING_AGENT_OPENCODE"
+        )
+        variant = opencode["config"]["model_config"]["opencode"]
+        assert variant["models"] == ["system.ai.claude-opus-4-8", "system.ai.kimi-k2-6"]
+
+    def test_model_provider_service_is_carried_through(self):
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "model_provider_service": "main.default.anthropic-mps",
+                        "default_model": "claude-sonnet-4-6",
+                    }
+                }
+            },
+        }
+        payload = serialize_managed_config(manifest)
+        variant = payload["enabled_agents"][0]["config"]["model_config"]["claude"]
+        assert variant["model_provider_service"] == "main.default.anthropic-mps"
+
+    def test_mcp_types_map_to_proto_enums(self):
+        payload = serialize_managed_config(_full_manifest())
+        assert payload["mcp_servers"] == [
+            {"name": "system.ai.github", "type": "MCP_SERVER_TYPE_UC_SERVICE"},
+            {"name": "genie-space-id", "type": "MCP_SERVER_TYPE_GENIE"},
+        ]
+
+    def test_tracing_becomes_a_table_object(self):
+        payload = serialize_managed_config(_full_manifest())
+        assert payload["tracing"] == {"table": "main.default.ucode-traces"}
+
+    def test_per_agent_tracing_override(self):
+        payload = serialize_managed_config(_full_manifest())
+        claude = next(
+            entry
+            for entry in payload["enabled_agents"]
+            if entry["agent"] == "CODING_AGENT_CLAUDE_CODE"
+        )
+        assert claude["config"]["tracing_config"] == {"table": "main.default.claude-traces"}
+
+    def test_budget_tiers_keep_fractions(self):
+        # The server validates 0 <= spending_percentage <= 1, so these stay fractions.
+        payload = serialize_managed_config(_full_manifest())
+        tiers = payload["budget_policy"]["tiers"]
+        assert [tier["spending_percentage"] for tier in tiers] == [0.8, 1.0]
+        assert tiers[1]["default_agent"] == "CODING_AGENT_OPENCODE"
+
+    def test_unknown_agent_is_dropped(self):
+        payload = serialize_managed_config(
+            {
+                "default_agent": "claude",
+                "enabled_agents": {
+                    "claude": {"model_config": {"default_model": "m"}},
+                    "some-future-agent": {"model_config": {"default_model": "m"}},
+                },
+            }
+        )
+        assert [entry["agent"] for entry in payload["enabled_agents"]] == [
+            "CODING_AGENT_CLAUDE_CODE"
+        ]
+
+    def test_unknown_mcp_type_is_dropped(self):
+        payload = serialize_managed_config(
+            {"mcp_servers": [{"name": "a", "type": "not-a-type"}, {"name": "b", "type": "sql"}]}
+        )
+        assert payload["mcp_servers"] == [{"name": "b", "type": "MCP_SERVER_TYPE_DATABRICKS_SQL"}]
+
+    def test_empty_manifest_serializes_to_empty_payload(self):
+        assert serialize_managed_config({}) == {}
+
+    def test_output_only_fields_are_never_emitted(self):
+        # A caller (or a round-tripped GET) may carry server-owned fields; they must not be sent.
+        payload = serialize_managed_config(
+            {
+                **_minimal_manifest(),
+                "workspace_id": 12345,
+                "create_time": "2026-01-01T00:00:00Z",
+                "created_user_id": 42,
+            }
+        )
+        assert "workspace_id" not in payload
+        assert "create_time" not in payload
+        assert "created_user_id" not in payload
+
+    def test_name_is_carried_through_when_present(self):
+        payload = serialize_managed_config(
+            {**_minimal_manifest(), "name": "coding-agent-configs/abc"}
+        )
+        assert payload["name"] == "coding-agent-configs/abc"
+
+    def test_use_as_global_settings_false_is_preserved(self):
+        # `False` is meaningful (write to the user-level file), so it must not be dropped as falsy.
+        payload = serialize_managed_config(
+            {
+                "default_agent": "codex",
+                "enabled_agents": {
+                    "codex": {
+                        "use_as_global_settings": False,
+                        "model_config": {"default_model": "m"},
+                    }
+                },
+            }
+        )
+        assert payload["enabled_agents"][0]["config"]["use_as_global_settings"] is False
+
+
+class TestModelOptions:
+    def test_claude_only_sees_claude_models(self):
+        options = model_options_for_agent("claude", STATE)
+        assert options == [
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-sonnet-4-6",
+            "system.ai.claude-haiku-4-5",
+        ]
+
+    def test_gemini_only_sees_gemini_models(self):
+        assert model_options_for_agent("gemini", STATE) == ["system.ai.gemini-3-flash"]
+
+    def test_codex_sees_gpt_and_oss(self):
+        assert model_options_for_agent("codex", STATE) == [
+            "system.ai.gpt-5-6",
+            "system.ai.kimi-k2-6",
+        ]
+
+    def test_multi_provider_agents_see_everything(self):
+        for tool in ("opencode", "pi", "copilot"):
+            options = model_options_for_agent(tool, STATE)
+            assert "system.ai.claude-opus-4-8" in options, tool
+            assert "system.ai.gpt-5-6" in options, tool
+            assert "system.ai.gemini-3-flash" in options, tool
+            assert "system.ai.kimi-k2-6" in options, tool
+
+    def test_empty_state_yields_no_options(self):
+        assert model_options_for_agent("claude", {}) == []
+
+    def test_options_are_deduplicated(self):
+        # An id can land in two family buckets (e.g. an OSS model also listed under gpt).
+        state = {"codex_models": ["system.ai.kimi-k2-6"], "oss_models": ["system.ai.kimi-k2-6"]}
+        assert model_options_for_agent("codex", state) == ["system.ai.kimi-k2-6"]
+
+    def test_unknown_agent_has_no_families(self):
+        assert model_families_for_agent("not-an-agent") == ()
+        assert model_options_for_agent("not-an-agent", STATE) == []
+
+    def test_malformed_state_is_ignored(self):
+        state = {"claude_models": "not-a-dict", "codex_models": {"not": "a list"}}
+        assert model_options_for_agent("claude", state) == []
+        assert model_options_for_agent("codex", state) == []
+
+
+class TestProviderServiceSupport:
+    def test_claude_supports_anthropic_and_bedrock(self):
+        assert supports_provider_service("claude", "anthropic")
+        assert supports_provider_service("claude", "amazon_bedrock")
+
+    def test_codex_supports_openai(self):
+        assert supports_provider_service("codex", "openai")
+
+    def test_claude_does_not_support_openai(self):
+        assert not supports_provider_service("claude", "openai")
+
+    def test_other_agents_have_no_provider_support(self):
+        for tool in ("gemini", "opencode", "pi", "copilot"):
+            assert not supports_provider_service(tool, "anthropic"), tool
+
+
+class TestClaudeSlots:
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("system.ai.claude-opus-4-8", "opus"),
+            ("databricks-claude-sonnet-4-6", "sonnet"),
+            ("system.ai.claude-haiku-4-5", "haiku"),
+            ("system.ai.claude-fable-5", "fable"),
+            ("system.ai.gpt-5-6", None),
+            ("claude-without-family", None),
+        ],
+    )
+    def test_family_detection(self, model, expected):
+        assert claude_family_for_model(model) == expected
+
+    def test_groups_models_into_slots(self):
+        slots = claude_model_slots(["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-4-6"])
+        assert slots == {
+            "default_opus_model": "system.ai.claude-opus-4-8",
+            "default_sonnet_model": "system.ai.claude-sonnet-4-6",
+        }
+
+    def test_first_model_wins_within_a_family(self):
+        slots = claude_model_slots(["system.ai.claude-opus-4-8", "system.ai.claude-opus-4-7"])
+        assert slots == {"default_opus_model": "system.ai.claude-opus-4-8"}
+
+    def test_unidentifiable_models_are_skipped(self):
+        assert claude_model_slots(["system.ai.gpt-5-6"]) == {}
+
+    def test_slots_serialize_into_the_claude_variant(self):
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "default_model": "system.ai.claude-opus-4-8",
+                        "models": claude_model_slots(["system.ai.claude-opus-4-8"]),
+                    }
+                }
+            },
+        }
+        payload = serialize_managed_config(manifest)
+        variant = payload["enabled_agents"][0]["config"]["model_config"]["claude"]
+        assert variant["models"] == {"default_opus_model": "system.ai.claude-opus-4-8"}
+
+
+class TestValidate:
+    def test_full_manifest_is_valid(self):
+        assert validate_manifest(_full_manifest(), STATE) == []
+
+    def test_minimal_manifest_is_valid(self):
+        assert validate_manifest(_minimal_manifest(), STATE) == []
+
+    def test_empty_manifest_is_valid(self):
+        # Nothing configured is not an error here; the wizard decides whether to publish it.
+        assert validate_manifest({}, STATE) == []
+
+    def test_default_agent_required_when_agents_present(self):
+        manifest = {"enabled_agents": {"claude": {"model_config": {"default_model": "m"}}}}
+        errors = validate_manifest(manifest)
+        assert any("default_agent is required" in e for e in errors)
+
+    def test_default_agent_must_be_enabled(self):
+        manifest = {
+            "default_agent": "codex",
+            "enabled_agents": {"claude": {"model_config": {"default_model": "m"}}},
+        }
+        errors = validate_manifest(manifest)
+        assert any("must appear in enabled_agents" in e for e in errors)
+
+    def test_default_agent_needs_a_default_model(self):
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {"claude": {"use_as_global_settings": True}},
+        }
+        errors = validate_manifest(manifest)
+        assert any("model_config.default_model" in e for e in errors)
+
+    def test_unknown_agent_is_rejected(self):
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}},
+                "not-an-agent": {},
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("not a supported agent" in e for e in errors)
+
+    def test_unknown_model_is_rejected(self):
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {"claude": {"model_config": {"default_model": "system.ai.nope"}}},
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("not available on this workspace" in e for e in errors)
+
+    def test_model_check_skipped_without_state(self):
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {"claude": {"model_config": {"default_model": "anything"}}},
+        }
+        assert validate_manifest(manifest) == []
+
+    def test_model_check_skipped_for_provider_service(self):
+        # MPS model ids come from the provider's catalog, not the UC inventory.
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "model_provider_service": "main.default.anthropic-mps",
+                        "default_model": "claude-sonnet-5",
+                    }
+                }
+            },
+        }
+        assert validate_manifest(manifest, STATE) == []
+
+    def test_mcp_server_needs_a_name(self):
+        errors = validate_manifest({"mcp_servers": [{"type": "sql"}]})
+        assert any("name is required" in e for e in errors)
+
+    def test_mcp_server_needs_a_known_type(self):
+        errors = validate_manifest({"mcp_servers": [{"name": "a", "type": "bogus"}]})
+        assert any("is not recognized" in e for e in errors)
+
+    def test_empty_skill_name_is_rejected(self):
+        errors = validate_manifest({"skills": {"names": ["ok", ""]}})
+        assert any("skills.names" in e for e in errors)
+
+    def test_empty_tracing_table_is_rejected(self):
+        errors = validate_manifest({"tracing_table": ""})
+        assert any("tracing_table" in e for e in errors)
+
+    def test_budget_policy_needs_a_budget_id(self):
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {
+                "tiers": [
+                    {
+                        "spending_percentage": 0.5,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    }
+                ]
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("budget_policy.budget_id is required" in e for e in errors)
+
+    @pytest.mark.parametrize("pct", [1.5, -0.1, 80])
+    def test_tier_percentage_must_be_a_fraction(self, pct):
+        # 80 is the classic mistake: the spec doc writes percents, the API wants fractions.
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {
+                "budget_id": "b",
+                "tiers": [
+                    {
+                        "spending_percentage": pct,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    }
+                ],
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("fraction" in e for e in errors), errors
+
+    def test_tier_percentages_must_be_unique(self):
+        tier = {
+            "spending_percentage": 0.5,
+            "default_agent": "claude",
+            "default_model": "system.ai.claude-opus-4-8",
+        }
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {"budget_id": "b", "tiers": [tier, dict(tier)]},
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("must be unique" in e for e in errors)
+
+    def test_tier_agent_must_be_enabled(self):
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {
+                "budget_id": "b",
+                "tiers": [
+                    {
+                        "spending_percentage": 0.5,
+                        "default_agent": "opencode",
+                        "default_model": "system.ai.kimi-k2-6",
+                    }
+                ],
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("must appear in enabled_agents" in e for e in errors)
+
+    def test_tier_needs_a_default_model(self):
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {
+                "budget_id": "b",
+                "tiers": [{"spending_percentage": 0.5, "default_agent": "claude"}],
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("default_model is required" in e for e in errors)
+
+    def test_budget_policy_alone_still_requires_a_default_agent(self):
+        errors = validate_manifest({"budget_policy": {"budget_id": "b"}})
+        assert any("default_agent is required" in e for e in errors)
+
+    def test_errors_accumulate(self):
+        manifest = {
+            "default_agent": "codex",
+            "enabled_agents": {"claude": {}},
+            "mcp_servers": [{"type": "bogus"}],
+        }
+        assert len(validate_manifest(manifest, STATE)) >= 3
+
+
+class TestPersistence:
+    def test_round_trips_through_disk(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(
+            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
+        )
+        manifest = _full_manifest()
+        save_managed_settings(WORKSPACE, manifest)
+        assert load_managed_settings(WORKSPACE) == manifest
+
+    def test_stores_the_workspace_alongside_the_manifest(self, tmp_path, monkeypatch):
+        path = tmp_path / "managed-settings.json"
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
+        save_managed_settings(WORKSPACE, _minimal_manifest())
+        assert json.loads(path.read_text())["workspace"] == WORKSPACE
+        assert managed_settings_workspace() == WORKSPACE
+
+    def test_load_is_workspace_scoped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(
+            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
+        )
+        save_managed_settings(WORKSPACE, _minimal_manifest())
+        # A manifest authored for another workspace must not be published to this one.
+        assert load_managed_settings("https://other.example.com") is None
+
+    def test_load_without_a_workspace_returns_whatever_is_on_disk(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(
+            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
+        )
+        save_managed_settings(WORKSPACE, _minimal_manifest())
+        assert load_managed_settings() == _minimal_manifest()
+
+    def test_load_returns_none_when_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "missing.json")
+        assert load_managed_settings(WORKSPACE) is None
+        assert managed_settings_workspace() is None
+
+    def test_dry_run_writes_nothing(self, tmp_path, monkeypatch):
+        path = tmp_path / "managed-settings.json"
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
+        monkeypatch.setattr(config_io_mod, "is_dry_run", lambda: True)
+        save_managed_settings(WORKSPACE, _minimal_manifest())
+        assert not path.exists()
+
+    def test_corrupt_file_reads_as_absent(self, tmp_path, monkeypatch):
+        path = tmp_path / "managed-settings.json"
+        path.write_text("{not json", encoding="utf-8")
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
+        assert load_managed_settings(WORKSPACE) is None
+
+    def test_serialized_payload_is_json_encodable(self, tmp_path, monkeypatch):
+        # `ucode apply` POSTs this, so it must survive json.dumps with no custom encoder.
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(
+            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
+        )
+        save_managed_settings(WORKSPACE, _full_manifest())
+        manifest = load_managed_settings(WORKSPACE)
+        assert manifest is not None
+        assert json.loads(json.dumps(serialize_managed_config(manifest)))
+
+    def test_settings_file_is_user_only(self, tmp_path, monkeypatch):
+        path = tmp_path / "managed-settings.json"
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
+        save_managed_settings(WORKSPACE, _minimal_manifest())
+        assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
