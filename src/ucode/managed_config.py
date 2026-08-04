@@ -4,11 +4,13 @@ An org admin authors a ``CodingAgentConfig`` through the Databricks AI Gateway; 
 (non-admin) and ``ucode`` applies it locally. This module owns the developer-read half:
 
 - fetching the raw manifest (via :func:`ucode.databricks.fetch_managed_coding_agent_configs`),
-- normalizing the proto-JSON into a stable internal dict keyed by ucode's own tool names, and
-- persisting it to ``~/.ucode/managed-state.json`` (0600) so launches can reconcile against it.
+- normalizing the proto-JSON into a stable internal dict keyed by ucode's own tool names,
+- persisting it to ``~/.ucode/managed-state.json`` (0600), and
+- re-reading it on each launch, falling back to the persisted copy when the read fails.
 
-Reconciliation against the local ``state.json`` and applying the manifest to agents live in later
-changes; this module deliberately stops at "read + normalize + persist".
+:func:`managed_launch_state` is the launch path's entry point: it refreshes the manifest and hands
+back the state to configure the agent with. Deciding *which* value wins for a given key is
+:mod:`ucode.managed_resolve`'s job, kept separate so that logic stays pure and I/O-free.
 """
 
 from __future__ import annotations
@@ -19,7 +21,9 @@ from pathlib import Path
 from typing import cast
 
 import ucode.config_io as config_io
-from ucode.databricks import fetch_managed_coding_agent_configs
+from ucode.databricks import fetch_managed_coding_agent_configs, get_databricks_token
+from ucode.managed_resolve import resolve_state
+from ucode.ui import print_warning
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
 
@@ -271,6 +275,10 @@ def save_managed_state(workspace: str, config: dict) -> None:
 
     The file is org-authored, not developer-editable — 0600 keeps it readable/writable only by the
     user (a light guard; hard enforcement / sudo ownership is a separate concern). No-op in dry-run.
+
+    An empty ``config`` records "this workspace has no managed config", which matters because the
+    file doubles as the fallback when a later read fails: without it, removing a config server-side
+    would leave the old one on disk to be reapplied after a transient outage.
     """
     if config_io.is_dry_run():
         return
@@ -307,11 +315,67 @@ def load_managed_state(workspace: str | None) -> dict | None:
     return config if isinstance(config, dict) else None
 
 
-def delete_managed_state() -> None:
-    """Remove the managed-state file, if any. No-op in dry-run."""
-    if config_io.is_dry_run():
-        return
+def refresh_managed_config(state: dict) -> dict | None:
+    """Fetch the workspace's managed config and persist it, returning the normalized manifest.
+
+    Runs on every launch so a developer picks up an admin's edits without re-running
+    ``ucode configure``. Returns None when the workspace has no managed config — the normal case for
+    a workspace whose admin hasn't published one.
+
+    A failed fetch never blocks the launch: an unreachable control plane shouldn't stop someone from
+    coding. Instead it falls back to the last config persisted for this workspace, so the admin's
+    most recent known policy still applies; only when there is no persisted config either does the
+    launch fall through to the developer's own settings.
+    """
+    workspace = state.get("workspace")
+    if not workspace:
+        return None
     try:
-        MANAGED_STATE_PATH.unlink(missing_ok=True)
-    except OSError as exc:
-        raise RuntimeError(f"Failed to remove managed state file: {MANAGED_STATE_PATH}") from exc
+        token = get_databricks_token(workspace, state.get("profile"))
+    except RuntimeError as exc:
+        return _persisted_fallback(workspace, str(exc))
+    managed, reason = get_managed_config(workspace, token)
+    if reason is not None:
+        return _persisted_fallback(workspace, reason)
+    if managed is None:
+        # Record that this workspace has no config, rather than leaving an earlier one on disk:
+        # the file doubles as the fallback above, so a removed policy would otherwise come back
+        # into force after the next transient outage.
+        save_managed_state(workspace, {})
+        return None
+    save_managed_state(workspace, managed)
+    return managed
+
+
+def _persisted_fallback(workspace: str, reason: str) -> dict | None:
+    """Return the last persisted config for ``workspace`` after a failed fetch, warning either way.
+
+    Distinguishes the two outcomes in the warning: continuing on a possibly-stale admin config is
+    materially different from continuing on the developer's own settings.
+    """
+    # An empty persisted config means the last successful read found none, so there is no admin
+    # policy to fall back to — treat it the same as having no file at all.
+    persisted = load_managed_state(workspace)
+    if persisted:
+        print_warning(
+            f"Could not read your workspace's managed config ({reason}); "
+            "using the last one saved for this workspace."
+        )
+        return persisted
+    print_warning(
+        f"Could not read your workspace's managed config ({reason}); using your local settings."
+    )
+    return None
+
+
+def managed_launch_state(state: dict, tool: str) -> tuple[dict, dict | None]:
+    """Return ``(state, managed)`` for launching ``tool`` under any managed config.
+
+    The returned state has the manifest's models and provider layered over the developer's own —
+    managed wins per key — so the settings file written from it reflects the admin's choices. When
+    the workspace has no managed config the state is handed back untouched.
+    """
+    managed = refresh_managed_config(state)
+    if managed is None:
+        return state, None
+    return resolve_state(managed, state, tool), managed

@@ -12,7 +12,9 @@ import ucode.managed_config as mc_mod
 from ucode.managed_config import (
     get_managed_config,
     load_managed_state,
+    managed_launch_state,
     normalize_managed_config,
+    refresh_managed_config,
     save_managed_state,
 )
 
@@ -203,14 +205,12 @@ class TestPersistence:
     def test_load_none_workspace_returns_none(self, _managed_path):
         assert load_managed_state(None) is None
 
-    def test_delete_removes_file(self, _managed_path):
+    def test_empty_config_overwrites_a_previous_one(self, _managed_path):
+        # Saving an empty config is how "the admin removed it" is recorded: the stored config must
+        # be replaced, not left behind for the read-failure fallback to reapply.
         save_managed_state("https://ws.example.com", {"default_agent": "claude"})
-        assert _managed_path.exists()
-        mc_mod.delete_managed_state()
-        assert not _managed_path.exists()
-
-    def test_delete_missing_is_noop(self, _managed_path):
-        mc_mod.delete_managed_state()  # should not raise
+        save_managed_state("https://ws.example.com", {})
+        assert load_managed_state("https://ws.example.com") == {}
 
 
 class TestFetchClient:
@@ -247,3 +247,146 @@ class TestFetchClient:
         configs, reason = db_mod.fetch_managed_coding_agent_configs("https://ws", "tok")
         assert configs == []
         assert reason == "HTTP 403 Forbidden"
+
+
+WORKSPACE = "https://ws.example.com"
+
+# A normalized managed config, as `normalize_managed_config` produces it.
+MANAGED = {
+    "default_agent": "claude",
+    "enabled_agents": {
+        "claude": {
+            "model_config": {
+                "default_model": "system.ai.claude-opus-5",
+                "models": {"default_opus_model": "system.ai.claude-opus-5"},
+            }
+        }
+    },
+}
+
+
+def _state(**overrides) -> dict:
+    state = {"workspace": WORKSPACE, "managed_configs": {"claude": {"keys": []}}}
+    state.update(overrides)
+    return state
+
+
+class TestRefreshManagedConfig:
+    """The per-launch re-read, so an admin's edits land without re-running `ucode configure`."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_token(self, monkeypatch):
+        monkeypatch.setattr(mc_mod, "get_databricks_token", lambda ws, profile: "tok")
+
+    def test_persists_and_returns_the_manifest(self, monkeypatch):
+        saved: list[tuple] = []
+        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (MANAGED, None))
+        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: saved.append((ws, cfg)))
+        assert refresh_managed_config(_state()) == MANAGED
+        assert saved == [(WORKSPACE, MANAGED)]
+
+    def test_no_managed_config_returns_none(self, monkeypatch):
+        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
+        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
+        assert refresh_managed_config(_state()) is None
+
+    def test_read_failure_falls_back_to_the_persisted_config(self, monkeypatch):
+        # The admin's last known policy beats no policy, so a failed fetch reuses what we saved.
+        warnings: list[str] = []
+        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, "HTTP 500"))
+        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: MANAGED)
+        monkeypatch.setattr(mc_mod, "print_warning", lambda msg: warnings.append(msg))
+        assert refresh_managed_config(_state()) == MANAGED
+        assert "HTTP 500" in warnings[0]
+        assert "last one saved" in warnings[0]
+
+    def test_read_failure_without_persisted_config_uses_local_settings(self, monkeypatch):
+        warnings: list[str] = []
+        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, "HTTP 500"))
+        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
+        monkeypatch.setattr(mc_mod, "print_warning", lambda msg: warnings.append(msg))
+        assert refresh_managed_config(_state()) is None
+        assert "your local settings" in warnings[0]
+
+    def test_auth_failure_falls_back_to_the_persisted_config(self, monkeypatch):
+        warnings: list[str] = []
+
+        def boom(ws, profile):
+            raise RuntimeError("no token")
+
+        monkeypatch.setattr(mc_mod, "get_databricks_token", boom)
+        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: MANAGED)
+        monkeypatch.setattr(mc_mod, "print_warning", lambda msg: warnings.append(msg))
+        assert refresh_managed_config(_state()) == MANAGED
+        assert "no token" in warnings[0]
+
+    def test_auth_failure_without_persisted_config_uses_local_settings(self, monkeypatch):
+        warnings: list[str] = []
+
+        def boom(ws, profile):
+            raise RuntimeError("no token")
+
+        monkeypatch.setattr(mc_mod, "get_databricks_token", boom)
+        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
+        monkeypatch.setattr(mc_mod, "print_warning", lambda msg: warnings.append(msg))
+        assert refresh_managed_config(_state()) is None
+        assert "your local settings" in warnings[0]
+
+    def test_no_config_on_the_server_does_not_use_a_stale_persisted_file(self, monkeypatch):
+        # A successful read saying "no config" means the admin removed it — that's authoritative,
+        # so a previously persisted file must not resurrect the old policy.
+        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
+        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
+        monkeypatch.setattr(
+            mc_mod, "load_managed_state", lambda ws: pytest.fail("must not fall back")
+        )
+        assert refresh_managed_config(_state()) is None
+
+    def test_no_config_on_the_server_clears_the_persisted_one(self, monkeypatch):
+        # Without this, removing the config server-side would leave the old one on disk and the next
+        # failed read would put a dead policy back into force.
+        saved: list[tuple] = []
+        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
+        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: saved.append((ws, cfg)))
+        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
+        assert refresh_managed_config(_state()) is None
+        assert saved == [(WORKSPACE, {})]
+
+    def test_empty_persisted_config_is_not_treated_as_a_fallback(self, monkeypatch):
+        # The empty marker means "no admin policy", so a later failed read must fall through to the
+        # developer's own settings rather than reporting a managed config.
+        warnings: list[str] = []
+        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, "HTTP 500"))
+        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: {})
+        monkeypatch.setattr(mc_mod, "print_warning", lambda msg: warnings.append(msg))
+        assert refresh_managed_config(_state()) is None
+        assert "your local settings" in warnings[0]
+
+    def test_no_workspace_is_a_noop(self, monkeypatch):
+        monkeypatch.setattr(
+            mc_mod, "get_managed_config", lambda ws, tok: pytest.fail("should not fetch")
+        )
+        assert refresh_managed_config({}) is None
+
+
+class TestManagedLaunchState:
+    @pytest.fixture(autouse=True)
+    def _stub_token(self, monkeypatch):
+        monkeypatch.setattr(mc_mod, "get_databricks_token", lambda ws, profile: "tok")
+        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
+
+    def test_layers_managed_models_when_a_config_exists(self, monkeypatch):
+        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (MANAGED, None))
+        state = _state(claude_models={"opus": "local-opus"})
+        resolved, managed = managed_launch_state(state, "claude")
+        assert managed == MANAGED
+        assert resolved["claude_models"]["opus"] == "system.ai.claude-opus-5"
+        # The developer's own state is untouched — precedence is resolved in memory.
+        assert state["claude_models"]["opus"] == "local-opus"
+
+    def test_state_untouched_when_no_managed_config(self, monkeypatch):
+        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
+        state = _state(claude_models={"opus": "local-opus"})
+        resolved, managed = managed_launch_state(state, "claude")
+        assert managed is None
+        assert resolved is state
