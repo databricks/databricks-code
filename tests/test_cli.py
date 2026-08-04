@@ -126,6 +126,10 @@ def _patch_launch(tool: str):
             "ucode.cli.configure_tool",
             return_value=MINIMAL_STATE,
         ),
+        patch(
+            "ucode.cli.managed_launch_state",
+            side_effect=lambda state, tool: (state, None),
+        ),
         patch("ucode.cli.launch_agent"),
     ]
 
@@ -141,7 +145,8 @@ class TestSubcommandRouting:
             patches[3],
             patches[4],
             patches[5],
-            patches[6] as mock_launch,
+            patches[6],
+            patches[7] as mock_launch,
         ):
             result = runner.invoke(app, [tool])
         assert result.exit_code == 0, result.output
@@ -165,6 +170,7 @@ class TestSubcommandRouting:
             patches[4],
             patches[5],
             patches[6],
+            patches[7],
             patch("ucode.cli.set_current_workspace") as mock_set,
         ):
             result = runner.invoke(
@@ -185,6 +191,7 @@ class TestSubcommandRouting:
             patches[4],
             patches[5],
             patches[6],
+            patches[7],
             patch("ucode.cli.set_current_workspace") as mock_set,
         ):
             result = runner.invoke(app, ["claude"])
@@ -246,6 +253,10 @@ class TestSubcommandRouting:
                 return_value=(decision, None),
             ),
             patch("ucode.cli.configure_tool", return_value=state) as mock_configure,
+            patch(
+                "ucode.cli.managed_launch_state",
+                side_effect=lambda state, tool: (state, None),
+            ),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["codex"])
@@ -712,6 +723,10 @@ class TestAutoConfigureOnFirstRun:
                 return_value=(configured_state, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=configured_state),
+            patch(
+                "ucode.cli.managed_launch_state",
+                side_effect=lambda state, tool: (state, None),
+            ),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["claude"])
@@ -736,6 +751,10 @@ class TestAutoConfigureOnFirstRun:
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
+            patch(
+                "ucode.cli.managed_launch_state",
+                side_effect=lambda state, tool: (state, None),
+            ),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["claude"])
@@ -759,6 +778,10 @@ class TestAutoConfigureOnFirstRun:
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
+            patch(
+                "ucode.cli.managed_launch_state",
+                side_effect=lambda state, tool: (state, None),
+            ),
             patch("ucode.cli.launch_agent"),
         ):
             runner.invoke(app, ["claude"])
@@ -787,7 +810,8 @@ class TestPassthroughArgs:
             patches[3],
             patches[4],
             patches[5],
-            patches[6] as mock_launch,
+            patches[6],
+            patches[7] as mock_launch,
         ):
             result = runner.invoke(app, [tool, *extra_args])
         assert result.exit_code == 0, result.output
@@ -803,7 +827,8 @@ class TestPassthroughArgs:
             patches[3],
             patches[4],
             patches[5],
-            patches[6] as mock_launch,
+            patches[6],
+            patches[7] as mock_launch,
         ):
             runner.invoke(app, ["claude"])
         forwarded = mock_launch.call_args[0][2]
@@ -2053,6 +2078,10 @@ class TestSkipPreflightFlag:
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
+            patch(
+                "ucode.cli.managed_launch_state",
+                side_effect=lambda state, tool: (state, None),
+            ),
             patch("ucode.cli.launch_agent"),
         ]
 
