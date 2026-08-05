@@ -202,8 +202,20 @@ def route_spawn_tool(
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
-    task_name = tool_input.get("task_name") or tool_input.get("agent_name")
-    task = task_name if isinstance(task_name, str) and task_name else default_task_label
+    # Derive the routing task from the first available plaintext field. `message`
+    # carries the actual subagent task content — prefer it when present and a
+    # plaintext string (Codex encrypts it at send-time, but the PreToolUse hook
+    # fires before that, so it may be readable here). When `message` is an
+    # encrypted dict (or absent), fall back to `task_name` / `agent_name`
+    # (weaker labels), then the generic default.
+    task = next(
+        (
+            value
+            for field in ("message", "task_name", "agent_name")
+            if isinstance(value := tool_input.get(field), str) and value
+        ),
+        default_task_label,
+    )
     decision, _ = decision_fn(task)
     if decision is None:
         return None

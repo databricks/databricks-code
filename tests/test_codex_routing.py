@@ -230,6 +230,64 @@ def test_non_spawn_tool_has_no_opinion():
     )
 
 
+def test_spawn_routes_on_plaintext_message_when_present(monkeypatch):
+    # When the spawn's `message` is a plaintext string at PreToolUse (before
+    # Codex encrypts it at send-time), routing uses it as the task — giving the
+    # router real signal instead of the generic fallback.
+    captured = {}
+
+    def fake_decision(*args, **kwargs):
+        captured["task"] = args[2] if len(args) > 2 else kwargs.get("task")
+        return (
+            codex_routing.RoutingDecision(model="databricks-gpt-5-5", raw_model="gpt-5-6-sol"),
+            None,
+        )
+
+    monkeypatch.setattr(codex_routing, "request_routing_decision", fake_decision)
+    codex_routing.route_pre_tool_use(
+        {
+            "tool_name": "collaborationspawn_agent",
+            "tool_input": {
+                "task_name": "task_3",
+                "message": "Review the parser error handling and add missing null checks",
+            },
+        },
+        workspace=WS,
+        token="token",
+        available_models=["databricks-gpt-5-5"],
+    )
+    assert captured["task"] == "Review the parser error handling and add missing null checks"
+
+
+def test_spawn_falls_through_encrypted_message_to_task_name(monkeypatch):
+    # When `message` is an encrypted dict (not a plaintext string), routing
+    # falls through to `task_name` — no regression from the encrypted case.
+    captured = {}
+
+    def fake_decision(*args, **kwargs):
+        captured["task"] = args[2] if len(args) > 2 else kwargs.get("task")
+        return (
+            codex_routing.RoutingDecision(model="databricks-gpt-5-5", raw_model="gpt-5-6-sol"),
+            None,
+        )
+
+    monkeypatch.setattr(codex_routing, "request_routing_decision", fake_decision)
+    codex_routing.route_pre_tool_use(
+        {
+            "tool_name": "collaborationspawn_agent",
+            "tool_input": {
+                "task_name": "reviewer",
+                "message": {"encrypted": "opaque-ciphertext"},
+            },
+        },
+        workspace=WS,
+        token="token",
+        available_models=["databricks-gpt-5-5"],
+    )
+    # Encrypted dict skipped (not a string), fell through to task_name.
+    assert captured["task"] == "reviewer"
+
+
 def test_canary_and_audit_are_written(tmp_path, monkeypatch):
     canary = tmp_path / "canary.json"
     audit = tmp_path / "audit.jsonl"
