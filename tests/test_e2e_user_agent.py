@@ -248,8 +248,11 @@ class TestOpencodeUserAgent:
         opencode_dir = xdg / "opencode"
         opencode_dir.mkdir(parents=True)
         config_path = opencode_dir / "opencode.json"
+        plugin_path = opencode_dir / "plugins" / "ucode-databricks-auth.js"
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
         monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", config_path)
+        monkeypatch.setattr(opencode, "OPENCODE_AUTH_PLUGIN_PATH", plugin_path)
         monkeypatch.setattr(opencode, "OPENCODE_BACKUP_PATH", tmp_path / "opencode.backup.json")
 
         # Construct a state with localhost base URLs so render_overlay points
@@ -266,14 +269,12 @@ class TestOpencodeUserAgent:
         }
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr("ucode.state.save_state", lambda s: None)
-            mp.setattr(
-                "ucode.agents.opencode.get_databricks_token",
-                lambda ws, profile=None, **kwargs: "test-token",
-            )
-            opencode.write_tool_config(state, "test-claude-model", token="test-token")
+            opencode.write_tool_config(state, "test-claude-model")
 
-        env = {**os.environ, "OAUTH_TOKEN": "test-token", "XDG_CONFIG_HOME": str(xdg)}
-        result = _run_until_first_request(opencode.validate_cmd("opencode"), env)
+        env = opencode.build_runtime_env()
+        env["DATABRICKS_BEARER"] = "test-token"
+        # A fresh OpenCode XDG home installs its plugin runtime on first use.
+        result = _run_until_first_request(opencode.validate_cmd("opencode"), env, timeout=45)
 
         req = capture_server.first_request_with_path_prefix("/ai-gateway/anthropic")
         assert req is not None, _no_request_msg(capture_server, result)
@@ -286,6 +287,7 @@ class TestOpencodeUserAgent:
         assert ua.startswith(expected_prefix), (
             f"OpenCode UA missing ucode prefix.\n  got:    {ua!r}\n  prefix: {expected_prefix!r}"
         )
+        assert req.headers.get("Authorization") == "Bearer test-token"
 
 
 class TestGeminiUserAgent:
@@ -319,14 +321,15 @@ class TestPiUserAgent:
         from ucode.agents import pi
 
         _require_binary("pi")
-        pi_home = tmp_path / "pi-home"
-        pi_dir = pi_home / ".pi" / "agent"
+        pi_dir = tmp_path / "pi-home" / ".pi" / "agent"
         config_path = pi_dir / "models.json"
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(pi, "PI_UCODE_HOME", pi_home)
+        monkeypatch.setattr(pi, "PI_CONFIG_DIR", pi_dir)
         monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_PATH", pi_dir / "settings.json")
         monkeypatch.setattr(pi, "PI_BACKUP_PATH", tmp_path / "pi.backup.json")
+        monkeypatch.setattr(pi, "PI_SETTINGS_BACKUP_PATH", tmp_path / "pi-settings.backup.json")
 
         state = {
             "workspace": capture_server.base_url,
@@ -343,15 +346,13 @@ class TestPiUserAgent:
         }
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr("ucode.state.save_state", lambda s: None)
-            mp.setattr(
-                "ucode.agents.pi.get_databricks_token",
-                lambda ws, profile=None, **kwargs: "test-token",
-            )
-            pi.write_tool_config(state, "test-claude-model", token="test-token")
+            pi.write_tool_config(state, "test-claude-model")
 
-        env = pi.build_runtime_env("test-token")
+        env = pi.build_runtime_env()
+        env["DATABRICKS_BEARER"] = "test-token"
         result = _run_until_first_request(pi.validate_cmd("pi"), env)
 
         req = capture_server.first_request_with_path_prefix("/ai-gateway/anthropic")
         assert req is not None, _no_request_msg(capture_server, result)
         _assert_ua(req, _expected_ua("pi", "pi"))
+        assert req.headers.get("Authorization") == "Bearer test-token"

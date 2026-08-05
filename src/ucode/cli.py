@@ -931,11 +931,12 @@ def auth_token_cmd(
 ) -> None:
     """Print a Databricks bearer token to stdout, then exit.
 
-    This is the cross-platform helper invoked by Claude Code's `apiKeyHelper`
-    and Codex's auth command on every token refresh. It is not meant for
-    interactive use. All token logic (DATABRICKS_BEARER short-circuit, PAT
-    profiles, OAuth refresh) lives in `get_databricks_token`, so the same
-    binary works on macOS, Linux, and Windows without any POSIX shell."""
+    This is the cross-platform helper invoked by Claude, Codex, Pi, and the
+    ucode-managed OpenCode auth plugin whenever they need a bearer token. It is
+    not meant for interactive use. All token logic (DATABRICKS_BEARER
+    short-circuit, PAT profiles, OAuth refresh) lives in
+    `get_databricks_token`, so the same binary works on macOS, Linux, and
+    Windows without any POSIX shell."""
     import sys
 
     state = load_state()
@@ -1332,7 +1333,12 @@ def _launch_tool(
                     f"{TOOL_SPECS[tool]['display']} requires one-time hook review. Open "
                     "`/hooks` and trust the ucode routing hooks if prompted."
                 )
-        if tool in ("gemini", "opencode", "copilot", "pi"):
+        if tool in ("opencode", "pi"):
+            print_note(
+                f"{TOOL_SPECS[tool]['display']} obtains a fresh Databricks token "
+                "through `ucode auth-token` for every model request."
+            )
+        elif tool in ("gemini", "copilot"):
             print_note(
                 f"{TOOL_SPECS[tool]['display']} token refresh is managed automatically "
                 f"every 30 minutes while the session is running."

@@ -21,16 +21,14 @@ pi today — they live behind /ai-gateway/mlflow/v1 with per-model
 `max_tokens` caps that pi has no global way to honor without per-model
 config we don't currently maintain.
 
-The bearer token is baked into the file and refreshed by a background thread
-while the session runs (same pattern as OpenCode/Copilot).
+Each provider delegates authentication to ``ucode auth-token`` through Pi's
+request-time ``!command`` API-key resolution. Tokens stay out of configuration
+and the Databricks CLI owns OAuth refresh.
 """
 
 from __future__ import annotations
 
 import os
-import signal
-import subprocess
-import threading
 
 from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
@@ -42,15 +40,14 @@ from ucode.config_io import (
     write_json_file,
 )
 from ucode.databricks import (
-    TOKEN_REFRESH_INTERVAL_SECONDS,
+    build_auth_shell_command,
     build_pi_base_urls,
-    get_databricks_token,
 )
+from ucode.launcher import exec_or_spawn
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 
-PI_UCODE_HOME = APP_DIR / "pi-home"
-PI_CONFIG_DIR = PI_UCODE_HOME / ".pi" / "agent"
+PI_CONFIG_DIR = APP_DIR / "pi-home" / ".pi" / "agent"
 PI_CONFIG_PATH = PI_CONFIG_DIR / "models.json"
 PI_SETTINGS_PATH = PI_CONFIG_DIR / "settings.json"
 PI_BACKUP_PATH = APP_DIR / "pi-models.backup.json"
@@ -102,7 +99,7 @@ def _resolve_model_selector(
 
 def render_overlay(
     model: str,
-    token: str,
+    auth_command: str,
     pi_base_urls: dict[str, str],
     claude_models: dict[str, str],
     codex_models: list[str],
@@ -120,7 +117,7 @@ def render_overlay(
         providers["databricks-claude"] = {
             "baseUrl": pi_base_urls["claude"],
             "api": "anthropic-messages",
-            "apiKey": token,
+            "apiKey": f"!{auth_command}",
             "authHeader": True,
             # Gateway's Anthropic translator rejects per-tool
             # `eager_input_streaming` on the streaming + tools path. Pi sends
@@ -134,7 +131,7 @@ def render_overlay(
         providers["databricks-openai"] = {
             "baseUrl": pi_base_urls["openai"],
             "api": "openai-responses",
-            "apiKey": token,
+            "apiKey": f"!{auth_command}",
             "authHeader": True,
             "headers": ua_headers,
             "models": [{"id": m} for m in codex_models],
@@ -144,7 +141,7 @@ def render_overlay(
         providers["databricks-gemini"] = {
             "baseUrl": pi_base_urls["gemini"],
             "api": "google-generative-ai",
-            "apiKey": token,
+            "apiKey": f"!{auth_command}",
             "authHeader": True,
             "headers": ua_headers,
             "models": [{"id": m} for m in gemini_models],
@@ -158,22 +155,15 @@ def render_overlay(
     return overlay, keys
 
 
-def write_tool_config(
-    state: dict,
-    model: str,
-    token: str | None = None,
-    *,
-    force_refresh: bool = False,
-) -> tuple[dict, str]:
+def write_tool_config(state: dict, model: str) -> dict:
     backup_existing_file(PI_CONFIG_PATH, PI_BACKUP_PATH)
-    if token is None:
-        token = get_databricks_token(
-            state["workspace"], state.get("profile"), force_refresh=force_refresh
-        )
+    auth_command = build_auth_shell_command(
+        state["workspace"], state.get("profile"), use_pat=bool(state.get("use_pat"))
+    )
     pi_base_urls = state.get("base_urls", {}).get("pi") or build_pi_base_urls(state["workspace"])
     overlay, managed_keys = render_overlay(
         model,
-        token,
+        auth_command,
         pi_base_urls,
         state.get("claude_models") or {},
         state.get("codex_models") or [],
@@ -189,7 +179,7 @@ def write_tool_config(
     _write_settings(overlay["model"])
     state = mark_tool_managed(state, "pi", managed_keys)
     save_state(state)
-    return state, token
+    return state
 
 
 def _write_settings(model_selector: str) -> None:
@@ -218,52 +208,16 @@ def default_model(state: dict) -> str | None:
     return gemini_models[0] if gemini_models else None
 
 
-def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> str:
-    model = default_model(state)
-    if not model:
-        raise RuntimeError("No Pi model is available on this workspace.")
-    _, token = write_tool_config(state, model, force_refresh=force_refresh)
-    return token
-
-
-def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
-    while not stop_event.wait(TOKEN_REFRESH_INTERVAL_SECONDS):
-        try:
-            _refresh_token_once(state, force_refresh=True)
-        except RuntimeError:
-            continue
-
-
-def build_runtime_env(token: str) -> dict[str, str]:
+def build_runtime_env() -> dict[str, str]:
     env = os.environ.copy()
-    env["OAUTH_TOKEN"] = token
-    env["HOME"] = str(PI_UCODE_HOME)
+    env["PI_CODING_AGENT_DIR"] = str(PI_CONFIG_DIR)
     return env
 
 
 def launch(state: dict, tool_args: list[str]) -> None:
-    token = _refresh_token_once(state)
-    env = build_runtime_env(token)
-
-    stop_event = threading.Event()
-    refresher = threading.Thread(
-        target=_refresh_forever,
-        args=(state, stop_event),
-        daemon=True,
-    )
-    refresher.start()
-
-    proc = subprocess.Popen([SPEC["binary"], *tool_args], env=env)
-    try:
-        returncode = proc.wait()
-    except KeyboardInterrupt:
-        proc.send_signal(signal.SIGINT)
-        returncode = proc.wait()
-    finally:
-        stop_event.set()
-        refresher.join(timeout=1)
-
-    raise SystemExit(returncode)
+    _ = state
+    os.environ["PI_CODING_AGENT_DIR"] = str(PI_CONFIG_DIR)
+    exec_or_spawn([SPEC["binary"], *tool_args])
 
 
 def validate_cmd(binary: str) -> list[str]:
@@ -274,4 +228,4 @@ def validate_env(state: dict) -> dict[str, str]:
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError("No workspace configured.")
-    return build_runtime_env(get_databricks_token(workspace, state.get("profile")))
+    return build_runtime_env()

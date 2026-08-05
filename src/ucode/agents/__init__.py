@@ -342,7 +342,7 @@ def configure_tool(
             result = pi.write_tool_config(state, model)
         else:
             result = opencode.write_tool_config(state, model)
-    # gemini/opencode/copilot/pi return (state, token); codex/claude return state
+    # gemini/copilot return (state, token); the other tools return state.
     if isinstance(result, tuple):
         return result[0]
     return result

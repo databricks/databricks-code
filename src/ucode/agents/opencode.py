@@ -1,11 +1,9 @@
-"""OpenCode agent: writes opencode.json with Databricks-backed providers."""
+"""OpenCode agent: writes Databricks providers and a request-time auth plugin."""
 
 from __future__ import annotations
 
+import json
 import os
-import signal
-import subprocess
-import threading
 
 from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
@@ -15,19 +13,21 @@ from ucode.config_io import (
     deep_merge_dict,
     read_json_safe,
     write_json_file,
+    write_text_file,
 )
 from ucode.databricks import (
-    TOKEN_REFRESH_INTERVAL_SECONDS,
+    build_auth_token_argv,
     build_opencode_base_urls,
-    get_databricks_token,
     model_token_limits,
 )
+from ucode.launcher import exec_or_spawn
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 
 OPENCODE_XDG_CONFIG_HOME = APP_DIR / "opencode-xdg"
 OPENCODE_CONFIG_DIR = OPENCODE_XDG_CONFIG_HOME / "opencode"
 OPENCODE_CONFIG_PATH = OPENCODE_CONFIG_DIR / "opencode.json"
+OPENCODE_AUTH_PLUGIN_PATH = OPENCODE_CONFIG_DIR / "plugins" / "ucode-databricks-auth.js"
 OPENCODE_BACKUP_PATH = APP_DIR / "opencode-config.backup.json"
 
 SPEC: ToolSpec = {
@@ -38,11 +38,8 @@ SPEC: ToolSpec = {
     "backup_path": OPENCODE_BACKUP_PATH,
 }
 
-PROVIDER_KEYS: list[list[str]] = [
-    ["provider", "databricks-anthropic"],
-    ["provider", "databricks-google"],
-    ["provider", "databricks-oss"],
-]
+PROVIDER_NAMES = ("databricks-anthropic", "databricks-google", "databricks-oss")
+PROVIDER_KEYS: list[list[str]] = [["provider", name] for name in PROVIDER_NAMES]
 
 
 def is_update_available() -> tuple[str, str] | None:
@@ -85,12 +82,10 @@ def _oss_model_overlay(model: str, ua_header: dict[str, str]) -> dict:
 
 def render_overlay(
     model: str,
-    token: str,
     opencode_base_urls: dict[str, str],
     opencode_models: dict[str, list[str]],
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for opencode.json."""
-    auth_headers = {"Authorization": f"Bearer {token}"}
     # OpenCode hardcodes `User-Agent: opencode/<ver>` in session/llm.ts for
     # every provider, after the AI SDK's combineHeaders. The provider-level
     # `headers` are clobbered by that injection, but per-model `headers` are
@@ -119,8 +114,6 @@ def render_overlay(
             "npm": "@ai-sdk/anthropic",
             "options": {
                 "baseURL": opencode_base_urls["anthropic"],
-                "apiKey": token,
-                "headers": auth_headers,
             },
             "models": dict.fromkeys(anthropic_models, anthropic_model_overlay),
         }
@@ -130,8 +123,6 @@ def render_overlay(
             "npm": "@ai-sdk/google",
             "options": {
                 "baseURL": opencode_base_urls["gemini"],
-                "apiKey": token,
-                "headers": auth_headers,
             },
             "models": {m: {"headers": ua_header} for m in gemini_models},
         }
@@ -141,8 +132,6 @@ def render_overlay(
             "npm": "@ai-sdk/openai",
             "options": {
                 "baseURL": opencode_base_urls["oss"],
-                "apiKey": token,
-                "headers": auth_headers,
             },
             "models": {m: _oss_model_overlay(m, ua_header) for m in oss_models},
         }
@@ -154,42 +143,63 @@ def render_overlay(
     return overlay, keys
 
 
-def write_tool_config(
-    state: dict,
-    model: str,
-    token: str | None = None,
-    *,
-    force_refresh: bool = False,
-) -> tuple[dict, str]:
+def render_auth_plugin(auth_argv: list[str]) -> str:
+    """Render an OpenCode plugin that obtains a fresh bearer per request."""
+    return f"""import {{ execFileSync }} from "node:child_process"
+
+const [command, ...args] = {json.dumps(auth_argv)}
+const providers = {json.dumps(PROVIDER_NAMES)}
+
+function token() {{
+  const value = execFileSync(command, args, {{ encoding: "utf8" }}).trim()
+  if (!value) throw new Error("ucode auth-token returned no access token")
+  return value
+}}
+
+async function authenticatedFetch(input, init) {{
+  const headers = new Headers(init?.headers)
+  headers.set("Authorization", `Bearer ${{token()}}`)
+  return fetch(input, {{ ...init, headers }})
+}}
+
+export const UcodeDatabricksAuth = async () => ({{
+  async config(config) {{
+    for (const providerName of providers) {{
+      const provider = config.provider?.[providerName]
+      if (!provider) continue
+      provider.options ??= {{}}
+      provider.options.apiKey = "databricks-cli"
+      provider.options.fetch = authenticatedFetch
+    }}
+  }},
+}})
+"""
+
+
+def write_tool_config(state: dict, model: str) -> dict:
     backup_existing_file(OPENCODE_CONFIG_PATH, OPENCODE_BACKUP_PATH)
-    if token is None:
-        token = get_databricks_token(
-            state["workspace"], state.get("profile"), force_refresh=force_refresh
-        )
+    auth_argv = build_auth_token_argv(
+        state["workspace"], state.get("profile"), use_pat=bool(state.get("use_pat"))
+    )
+    write_text_file(OPENCODE_AUTH_PLUGIN_PATH, render_auth_plugin(auth_argv))
     opencode_base_urls = state.get("base_urls", {}).get("opencode") or build_opencode_base_urls(
         state["workspace"]
     )
     overlay, managed_keys = render_overlay(
         model,
-        token,
         opencode_base_urls,
         state.get("opencode_models") or {},
     )
     existing = read_json_safe(OPENCODE_CONFIG_PATH)
     providers = existing.get("provider")
     if isinstance(providers, dict):
-        for stale in (
-            "databricks-anthropic",
-            "databricks-google",
-            "databricks-openai",
-            "databricks-oss",
-        ):
+        for stale in (*PROVIDER_NAMES, "databricks-openai"):
             providers.pop(stale, None)
     merged = deep_merge_dict(existing, overlay)
     write_json_file(OPENCODE_CONFIG_PATH, merged)
     state = mark_tool_managed(state, "opencode", managed_keys)
     save_state(state)
-    return state, token
+    return state
 
 
 def build_mcp_server_entry(argv: list[str]) -> dict:
@@ -239,53 +249,16 @@ def default_model(state: dict) -> str | None:
     return oss[0] if oss else None
 
 
-def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> str:
-    model = default_model(state)
-    if not model:
-        raise RuntimeError("No OpenCode model is configured.")
-    _, token = write_tool_config(state, model, force_refresh=force_refresh)
-    return token
-
-
-def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
-    while not stop_event.wait(TOKEN_REFRESH_INTERVAL_SECONDS):
-        try:
-            _refresh_token_once(state, force_refresh=True)
-        except RuntimeError:
-            continue
-
-
-def build_runtime_env(token: str, state: dict | None = None) -> dict[str, str]:
+def build_runtime_env() -> dict[str, str]:
     env = os.environ.copy()
-    env["OAUTH_TOKEN"] = token
     env["XDG_CONFIG_HOME"] = str(OPENCODE_XDG_CONFIG_HOME)
     return env
 
 
 def launch(state: dict, tool_args: list[str]) -> None:
-    """Launch opencode with background token refresh (same pattern as Gemini)."""
-    token = _refresh_token_once(state)
-    env = build_runtime_env(token, state)
-
-    stop_event = threading.Event()
-    refresher = threading.Thread(
-        target=_refresh_forever,
-        args=(state, stop_event),
-        daemon=True,
-    )
-    refresher.start()
-
-    proc = subprocess.Popen([SPEC["binary"], *tool_args], env=env)
-    try:
-        returncode = proc.wait()
-    except KeyboardInterrupt:
-        proc.send_signal(signal.SIGINT)
-        returncode = proc.wait()
-    finally:
-        stop_event.set()
-        refresher.join(timeout=1)
-
-    raise SystemExit(returncode)
+    _ = state
+    os.environ["XDG_CONFIG_HOME"] = str(OPENCODE_XDG_CONFIG_HOME)
+    exec_or_spawn([SPEC["binary"], *tool_args])
 
 
 def validate_cmd(binary: str) -> list[str]:
@@ -296,4 +269,4 @@ def validate_env(state: dict) -> dict[str, str]:
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError("No workspace configured.")
-    return build_runtime_env(get_databricks_token(workspace, state.get("profile")), state)
+    return build_runtime_env()

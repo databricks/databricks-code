@@ -777,9 +777,11 @@ class TestOpencodeLaunch:
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
         xdg = tmp_path / "opencode-xdg"
         config_path = xdg / "opencode" / "opencode.json"
+        plugin_path = xdg / "opencode" / "plugins" / "ucode-databricks-auth.js"
         backup_path = tmp_path / "opencode-config.backup.json"
         monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
         monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", config_path)
+        monkeypatch.setattr(opencode, "OPENCODE_AUTH_PLUGIN_PATH", plugin_path)
         monkeypatch.setattr(opencode, "OPENCODE_BACKUP_PATH", backup_path)
 
         import sys
@@ -794,21 +796,18 @@ class TestOpencodeLaunch:
 
             with pytest.MonkeyPatch().context() as mp:
                 mp.setattr("ucode.state.save_state", lambda s: None)
-                mp.setattr(
-                    "ucode.agents.opencode.get_databricks_token",
-                    lambda ws, profile=None, **kwargs: e2e_token,
-                )
                 opencode.write_tool_config(
                     {**e2e_state, "workspace": e2e_workspace},
                     model,
-                    token=e2e_token,
                 )
 
             cmd = opencode.validate_cmd("opencode")
             print(f"[opencode-per-model] -> {provider}/{model}", flush=True)
             t0 = time.monotonic()
             try:
-                result = _run_agent(cmd, env=opencode.build_runtime_env(e2e_token), timeout=180)
+                env = opencode.build_runtime_env()
+                env["DATABRICKS_BEARER"] = e2e_token
+                result = _run_agent(cmd, env=env, timeout=180)
             except subprocess.TimeoutExpired as exc:
                 elapsed = time.monotonic() - t0
                 partial_stdout = (exc.stdout or b"").decode("utf-8", errors="replace")
@@ -942,15 +941,16 @@ class TestPiLaunch:
             pytest.skip("No Pi-compatible models available on this workspace")
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        # Pi reads models.json below HOME/.pi/agent. Point both pi's runtime
-        # HOME and our writer at the same isolated tmp home.
-        pi_home = tmp_path / "pi-home"
-        pi_dir = pi_home / ".pi" / "agent"
+        # Point Pi's native config-directory override and our writer at the
+        # same isolated directory.
+        pi_dir = tmp_path / "pi-home" / ".pi" / "agent"
         config_path = pi_dir / "models.json"
         backup_path = tmp_path / "pi-models.backup.json"
-        monkeypatch.setattr(pi, "PI_UCODE_HOME", pi_home)
+        monkeypatch.setattr(pi, "PI_CONFIG_DIR", pi_dir)
         monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_PATH", pi_dir / "settings.json")
         monkeypatch.setattr(pi, "PI_BACKUP_PATH", backup_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_BACKUP_PATH", tmp_path / "pi-settings.backup.json")
 
         failures = []
         for family, model in models:
@@ -959,17 +959,13 @@ class TestPiLaunch:
 
             with pytest.MonkeyPatch().context() as mp:
                 mp.setattr("ucode.state.save_state", lambda s: None)
-                mp.setattr(
-                    "ucode.agents.pi.get_databricks_token",
-                    lambda ws, profile=None, **kwargs: e2e_token,
-                )
                 pi.write_tool_config(
                     {**e2e_state, "workspace": e2e_workspace},
                     model,
-                    token=e2e_token,
                 )
 
-            env = pi.build_runtime_env(e2e_token)
+            env = pi.build_runtime_env()
+            env["DATABRICKS_BEARER"] = e2e_token
             cmd = pi.validate_cmd("pi")
             result = _run_agent(cmd, env=env, timeout=120)
             combined = (result.stdout + result.stderr).strip()
@@ -1086,8 +1082,8 @@ class TestWebSearchMcpSubprocess:
 # These tests verify that when Databricks auth fails (empty token), the agents
 # recover by re-authenticating rather than hanging or crashing.
 #
-# Claude uses apiKeyHelper (shell command called by Claude Code on each refresh).
-# Gemini/OpenCode/Copilot use get_databricks_token() at launch and on refresh.
+# Claude, OpenCode, and Pi invoke `ucode auth-token` from their request path.
+# Gemini and Copilot use get_databricks_token() at launch and on refresh.
 # ---------------------------------------------------------------------------
 
 

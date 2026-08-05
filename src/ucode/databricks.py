@@ -1177,8 +1177,9 @@ def build_auth_shell_command(
     """Single-line, shell-quoted form of :func:`build_auth_token_argv`.
 
     Used where a tool wants the helper as one command *string* (Claude Code's
-    `apiKeyHelper`). On every platform this resolves to the `ucode auth-token`
-    executable rather than a POSIX shell pipeline, so no `sh`/`jq` is required."""
+    `apiKeyHelper` and Pi's `!command` API key). On every platform this resolves
+    to the `ucode auth-token` executable rather than a POSIX shell pipeline, so
+    no `sh`/`jq` is required."""
     argv = build_auth_token_argv(workspace, profile, use_pat=use_pat)
     if platform.system() == "Windows":
         return subprocess.list2cmdline(argv)

@@ -29,12 +29,12 @@ def _empty() -> dict:
     }
 
 
-def _overlay(model: str, token: str = "tok", **kwargs):
+def _overlay(model: str, auth_command: str = "ucode auth-token", **kwargs):
     """Wrapper to call render_overlay with sensible defaults so tests stay terse."""
     bundle = {**_empty(), **kwargs}
     return pi.render_overlay(
         model,
-        token,
+        auth_command,
         _base_urls(),
         bundle["claude_models"],
         bundle["codex_models"],
@@ -55,7 +55,7 @@ class TestPiSpec:
     def test_config_path_under_pi_agent_dir(self):
         assert pi.SPEC["config_path"].name == "models.json"
         assert pi.SPEC["config_path"].parent.name == "agent"
-        assert pi.PI_UCODE_HOME in pi.SPEC["config_path"].parents
+        assert pi.SPEC["config_path"].parent == pi.PI_CONFIG_DIR
 
 
 class TestRenderOverlayProviders:
@@ -131,11 +131,15 @@ class TestRenderOverlayCompatFlags:
 
 
 class TestRenderOverlayAuthAndModels:
-    def test_token_in_api_key(self):
+    def test_auth_command_in_api_key(self):
         overlay, _ = _overlay(
-            "claude-sonnet", token="mytoken", claude_models={"sonnet": "claude-sonnet"}
+            "claude-sonnet",
+            auth_command="/opt/ucode auth-token --host https://example.databricks.com",
+            claude_models={"sonnet": "claude-sonnet"},
         )
-        assert overlay["providers"]["databricks-claude"]["apiKey"] == "mytoken"
+        assert overlay["providers"]["databricks-claude"]["apiKey"] == (
+            "!/opt/ucode auth-token --host https://example.databricks.com"
+        )
 
     def test_auth_header_flag_set_on_all_providers(self):
         overlay, _ = _overlay(
@@ -236,13 +240,19 @@ class TestPiDefaultModel:
 
 
 class TestBuildRuntimeEnv:
-    def test_sets_oauth_token(self):
-        env = pi.build_runtime_env("tok")
-        assert env["OAUTH_TOKEN"] == "tok"
+    def test_does_not_set_oauth_token(self, monkeypatch):
+        monkeypatch.delenv("OAUTH_TOKEN", raising=False)
+        env = pi.build_runtime_env()
+        assert "OAUTH_TOKEN" not in env
 
-    def test_sets_ucode_home(self):
-        env = pi.build_runtime_env("tok")
-        assert env["HOME"] == str(pi.PI_UCODE_HOME)
+    def test_sets_pi_config_dir(self):
+        env = pi.build_runtime_env()
+        assert env["PI_CODING_AGENT_DIR"] == str(pi.PI_CONFIG_DIR)
+
+    def test_preserves_home_for_databricks_auth(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/Users/example")
+        env = pi.build_runtime_env()
+        assert env["HOME"] == "/Users/example"
 
 
 class TestPiValidateCmd:
@@ -302,10 +312,13 @@ class TestWriteToolConfig:
         config_file.write_text(json.dumps(stale), encoding="utf-8")
 
         with (
-            patch("ucode.agents.pi.get_databricks_token", return_value="tok"),
+            patch(
+                "ucode.agents.pi.build_auth_shell_command",
+                return_value="/opt/ucode auth-token --host https://example.databricks.com",
+            ),
             patch("ucode.agents.pi.save_state"),
         ):
-            pi_mod.write_tool_config(self._state(), "claude-sonnet", token="tok")
+            pi_mod.write_tool_config(self._state(), "claude-sonnet")
 
         written = json.loads(config_file.read_text())
         providers = written.get("providers", {})
@@ -333,28 +346,36 @@ class TestWriteToolConfig:
         )
 
         with (
-            patch("ucode.agents.pi.get_databricks_token", return_value="tok"),
+            patch(
+                "ucode.agents.pi.build_auth_shell_command",
+                return_value="/opt/ucode auth-token --host https://example.databricks.com",
+            ),
             patch("ucode.agents.pi.save_state"),
         ):
-            pi_mod.write_tool_config(self._state(), "claude-sonnet", token="tok")
+            pi_mod.write_tool_config(self._state(), "claude-sonnet")
 
         written_providers = json.loads(config_file.read_text()).get("providers", {})
         for legacy in ("databricks-anthropic", "databricks-codex", "databricks-oss"):
             assert legacy not in written_providers
         assert "databricks-claude" in written_providers
 
-    def test_config_written_with_correct_model_and_token(self, tmp_path, monkeypatch):
+    def test_config_written_with_correct_model_and_auth_command(self, tmp_path, monkeypatch):
         pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
 
         with (
-            patch("ucode.agents.pi.get_databricks_token", return_value="tok"),
+            patch(
+                "ucode.agents.pi.build_auth_shell_command",
+                return_value="/opt/ucode auth-token --host https://example.databricks.com",
+            ),
             patch("ucode.agents.pi.save_state"),
         ):
-            pi_mod.write_tool_config(self._state(), "claude-sonnet", token="tok")
+            pi_mod.write_tool_config(self._state(), "claude-sonnet")
 
         written = json.loads(config_file.read_text())
         assert written["model"] == "databricks-claude/claude-sonnet"
-        assert written["providers"]["databricks-claude"]["apiKey"] == "tok"
+        assert written["providers"]["databricks-claude"]["apiKey"] == (
+            "!/opt/ucode auth-token --host https://example.databricks.com"
+        )
 
     def test_settings_pins_default_provider_and_model(self, tmp_path, monkeypatch):
         # Without this, Pi's `findInitialModel` can fall through to a built-in
@@ -363,10 +384,13 @@ class TestWriteToolConfig:
         pi_mod, _, settings_file, _ = self._setup(tmp_path, monkeypatch)
 
         with (
-            patch("ucode.agents.pi.get_databricks_token", return_value="tok"),
+            patch(
+                "ucode.agents.pi.build_auth_shell_command",
+                return_value="/opt/ucode auth-token --host https://example.databricks.com",
+            ),
             patch("ucode.agents.pi.save_state"),
         ):
-            pi_mod.write_tool_config(self._state(), "claude-sonnet", token="tok")
+            pi_mod.write_tool_config(self._state(), "claude-sonnet")
 
         settings = json.loads(settings_file.read_text())
         assert settings["defaultProvider"] == "databricks-claude"
@@ -380,10 +404,13 @@ class TestWriteToolConfig:
         settings_file.write_text(original, encoding="utf-8")
 
         with (
-            patch("ucode.agents.pi.get_databricks_token", return_value="tok"),
+            patch(
+                "ucode.agents.pi.build_auth_shell_command",
+                return_value="/opt/ucode auth-token --host https://example.databricks.com",
+            ),
             patch("ucode.agents.pi.save_state"),
         ):
-            pi_mod.write_tool_config(self._state(), "claude-sonnet", token="tok")
+            pi_mod.write_tool_config(self._state(), "claude-sonnet")
 
         assert settings_backup_file.read_text(encoding="utf-8") == original
         # The on-disk settings still get the ucode pin applied via deep_merge.

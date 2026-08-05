@@ -36,88 +36,76 @@ class TestOpencodeSpec:
 
 class TestRenderOverlay:
     def test_sets_model(self):
-        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), {})
+        overlay, _ = opencode.render_overlay("claude-sonnet", _base_urls(), {})
         assert overlay["model"] == "claude-sonnet"
 
     def test_anthropic_provider_added_when_models_present(self):
         models = {"anthropic": ["claude-sonnet"], "gemini": []}
-        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("claude-sonnet", _base_urls(), models)
         assert "databricks-anthropic" in overlay["provider"]
 
     def test_gemini_provider_added_when_models_present(self):
         models = {"anthropic": [], "gemini": ["gemini-2"]}
-        overlay, _ = opencode.render_overlay("gemini-2", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("gemini-2", _base_urls(), models)
         assert "databricks-google" in overlay["provider"]
 
     def test_oss_provider_added_when_models_present(self):
         models = {"oss": ["system.ai.kimi-k2-7-code"]}
-        overlay, _ = opencode.render_overlay(
-            "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
-        )
+        overlay, _ = opencode.render_overlay("system.ai.kimi-k2-7-code", _base_urls(), models)
         assert "databricks-oss" in overlay["provider"]
 
     def test_oss_provider_uses_ai_sdk_openai_package(self):
         models = {"oss": ["system.ai.kimi-k2-7-code"]}
-        overlay, _ = opencode.render_overlay(
-            "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
-        )
+        overlay, _ = opencode.render_overlay("system.ai.kimi-k2-7-code", _base_urls(), models)
         assert overlay["provider"]["databricks-oss"]["npm"] == "@ai-sdk/openai"
 
     def test_both_providers_when_both_present(self):
         models = {"anthropic": ["claude-sonnet"], "gemini": ["gemini-2"]}
-        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("claude-sonnet", _base_urls(), models)
         assert "databricks-anthropic" in overlay["provider"]
         assert "databricks-google" in overlay["provider"]
 
     def test_no_provider_key_when_no_models(self):
-        overlay, _ = opencode.render_overlay("model", "tok", _base_urls(), {})
+        overlay, _ = opencode.render_overlay("model", _base_urls(), {})
         assert "provider" not in overlay
 
     def test_anthropic_base_url(self):
         models = {"anthropic": ["claude-sonnet"]}
-        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("claude-sonnet", _base_urls(), models)
         options = overlay["provider"]["databricks-anthropic"]["options"]
         assert options["baseURL"] == f"{WS}/ai-gateway/anthropic/v1"
 
     def test_gemini_base_url(self):
         models = {"gemini": ["gemini-2"]}
-        overlay, _ = opencode.render_overlay("gemini-2", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("gemini-2", _base_urls(), models)
         options = overlay["provider"]["databricks-google"]["options"]
         assert options["baseURL"] == f"{WS}/ai-gateway/gemini/v1beta"
 
     def test_oss_base_url(self):
         models = {"oss": ["system.ai.kimi-k2-7-code"]}
-        overlay, _ = opencode.render_overlay(
-            "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
-        )
+        overlay, _ = opencode.render_overlay("system.ai.kimi-k2-7-code", _base_urls(), models)
         options = overlay["provider"]["databricks-oss"]["options"]
         assert options["baseURL"] == f"{WS}/ai-gateway/mlflow/v1"
 
     def test_glm_gets_token_limits(self):
         models = {"oss": ["system.ai.glm-5-2"]}
-        overlay, _ = opencode.render_overlay("system.ai.glm-5-2", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("system.ai.glm-5-2", _base_urls(), models)
         glm = overlay["provider"]["databricks-oss"]["models"]["system.ai.glm-5-2"]
         # OpenCode's schema requires both context and output on `limit`.
         assert glm["limit"] == {"context": 200000, "output": 25000}
 
     def test_non_glm_oss_model_has_no_output_cap(self):
         models = {"oss": ["system.ai.kimi-k2-7-code"]}
-        overlay, _ = opencode.render_overlay(
-            "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
-        )
+        overlay, _ = opencode.render_overlay("system.ai.kimi-k2-7-code", _base_urls(), models)
         kimi = overlay["provider"]["databricks-oss"]["models"]["system.ai.kimi-k2-7-code"]
         assert "limit" not in kimi
 
-    def test_token_in_api_key(self):
+    def test_provider_options_do_not_persist_credentials(self):
         models = {"anthropic": ["claude-sonnet"]}
-        overlay, _ = opencode.render_overlay("claude-sonnet", "mytoken", _base_urls(), models)
-        assert overlay["provider"]["databricks-anthropic"]["options"]["apiKey"] == "mytoken"
-
-    def test_authorization_header(self):
-        models = {"anthropic": ["claude-sonnet"]}
-        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
-        headers = overlay["provider"]["databricks-anthropic"]["options"]["headers"]
-        assert headers["Authorization"] == "Bearer tok"
+        overlay, _ = opencode.render_overlay("claude-sonnet", _base_urls(), models)
+        options = overlay["provider"]["databricks-anthropic"]["options"]
+        assert "apiKey" not in options
+        assert "headers" not in options
 
     def test_anthropic_tool_streaming_disabled(self):
         # @ai-sdk/anthropic injects `eager_input_streaming: true` on tool defs,
@@ -125,7 +113,7 @@ class TestRenderOverlay:
         # Claude models, so we opt out per-model. The setting must live in
         # `models.<m>.options` — per-call providerOptions — not provider options.
         models = {"anthropic": ["claude-sonnet"]}
-        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("claude-sonnet", _base_urls(), models)
         model_entry = overlay["provider"]["databricks-anthropic"]["models"]["claude-sonnet"]
         assert model_entry["options"]["toolStreaming"] is False
 
@@ -135,7 +123,7 @@ class TestRenderOverlay:
         monkeypatch.setattr(opencode, "ucode_version", lambda: "0.1.0")
         monkeypatch.setattr(opencode, "agent_version", lambda binary: "0.74.0")
         models = {"anthropic": ["claude-sonnet"]}
-        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("claude-sonnet", _base_urls(), models)
         model_headers = overlay["provider"]["databricks-anthropic"]["models"]["claude-sonnet"][
             "headers"
         ]
@@ -145,60 +133,49 @@ class TestRenderOverlay:
         monkeypatch.setattr(opencode, "ucode_version", lambda: "0.1.0")
         monkeypatch.setattr(opencode, "agent_version", lambda binary: "0.74.0")
         models = {"gemini": ["gemini-2"]}
-        overlay, _ = opencode.render_overlay("gemini-2", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("gemini-2", _base_urls(), models)
         model_headers = overlay["provider"]["databricks-google"]["models"]["gemini-2"]["headers"]
         assert model_headers["User-Agent"] == "ucode/0.1.0 opencode/0.74.0"
 
-    def test_provider_level_headers_only_authorization(self, monkeypatch):
-        # Sanity: provider-level headers should NOT include User-Agent (since
-        # it's clobbered there) — only Authorization.
-        models = {"anthropic": ["claude-sonnet"]}
-        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
-        provider_headers = overlay["provider"]["databricks-anthropic"]["options"]["headers"]
-        assert "User-Agent" not in provider_headers
-        assert provider_headers["Authorization"] == "Bearer tok"
-
     def test_managed_keys_include_model(self):
-        _, keys = opencode.render_overlay("model", "tok", _base_urls(), {})
+        _, keys = opencode.render_overlay("model", _base_urls(), {})
         assert ["model"] in keys
 
     def test_managed_keys_include_anthropic_provider(self):
         models = {"anthropic": ["claude-sonnet"]}
-        _, keys = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        _, keys = opencode.render_overlay("claude-sonnet", _base_urls(), models)
         assert ["provider", "databricks-anthropic"] in keys
 
     def test_managed_keys_include_gemini_provider(self):
         models = {"gemini": ["gemini-2"]}
-        _, keys = opencode.render_overlay("gemini-2", "tok", _base_urls(), models)
+        _, keys = opencode.render_overlay("gemini-2", _base_urls(), models)
         assert ["provider", "databricks-google"] in keys
 
     def test_managed_keys_include_oss_provider(self):
         models = {"oss": ["system.ai.kimi-k2-7-code"]}
-        _, keys = opencode.render_overlay("system.ai.kimi-k2-7-code", "tok", _base_urls(), models)
+        _, keys = opencode.render_overlay("system.ai.kimi-k2-7-code", _base_urls(), models)
         assert ["provider", "databricks-oss"] in keys
 
     def test_anthropic_models_listed(self):
         models = {"anthropic": ["claude-sonnet", "claude-haiku"]}
-        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("claude-sonnet", _base_urls(), models)
         provider_models = overlay["provider"]["databricks-anthropic"]["models"]
         assert "claude-sonnet" in provider_models
         assert "claude-haiku" in provider_models
 
     def test_prefixes_anthropic_model_with_provider_id(self):
         models = {"anthropic": ["claude-sonnet"], "gemini": []}
-        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("claude-sonnet", _base_urls(), models)
         assert overlay["model"] == "databricks-anthropic/claude-sonnet"
 
     def test_prefixes_gemini_model_with_provider_id(self):
         models = {"anthropic": [], "gemini": ["gemini-2"]}
-        overlay, _ = opencode.render_overlay("gemini-2", "tok", _base_urls(), models)
+        overlay, _ = opencode.render_overlay("gemini-2", _base_urls(), models)
         assert overlay["model"] == "databricks-google/gemini-2"
 
     def test_prefixes_oss_model_with_provider_id(self):
         models = {"oss": ["system.ai.kimi-k2-7-code"]}
-        overlay, _ = opencode.render_overlay(
-            "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
-        )
+        overlay, _ = opencode.render_overlay("system.ai.kimi-k2-7-code", _base_urls(), models)
         assert overlay["model"] == "databricks-oss/system.ai.kimi-k2-7-code"
 
 
@@ -294,15 +271,27 @@ class TestMcpServerConfig:
 
 
 class TestBuildRuntimeEnv:
-    def test_sets_oauth_token_for_mcp(self):
-        env = opencode.build_runtime_env("tok")
-
-        assert env["OAUTH_TOKEN"] == "tok"
-
     def test_sets_ucode_xdg_config_home(self):
-        env = opencode.build_runtime_env("tok")
+        env = opencode.build_runtime_env()
 
         assert env["XDG_CONFIG_HOME"] == str(opencode.OPENCODE_XDG_CONFIG_HOME)
+
+
+class TestRenderAuthPlugin:
+    def test_calls_ucode_auth_token_and_injects_bearer(self):
+        plugin = opencode.render_auth_plugin(
+            ["/opt/ucode", "auth-token", "--host", WS, "--profile", "DEFAULT"]
+        )
+
+        assert '[command, ...args] = ["/opt/ucode", "auth-token"' in plugin
+        assert '"auth-token", "--host"' in plugin
+        assert 'headers.set("Authorization", `Bearer ${token()}`)' in plugin
+
+    def test_targets_all_ucode_provider_names(self):
+        plugin = opencode.render_auth_plugin(["ucode", "auth-token", "--host", WS])
+
+        for provider_name in opencode.PROVIDER_NAMES:
+            assert provider_name in plugin
 
 
 class TestOpencodeDefaultModel:
@@ -351,8 +340,10 @@ class TestWriteToolConfigStaleProviderCleanup:
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
         config_file = tmp_path / "opencode.json"
         backup_file = tmp_path / "opencode-backup.json"
+        plugin_file = tmp_path / "plugins" / "ucode-databricks-auth.js"
         monkeypatch.setattr(oc_mod, "OPENCODE_CONFIG_PATH", config_file)
         monkeypatch.setattr(oc_mod, "OPENCODE_BACKUP_PATH", backup_file)
+        monkeypatch.setattr(oc_mod, "OPENCODE_AUTH_PLUGIN_PATH", plugin_file)
 
         stale = {
             "provider": {
@@ -371,10 +362,13 @@ class TestWriteToolConfigStaleProviderCleanup:
         }
 
         with (
-            patch("ucode.agents.opencode.get_databricks_token", return_value="tok"),
+            patch(
+                "ucode.agents.opencode.build_auth_token_argv",
+                return_value=["/opt/ucode", "auth-token", "--host", WS],
+            ),
             patch("ucode.agents.opencode.save_state"),
         ):
-            oc_mod.write_tool_config(state, "claude-sonnet", token="tok")
+            oc_mod.write_tool_config(state, "claude-sonnet")
 
         written = json.loads(config_file.read_text())
         providers = written.get("provider", {})
@@ -382,6 +376,7 @@ class TestWriteToolConfigStaleProviderCleanup:
         assert providers.get("databricks-anthropic") != {"old": True}
         # unmanaged provider entry survives
         assert providers.get("other-provider") == {"keep": True}
+        assert "/opt/ucode" in plugin_file.read_text(encoding="utf-8")
 
     def test_config_written_with_correct_model(self, tmp_path, monkeypatch):
         import ucode.agents.opencode as oc_mod
@@ -390,8 +385,10 @@ class TestWriteToolConfigStaleProviderCleanup:
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
         config_file = tmp_path / "opencode.json"
         backup_file = tmp_path / "opencode-backup.json"
+        plugin_file = tmp_path / "plugins" / "ucode-databricks-auth.js"
         monkeypatch.setattr(oc_mod, "OPENCODE_CONFIG_PATH", config_file)
         monkeypatch.setattr(oc_mod, "OPENCODE_BACKUP_PATH", backup_file)
+        monkeypatch.setattr(oc_mod, "OPENCODE_AUTH_PLUGIN_PATH", plugin_file)
 
         state = {
             "workspace": WS,
@@ -401,10 +398,13 @@ class TestWriteToolConfigStaleProviderCleanup:
         }
 
         with (
-            patch("ucode.agents.opencode.get_databricks_token", return_value="tok"),
+            patch(
+                "ucode.agents.opencode.build_auth_token_argv",
+                return_value=["/opt/ucode", "auth-token", "--host", WS],
+            ),
             patch("ucode.agents.opencode.save_state"),
         ):
-            oc_mod.write_tool_config(state, "claude-sonnet", token="tok")
+            oc_mod.write_tool_config(state, "claude-sonnet")
 
         written = json.loads(config_file.read_text())
         assert written["model"] == "databricks-anthropic/claude-sonnet"
