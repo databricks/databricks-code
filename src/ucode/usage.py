@@ -489,7 +489,8 @@ def usage() -> int:
     requester_name = find_requester_name(workspace, resolved_http_path, token, records)
 
     # Opt-in per workspace: omit the lines rather than fail the report.
-    budget_spend, _ = resolve_current_budget_spend(workspace, token)
+    with spinner("Checking budget spend..."):
+        budget_spend, _ = resolve_current_budget_spend(workspace, token)
 
     tool_displays = {tool: spec["display"] for tool, spec in TOOL_SPECS.items()}
     configured_tools = configured_usage_tools(state, tool_displays)
