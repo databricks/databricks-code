@@ -26,6 +26,7 @@ from ucode.databricks import (
     build_skills_mcp_url,
     build_tool_base_url,
     classify_model_family,
+    discover_sql_warehouses,
     ensure_databricks_cli_version,
     ensure_pat_bearer,
     get_databricks_token,
@@ -38,6 +39,22 @@ from ucode.databricks import (
 )
 
 WS = "https://example.databricks.com"
+
+
+class _FakeResponse:
+    """Minimal urlopen context manager returning a JSON body."""
+
+    def __init__(self, payload: dict):
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
 
 
 class TestWorkspaceHostname:
@@ -2400,3 +2417,70 @@ class TestResolveCurrentBudgetSpend:
         spend, reason = resolve_current_budget_spend("https://ws", "token")
         assert spend is None
         assert "not a JSON object" in reason
+
+
+class TestDiscoverSqlWarehouses:
+    def _payload(self, *entries: dict) -> dict:
+        return {"warehouses": list(entries)}
+
+    def test_explicit_id_skips_discovery(self, monkeypatch):
+        def fail(*a, **k):
+            raise AssertionError("discovery should not be called")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fail)
+        assert discover_sql_warehouses(WS, "token", warehouse_id="abc") == [
+            db_mod.SqlWarehouse("/sql/1.0/warehouses/abc", "abc", "REQUESTED")
+        ]
+
+    def test_running_sorted_before_stopped(self, monkeypatch):
+        payload = self._payload(
+            {"id": "s1", "name": "stopped", "state": "STOPPED"},
+            {"id": "r1", "name": "running", "state": "RUNNING"},
+        )
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse(payload)
+        )
+        result = discover_sql_warehouses(WS, "token")
+        assert [w.label for w in result] == ["running", "stopped"]
+
+    def test_returns_all_candidates(self, monkeypatch):
+        payload = self._payload(
+            {"id": "a", "name": "A", "state": "RUNNING"},
+            {"id": "b", "name": "B", "state": "RUNNING"},
+        )
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse(payload)
+        )
+        assert len(discover_sql_warehouses(WS, "token")) == 2
+
+    def test_skips_entries_without_id(self, monkeypatch):
+        payload = self._payload(
+            {"name": "no id", "state": "RUNNING"},
+            {"id": "b", "name": "B", "state": "RUNNING"},
+        )
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse(payload)
+        )
+        assert [w.label for w in discover_sql_warehouses(WS, "token")] == ["B"]
+
+    def test_falls_back_to_id_as_label(self, monkeypatch):
+        payload = self._payload({"id": "abc", "state": "RUNNING"})
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse(payload)
+        )
+        assert discover_sql_warehouses(WS, "token")[0].label == "abc"
+
+    def test_empty_list_raises_with_flag_hint(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse({"warehouses": []})
+        )
+        with pytest.raises(RuntimeError, match="--warehouse-id"):
+            discover_sql_warehouses(WS, "token")
+
+    def test_only_unusable_entries_raises(self, monkeypatch):
+        payload = self._payload({"name": "no id", "state": "RUNNING"})
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda *a, **k: _FakeResponse(payload)
+        )
+        with pytest.raises(RuntimeError, match="No usable SQL warehouse"):
+            discover_sql_warehouses(WS, "token")

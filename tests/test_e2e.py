@@ -25,7 +25,7 @@ import pytest
 from ucode.databricks import (
     build_shared_base_urls,
     build_tool_base_url,
-    discover_sql_warehouse_http_path,
+    discover_sql_warehouses,
     ensure_ai_gateway_v2,
     fetch_ai_gateway_claude_models,
     fetch_codex_models,
@@ -247,10 +247,11 @@ class TestStateRoundTrip:
 class TestSqlWarehouseDiscovery:
     def test_discovers_http_path(self, e2e_workspace, e2e_token):
         try:
-            http_path = discover_sql_warehouse_http_path(e2e_workspace, e2e_token, quiet=True)
+            candidates = discover_sql_warehouses(e2e_workspace, e2e_token)
         except RuntimeError as exc:
             pytest.skip(f"No SQL warehouse available: {exc}")
-        assert http_path.startswith("/sql/1.0/warehouses/")
+        assert candidates
+        assert all(w.http_path.startswith("/sql/1.0/warehouses/") for w in candidates)
 
 
 # ---------------------------------------------------------------------------

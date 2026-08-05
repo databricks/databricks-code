@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 import ucode.usage as usage_mod
+from ucode.databricks import SqlWarehouse
 from ucode.ui import label, value
 from ucode.usage import (
     USAGE_BREAKDOWN_DAYS,
@@ -24,6 +27,7 @@ from ucode.usage import (
     parse_usage_rows,
     render_budget_lines,
     render_usage_summary,
+    run_query_on_first_working_warehouse,
     simplify_model_name,
     summarize_model_tokens,
     summarize_models,
@@ -515,8 +519,8 @@ class TestUsageCommand:
         monkeypatch.setattr(usage_mod, "get_databricks_token", lambda *args, **kwargs: "token")
         monkeypatch.setattr(
             usage_mod,
-            "discover_sql_warehouse_http_path",
-            lambda *args, **kwargs: "/sql/1.0/warehouses/abc",
+            "discover_sql_warehouses",
+            lambda *args, **kwargs: [SqlWarehouse("/sql/1.0/warehouses/abc", "wh", "RUNNING")],
         )
         monkeypatch.setattr(usage_mod, "run_usage_query", lambda *args, **kwargs: (columns, rows))
         monkeypatch.setattr(
@@ -532,8 +536,91 @@ class TestUsageCommand:
         assert "Codex · Last 7 Days" in headings
         assert "Claude Code · Last 7 Days" in headings
         assert all("Gemini" not in heading for heading in headings)
-        assert notes == [f"No usage for Claude Code in the last {USAGE_BREAKDOWN_DAYS} days."]
+        assert notes == [
+            "Using SQL warehouse `wh` (RUNNING).",
+            f"No usage for Claude Code in the last {USAGE_BREAKDOWN_DAYS} days.",
+        ]
         assert len(rendered_tables) == 1
         assert rendered_tables[0][0][2] == "100"
         assert "gemini" not in "\n".join(printed).lower()
         assert "900" not in "\n".join(printed)
+
+
+class TestRunQueryOnFirstWorkingWarehouse:
+    _COLUMNS = ["requester_name"]
+    _ROWS = [("user@example.com",)]
+
+    def _warehouses(self, *labels: str) -> list[SqlWarehouse]:
+        return [SqlWarehouse(f"/sql/1.0/warehouses/{label}", label, "RUNNING") for label in labels]
+
+    def test_returns_first_working_warehouse(self, monkeypatch):
+        monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
+        monkeypatch.setattr(
+            usage_mod, "run_usage_query", lambda *a, **k: (self._COLUMNS, self._ROWS)
+        )
+        http_path, columns, rows = run_query_on_first_working_warehouse(
+            "https://ws", "token", self._warehouses("a", "b"), "SELECT 1"
+        )
+        assert http_path == "/sql/1.0/warehouses/a"
+        assert (columns, rows) == (self._COLUMNS, self._ROWS)
+
+    def test_falls_through_to_next_warehouse(self, monkeypatch):
+        warnings: list[str] = []
+        monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
+        monkeypatch.setattr(usage_mod, "print_warning", warnings.append)
+        attempted: list[str] = []
+
+        def flaky(workspace, http_path, token, query):
+            attempted.append(http_path)
+            if http_path.endswith("dead"):
+                raise RuntimeError("ENDPOINT_NOT_FOUND")
+            return self._COLUMNS, self._ROWS
+
+        monkeypatch.setattr(usage_mod, "run_usage_query", flaky)
+        http_path, _, _ = run_query_on_first_working_warehouse(
+            "https://ws", "token", self._warehouses("dead", "alive"), "SELECT 1"
+        )
+        assert http_path == "/sql/1.0/warehouses/alive"
+        assert attempted == ["/sql/1.0/warehouses/dead", "/sql/1.0/warehouses/alive"]
+        assert len(warnings) == 1
+        assert "dead" in warnings[0]
+
+    def test_raises_last_error_when_all_fail(self, monkeypatch):
+        monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
+        monkeypatch.setattr(usage_mod, "print_warning", lambda *a: None)
+
+        def always_fail(workspace, http_path, token, query):
+            raise RuntimeError(f"boom {http_path[-1]}")
+
+        monkeypatch.setattr(usage_mod, "run_usage_query", always_fail)
+        with pytest.raises(RuntimeError, match="boom b"):
+            run_query_on_first_working_warehouse(
+                "https://ws", "token", self._warehouses("a", "b"), "SELECT 1"
+            )
+
+    def test_raises_when_no_candidates(self, monkeypatch):
+        monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
+        with pytest.raises(RuntimeError, match="No SQL warehouse could run"):
+            run_query_on_first_working_warehouse("https://ws", "token", [], "SELECT 1")
+
+
+class TestUsageWarehouseIdPassthrough:
+    def test_forwards_warehouse_id_to_discovery(self, monkeypatch):
+        captured = {}
+
+        def fake_discover(workspace, token, *, warehouse_id=None):
+            captured["warehouse_id"] = warehouse_id
+            return [SqlWarehouse("/sql/1.0/warehouses/xyz", "xyz", "REQUESTED")]
+
+        monkeypatch.setattr(
+            usage_mod, "load_state", lambda: {"workspace": "https://ws", "available_tools": []}
+        )
+        monkeypatch.setattr(usage_mod, "ensure_databricks_auth", lambda *a, **k: None)
+        monkeypatch.setattr(usage_mod, "get_databricks_token", lambda *a, **k: "token")
+        monkeypatch.setattr(usage_mod, "discover_sql_warehouses", fake_discover)
+        monkeypatch.setattr(usage_mod, "run_usage_query", lambda *a, **k: (["c"], []))
+        monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
+        monkeypatch.setattr(usage_mod, "console", type("C", (), {"print": lambda *a: None})())
+
+        assert usage(warehouse_id="xyz") == 0
+        assert captured["warehouse_id"] == "xyz"

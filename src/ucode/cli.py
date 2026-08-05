@@ -2360,11 +2360,16 @@ def revert_cmd() -> None:
 
 
 @app.command("usage")
-def usage_cmd() -> None:
+def usage_cmd(
+    warehouse_id: Annotated[
+        str | None,
+        typer.Option("--warehouse-id", help="SQL warehouse to query, instead of discovering one."),
+    ] = None,
+) -> None:
     """Show Databricks AI Gateway usage summary (last 7 days)."""
     try:
         install_databricks_cli()
-        usage_report()
+        usage_report(warehouse_id=warehouse_id)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
