@@ -57,7 +57,7 @@ from ucode.databricks import (
 )
 from ucode.managed_config import managed_agent_config_enabled, managed_launch_state
 from ucode.managed_resolve import managed_default_model, managed_provider_service
-from ucode.managed_wizard import setup_command, show_command
+from ucode.managed_wizard import apply_command, setup_command, show_command
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
@@ -1963,6 +1963,34 @@ def setup_show_cmd() -> None:
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@app.command("apply")
+def apply_cmd(
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Publish without the confirmation prompt."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Validate and preview without publishing."),
+    ] = False,
+) -> None:
+    """Publish this workspace's managed coding config (workspace admins only)."""
+    set_dry_run(dry_run)
+    # See the `setup` callback: `typer.Exit` subclasses RuntimeError, so it must be raised after
+    # the try block or the handler below would report a successful exit as an error.
+    try:
+        install_databricks_cli()
+        code = apply_command(yes=yes)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
     if code:
         raise typer.Exit(code)
 

@@ -14,6 +14,7 @@ import pytest
 import typer.main
 from typer.testing import CliRunner
 
+import ucode.cli as cli_mod
 import ucode.config_io as config_io_mod
 import ucode.managed_setup as managed_setup_mod
 import ucode.managed_wizard as wizard
@@ -1225,6 +1226,202 @@ class TestSearchablePickers:
         assert any("model" in p for p in searchable_prompts), searchable_prompts
 
 
+class TestApplyCommand:
+    MANIFEST = {
+        "default_agent": "claude",
+        "enabled_agents": {
+            "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}}
+        },
+    }
+
+    @staticmethod
+    def _patches(**overrides):
+        """The network/auth boundary `apply_command` sits behind, with per-test overrides."""
+        defaults = {
+            "load_state": lambda: {"workspace": WORKSPACE, "profile": "p", **STATE},
+            "ensure_databricks_auth": lambda *a, **k: None,
+            "get_databricks_token": lambda *a, **k: "tok",
+            "is_workspace_admin": lambda *a, **k: True,
+            "get_managed_config": lambda *a, **k: (None, None),
+            "create_coding_agent_config": lambda *a, **k: (
+                {"name": "coding-agent-configs/new"},
+                None,
+            ),
+            "update_coding_agent_config": lambda *a, **k: (
+                {"name": "coding-agent-configs/old"},
+                None,
+            ),
+            "prompt_yes_no_default": lambda *a, **k: True,
+        }
+        defaults.update(overrides)
+        return [patch.object(wizard, name, value) for name, value in defaults.items()]
+
+    def _run(self, *, yes=False, **overrides):
+        import contextlib
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(**overrides):
+                stack.enter_context(p)
+            return wizard.apply_command(yes=yes)
+
+    def test_unauthored_config_is_an_actionable_error(self):
+        with patch.object(wizard, "load_state", return_value={"workspace": WORKSPACE}):
+            with pytest.raises(RuntimeError, match="ucode setup"):
+                wizard.apply_command()
+
+    def test_creates_when_no_config_exists(self):
+        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        created = {}
+
+        def fake_create(workspace, token, payload):
+            created.update(workspace=workspace, payload=payload)
+            return {"name": "coding-agent-configs/new"}, None
+
+        assert self._run(create_coding_agent_config=fake_create) == 0
+        assert created["workspace"] == WORKSPACE
+        # What goes over the wire is proto-JSON, not ucode's manifest shape.
+        assert created["payload"]["default_agent"] == "CODING_AGENT_CLAUDE_CODE"
+
+    def test_updates_in_place_when_a_config_exists(self):
+        # Delete-then-create would leave the workspace with no config if the create failed, so an
+        # existing config must be PATCHed rather than replaced.
+        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        existing = {"name": "coding-agent-configs/abc", "enabled_agents": {"codex": {}}}
+        updated = {}
+        created = {"called": False}
+
+        def fake_update(workspace, token, name, payload):
+            updated.update(name=name, payload=payload)
+            return {"name": name}, None
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {}, None
+
+        assert (
+            self._run(
+                get_managed_config=lambda *a, **k: (existing, None),
+                update_coding_agent_config=fake_update,
+                create_coding_agent_config=fake_create,
+            )
+            == 0
+        )
+        assert updated["name"] == "coding-agent-configs/abc"
+        assert created["called"] is False
+
+    def test_invalid_manifest_is_not_published(self):
+        # `default_agent` names an agent that isn't enabled.
+        managed_setup_mod.save_managed_settings(
+            WORKSPACE, {"default_agent": "codex", "enabled_agents": {"claude": {}}}
+        )
+        created = {"called": False}
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {}, None
+
+        assert self._run(create_coding_agent_config=fake_create) == 1
+        assert created["called"] is False
+
+    def test_declining_the_prompt_publishes_nothing(self):
+        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        created = {"called": False}
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {}, None
+
+        code = self._run(
+            prompt_yes_no_default=lambda *a, **k: False, create_coding_agent_config=fake_create
+        )
+        assert code == 1
+        assert created["called"] is False
+
+    def test_yes_skips_the_prompt(self):
+        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+
+        def refuse(*a, **k):
+            raise AssertionError("--yes must not prompt")
+
+        assert self._run(yes=True, prompt_yes_no_default=refuse) == 0
+
+    def test_non_admin_is_rejected_before_publishing(self):
+        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        created = {"called": False}
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {}, None
+
+        with pytest.raises(RuntimeError, match="not an admin"):
+            self._run(
+                is_workspace_admin=lambda *a, **k: False, create_coding_agent_config=fake_create
+            )
+        assert created["called"] is False
+
+    def test_unreadable_existing_config_refuses_to_publish(self):
+        # Publishing without knowing whether a config exists risks silently overwriting one.
+        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        created = {"called": False}
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {}, None
+
+        with pytest.raises(RuntimeError, match="Refusing to publish"):
+            self._run(
+                get_managed_config=lambda *a, **k: (None, "HTTP 500 Server Error"),
+                create_coding_agent_config=fake_create,
+            )
+        assert created["called"] is False
+
+    def test_existing_config_without_a_resource_name_is_an_error(self):
+        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        with pytest.raises(RuntimeError, match="resource name"):
+            self._run(get_managed_config=lambda *a, **k: ({"enabled_agents": {}}, None))
+
+    def test_dry_run_validates_without_publishing(self, monkeypatch):
+        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        monkeypatch.setattr(config_io_mod, "_dry_run", True)
+        created = {"called": False}
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {}, None
+
+        assert self._run(create_coding_agent_config=fake_create) == 0
+        assert created["called"] is False
+
+
+class TestPublishFailureMessages:
+    """The server's error codes, turned into something an admin can act on."""
+
+    def test_feature_disabled_names_the_flag(self):
+        message = wizard._explain_publish_failure(
+            'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED","message":"..."}'
+        )
+        assert "codingAgentConfigCrudEnabled" in message
+
+    def test_permission_denied_says_admin_is_required(self):
+        message = wizard._explain_publish_failure(
+            'HTTP 403 Forbidden: {"error_code":"PERMISSION_DENIED"}'
+        )
+        assert "workspace admin" in message
+
+    def test_invalid_parameter_value_is_passed_through_verbatim(self):
+        # The server names the offending field, which is more useful than any paraphrase.
+        reason = (
+            'HTTP 400 Bad Request: {"error_code":"INVALID_PARAMETER_VALUE",'
+            '"message":"budget_policy.tiers[0].spending_percentage must be between 0 and 1"}'
+        )
+        message = wizard._explain_publish_failure(reason)
+        assert "budget_policy.tiers[0].spending_percentage" in message
+
+    def test_unknown_failure_still_surfaces_the_reason(self):
+        message = wizard._explain_publish_failure("network error: timed out")
+        assert "timed out" in message
+
+
 class TestCliWiring:
     def test_setup_is_registered(self):
         result = runner.invoke(app, ["--help"])
@@ -1245,6 +1442,31 @@ class TestCliWiring:
         result = runner.invoke(app, ["setup", "--help"])
         assert result.exit_code == 0
         assert "show" in result.output
+
+    def test_apply_is_registered(self):
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        assert "apply" in result.output
+
+    def test_apply_declares_yes_and_dry_run(self):
+        # Asserted on the declared options rather than rendered help, which Rich ellipsizes at
+        # narrow terminal widths (see test_setup_help_lists_from_file).
+        command = typer.main.get_command(app).commands["apply"]  # type: ignore[attr-defined]
+        declared = {opt for param in command.params for opt in param.opts}
+        assert {"--yes", "--dry-run"} <= declared
+
+    def test_apply_error_exits_nonzero_with_a_message(self):
+        with patch.object(cli_mod, "apply_command", side_effect=RuntimeError("no config authored")):
+            result = runner.invoke(app, ["apply"])
+        assert result.exit_code == 1
+
+    def test_successful_apply_exits_zero(self):
+        # Same trap as `setup`: `typer.Exit` subclasses RuntimeError, so raising it inside the
+        # command's try block would report success as "ERROR 0".
+        with patch.object(cli_mod, "apply_command", return_value=0):
+            result = runner.invoke(app, ["apply"])
+        assert result.exit_code == 0
+        assert "ERROR" not in result.output
 
     def test_successful_setup_exits_zero(self):
         # `typer.Exit` subclasses RuntimeError, so a success code must not be caught and reported
