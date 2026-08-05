@@ -187,7 +187,9 @@ def test_spawn_rewrite_uses_codex_model_id_for_uc_endpoint(monkeypatch):
     assert output["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-5.6-luna"
 
 
-def test_spawn_glm_decision_keeps_original_model(monkeypatch):
+def test_spawn_glm_decision_applies_glm_model(monkeypatch):
+    # GLM is no longer skipped for Codex subagents: a GLM routing decision is
+    # applied like any other arm.
     monkeypatch.setattr(
         codex_routing,
         "request_routing_decision",
@@ -210,12 +212,8 @@ def test_spawn_glm_decision_keeps_original_model(monkeypatch):
         available_models=["system.ai.gpt-5-6-luna", "system.ai.gpt-5-6-sol"],
     )
 
-    assert output == {
-        "systemMessage": (
-            "Smart Routing selected GLM 5.2, which is not enabled for Codex "
-            "subagents. Keeping the original subagent model."
-        )
-    }
+    assert output["hookSpecificOutput"]["updatedInput"]["model"] == "system.ai.glm-5-2"
+    assert "Using Smart Routing. Routing to system.ai.glm-5-2." in output["systemMessage"]
 
 
 def test_non_spawn_tool_has_no_opinion():
