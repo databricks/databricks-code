@@ -55,8 +55,16 @@ from ucode.databricks import (
     resolve_pat_token,
     run_databricks_login,
 )
-from ucode.managed_config import managed_agent_config_enabled, managed_launch_state
-from ucode.managed_resolve import managed_default_model, managed_provider_service
+from ucode.managed_config import (
+    load_managed_state,
+    managed_agent_config_enabled,
+    managed_launch_state,
+)
+from ucode.managed_resolve import (
+    managed_default_model,
+    managed_provider_service,
+    managed_supplies_models,
+)
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
@@ -1179,6 +1187,10 @@ def _launch_tool(
         # back to whatever `ucode configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
         routing_agent = _ROUTING_AGENTS.get(tool)
+        # Discovery exists to find models and isn't needed for managed config that already names them.
+        managed_models_known = managed_agent_config_enabled() and managed_supplies_models(
+            load_managed_state(state.get("workspace")), tool
+        )
         # Re-fetch model lists on every launch so newly-added Databricks
         # endpoints show up without a manual `ucode configure` (and so that
         # tools like pi which read multiple model bundles never run on
@@ -1188,7 +1200,7 @@ def _launch_tool(
             state["workspace"],
             profile=state.get("profile"),
             tools=[tool],
-            skip_model_discovery=bool(provider),
+            skip_model_discovery=bool(provider) or managed_models_known,
             skip_preflight=skip_preflight,
         )
         # An admin-published managed config wins over the developer's own settings. Resolved before
@@ -1202,6 +1214,16 @@ def _launch_tool(
                 state, managed = managed_launch_state(state, tool, skip_preflight=skip_preflight)
             if managed is not None:
                 print_success("Applied your workspace's managed coding agent config")
+                # The enterprise scope outranks the --settings file ucode writes, so a model pinned
+                # there quietly beats the admin's — point at the file rather than let the mismatch
+                # look like a ucode bug.
+                if tool == "claude":
+                    overrides = claude_agent.managed_settings_model_overrides()
+                    if overrides is not None:
+                        print_warning(
+                            f"Default models are set in your enterprise managed settings at "
+                            f"{overrides}, which may override your admin's managed config."
+                        )
             else:
                 print_note("No managed coding agent config found; using your own settings")
         if managed is not None:

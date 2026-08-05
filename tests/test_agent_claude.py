@@ -864,3 +864,44 @@ class TestClaudeSmartRouting:
         assert state.get(claude.SMART_ROUTING_STATE_KEY) is None
         assert list(doc["hooks"]) == ["PreToolUse"]
         assert doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "user-policy"
+
+
+class TestManagedSettingsModelOverrides:
+    """Enterprise managed settings outrank ucode's --settings, so a model pinned there beats the
+    one an admin published — worth pointing a developer at the file."""
+
+    @staticmethod
+    def _write(monkeypatch, tmp_path, payload):
+        path = tmp_path / "managed-settings.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: path)
+        return path
+
+    @pytest.mark.parametrize(
+        "key",
+        ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+    )
+    def test_reports_the_path_when_a_model_is_pinned(self, monkeypatch, tmp_path, key):
+        path = self._write(monkeypatch, tmp_path, {"env": {key: "system.ai.claude-opus-5"}})
+        assert claude.managed_settings_model_overrides() == path
+
+    def test_none_for_name_companions_that_select_nothing(self, monkeypatch, tmp_path):
+        # The `_NAME` keys are picker labels, so an enterprise value there overrides no model.
+        self._write(monkeypatch, tmp_path, {"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "Opus 5"}})
+        assert claude.managed_settings_model_overrides() is None
+
+    def test_none_when_no_model_keys_are_set(self, monkeypatch, tmp_path):
+        self._write(monkeypatch, tmp_path, {"env": {"SOMETHING_ELSE": "1"}})
+        assert claude.managed_settings_model_overrides() is None
+
+    def test_none_when_env_block_is_absent(self, monkeypatch, tmp_path):
+        self._write(monkeypatch, tmp_path, {"permissions": {}})
+        assert claude.managed_settings_model_overrides() is None
+
+    def test_none_on_platforms_without_managed_settings(self, monkeypatch):
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: None)
+        assert claude.managed_settings_model_overrides() is None
+
+    def test_none_when_the_file_does_not_exist(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: tmp_path / "missing.json")
+        assert claude.managed_settings_model_overrides() is None

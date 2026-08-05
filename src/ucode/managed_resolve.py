@@ -60,25 +60,52 @@ def _agent_model_config(managed: dict, tool: str) -> dict[str, object]:
 def effective_agent_models(managed: dict, state: dict, tool: str) -> dict | list | None:
     """Resolve ``tool``'s model list/slots from the manifest, falling back to ucode state.
 
-    Claude keys its models by family (``opus``/``sonnet``/``haiku``/``fable``) and resolves per
-    family, so a family the manifest omits keeps the developer's value. Every other agent stores a
-    flat list, which has no per-key identity — there the manifest's list replaces the local one
-    outright, or the local one stands when the manifest specifies none.
+    Once the manifest says anything about ``tool``'s models it is the whole allowlist: the
+    developer's discovered models drop out entirely, so a launch can only reach models the admin
+    named. Each claude family resolves only to its own slot — a family the manifest leaves out stays
+    unset rather than inheriting ``default_model``, so ucode writes no
+    ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` for it and the agent falls back to its own default. Omitting
+    a family is how an admin steers people off it, and filling it in with ``default_model`` would
+    quietly re-enable what they left out. Every other agent stores a flat list, which has no per-key
+    identity — there the manifest's list replaces the local one outright. Only when the manifest
+    names nothing for ``tool`` does the developer's own list stand.
     """
-    manifest_models = _agent_model_config(managed, tool).get("models")
+    model_config = _agent_model_config(managed, tool)
+    manifest_models = model_config.get("models")
     if tool == "claude":
-        local = dict(_as_dict(state.get("claude_models")))
+        slots: dict[str, str] = {}
         for slot, family in _CLAUDE_FAMILY_SLOTS.items():
             model = _str(_as_dict(manifest_models).get(slot))
             if model:
-                local[family] = model
-        return local or None
+                slots[family] = model
+        if slots:
+            return slots
+        local = _as_dict(state.get("claude_models"))
+        return dict(local) if local else None
     if isinstance(manifest_models, list):
         models = [m for m in (_str(item) for item in manifest_models) if m]
         if models:
             return models
     local_list = state.get(f"{tool}_models")
     return local_list if local_list else None
+
+
+def managed_supplies_models(managed: dict | None, tool: str) -> bool:
+    """True when the managed config already says which models ``tool`` should use.
+
+    Lets the launch path skip Databricks model discovery, whose whole purpose is to find the models
+    the config has now specified. Any of the three counts: a provider (the agent routes by header and
+    pins no Databricks model), a ``default_model``, or at least one entry in ``models``.
+    """
+    model_config = _agent_model_config(managed or {}, tool)
+    if _str(model_config.get("model_provider_service")) or _str(model_config.get("default_model")):
+        return True
+    models = model_config.get("models")
+    if isinstance(models, dict):
+        return any(_str(value) for value in models.values())
+    if isinstance(models, list):
+        return any(_str(item) for item in models)
+    return False
 
 
 def managed_provider_service(managed: dict, tool: str) -> str | None:

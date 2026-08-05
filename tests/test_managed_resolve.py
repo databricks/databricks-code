@@ -13,6 +13,7 @@ from ucode.managed_resolve import (
     effective_agent_models,
     managed_default_model,
     managed_provider_service,
+    managed_supplies_models,
     resolve_state,
 )
 from ucode.state import MANAGED_OVERLAY_KEY
@@ -58,6 +59,7 @@ def _state(**overrides) -> dict:
 class TestClaudeModels:
     def test_proto_slots_map_to_families(self):
         # The manifest keeps proto spelling (`default_opus_model`); render_overlay reads `opus`.
+        # `fable` has no slot here, so it stays unset rather than inheriting `default_model`.
         models = effective_agent_models(MANAGED, _state(), "claude")
         assert models == {
             "opus": "system.ai.claude-opus-5",
@@ -70,16 +72,33 @@ class TestClaudeModels:
         models = effective_agent_models(MANAGED, state, "claude")
         assert models["opus"] == "system.ai.claude-opus-5"
 
-    def test_family_absent_from_manifest_keeps_local_value(self):
-        # Claude resolves per family, so a family the admin didn't pin keeps the developer's choice.
+    def test_family_absent_from_manifest_is_dropped(self):
+        # The manifest is the whole allowlist: a family the admin didn't pin is left unset rather
+        # than inheriting the developer's model, so a launch can't reach models the admin didn't
+        # sanction. Nothing is written for it, so the agent uses its own default.
         managed = {
             "enabled_agents": {
                 "claude": {"model_config": {"models": {"default_opus_model": "managed-opus"}}}
             }
         }
         state = _state(claude_models={"opus": "local-opus", "fable": "local-fable"})
-        models = effective_agent_models(managed, state, "claude")
-        assert models == {"opus": "managed-opus", "fable": "local-fable"}
+        assert effective_agent_models(managed, state, "claude") == {"opus": "managed-opus"}
+
+    def test_unset_families_do_not_inherit_the_default_model(self):
+        # An admin who names only opus is steering people off the other families, so filling them in
+        # from `default_model` would quietly re-enable what they left out.
+        managed = {
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "default_model": "managed-default",
+                        "models": {"default_opus_model": "managed-opus"},
+                    }
+                }
+            }
+        }
+        state = _state(claude_models={"sonnet": "local-sonnet"})
+        assert effective_agent_models(managed, state, "claude") == {"opus": "managed-opus"}
 
     def test_no_manifest_models_falls_back_to_local(self):
         state = _state(claude_models={"sonnet": "local-sonnet"})
@@ -307,3 +326,54 @@ class TestManagedDefaultModel:
         # Nothing lands in the model list, so the launch path must pass the default model into
         # resolve_launch_model rather than relying on state having one.
         assert resolve_state(managed, state, "codex").get("codex_models") is None
+
+
+class TestManagedSuppliesModels:
+    """Whether the config already says which models an agent uses, so discovery can be skipped."""
+
+    def test_true_when_a_family_slot_is_pinned(self):
+        managed = {
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {"models": {"default_opus_model": "system.ai.claude-opus-5"}}
+                }
+            }
+        }
+        assert managed_supplies_models(managed, "claude") is True
+
+    def test_true_for_a_default_model(self):
+        managed = {"enabled_agents": {"codex": {"model_config": {"default_model": "gpt"}}}}
+        assert managed_supplies_models(managed, "codex") is True
+
+    def test_true_for_a_provider(self):
+        # A provider routes by header and pins no Databricks model, so discovery is moot.
+        managed = {
+            "enabled_agents": {
+                "claude": {"model_config": {"model_provider_service": "main.default.mps"}}
+            }
+        }
+        assert managed_supplies_models(managed, "claude") is True
+
+    def test_true_for_a_flat_model_list(self):
+        managed = {"enabled_agents": {"opencode": {"model_config": {"models": ["a", "b"]}}}}
+        assert managed_supplies_models(managed, "opencode") is True
+
+    def test_false_when_the_config_names_no_models(self):
+        # Discovery still has to run, or the launch has nothing to pin.
+        managed = {"enabled_agents": {"claude": {"use_as_global_settings": True}}}
+        assert managed_supplies_models(managed, "claude") is False
+
+    def test_false_for_an_agent_the_config_does_not_cover(self):
+        assert managed_supplies_models(MANAGED, "gemini") is False
+
+    def test_false_for_no_config_at_all(self):
+        # First launch has no persisted copy yet, so discovery runs exactly as it always did.
+        assert managed_supplies_models(None, "claude") is False
+
+    def test_false_when_slots_are_present_but_blank(self):
+        managed = {
+            "enabled_agents": {
+                "claude": {"model_config": {"models": {"default_opus_model": "   "}}}
+            }
+        }
+        assert managed_supplies_models(managed, "claude") is False

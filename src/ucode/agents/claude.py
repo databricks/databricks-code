@@ -184,6 +184,27 @@ def _managed_pinned_model() -> tuple[Path, str] | None:
     return (path, str(env["ANTHROPIC_MODEL"]))
 
 
+def managed_settings_model_overrides() -> Path | None:
+    """Path to enterprise managed settings when they pin a model ucode selects with, else None.
+
+    The enterprise scope outranks the ``--settings`` file ucode passes, so a model set there wins
+    over the one an admin published in the workspace's managed config — and unlike the user and
+    project scopes it can't be excluded with ``--setting-sources``. Callers surface this as a warning
+    so a developer whose models don't match their admin's config knows where to look.
+
+    Only the keys ucode actually writes count. The ``_NAME`` companions in
+    :data:`CLAUDE_MANAGED_MODEL_ENV_KEYS` are picker labels that select nothing, so an enterprise
+    value there can't override anything and warning about it would be noise."""
+    path = _managed_settings_path()
+    if path is None or not path.is_file():
+        return None
+    env = read_json_safe(path).get("env")
+    if not isinstance(env, dict):
+        return None
+    selecting_keys = (key for key in CLAUDE_MANAGED_MODEL_ENV_KEYS if not key.endswith("_NAME"))
+    return path if any(env.get(key) for key in selecting_keys) else None
+
+
 def relayed_proxy_base_url(state: dict) -> str:
     """Loopback base URL for the relayed refresh proxy, allocating a free port
     on first call and caching it in state so config and launch agree."""
