@@ -331,6 +331,76 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
         return None, f"network error: {exc.reason}"
 
 
+# Workspace group whose members are workspace admins. `ucode setup` / `ucode apply` are restricted
+# to this group because the coding-agent-config CRUD API enforces the same check server-side.
+WORKSPACE_ADMIN_GROUP = "admins"
+
+
+def is_workspace_admin(workspace: str, token: str) -> bool | None:
+    """Whether the caller is a workspace admin, via their SCIM `Me` group membership.
+
+    Returns True/False, or None when the check itself could not be made (SCIM unreachable or a
+    malformed response). Callers should treat None as "unknown" and proceed optimistically rather
+    than blocking: the API enforces the same check server-side, so a false negative here would
+    needlessly stop a legitimate admin, while a false positive just surfaces the server's
+    PERMISSION_DENIED later.
+    """
+    hostname = workspace_hostname(workspace)
+    payload, _ = _http_get_json(f"https://{hostname}/api/2.0/preview/scim/v2/Me", token)
+    if not isinstance(payload, dict):
+        return None
+    groups = payload.get("groups")
+    if not isinstance(groups, list):
+        # A well-formed `Me` for a user in no groups omits `groups` entirely, so this is a
+        # definitive "not an admin" rather than a failed check.
+        return False
+    return any(
+        isinstance(group, dict) and group.get("display") == WORKSPACE_ADMIN_GROUP
+        for group in groups
+    )
+
+
+# Workspace-scoped budget listing. Account-level budget APIs need account auth, which ucode does not
+# have; this endpoint resolves the workspace server-side from the caller's token.
+_WORKSPACE_BUDGETS_API_PATH = "/api/ai-gateway/v2/workspace-metrics/budgets"
+
+
+def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str | None]:
+    """List the AI Gateway budgets that apply to this workspace.
+
+    Returns ``(budgets, reason)`` where each budget is ``{"id": ..., "display_name": ...}``.
+    ``reason`` is None on success, otherwise it explains why the list is empty. ucode never creates
+    budgets — an admin picks an existing one to attach a spend-routing policy to.
+    """
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}{_WORKSPACE_BUDGETS_API_PATH}"
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if reason is not None:
+        return [], reason
+    if not isinstance(payload, dict):
+        return [], "workspace budget listing returned an unexpected response shape"
+    raw = payload.get("workspace_ai_gateway_budgets")
+    if not isinstance(raw, list):
+        return [], "workspace budget listing returned no budgets"
+    budgets: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        budget_id = entry.get("budget_configuration_id")
+        if not isinstance(budget_id, str) or not budget_id:
+            continue
+        display_name = entry.get("display_name")
+        budgets.append(
+            {
+                "id": budget_id,
+                "display_name": display_name if isinstance(display_name, str) else "",
+            }
+        )
+    if not budgets:
+        return [], "workspace budget listing returned no budgets"
+    return budgets, None
+
+
 def get_current_user_name(workspace: str, token: str) -> str | None:
     """Return the current user's login (email) via SCIM `Me`, or None on failure.
 
@@ -1321,6 +1391,20 @@ def list_model_services(
     if deduped:
         return deduped, None
     return [], last_reason or "model-services listing returned no models"
+
+
+def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """Every `system.ai.claude-*` id on the workspace, unbucketed.
+
+    `discover_model_services` keeps only the newest id per family because the launch path pins one
+    model per Claude family alias. An admin authoring a managed config needs the alternatives too
+    (see `managed_setup.claude_family_candidates`), so this returns the full set without disturbing
+    that shape.
+    """
+    ids, reason = list_model_services(workspace, token)
+    if not ids:
+        return [], reason
+    return [m for m in ids if "claude-" in m.lower()], None
 
 
 def discover_model_services(

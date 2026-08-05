@@ -268,12 +268,18 @@ def prompt_for_workspace(
             print_err(str(exc))
 
 
-def prompt_for_tools(available: list[tuple[str, str]]) -> list[str]:
+def prompt_for_tools(
+    available: list[tuple[str, str]],
+    preselected: list[str] | set[str] | None = None,
+    prompt: str = "Select coding agents to configure:",
+) -> list[str]:
     """Multi-select picker for coding agents.
 
     `available` is [(tool_id, display_name), ...]. Returns the chosen tool_ids.
-    All options are checked by default so hitting Enter selects everything.
-    Returns [] if the user submits an empty selection.
+    When ``preselected`` is None every option is checked by default, so hitting
+    Enter selects everything; pass a subset to pre-check only those (e.g. the
+    agents an existing managed config already enables). Returns [] if the user
+    submits an empty selection.
     """
     style = questionary.Style(
         [
@@ -287,12 +293,17 @@ def prompt_for_tools(available: list[tuple[str, str]]) -> list[str]:
             ("answer", "fg:cyan"),
         ]
     )
+    preselected_set = {str(item) for item in preselected} if preselected is not None else None
     choices = [
-        questionary.Choice(title=display, value=tool_id, checked=True)
+        questionary.Choice(
+            title=display,
+            value=tool_id,
+            checked=(preselected_set is None or tool_id in preselected_set),
+        )
         for tool_id, display in available
     ]
     answer = questionary.checkbox(
-        "Select coding agents to configure:",
+        prompt,
         choices=choices,
         style=style,
         pointer="›",
@@ -300,6 +311,89 @@ def prompt_for_tools(available: list[tuple[str, str]]) -> list[str]:
         instruction="(space to toggle, enter to confirm)",
     ).ask()
     return list(answer) if answer else []
+
+
+def prompt_for_multi_selection(
+    prompt: str,
+    options: list[tuple[str, str]],
+    preselected: list[str] | set[str] | None = None,
+) -> list[str] | None:
+    """Multi-select picker over arbitrary `(value, label)` options.
+
+    Distinct from :func:`prompt_for_tools`, which is agent-specific and defaults to
+    everything checked: here nothing is checked unless ``preselected`` says so, since
+    an admin picking models wants an explicit choice rather than "all of them".
+    Returns the chosen values, [] on an empty submission, or None if cancelled
+    (Ctrl-C) so callers can distinguish "chose nothing" from "aborted".
+    """
+    style = questionary.Style(
+        [
+            ("pointer", "fg:cyan bold"),
+            ("highlighted", "noinherit"),
+            ("selected", "noinherit"),
+            ("answer", "fg:cyan"),
+        ]
+    )
+    preselected_set = {str(item) for item in preselected} if preselected is not None else set()
+    choices = [
+        questionary.Choice(title=option_label, value=value, checked=value in preselected_set)
+        for value, option_label in options
+    ]
+    answer = questionary.checkbox(
+        prompt,
+        choices=choices,
+        style=style,
+        pointer="›",
+        qmark="",
+        instruction="(space to toggle, enter to confirm)",
+    ).ask()
+    return None if answer is None else list(answer)
+
+
+def prompt_for_text(prompt: str, *, default: str | None = None) -> str | None:
+    """Free-text prompt, used when model discovery found nothing to pick from.
+
+    Returns the trimmed input, ``default`` on an empty answer, or None when there is no
+    default and the user submits nothing (or closes stdin).
+    """
+    hint = f" [{default}]" if default else ""
+    while True:
+        try:
+            raw_value = console.input(f"{label(prompt)}{muted(hint)} {muted('›')} ").strip()
+        except EOFError:
+            return default
+        if raw_value:
+            return raw_value
+        if default is not None:
+            return default
+        print_err("Please enter a value.")
+
+
+def prompt_for_percentage(prompt: str, *, default: float | None = None) -> float:
+    """Prompt for a percentage (0-100) and return it as a fraction in [0, 1].
+
+    Budget tiers are fractions in the API (the server validates 0..1), but admins think in
+    percent — and the spec's own prose says "80%". Prompting in percent and converting here
+    keeps that mismatch in one place instead of at every call site.
+    """
+    hint = f" [{default * 100:g}]" if default is not None else ""
+    while True:
+        try:
+            raw_value = console.input(f"{label(prompt)}{muted(hint)} {muted('› ')}").strip()
+        except EOFError:
+            if default is not None:
+                return default
+            raise
+        if not raw_value and default is not None:
+            return default
+        try:
+            percent = float(raw_value.rstrip("%"))
+        except ValueError:
+            print_err("Please enter a number between 0 and 100.")
+            continue
+        if 0 <= percent <= 100:
+            return percent / 100
+        print_err("Please enter a number between 0 and 100.")
 
 
 def prompt_for_selection(prompt: str, options: list[tuple[str, str]]) -> str | None:

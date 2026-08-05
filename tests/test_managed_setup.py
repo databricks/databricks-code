@@ -421,6 +421,73 @@ class TestClaudeSlots:
         assert variant["models"] == {"default_opus_model": "system.ai.claude-opus-4-8"}
 
 
+class TestClaudeFamilyCandidates:
+    """Discovery keeps one id per family for the launch path; authoring needs the alternatives."""
+
+    ALL = [
+        "system.ai.claude-opus-4-1",
+        "system.ai.claude-opus-4-8",
+        "system.ai.claude-opus-5",
+        "system.ai.claude-sonnet-4-6",
+        "system.ai.claude-sonnet-5",
+        "system.ai.claude-haiku-4-5",
+        "system.ai.gpt-5-6",
+    ]
+
+    def test_groups_by_family(self):
+        from ucode.managed_setup import claude_family_candidates
+
+        got = claude_family_candidates(self.ALL)
+        assert set(got) == {"opus", "sonnet", "haiku"}
+        assert got["haiku"] == ["system.ai.claude-haiku-4-5"]
+
+    def test_newest_first_within_a_family(self):
+        from ucode.managed_setup import claude_family_candidates
+
+        assert claude_family_candidates(self.ALL)["opus"] == [
+            "system.ai.claude-opus-5",
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-opus-4-1",
+        ]
+
+    def test_non_claude_models_are_ignored(self):
+        from ucode.managed_setup import claude_family_candidates
+
+        assert not any(
+            "gpt" in m for models in claude_family_candidates(self.ALL).values() for m in models
+        )
+
+    def test_deduplicates(self):
+        from ucode.managed_setup import claude_family_candidates
+
+        got = claude_family_candidates(["system.ai.claude-opus-5", "system.ai.claude-opus-5"])
+        assert got["opus"] == ["system.ai.claude-opus-5"]
+
+    def test_falls_back_to_the_per_family_picks(self):
+        # Without the full listing, the bucketed state is all that's available — one per family, but
+        # enough for the per-slot prompts to work.
+        from ucode.managed_setup import claude_family_candidates
+
+        got = claude_family_candidates([], {"claude_models": {"opus": "system.ai.claude-opus-5"}})
+        assert got == {"opus": ["system.ai.claude-opus-5"]}
+
+    def test_empty_everything_yields_nothing(self):
+        from ucode.managed_setup import claude_family_candidates
+
+        assert claude_family_candidates([], {}) == {}
+
+    def test_slot_names_match_the_proto(self):
+        # ClaudeDefaultModels fields, verified against ai-gateway-api service.proto.
+        from ucode.managed_setup import CLAUDE_SLOT_FOR_FAMILY
+
+        assert set(CLAUDE_SLOT_FOR_FAMILY.values()) == {
+            "default_fable_model",
+            "default_opus_model",
+            "default_sonnet_model",
+            "default_haiku_model",
+        }
+
+
 class TestValidate:
     def test_full_manifest_is_valid(self):
         assert validate_manifest(_full_manifest(), STATE) == []
@@ -470,6 +537,40 @@ class TestValidate:
             "enabled_agents": {"claude": {"model_config": {"default_model": "system.ai.nope"}}},
         }
         errors = validate_manifest(manifest, STATE)
+        assert any("not available on this workspace" in e for e in errors)
+
+    def test_older_claude_version_is_recognized(self):
+        # `claude_models` holds only the newest per family, so without the full listing an older
+        # version the per-family prompts offered would be wrongly rejected.
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "default_model": "system.ai.claude-opus-4-8",
+                        "models": {"default_opus_model": "system.ai.claude-opus-4-8"},
+                    }
+                }
+            },
+        }
+        state = {
+            "claude_models": {"opus": "system.ai.claude-opus-5"},
+            "all_claude_models": ["system.ai.claude-opus-5", "system.ai.claude-opus-4-8"],
+        }
+        assert validate_manifest(manifest, state) == []
+
+    def test_unknown_claude_version_is_still_rejected(self):
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {"model_config": {"default_model": "system.ai.claude-opus-9-9"}}
+            },
+        }
+        state = {
+            "claude_models": {"opus": "system.ai.claude-opus-5"},
+            "all_claude_models": ["system.ai.claude-opus-5", "system.ai.claude-opus-4-8"],
+        }
+        errors = validate_manifest(manifest, state)
         assert any("not available on this workspace" in e for e in errors)
 
     def test_model_check_skipped_without_state(self):
@@ -585,6 +686,106 @@ class TestValidate:
         }
         errors = validate_manifest(manifest, STATE)
         assert any("default_model is required" in e for e in errors)
+
+    def test_tier_model_must_be_one_the_agent_has(self):
+        # The server only checks that the tier's agent is enabled, so without this a tier activates
+        # and hands the developer a model their agent was never configured with.
+        manifest = {
+            "default_agent": "pi",
+            "enabled_agents": {
+                "pi": {
+                    "model_config": {
+                        "default_model": "system.ai.kimi-k2-6",
+                        "models": ["system.ai.kimi-k2-6"],
+                    }
+                }
+            },
+            "budget_policy": {
+                "budget_id": "b",
+                "tiers": [
+                    {
+                        "spending_percentage": 0.8,
+                        "default_agent": "pi",
+                        "default_model": "system.ai.gpt-5-6",
+                    }
+                ],
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("is not one of the models configured for 'pi'" in e for e in errors), errors
+
+    def test_tier_model_from_the_agents_list_is_accepted(self):
+        manifest = {
+            "default_agent": "pi",
+            "enabled_agents": {
+                "pi": {
+                    "model_config": {
+                        "default_model": "system.ai.kimi-k2-6",
+                        "models": ["system.ai.kimi-k2-6", "system.ai.gpt-5-6"],
+                    }
+                }
+            },
+            "budget_policy": {
+                "budget_id": "b",
+                "tiers": [
+                    {
+                        "spending_percentage": 0.8,
+                        "default_agent": "pi",
+                        "default_model": "system.ai.gpt-5-6",
+                    }
+                ],
+            },
+        }
+        assert validate_manifest(manifest, STATE) == []
+
+    def test_tier_model_matching_a_claude_family_slot_is_accepted(self):
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "default_model": "system.ai.claude-opus-4-8",
+                        "models": {"default_sonnet_model": "system.ai.claude-sonnet-4-6"},
+                    }
+                }
+            },
+            "budget_policy": {
+                "budget_id": "b",
+                "tiers": [
+                    {
+                        "spending_percentage": 0.8,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-sonnet-4-6",
+                    }
+                ],
+            },
+        }
+        assert validate_manifest(manifest, STATE) == []
+
+    def test_tier_model_check_skipped_when_the_agent_lists_nothing(self):
+        # A provider-service agent has no enumerable catalog, so there is nothing to check against.
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "model_provider_service": "main.default.anthropic-mps",
+                        "default_model": "claude-sonnet-5",
+                    }
+                }
+            },
+            "budget_policy": {
+                "budget_id": "b",
+                "tiers": [
+                    {
+                        "spending_percentage": 0.8,
+                        "default_agent": "claude",
+                        "default_model": "claude-sonnet-5",
+                    }
+                ],
+            },
+        }
+        assert validate_manifest(manifest, STATE) == []
 
     def test_budget_policy_alone_still_requires_a_default_agent(self):
         errors = validate_manifest({"budget_policy": {"budget_id": "b"}})
