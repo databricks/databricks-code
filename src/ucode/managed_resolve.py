@@ -62,20 +62,20 @@ def effective_agent_models(managed: dict, state: dict, tool: str) -> dict | list
 
     Once the manifest says anything about ``tool``'s models it is the whole allowlist: the
     developer's discovered models drop out entirely, so a launch can only reach models the admin
-    named. Each claude family resolves to its own slot, or to ``default_model`` when that slot is
-    unset; with neither set the family is left out, so ucode writes no
-    ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` and the agent uses its own default rather than a model the
-    admin never sanctioned. Every other agent stores a flat list, which has no per-key identity —
-    there the manifest's list replaces the local one outright. Only when the manifest names nothing
-    for ``tool`` does the developer's own list stand.
+    named. Each claude family resolves only to its own slot — a family the manifest leaves out stays
+    unset rather than inheriting ``default_model``, so ucode writes no
+    ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` for it and the agent falls back to its own default. Omitting
+    a family is how an admin steers people off it, and filling it in with ``default_model`` would
+    quietly re-enable what they left out. Every other agent stores a flat list, which has no per-key
+    identity — there the manifest's list replaces the local one outright. Only when the manifest
+    names nothing for ``tool`` does the developer's own list stand.
     """
     model_config = _agent_model_config(managed, tool)
     manifest_models = model_config.get("models")
-    default_model = _str(model_config.get("default_model"))
     if tool == "claude":
         slots: dict[str, str] = {}
         for slot, family in _CLAUDE_FAMILY_SLOTS.items():
-            model = _str(_as_dict(manifest_models).get(slot)) or default_model
+            model = _str(_as_dict(manifest_models).get(slot))
             if model:
                 slots[family] = model
         if slots:

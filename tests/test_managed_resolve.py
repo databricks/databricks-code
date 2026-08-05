@@ -59,13 +59,12 @@ def _state(**overrides) -> dict:
 class TestClaudeModels:
     def test_proto_slots_map_to_families(self):
         # The manifest keeps proto spelling (`default_opus_model`); render_overlay reads `opus`.
-        # `fable` has no slot in this manifest, so it takes the config's `default_model`.
+        # `fable` has no slot here, so it stays unset rather than inheriting `default_model`.
         models = effective_agent_models(MANAGED, _state(), "claude")
         assert models == {
             "opus": "system.ai.claude-opus-5",
             "sonnet": "system.ai.claude-sonnet-4-6",
             "haiku": "system.ai.claude-haiku-4-5",
-            "fable": "system.ai.claude-opus-5",
         }
 
     def test_manifest_wins_over_local_per_family(self):
@@ -85,7 +84,9 @@ class TestClaudeModels:
         state = _state(claude_models={"opus": "local-opus", "fable": "local-fable"})
         assert effective_agent_models(managed, state, "claude") == {"opus": "managed-opus"}
 
-    def test_unset_families_fall_back_to_the_configs_default_model(self):
+    def test_unset_families_do_not_inherit_the_default_model(self):
+        # An admin who names only opus is steering people off the other families, so filling them in
+        # from `default_model` would quietly re-enable what they left out.
         managed = {
             "enabled_agents": {
                 "claude": {
@@ -97,12 +98,7 @@ class TestClaudeModels:
             }
         }
         state = _state(claude_models={"sonnet": "local-sonnet"})
-        assert effective_agent_models(managed, state, "claude") == {
-            "opus": "managed-opus",
-            "sonnet": "managed-default",
-            "haiku": "managed-default",
-            "fable": "managed-default",
-        }
+        assert effective_agent_models(managed, state, "claude") == {"opus": "managed-opus"}
 
     def test_no_manifest_models_falls_back_to_local(self):
         state = _state(claude_models={"sonnet": "local-sonnet"})
