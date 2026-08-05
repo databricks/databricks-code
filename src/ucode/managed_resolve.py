@@ -86,6 +86,16 @@ def managed_provider_service(managed: dict, tool: str) -> str | None:
     return _str(_agent_model_config(managed, tool).get("model_provider_service"))
 
 
+def managed_default_model(managed: dict, tool: str) -> str | None:
+    """Return the model the managed config wants ``tool`` to launch on, if it names one.
+
+    Distinct from the family slots :func:`effective_agent_models` resolves: those set what each
+    family shortcut maps to, while this is the model the session actually starts on. The launch path
+    pins it explicitly, so the admin's choice holds even for agents that would otherwise pick their
+    own default."""
+    return _str(_agent_model_config(managed, tool).get("default_model"))
+
+
 def resolve_state(managed: dict, state: dict, tool: str) -> dict:
     """Return a copy of ``state`` with ``tool``'s managed values layered on top.
 

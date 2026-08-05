@@ -11,6 +11,7 @@ import ucode.config_io as config_io
 import ucode.state as state_mod
 from ucode.managed_resolve import (
     effective_agent_models,
+    managed_default_model,
     managed_provider_service,
     resolve_state,
 )
@@ -282,3 +283,27 @@ class TestStateFileIsNotRewritten:
         full = json.loads((tmp_path / "state.json").read_text())
         assert full["workspaces"][WORKSPACE][models_key] == ["mine"]
         assert resolved_state[models_key] == managed_models
+
+
+class TestManagedDefaultModel:
+    """The model a launch starts on, which is separate from the family slots."""
+
+    def test_returns_the_manifest_default_model(self):
+        assert managed_default_model(MANAGED, "claude") == "system.ai.claude-opus-5"
+
+    def test_none_when_the_manifest_names_no_default(self):
+        managed = {"enabled_agents": {"claude": {"model_config": {"models": {}}}}}
+        assert managed_default_model(managed, "claude") is None
+
+    def test_none_for_agent_not_in_manifest(self):
+        assert managed_default_model({}, "codex") is None
+
+    def test_survives_a_config_with_no_model_list(self):
+        # CodexModelConfig has no `models` field at all, so default_model is the only model an
+        # admin can set — it has to be usable on its own or a codex launch can't honor the config.
+        managed = {"enabled_agents": {"codex": {"model_config": {"default_model": "admin-codex"}}}}
+        state = {"workspace": WORKSPACE, "managed_configs": {"codex": {"keys": []}}}
+        assert managed_default_model(managed, "codex") == "admin-codex"
+        # Nothing lands in the model list, so the launch path must pass the default model into
+        # resolve_launch_model rather than relying on state having one.
+        assert resolve_state(managed, state, "codex").get("codex_models") is None
