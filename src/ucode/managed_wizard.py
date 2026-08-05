@@ -22,6 +22,7 @@ from ucode.databricks import (
     discover_claude_models_unbucketed,
     ensure_databricks_auth,
     get_databricks_token,
+    has_cached_model_provider_services,
     is_model_provider_feature_unavailable,
     is_workspace_admin,
     list_model_provider_services,
@@ -42,10 +43,11 @@ from ucode.managed_setup import (
 from ucode.state import load_state
 from ucode.ui import (
     console,
+    kv_line,
     print_err,
     print_heading,
-    print_kv,
     print_note,
+    print_panel,
     print_section,
     print_success,
     print_warning,
@@ -183,8 +185,14 @@ def _select_provider_service(tool: str, workspace: str, token: str) -> dict | No
         return None
 
     display = TOOL_SPECS[tool]["display"]
-    with spinner(f"Checking for model provider services for {display}..."):
+    # The listing is memoized per workspace, so only the first agent's call does any I/O. That one
+    # takes over a second and deserves a spinner; the rest are instant, and spinning once per agent
+    # made the wizard look like it re-listed the services every time.
+    if has_cached_model_provider_services(workspace):
         services, reason = list_model_provider_services(workspace, token)
+    else:
+        with spinner("Checking for model provider services..."):
+            services, reason = list_model_provider_services(workspace, token)
     if reason is not None:
         # A workspace without the feature enabled is the common case and not worth a warning; any
         # other failure is worth surfacing, or the admin silently loses the MPS option and has no
@@ -217,6 +225,7 @@ def _select_provider_service(tool: str, workspace: str, token: str) -> dict | No
     selected = prompt_for_selection(
         f"Select the model provider service for {display}:",
         [(service["name"], service["name"]) for service in usable],
+        searchable=True,
     )
     if not selected:
         return None
@@ -323,8 +332,11 @@ def _prompt_claude_models(state: dict) -> dict:
     filled, so it can never name a model the config doesn't carry.
     """
     display = TOOL_SPECS["claude"]["display"]
-    with spinner(f"Fetching Claude models for {display}..."):
-        candidates = _claude_candidates(state)
+    # No spinner: the model-services listing is already cached by the time the flow reaches here
+    # (`configure_shared_state` walked it up front), so this is a filter over data in hand, not a
+    # fetch. Showing "Fetching Claude models..." made the wizard look like it listed the catalog
+    # twice.
+    candidates = _claude_candidates(state)
     if not candidates:
         print_warning(f"No Claude models were discovered for {display} on this workspace.")
         return {"default_model": _require_text(f"Default model for {display}")}
@@ -341,6 +353,7 @@ def _prompt_claude_models(state: dict) -> dict:
         choice = prompt_for_selection(
             f"Default {family} model:",
             [(model, model) for model in family_models] + [(_SKIP_FAMILY, f"(skip {family})")],
+            searchable=True,
         )
         if choice is None:
             raise KeyboardInterrupt
@@ -401,6 +414,10 @@ def _claude_candidates(state: dict) -> dict[str, list[str]]:
     return claude_family_candidates(all_claude, state)
 
 
+# Every picker in this flow chooses a model, a provider service, or a budget — lists that on a real
+# workspace run to a dozen-plus entries (16 GPT models on the workspace this was built against), so
+# they are all filterable by typing. That trades away j/k navigation, which questionary can't offer
+# alongside search; arrow keys still work.
 def _require_selection(prompt: str, options: list[tuple[str, str]]) -> str:
     """Single-select that won't take "nothing" for an answer.
 
@@ -409,7 +426,7 @@ def _require_selection(prompt: str, options: list[tuple[str, str]]) -> str:
     dismissed without a choice — re-ask instead of silently producing a model-less config.
     """
     while True:
-        answer = prompt_for_selection(prompt, options)
+        answer = prompt_for_selection(prompt, options, searchable=True)
         if answer:
             return answer
         print_err("Please choose one of the options.")
@@ -420,7 +437,9 @@ def _require_multi_selection(
 ) -> list[str]:
     """Multi-select that requires at least one choice. None (Ctrl-C) still aborts."""
     while True:
-        picked = prompt_for_multi_selection(prompt, options, preselected=preselected)
+        picked = prompt_for_multi_selection(
+            prompt, options, preselected=preselected, searchable=True
+        )
         if picked is None:
             raise KeyboardInterrupt
         if picked:
@@ -494,6 +513,7 @@ def _prompt_budget_policy(
             (budget["id"], f"{budget['display_name'] or budget['id']} ({budget['id']})")
             for budget in budgets
         ],
+        searchable=True,
     )
     if not budget_id:
         return None
@@ -527,7 +547,9 @@ def _prompt_budget_policy(
         if not options:
             options = model_options_for_agent(agent, state)
         if options:
-            model = prompt_for_selection(f"Tier {index}: which model?", [(m, m) for m in options])
+            model = prompt_for_selection(
+                f"Tier {index}: which model?", [(m, m) for m in options], searchable=True
+            )
         else:
             model = prompt_for_text(f"Tier {index}: which model?")
         if not model:
@@ -549,12 +571,19 @@ def _prompt_budget_policy(
 
 
 def _render_summary(workspace: str, manifest: dict) -> None:
-    """Print the authored config so an admin can eyeball it before publishing."""
-    print_heading("Configuration summary")
-    print_kv("Workspace", workspace)
+    """Print the authored config in a box so an admin can eyeball it before publishing.
+
+    Boxed rather than printed as loose lines: this is the one block an admin is meant to read as a
+    whole and check against what they intended, and it lands after a long flow of prompts.
+    """
+    lines: list[str] = [kv_line("Workspace", workspace)]
     default_agent = manifest.get("default_agent")
     if isinstance(default_agent, str):
-        print_kv("Default agent", TOOL_SPECS.get(default_agent, {}).get("display", default_agent))
+        lines.append(
+            kv_line(
+                "Default agent", TOOL_SPECS.get(default_agent, {}).get("display", default_agent)
+            )
+        )
 
     for tool, agent_config in (manifest.get("enabled_agents") or {}).items():
         display = TOOL_SPECS.get(tool, {}).get("display", tool)
@@ -564,37 +593,43 @@ def _render_summary(workspace: str, manifest: dict) -> None:
         if provider:
             detail = f"{detail} via {provider}"
         scope = "machine-wide" if agent_config.get("use_as_global_settings") else "per-user"
-        print_kv(display, f"{detail} ({scope})")
+        lines.append(kv_line(display, f"{detail} ({scope})"))
         # Spell out the per-family slots and model lists: the one-line default alone doesn't show
         # which families an admin configured, which is most of what they chose for claude.
         models = model_config.get("models")
         if isinstance(models, dict):
             for slot, model in models.items():
                 family = slot.removeprefix("default_").removesuffix("_model")
-                print_kv(f"  {family}", str(model))
+                lines.append(kv_line(f"  {family}", str(model)))
         elif isinstance(models, list) and len(models) > 1:
-            print_kv("  models", ", ".join(str(m) for m in models))
+            lines.append(kv_line("  models", ", ".join(str(m) for m in models)))
 
     mcp_servers = manifest.get("mcp_servers") or []
-    print_kv(
-        "MCP servers",
-        ", ".join(str(server.get("name")) for server in mcp_servers) if mcp_servers else "none",
+    lines.append(
+        kv_line(
+            "MCP servers",
+            ", ".join(str(server.get("name")) for server in mcp_servers) if mcp_servers else "none",
+        )
     )
     skills = (manifest.get("skills") or {}).get("names") or []
-    print_kv("Skills", ", ".join(skills) if skills else "none")
-    print_kv("Tracing", manifest.get("tracing_table") or "disabled")
+    lines.append(kv_line("Skills", ", ".join(skills) if skills else "none"))
+    lines.append(kv_line("Tracing", manifest.get("tracing_table") or "disabled"))
 
     policy = manifest.get("budget_policy")
     if isinstance(policy, dict):
         tiers = policy.get("tiers") or []
-        print_kv("Budget policy", policy.get("display_name") or policy.get("budget_id") or "set")
+        lines.append(
+            kv_line("Budget policy", policy.get("display_name") or policy.get("budget_id") or "set")
+        )
         for tier in tiers:
             agent = tier.get("default_agent")
             display = TOOL_SPECS.get(agent, {}).get("display", agent)
             percent = float(tier.get("spending_percentage", 0)) * 100
-            print_kv(f"  at {percent:g}%", f"{display} / {tier.get('default_model')}")
+            lines.append(kv_line(f"  at {percent:g}%", f"{display} / {tier.get('default_model')}"))
     else:
-        print_kv("Budget policy", "none")
+        lines.append(kv_line("Budget policy", "none"))
+
+    print_panel("Configuration summary", lines)
 
 
 def _require_admin(workspace: str, token: str) -> None:
@@ -620,7 +655,12 @@ def _require_admin(workspace: str, token: str) -> None:
 
 
 def _warn_on_existing_config(workspace: str, token: str) -> None:
-    """Warn when the workspace already has a published config that `ucode apply` would replace."""
+    """Warn when the workspace already has a published config that `ucode apply` would replace.
+
+    Deliberately doesn't itemize what the existing config holds. The admin doesn't need an inventory
+    to act on this — the instruction is the same either way ("include everything you want to keep")
+    — and `ucode setup show` prints the real thing for anyone who wants to compare.
+    """
     with spinner("Checking for an existing managed config..."):
         existing, reason = get_managed_config(workspace, token)
     if reason is not None:
@@ -628,10 +668,10 @@ def _warn_on_existing_config(workspace: str, token: str) -> None:
         return
     if existing is None:
         return
-    agents = ", ".join((existing.get("enabled_agents") or {}).keys()) or "no agents"
     print_warning(
-        f"This workspace already has a published config ({agents}). Publishing will replace it "
-        "outright — there is no partial update yet, so anything you skip here will be dropped."
+        "This workspace already has a managed configuration — one config covers every agent, MCP "
+        "server, skill, tracing table, and budget policy for the whole workspace. Publishing "
+        "replaces all of it, so make sure this run includes everything you want to keep."
     )
 
 
@@ -680,8 +720,10 @@ def setup_from_file(path: str) -> int:
 def _print_next_steps() -> None:
     console.print()
     print_heading("Next steps")
-    print_note("Try it locally without publishing:  ucode configure --dry-run")
-    print_note("Publish it to the workspace:        ucode apply")
+    # Deliberately only `apply`. There is no way yet to try the authored config locally: the
+    # manifest describes what developers should get, while `ucode configure --dry-run` previews
+    # this machine's own agent configs, so pointing at it implied a local test it doesn't perform.
+    print_note("Publish it to the workspace:  ucode apply")
 
 
 def setup_command(from_file: str | None = None) -> int:
@@ -702,7 +744,10 @@ def setup_command(from_file: str | None = None) -> int:
     print_note("Developers pull it automatically when they run ucode.")
 
     workspace, profile = _prompt_for_configuration()
-    ensure_databricks_auth(workspace, profile)
+    # `configure_shared_state` below authenticates too and prints its own success line, so this one
+    # stays quiet rather than reporting the same thing twice. It still has to run first: the admin
+    # gate and the existing-config check both need a token before discovery.
+    ensure_databricks_auth(workspace, profile, quiet=True)
     token = get_databricks_token(workspace, profile)
 
     _require_admin(workspace, token)

@@ -176,15 +176,39 @@ class TestAdminGate:
 
 
 class TestExistingConfigWarning:
-    def test_warns_when_a_config_already_exists(self):
-        existing = {"enabled_agents": {"claude": {}}}
+    @staticmethod
+    def _warn(existing: dict) -> str:
         with (
             patch.object(wizard, "get_managed_config", return_value=(existing, None)),
             patch.object(wizard, "print_warning") as warn,
         ):
             wizard._warn_on_existing_config(WORKSPACE, "token")
         assert warn.called
-        assert "replace it" in warn.call_args[0][0]
+        return warn.call_args[0][0]
+
+    def test_warns_that_publishing_replaces_the_whole_config(self):
+        message = self._warn({"enabled_agents": {"claude": {}, "codex": {}}})
+        # There is one config per workspace covering everything, so the warning says that rather
+        # than reading like a per-agent notice.
+        assert "one config covers every agent" in message
+        assert "replaces all of it" in message
+        assert "everything you want to keep" in message
+
+    def test_warning_does_not_itemize_the_existing_config(self):
+        # The message is the same whatever the config holds: an inventory doesn't change what the
+        # admin should do, and `ucode setup show` prints the real thing for comparison.
+        rich = self._warn(
+            {
+                "enabled_agents": {"claude": {}, "opencode": {}, "pi": {}},
+                "mcp_servers": [{"name": "a", "type": "sql"}],
+                "skills": {"names": ["main.default"]},
+                "tracing_table": "main.default.traces",
+                "budget_policy": {"display_name": "lillys_budget", "budget_id": "abc"},
+            }
+        )
+        assert rich == self._warn({"enabled_agents": {}})
+        for leaked in ("Claude Code", "OpenCode", "lillys_budget", "main.default"):
+            assert leaked not in rich, leaked
 
     def test_silent_when_no_config_exists(self):
         with (
@@ -222,7 +246,7 @@ class TestModelPrompting:
         }
         asked: list[str] = []
 
-        def fake_sel(prompt, options):
+        def fake_sel(prompt, options, **kwargs):
             asked.append(prompt)
             return [v for v, _ in options][0]
 
@@ -243,7 +267,7 @@ class TestModelPrompting:
         candidates = {"opus": ["system.ai.claude-opus-5", "system.ai.claude-opus-4-8"]}
         offered: list[list[str]] = []
 
-        def fake_sel(prompt, options):
+        def fake_sel(prompt, options, **kwargs):
             values = [v for v, _ in options]
             offered.append(values)
             return values[1]  # pick the older opus on purpose
@@ -265,7 +289,7 @@ class TestModelPrompting:
             "sonnet": ["system.ai.claude-sonnet-5"],
         }
 
-        def fake_sel(prompt, options):
+        def fake_sel(prompt, options, **kwargs):
             values = [v for v, _ in options]
             return wizard._SKIP_FAMILY if "sonnet" in prompt else values[0]
 
@@ -286,7 +310,7 @@ class TestModelPrompting:
         }
         prompts: list[list[str]] = []
 
-        def fake_sel(prompt, options):
+        def fake_sel(prompt, options, **kwargs):
             values = [v for v, _ in options]
             prompts.append(values)
             return values[0]
@@ -307,7 +331,7 @@ class TestModelPrompting:
         candidates = {"opus": ["system.ai.claude-opus-5"]}
         calls = {"n": 0}
 
-        def fake_sel(prompt, options):
+        def fake_sel(prompt, options, **kwargs):
             calls["n"] += 1
             return [v for v, _ in options][0]
 
@@ -335,7 +359,7 @@ class TestModelPrompting:
         # learn that the default is set, and to what.
         candidates = {"opus": ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]}
 
-        def fake_sel(prompt, options):
+        def fake_sel(prompt, options, **kwargs):
             if prompt.startswith("Default opus"):
                 return "system.ai.claude-opus-4-8"
             return wizard._SKIP_FAMILY
@@ -362,7 +386,7 @@ class TestModelPrompting:
         }
         offered: list[list[str]] = []
 
-        def fake_sel(prompt, options):
+        def fake_sel(prompt, options, **kwargs):
             values = [v for v, _ in options]
             offered.append(values)
             if prompt.startswith("Default "):
@@ -469,7 +493,7 @@ class TestModelPrompting:
         # arbitrary config.
         captured: dict = {}
 
-        def fake_multi(prompt, options, preselected=None):
+        def fake_multi(prompt, options, preselected=None, **kwargs):
             captured["preselected"] = preselected
             return [v for v, _ in options][:1]
 
@@ -679,6 +703,52 @@ OPENAI_SERVICE = {
     "allow_all_targets": False,
     "relayed": False,
 }
+
+
+class TestProviderServiceSpinner:
+    """The MPS listing is cached per workspace, so only the first agent's lookup does any I/O."""
+
+    SERVICES = [
+        {
+            "name": "main.j.ant",
+            "provider_type": "anthropic",
+            "targets": ["claude-opus-5"],
+            "allow_all_targets": False,
+            "relayed": False,
+        }
+    ]
+
+    def test_spinner_shows_once_not_once_per_agent(self):
+        # The reported symptom: "Checking for model provider services for <agent>..." appeared for
+        # every configured agent even though the listing had already been fetched.
+        spins: list[str] = []
+        cached = {"yes": False}
+
+        def fake_list(workspace, token, **kwargs):
+            cached["yes"] = True
+            return list(self.SERVICES), None
+
+        def fake_spinner(message):
+            spins.append(message)
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+        with (
+            patch.object(wizard, "list_model_provider_services", side_effect=fake_list),
+            patch.object(
+                wizard, "has_cached_model_provider_services", side_effect=lambda ws: cached["yes"]
+            ),
+            patch.object(wizard, "spinner", side_effect=fake_spinner),
+            patch.object(wizard, "prompt_for_selection", return_value="databricks"),
+        ):
+            wizard._select_provider_service("claude", WORKSPACE, "tok")
+            wizard._select_provider_service("codex", WORKSPACE, "tok")
+
+        listing_spins = [m for m in spins if "provider service" in m]
+        assert len(listing_spins) == 1, listing_spins
+        # And it doesn't name an agent, since one lookup covers them all.
+        assert "Claude Code" not in listing_spins[0]
 
 
 class TestProviderServiceSelection:
@@ -1077,6 +1147,78 @@ class TestShowCommand:
         out = capsys.readouterr().out
         # The proto enum spelling is what `apply` sends, so it must appear verbatim.
         assert "CODING_AGENT_CLAUDE_CODE" in out
+
+
+class TestSummaryPanel:
+    def test_summary_is_boxed(self, capsys):
+        # The summary is the one block an admin reads as a whole to check against what they
+        # intended, and it lands after a long flow of prompts — so it gets a box rather than loose
+        # lines that blend into the preceding output.
+        wizard._render_summary(
+            WORKSPACE,
+            {
+                "default_agent": "claude",
+                "enabled_agents": {
+                    "claude": {"model_config": {"default_model": "system.ai.claude-opus-5"}}
+                },
+            },
+        )
+        out = capsys.readouterr().out
+        assert "Configuration summary" in out
+        # Rich box-drawing characters: the panel border.
+        assert "╭" in out and "╰" in out
+        assert "system.ai.claude-opus-5" in out
+
+
+class TestSearchablePickers:
+    """Long lists (models, provider services, budgets) filter as you type."""
+
+    def test_model_pickers_are_searchable(self):
+        seen: list[dict] = []
+
+        def fake_multi(prompt, options, preselected=None, **kwargs):
+            seen.append(kwargs)
+            return [options[0][0]]
+
+        with patch.object(wizard, "prompt_for_multi_selection", side_effect=fake_multi):
+            wizard._require_multi_selection("pick", [("a", "a"), ("b", "b")])
+        assert seen[0].get("searchable") is True
+
+    def test_single_select_pickers_are_searchable(self):
+        seen: list[dict] = []
+
+        def fake_sel(prompt, options, **kwargs):
+            seen.append(kwargs)
+            return options[0][0]
+
+        with patch.object(wizard, "prompt_for_selection", side_effect=fake_sel):
+            wizard._require_selection("pick", [("a", "a"), ("b", "b")])
+        assert seen[0].get("searchable") is True
+
+    def test_budget_and_tier_pickers_are_searchable(self):
+        budgets = [{"id": "budget-1", "display_name": "eng"}]
+        searchable_prompts: list[str] = []
+
+        def fake_sel(prompt, options, **kwargs):
+            if kwargs.get("searchable"):
+                searchable_prompts.append(prompt)
+            if "budget" in prompt:
+                return "budget-1"
+            if "agent" in prompt:
+                return "claude"
+            return "system.ai.claude-opus-4-8"
+
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(wizard, "prompt_for_selection", side_effect=fake_sel),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+        ):
+            wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        # Both the budget list and the tier's model list filter as you type.
+        assert any("budget" in p for p in searchable_prompts), searchable_prompts
+        assert any("model" in p for p in searchable_prompts), searchable_prompts
 
 
 class TestCliWiring:

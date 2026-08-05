@@ -913,12 +913,20 @@ def run_databricks_login(workspace: str, profile: str | None = None) -> None:
     print_success("Databricks authentication complete")
 
 
-def ensure_databricks_auth(workspace: str, profile: str | None = None) -> None:
-    """Check auth and login only if needed (used by launch path)."""
+def ensure_databricks_auth(
+    workspace: str, profile: str | None = None, *, quiet: bool = False
+) -> None:
+    """Check auth and login only if needed (used by launch path).
+
+    ``quiet`` suppresses the "already available" line for a caller that only needs a token before
+    some later step re-authenticates and reports it — otherwise the same success prints twice. A
+    login that actually runs is never silent.
+    """
     with spinner("Checking Databricks auth..."):
         auth_is_valid = has_valid_databricks_auth(workspace, profile)
     if auth_is_valid:
-        print_success(f"Databricks auth already available for {workspace}")
+        if not quiet:
+            print_success(f"Databricks auth already available for {workspace}")
         return
     run_databricks_login(workspace, profile)
 
@@ -1342,12 +1350,42 @@ def _get_model_services_page(
     return payload, reason
 
 
+# Successful model-service listings for this process, keyed by workspace. The listing is a paginated
+# walk of the whole metastore catalog, and several callers want different views of the same result
+# (`discover_model_services` buckets it per family, `discover_claude_models_unbucketed` keeps the raw
+# Claude ids), so a single `ucode setup` run would otherwise page it twice. Cached per process, not
+# persisted: a long-lived process is not a thing here, and a new model appearing mid-command is not
+# worth a second walk. Failures are never cached, so a transient error still retries.
+_MODEL_SERVICES_CACHE: dict[str, list[str]] = {}
+
+# Same idea for the Model Provider Service listing (a different endpoint). It is workspace-wide and
+# filtered per agent afterwards, so `ucode setup` would otherwise re-list it once per MPS-capable
+# agent.
+_MODEL_PROVIDER_SERVICES_CACHE: dict[str, list[dict]] = {}
+
+
+def clear_model_services_cache() -> None:
+    """Forget cached model-service listings (used by tests, and after a workspace switch)."""
+    _MODEL_SERVICES_CACHE.clear()
+    _MODEL_PROVIDER_SERVICES_CACHE.clear()
+
+
+def has_cached_model_provider_services(workspace: str) -> bool:
+    """True when :func:`list_model_provider_services` will answer from cache.
+
+    Lets a caller skip a progress spinner it doesn't need: the cold listing takes over a second, so
+    it deserves one, but repeating it per agent on an instant cache hit is just noise.
+    """
+    return workspace in _MODEL_PROVIDER_SERVICES_CACHE
+
+
 def list_model_services(
     workspace: str,
     token: str,
     *,
     page_size: int = _MODEL_SERVICES_PAGE_SIZE,
     max_pages: int = 100,
+    use_cache: bool = True,
 ) -> tuple[list[str], str | None]:
     """List all `system.ai.*` model ids via the UC model-services API.
 
@@ -1356,7 +1394,15 @@ def list_model_services(
     de-duplicated, sorted list of ``system.ai.<model-name>`` ids. Returns
     (ids, reason); reason is None on success, otherwise it describes why the
     list is empty (HTTP/network error or no services).
+
+    A successful result is memoized per workspace for the life of the process; pass
+    ``use_cache=False`` to force a fresh walk.
     """
+    if use_cache:
+        cached = _MODEL_SERVICES_CACHE.get(workspace)
+        if cached is not None:
+            return list(cached), None
+
     hostname = workspace_hostname(workspace)
     ids: list[str] = []
     page_token: str | None = None
@@ -1389,6 +1435,8 @@ def list_model_services(
 
     deduped = sorted(set(ids))
     if deduped:
+        if use_cache:
+            _MODEL_SERVICES_CACHE[workspace] = list(deduped)
         return deduped, None
     return [], last_reason or "model-services listing returned no models"
 
@@ -1579,7 +1627,9 @@ def _provider_type_tag(provider_type: str | None) -> str:
     return tag.lower()
 
 
-def list_model_provider_services(workspace: str, token: str) -> tuple[list[dict], str | None]:
+def list_model_provider_services(
+    workspace: str, token: str, *, use_cache: bool = True
+) -> tuple[list[dict], str | None]:
     """List Unity Catalog Model Provider Services on the workspace.
 
     Returns ``(services, reason)`` where each service is
@@ -1589,7 +1639,20 @@ def list_model_provider_services(workspace: str, token: str) -> tuple[list[dict]
     Bedrock model names). ``relayed`` is True for a credential-less Anthropic
     service (Claude Max/Team/Enterprise subscription relay). A non-None
     ``reason`` means the listing call itself failed.
+
+    The listing is workspace-wide — it is filtered per agent afterwards by
+    :func:`service_usable_for_tool` — so a successful result is memoized per workspace for the life
+    of the process, like the model-services listing. Without that, `ucode setup` re-lists it once
+    per MPS-capable agent. Pass ``use_cache=False`` to force a fresh call.
     """
+    if use_cache:
+        cached = _MODEL_PROVIDER_SERVICES_CACHE.get(workspace)
+        if cached is not None:
+            # A fresh list of fresh dicts each time: callers treat the result as theirs (the wizard
+            # filters it per agent), so handing out the cached objects would let one caller's edit
+            # reach the next.
+            return [dict(service) for service in cached], None
+
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}/api/2.1/unity-catalog/model-provider-services"
     payload, reason = _http_get_json(url, token, timeout=30)
@@ -1626,6 +1689,8 @@ def list_model_provider_services(workspace: str, token: str) -> tuple[list[dict]
             }
         )
     services.sort(key=lambda s: s["name"])
+    if use_cache:
+        _MODEL_PROVIDER_SERVICES_CACHE[workspace] = [dict(service) for service in services]
     return services, None
 
 

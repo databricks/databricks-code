@@ -51,6 +51,22 @@ def print_kv(key: str, val: str) -> None:
     console.print(f"  [bold]{key}:[/bold] [cyan]{val}[/cyan]")
 
 
+def kv_line(key: str, val: str) -> str:
+    """A `print_kv`-styled line, returned instead of printed, for collecting into a panel."""
+    return f"[bold]{key}:[/bold] [cyan]{val}[/cyan]"
+
+
+def print_panel(title: str, lines: list[str]) -> None:
+    """Render `lines` inside a titled box.
+
+    Unlike :func:`print_section`, which boxes a bare title, this boxes the body — so a block that
+    should be read as one unit (a config summary an admin is about to publish) reads as one, rather
+    than as loose lines that blend into whatever the flow printed before it.
+    """
+    console.print()
+    console.print(Panel("\n".join(lines), title=title, style="blue", expand=False))
+
+
 def print_note(text: str) -> None:
     console.print(f"[dim]•[/dim] {text}")
 
@@ -317,6 +333,8 @@ def prompt_for_multi_selection(
     prompt: str,
     options: list[tuple[str, str]],
     preselected: list[str] | set[str] | None = None,
+    *,
+    searchable: bool = False,
 ) -> list[str] | None:
     """Multi-select picker over arbitrary `(value, label)` options.
 
@@ -325,6 +343,9 @@ def prompt_for_multi_selection(
     an admin picking models wants an explicit choice rather than "all of them".
     Returns the chosen values, [] on an empty submission, or None if cancelled
     (Ctrl-C) so callers can distinguish "chose nothing" from "aborted".
+
+    ``searchable`` lets the user narrow a long list by typing; see
+    :func:`prompt_for_selection` for why it trades away j/k navigation.
     """
     style = questionary.Style(
         [
@@ -339,13 +360,18 @@ def prompt_for_multi_selection(
         questionary.Choice(title=option_label, value=value, checked=value in preselected_set)
         for value, option_label in options
     ]
+    instruction = "(space to toggle, enter to confirm)"
+    if searchable:
+        instruction = "(type to filter, space to toggle, enter to confirm)"
     answer = questionary.checkbox(
         prompt,
         choices=choices,
         style=style,
         pointer="›",
         qmark="",
-        instruction="(space to toggle, enter to confirm)",
+        instruction=instruction,
+        use_search_filter=searchable,
+        use_jk_keys=not searchable,
     ).ask()
     return None if answer is None else list(answer)
 
@@ -396,11 +422,17 @@ def prompt_for_percentage(prompt: str, *, default: float | None = None) -> float
         print_err("Please enter a number between 0 and 100.")
 
 
-def prompt_for_selection(prompt: str, options: list[tuple[str, str]]) -> str | None:
+def prompt_for_selection(
+    prompt: str, options: list[tuple[str, str]], *, searchable: bool = False
+) -> str | None:
     """Single-select arrow-key picker. `options` is [(value, label), ...].
 
     The prompt renders above the choices (questionary convention). Returns the
     chosen value, or None if the user cancels (Ctrl-C / empty).
+
+    ``searchable`` lets the user narrow a long list by typing. It costs j/k navigation — questionary
+    rejects both at once, since j and k are also search characters — so it is opt-in for the pickers
+    that are actually long (model and budget lists), leaving short ones on plain arrow keys.
     """
     style = questionary.Style(
         [
@@ -417,7 +449,9 @@ def prompt_for_selection(prompt: str, options: list[tuple[str, str]]) -> str | N
         style=style,
         pointer="›",
         qmark="",
-        instruction="(use arrow keys)",
+        instruction="(type to filter, arrow keys to move)" if searchable else "(use arrow keys)",
+        use_search_filter=searchable,
+        use_jk_keys=not searchable,
     ).ask()
     return answer
 

@@ -1940,3 +1940,168 @@ class TestInstallAiTools:
         install_ai_tools(["copilot"])
         assert len(warnings) == 1
         assert "copilot: cli-not-on-path: could not resolve copilot" in warnings[0]
+
+
+class TestModelServicesCache:
+    """A successful listing is memoized per workspace: several callers want different views of the
+    same paginated walk (bucketed families vs the raw Claude ids), so one `ucode setup` run would
+    otherwise page the whole catalog twice."""
+
+    @staticmethod
+    def _counting_page(calls: dict):
+        def page(url, token):
+            calls["n"] = calls.get("n", 0) + 1
+            return {
+                "model_services": [
+                    {"name": "model-services/system.ai.claude-opus-5"},
+                    {"name": "model-services/system.ai.claude-opus-4-8"},
+                ]
+            }, None
+
+        return page
+
+    def test_repeat_listings_hit_the_api_once(self, monkeypatch):
+        calls: dict = {}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_get_model_services_page", self._counting_page(calls))
+        first, _ = db_mod.list_model_services(WS, "tok")
+        second, _ = db_mod.list_model_services(WS, "tok")
+        assert first == second
+        assert calls["n"] == 1
+
+    def test_the_two_discovery_helpers_share_one_walk(self, monkeypatch):
+        # The duplicate spinner in `ucode setup`: `discover_model_services` and
+        # `discover_claude_models_unbucketed` both page the same endpoint.
+        calls: dict = {}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_get_model_services_page", self._counting_page(calls))
+        claude, _codex, _gemini, _oss, _reason = db_mod.discover_model_services(WS, "tok")
+        unbucketed, _ = db_mod.discover_claude_models_unbucketed(WS, "tok")
+        assert calls["n"] == 1
+        # Both views still come back intact: newest-per-family, and the full list.
+        assert claude["opus"] == "system.ai.claude-opus-5"
+        assert unbucketed == ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]
+
+    def test_use_cache_false_forces_a_fresh_walk(self, monkeypatch):
+        calls: dict = {}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_get_model_services_page", self._counting_page(calls))
+        db_mod.list_model_services(WS, "tok")
+        db_mod.list_model_services(WS, "tok", use_cache=False)
+        assert calls["n"] == 2
+
+    def test_each_workspace_is_cached_separately(self, monkeypatch):
+        calls: dict = {}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_get_model_services_page", self._counting_page(calls))
+        db_mod.list_model_services(WS, "tok")
+        db_mod.list_model_services("https://other.databricks.com", "tok")
+        assert calls["n"] == 2
+
+    def test_failures_are_not_cached(self, monkeypatch):
+        # A transient error must not poison the rest of the process into believing there are no
+        # models on the workspace.
+        calls: dict = {}
+
+        def failing(url, token):
+            calls["n"] = calls.get("n", 0) + 1
+            return None, "HTTP 500 Server Error"
+
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_get_model_services_page", failing)
+        ids, reason = db_mod.list_model_services(WS, "tok")
+        assert ids == [] and reason is not None
+
+        monkeypatch.setattr(db_mod, "_get_model_services_page", self._counting_page(calls))
+        ids, reason = db_mod.list_model_services(WS, "tok")
+        assert reason is None
+        assert ids
+
+
+class TestModelProviderServicesCache:
+    """The MPS listing is workspace-wide and filtered per agent afterwards, so one call serves every
+    agent — `ucode setup` used to re-list it once per MPS-capable agent."""
+
+    @staticmethod
+    def _counting_listing(calls: dict):
+        def get_json(url, token, timeout=10):
+            calls["n"] = calls.get("n", 0) + 1
+            return {
+                "model_provider_services": [
+                    {
+                        "name": "model-provider-services/main.j.ant",
+                        "config": {
+                            "provider_type": "ANTHROPIC",
+                            "targets": [{"model": "claude-opus-5"}],
+                        },
+                    },
+                    {
+                        "name": "model-provider-services/main.j.oai",
+                        "config": {"provider_type": "OPENAI", "targets": [{"model": "gpt-5"}]},
+                    },
+                ]
+            }, None
+
+        return get_json
+
+    def test_one_call_serves_every_agent(self, monkeypatch):
+        calls: dict = {}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_http_get_json", self._counting_listing(calls))
+        claude, _ = db_mod.list_tool_provider_services("claude", WS, "tok")
+        codex, _ = db_mod.list_tool_provider_services("codex", WS, "tok")
+        assert calls["n"] == 1
+        # Each agent still gets only the services matching its API dialect.
+        assert claude == ["main.j.ant"]
+        assert codex == ["main.j.oai"]
+
+    def test_use_cache_false_forces_a_fresh_call(self, monkeypatch):
+        calls: dict = {}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_http_get_json", self._counting_listing(calls))
+        db_mod.list_model_provider_services(WS, "tok")
+        db_mod.list_model_provider_services(WS, "tok", use_cache=False)
+        assert calls["n"] == 2
+
+    def test_each_workspace_is_cached_separately(self, monkeypatch):
+        calls: dict = {}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_http_get_json", self._counting_listing(calls))
+        db_mod.list_model_provider_services(WS, "tok")
+        db_mod.list_model_provider_services("https://other.databricks.com", "tok")
+        assert calls["n"] == 2
+
+    def test_failures_are_not_cached(self, monkeypatch):
+        calls: dict = {}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda *a, **k: (None, "HTTP 500"))
+        services, reason = db_mod.list_model_provider_services(WS, "tok")
+        assert services == [] and reason is not None
+        monkeypatch.setattr(db_mod, "_http_get_json", self._counting_listing(calls))
+        services, reason = db_mod.list_model_provider_services(WS, "tok")
+        assert reason is None and services
+
+    def test_the_first_caller_cannot_corrupt_the_cache(self, monkeypatch):
+        # The caller that populates the cache gets the same list that was stored, so mutating it
+        # would poison every later reader.
+        calls: dict = {}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_http_get_json", self._counting_listing(calls))
+        first, _ = db_mod.list_model_provider_services(WS, "tok")
+        first[0]["name"] = "clobbered"
+        first.pop()
+        second, _ = db_mod.list_model_provider_services(WS, "tok")
+        assert [s["name"] for s in second] == ["main.j.ant", "main.j.oai"]
+
+    def test_a_later_caller_cannot_corrupt_the_cache(self, monkeypatch):
+        # And so does every cache *hit* — the wizard filters this list per agent, so the second
+        # agent's read must not see what the first one did to it.
+        calls: dict = {}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(db_mod, "_http_get_json", self._counting_listing(calls))
+        db_mod.list_model_provider_services(WS, "tok")  # populate
+        hit, _ = db_mod.list_model_provider_services(WS, "tok")
+        hit[0]["name"] = "clobbered"
+        hit.pop()
+        again, _ = db_mod.list_model_provider_services(WS, "tok")
+        assert [s["name"] for s in again] == ["main.j.ant", "main.j.oai"]
