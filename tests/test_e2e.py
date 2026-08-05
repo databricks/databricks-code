@@ -426,11 +426,12 @@ class TestCodexLaunch:
     CODEX_INCOMPATIBLE_MODEL_FRAGMENTS = (
         # nano endpoint is unreliably slow and times out past the 60s budget.
         "gpt-5-4-nano",
-        # These endpoints are discoverable as responses-capable, but the
-        # backing OpenAI endpoint returns ENDPOINT_NOT_FOUND in the CI region.
-        "gpt-5-6-luna",
-        "gpt-5-6-sol",
-        "gpt-5-6-terra",
+        # Discoverable and correctly configured, but the gateway's upstream OpenAI project can't
+        # serve this snapshot from the CI region: "The requested model snapshot is not available
+        # for your project's geography." The gateway relays that as a bare INTERNAL_ERROR
+        # ("invalid response from an upstream server"), so the launch fails after codex-cli
+        # exhausts its five reconnects. Nothing ucode writes can fix it.
+        "gpt-5-3-codex",
     )
 
     def _codex_models(self, e2e_state: dict) -> list[str]:
@@ -479,9 +480,12 @@ class TestCodexLaunch:
                 continue
 
             if result.returncode != 0 or not (result.stdout or result.stderr).strip():
+                # Keep a generous tail of stderr. codex-cli logs a non-fatal model-listing error
+                # first and the actual cause last, so a short prefix reports the wrong problem —
+                # at 200 chars the geography failure above read as a `/v1/models` routing error.
                 failures.append(
                     f"model={model} rc={result.returncode} "
-                    f"stdout={result.stdout[:200]!r} stderr={result.stderr[:200]!r}"
+                    f"stdout={result.stdout[-500:]!r} stderr={result.stderr[-1500:]!r}"
                 )
 
         assert not failures, "Codex launch failures:\n" + "\n".join(failures)
