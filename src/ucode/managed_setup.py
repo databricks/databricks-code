@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import cast
 
@@ -532,14 +533,30 @@ def _agent_model_ids(agent_config: dict) -> set[str]:
 
 
 def _validate_budget_policy(budget_policy: dict, enabled_agents: dict[str, dict]) -> list[str]:
-    """Validate a ``budget_policy`` against the agents the manifest enables."""
+    """Validate a ``budget_policy`` against the agents the manifest enables.
+
+    Tier positions are reported 0-based to match the server's own messages, which index with
+    ``zipWithIndex`` — an admin comparing the two error sources should see the same number.
+    """
     errors: list[str] = []
-    if not budget_policy.get("budget_id"):
+    budget_id = budget_policy.get("budget_id")
+    if not budget_id:
         errors.append("budget_policy.budget_id is required.")
+    else:
+        # The server requires a parseable UUID here. The wizard can only offer real
+        # `budget_configuration_id`s, but `--from-file` and hand-edited manifests can carry
+        # anything, and catching it locally beats an INVALID_PARAMETER_VALUE round-trip.
+        try:
+            uuid.UUID(str(budget_id))
+        except ValueError:
+            errors.append(
+                f"budget_policy.budget_id must be a UUID (got '{budget_id}'). Use the "
+                "budget_configuration_id from the workspace's AI Gateway budgets."
+            )
 
     percentages: list[float] = []
     tiers = budget_policy.get("tiers")
-    for index, tier in enumerate(tiers if isinstance(tiers, list) else [], start=1):
+    for index, tier in enumerate(tiers if isinstance(tiers, list) else []):
         if not isinstance(tier, dict):
             errors.append(f"budget_policy.tiers[{index}] must be an object.")
             continue

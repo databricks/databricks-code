@@ -24,6 +24,10 @@ runner = CliRunner()
 
 WORKSPACE = "https://ws.example.com"
 
+# `list_workspace_budgets` returns real `budget_configuration_id`s, and validation requires a
+# parseable UUID, so the fixtures use one rather than a readable placeholder.
+BUDGET_ID = "c6563b45-df9a-4b19-afb2-d42dc2b52576"
+
 STATE = {
     "workspace": WORKSPACE,
     "claude_models": {
@@ -885,14 +889,14 @@ class TestBudgetPolicy:
         assert warn.called
 
     def test_percentages_are_stored_as_fractions(self):
-        budgets = [{"id": "budget-1", "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
                 "prompt_for_selection",
-                side_effect=["budget-1", "claude", "system.ai.claude-opus-4-8"],
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
             ),
             patch.object(wizard, "prompt_for_text", return_value="tiered"),
             # prompt_for_percentage already converts; it returns the fraction.
@@ -900,7 +904,7 @@ class TestBudgetPolicy:
         ):
             policy = wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
         assert policy is not None
-        assert policy["budget_id"] == "budget-1"
+        assert policy["budget_id"] == BUDGET_ID
         assert policy["tiers"] == [
             {
                 "spending_percentage": 0.8,
@@ -920,14 +924,14 @@ class TestBudgetPolicy:
                 }
             }
         }
-        budgets = [{"id": "budget-1", "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
                 "prompt_for_selection",
-                side_effect=["budget-1", "pi", "system.ai.kimi-k2-6"],
+                side_effect=[BUDGET_ID, "pi", "system.ai.kimi-k2-6"],
             ) as select,
             patch.object(wizard, "prompt_for_text", return_value="tiered"),
             patch.object(wizard, "prompt_for_percentage", return_value=0.8),
@@ -949,14 +953,14 @@ class TestBudgetPolicy:
                 }
             }
         }
-        budgets = [{"id": "budget-1", "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
                 "prompt_for_selection",
-                side_effect=["budget-1", "claude", "system.ai.claude-opus-4-8"],
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
             ) as select,
             patch.object(wizard, "prompt_for_text", return_value="tiered"),
             patch.object(wizard, "prompt_for_percentage", return_value=0.8),
@@ -968,14 +972,14 @@ class TestBudgetPolicy:
     def test_falls_back_to_the_catalog_when_an_agent_lists_nothing(self):
         # An agent configured through a provider service has no enumerable list; better to offer the
         # catalog than nothing at all.
-        budgets = [{"id": "budget-1", "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
                 "prompt_for_selection",
-                side_effect=["budget-1", "gemini", "system.ai.gemini-3-flash"],
+                side_effect=[BUDGET_ID, "gemini", "system.ai.gemini-3-flash"],
             ) as select,
             patch.object(wizard, "prompt_for_text", return_value="tiered"),
             patch.object(wizard, "prompt_for_percentage", return_value=0.8),
@@ -985,14 +989,14 @@ class TestBudgetPolicy:
         assert offered == ["system.ai.gemini-3-flash"]
 
     def test_authored_policy_validates(self):
-        budgets = [{"id": "budget-1", "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
                 "prompt_for_selection",
-                side_effect=["budget-1", "claude", "system.ai.claude-opus-4-8"],
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
             ),
             patch.object(wizard, "prompt_for_text", return_value="tiered"),
             patch.object(wizard, "prompt_for_percentage", return_value=0.8),
