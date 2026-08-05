@@ -48,17 +48,6 @@ MANAGED_SETTINGS_PATH = config_io.APP_DIR / "managed-settings.json"
 AGENT_TOOL_TO_ENUM: dict[str, str] = {tool: enum for enum, tool in AGENT_ENUM_TO_TOOL.items()}
 MCP_TAG_TO_TYPE_ENUM: dict[str, str] = {tag: enum for enum, tag in MCP_TYPE_ENUM_TO_TAG.items()}
 
-# `AgentModelConfig` oneof variant key per agent. The server rejects a config whose variant doesn't
-# match its agent (`validateAgentModelConfig`), so this mapping is not cosmetic.
-_AGENT_MODEL_CONFIG_VARIANT: dict[str, str] = {
-    "claude": "claude",
-    "codex": "codex",
-    "opencode": "opencode",
-    "pi": "pi",
-    "gemini": "gemini",
-    "copilot": "copilot",
-}
-
 # Agents whose model config carries a flat `models` list. Claude instead uses per-family slots
 # (`ClaudeDefaultModels`), and Codex has no model list at all — it selects exactly one model.
 _FLAT_MODEL_LIST_AGENTS = frozenset({"opencode", "pi", "gemini", "copilot"})
@@ -250,8 +239,11 @@ def _enabled_agent_payload(tool: str, agent_config: dict) -> dict:
     if isinstance(model_config, dict):
         body = _model_config_payload(tool, model_config)
         if body:
-            variant = _AGENT_MODEL_CONFIG_VARIANT[tool]
-            config["model_config"] = {variant: body}
+            # The `AgentModelConfig` oneof field names are ucode's tool names verbatim (claude,
+            # codex, opencode, pi, gemini, copilot), so the tool doubles as the variant key. The
+            # server rejects a variant that doesn't match its agent (`validateAgentModelConfig`),
+            # and the round-trip through `normalize_managed_config` pins that alignment in tests.
+            config["model_config"] = {tool: body}
 
     entry: dict = {"agent": AGENT_TOOL_TO_ENUM[tool]}
     if config:
