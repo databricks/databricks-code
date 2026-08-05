@@ -211,6 +211,7 @@ skipped in a re-run is dropped.
 |---------|-------------|
 | `ucode status` | Show current workspace, base URLs, managed config files, and selected models |
 | `ucode usage` | Show AI Gateway usage summary, plus your budget spend against its alert threshold when the workspace reports one |
+| `ucode usage --warehouse-id <id>` | Query a specific SQL warehouse instead of discovering one |
 | `ucode revert` | Clear saved state and restore backed-up config files |
 | `ucode configure --dry-run` | Preview config files without writing them |
 | `ucode configure --agents claude,codex` | Configure specific agents without the interactive picker |

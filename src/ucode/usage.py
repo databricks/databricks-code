@@ -477,7 +477,9 @@ def run_query_on_first_working_warehouse(
     for warehouse in candidates:
         print_note(f"Using SQL warehouse `{warehouse.label}` ({warehouse.state}).")
         try:
-            columns, rows = run_usage_query(workspace, warehouse.http_path, token, query)
+            # Inside the loop so the spinner stops before any warning prints.
+            with spinner("Querying system.ai_gateway.usage..."):
+                columns, rows = run_usage_query(workspace, warehouse.http_path, token, query)
         except RuntimeError as exc:
             last_error = exc
             print_warning(f"SQL warehouse `{warehouse.label}` is unusable: {exc}")
