@@ -391,7 +391,10 @@ def _claude_candidates(state: dict) -> dict[str, list[str]]:
         try:
             token = get_databricks_token(workspace, state.get("profile"))
             all_claude, _ = discover_claude_models_unbucketed(workspace, token)
-        except RuntimeError:
+        except (RuntimeError, OSError):
+            # OSError covers a missing `databricks` binary: `get_databricks_token` shells out, so a
+            # machine without the CLI on PATH raises FileNotFoundError rather than RuntimeError.
+            # Either way the per-family picks below are a usable fallback.
             all_claude = []
     if all_claude:
         state["all_claude_models"] = all_claude

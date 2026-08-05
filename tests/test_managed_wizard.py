@@ -11,6 +11,7 @@ import json
 from unittest.mock import patch
 
 import pytest
+import typer.main
 from typer.testing import CliRunner
 
 import ucode.config_io as config_io_mod
@@ -601,9 +602,29 @@ class TestModelPrompting:
             with (
                 patch.object(wizard, "prompt_for_multi_selection", return_value=[options[0]]),
                 patch.object(wizard, "prompt_for_selection", return_value=options[0]),
+                # Without this the claude pass reaches for the real catalog, which shells out to
+                # `databricks auth token` and depends on the machine's CLI and credentials.
+                patch.object(wizard, "discover_claude_models_unbucketed", return_value=([], None)),
+                patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+                patch.object(wizard, "print_note"),
+                patch.object(wizard, "print_success"),
             ):
                 config = wizard._prompt_models_for_agent(tool, STATE, None)
             assert config.get("default_model"), tool
+
+    def test_claude_candidates_survive_a_missing_databricks_cli(self):
+        # `get_databricks_token` shells out, so a machine without the CLI on PATH raises
+        # FileNotFoundError, not RuntimeError. That must degrade to the bucketed per-family picks
+        # rather than aborting the wizard mid-flow.
+        def no_cli(*args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "databricks")
+
+        with patch.object(wizard, "get_databricks_token", side_effect=no_cli):
+            candidates = wizard._claude_candidates(dict(STATE))
+
+        # STATE's bucketed `claude_models` still supplies one model per family.
+        assert candidates["opus"] == ["system.ai.claude-opus-4-8"]
+        assert candidates["sonnet"] == ["system.ai.claude-sonnet-4-6"]
 
     def test_default_model_is_a_bare_uc_id(self):
         # Provider prefixes (e.g. opencode's `databricks-anthropic/`) are added by each agent's own
@@ -1065,9 +1086,14 @@ class TestCliWiring:
         assert "setup" in result.output
 
     def test_setup_help_lists_from_file(self):
+        # Assert on the declared option rather than the rendered help text: Rich ellipsizes option
+        # names to fit the terminal ("--fro…" below ~40 columns), and CI runners report no width, so
+        # grepping `--from-file` out of the output fails there while passing on a wide local one.
+        group = typer.main.get_command(app).commands["setup"]  # type: ignore[attr-defined]
+        declared = {opt for param in group.params for opt in param.opts}
+        assert "--from-file" in declared
         result = runner.invoke(app, ["setup", "--help"])
         assert result.exit_code == 0
-        assert "--from-file" in result.output
 
     def test_setup_show_is_registered(self):
         result = runner.invoke(app, ["setup", "--help"])
