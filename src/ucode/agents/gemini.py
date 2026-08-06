@@ -184,6 +184,8 @@ def write_tool_config(
 
 
 def default_model(state: dict) -> str | None:
+    if isinstance(state.get("gemini_default_model"), str):
+        return state.get("gemini_default_model")
     gemini_models = state.get("gemini_models") or []
     return gemini_models[0] if gemini_models else None
 

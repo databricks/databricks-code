@@ -215,3 +215,22 @@ class TestValidateCmd:
         cmd = copilot.validate_cmd("copilot")
 
         assert cmd[:3] == ["copilot", "--additional-mcp-config", f"@{mcp_path}"]
+
+
+class TestManagedModels:
+    def test_managed_models_win_over_the_shared_discovery_lists(self):
+        state = {
+            "copilot_models": ["system.ai.gpt-5"],
+            "claude_models": {"sonnet": "shared-should-not-win"},
+        }
+        assert copilot.default_model(state) == "system.ai.gpt-5"
+
+    def test_falls_back_to_the_shared_lists_without_a_managed_config(self):
+        assert copilot.default_model({"claude_models": {"sonnet": "discovered"}}) == "discovered"
+
+    def test_copilot_default_model_wins_over_allowlist(self):
+        state = {
+            "copilot_default_model": "admin-chosen-default",
+            "copilot_models": ["system.ai.gpt-5"],
+        }
+        assert copilot.default_model(state) == "admin-chosen-default"

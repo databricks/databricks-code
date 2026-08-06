@@ -71,7 +71,16 @@ def is_update_available() -> tuple[str, str] | None:
 
 
 def default_model(state: dict) -> str | None:
-    """Prefer Claude sonnet, then opus/haiku, then codex."""
+    """Prefer Claude sonnet, then opus/haiku, then codex.
+
+    A managed config's ``copilot_default_model`` and ``copilot_models`` both win outright: the former is
+    the admin's chosen session start, the latter their allowlist. Workspace-wide discovery falls back.
+    """
+    if isinstance(state.get("copilot_default_model"), str):
+        return state.get("copilot_default_model")
+    copilot_models = state.get("copilot_models") or []
+    if isinstance(copilot_models, list) and copilot_models:
+        return copilot_models[0]
     claude_models = state.get("claude_models") or {}
     for family in ("sonnet", "opus", "haiku"):
         if claude_models.get(family):

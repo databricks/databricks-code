@@ -515,6 +515,13 @@ class TestCodexDefaultModel:
 
         assert codex.default_model({"codex_models": models}) == "served-models/databricks-gpt-5-5"
 
+    def test_codex_default_model_wins_over_allowlist(self):
+        state = {
+            "codex_default_model": "admin-chosen-default",
+            "codex_models": ["databricks-gpt-5-5"],
+        }
+        assert codex.default_model(state) == "admin-chosen-default"
+
     def test_openai_model_id_maps_databricks_naming(self):
         assert codex._openai_model_id("databricks-gpt-5-5") == "gpt-5.5"
         assert codex._openai_model_id("databricks-gpt-5-5-mini") == "gpt-5.5-mini"

@@ -328,6 +328,13 @@ class TestOpencodeDefaultModel:
         assert opencode.default_model({}) is None
         assert opencode.default_model({"opencode_models": {}}) is None
 
+    def test_opencode_default_model_wins_over_bucketed_models(self):
+        state = {
+            "opencode_default_model": "admin-chosen-default",
+            "opencode_models": {"anthropic": ["claude-sonnet"]},
+        }
+        assert opencode.default_model(state) == "admin-chosen-default"
+
 
 class TestOpencodeValidateCmd:
     def test_starts_with_binary(self):

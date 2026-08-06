@@ -120,6 +120,13 @@ class TestGeminiDefaultModel:
     def test_returns_none_when_missing(self):
         assert gemini.default_model({}) is None
 
+    def test_gemini_default_model_wins_over_allowlist(self):
+        state = {
+            "gemini_default_model": "admin-chosen-default",
+            "gemini_models": ["gemini-2"],
+        }
+        assert gemini.default_model(state) == "admin-chosen-default"
+
 
 class TestGeminiVersionGating:
     def test_too_new_version_flags_045(self, monkeypatch):

@@ -8,9 +8,11 @@ An org admin authors a ``CodingAgentConfig`` through the Databricks AI Gateway; 
 - persisting it to ``~/.ucode/managed-state.json`` (0600), and
 - re-reading it on each launch, falling back to the persisted copy when the read fails.
 
-:func:`managed_launch_state` is the launch path's entry point: it refreshes the manifest and hands
-back the state to configure the agent with. Deciding *which* value wins for a given key is
-:mod:`ucode.managed_resolve`'s job, kept separate so that logic stays pure and I/O-free.
+:func:`refresh_managed_config` is the launch path's entry point. It is called before model discovery,
+because the manifest decides whether that discovery is needed at all; the launch path then hands the
+manifest to :func:`ucode.managed_resolve.resolve_state` once the state it layers over is final.
+Deciding *which* value wins for a given key is :mod:`ucode.managed_resolve`'s job, kept separate so
+that logic stays pure and I/O-free.
 """
 
 from __future__ import annotations
@@ -22,7 +24,6 @@ from typing import cast
 
 import ucode.config_io as config_io
 from ucode.databricks import fetch_managed_coding_agent_configs, get_databricks_token
-from ucode.managed_resolve import resolve_state
 from ucode.ui import print_warning
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
@@ -424,27 +425,3 @@ def managed_agent_config_enabled() -> bool:
     Opt-in while the feature is being bug-bashed: without the env var set, launches behave exactly
     as they did before and never read the workspace's config."""
     return os.environ.get(MANAGED_CONFIG_ENV_VAR, "").strip().lower() in ("1", "true", "yes")
-
-
-def managed_launch_state(
-    state: dict, tool: str, *, skip_preflight: bool = False
-) -> tuple[dict, dict | None]:
-    """Return ``(state, managed)`` for launching ``tool`` under any managed config.
-
-    The returned state has the manifest's models and provider layered over the developer's own —
-    managed wins per key — so the settings file written from it reflects the admin's choices. When
-    the workspace has no managed config the state is handed back untouched.
-
-    ``skip_preflight`` mirrors the launch flag: managed/headless launchers pass it to avoid
-    per-launch network calls, so the config is read from the last persisted copy instead of being
-    re-fetched (which means it can be arbitrarily stale until a normal launch refreshes it).
-    """
-    if not managed_agent_config_enabled():
-        return state, None
-    if skip_preflight:
-        managed = load_managed_state(state.get("workspace")) or None
-    else:
-        managed = refresh_managed_config(state)
-    if managed is None:
-        return state, None
-    return resolve_state(managed, state, tool), managed
