@@ -12,8 +12,6 @@ import ucode.databricks as db_mod
 from ucode.databricks import (
     AI_GATEWAY_V2_DOCS_URL,
     _format_subprocess_result,
-    _parse_databricks_cli_version,
-    _run_databricks_cli_installer,
     _scrub_databrickscfg,
     _scrub_json,
     build_auth_shell_command,
@@ -23,6 +21,7 @@ from ucode.databricks import (
     build_shared_base_urls,
     build_skills_mcp_url,
     build_tool_base_url,
+    ensure_databricks_cli,
     ensure_databricks_cli_version,
     ensure_pat_bearer,
     get_databricks_token,
@@ -1791,79 +1790,51 @@ class TestHttpGetJsonReason:
         assert reason == "HTTP 404 Not Found"
 
 
-class TestParseDatabricksCliVersion:
-    def test_parses_standard_format(self):
-        assert _parse_databricks_cli_version("Databricks CLI v0.299.2") == (0, 299, 2)
-
-    def test_parses_without_v_prefix(self):
-        assert _parse_databricks_cli_version("Databricks CLI 0.298.0") == (0, 298, 0)
-
-    def test_returns_none_on_garbage(self):
-        assert _parse_databricks_cli_version("not a version") is None
-
-
 class TestEnsureDatabricksCliVersion:
+    """The version check is deliberately a no-op: ucode must never inspect or
+    replace the user's CLI, however old it is."""
+
     def _fake_databricks(self, tmp_path, version_output: str) -> dict:
         fake = tmp_path / "databricks"
         fake.write_text(f"#!/bin/sh\necho '{version_output}'\n")
         fake.chmod(0o755)
         return {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
 
-    def test_passes_when_version_meets_minimum(self, tmp_path, monkeypatch):
-        env = self._fake_databricks(tmp_path, "Databricks CLI v1.0.0")
-        monkeypatch.setattr("os.environ", env)
-        ensure_databricks_cli_version()  # should not raise
-
-    def test_passes_when_version_exceeds_minimum(self, tmp_path, monkeypatch):
-        env = self._fake_databricks(tmp_path, "Databricks CLI v1.8.0")
+    @pytest.mark.parametrize(
+        "version_output",
+        ["Databricks CLI v1.8.0", "Databricks CLI v0.299.2", "completely broken output"],
+    )
+    def test_never_raises_regardless_of_version(self, tmp_path, monkeypatch, version_output):
+        env = self._fake_databricks(tmp_path, version_output)
         monkeypatch.setattr("os.environ", env)
         ensure_databricks_cli_version()
 
-    def test_auto_upgrades_when_version_too_old(self, tmp_path, monkeypatch):
-        import ucode.databricks as db_mod
-
-        env = self._fake_databricks(tmp_path, "Databricks CLI v0.299.2")
-        monkeypatch.setattr("os.environ", env)
-        upgraded = []
+    def test_runs_no_subprocess(self, monkeypatch):
         monkeypatch.setattr(
             db_mod,
-            "_run_databricks_cli_installer",
-            lambda brew_subcommand="install": upgraded.append(brew_subcommand),
+            "run",
+            lambda *a, **kw: pytest.fail("ensure_databricks_cli_version must not shell out"),
         )
-        # Stop the recursive re-check after upgrade
-        call_count = [0]
-        original = db_mod.ensure_databricks_cli_version
-
-        def once(*a, **kw):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                original()
-
-        monkeypatch.setattr(db_mod, "ensure_databricks_cli_version", once)
-        once()
-        assert upgraded == ["upgrade"]
-
-    def test_raises_when_version_unparseable(self, tmp_path, monkeypatch):
-        env = self._fake_databricks(tmp_path, "completely broken output")
-        monkeypatch.setattr("os.environ", env)
-        with pytest.raises(RuntimeError, match="Could not parse"):
-            ensure_databricks_cli_version()
+        ensure_databricks_cli_version()
 
 
-class TestRunDatabricksCliInstaller:
-    @pytest.mark.parametrize("brew_subcommand", ["install", "upgrade"])
-    def test_macos_uses_fully_qualified_tap_formula(self, monkeypatch, brew_subcommand):
-        calls = []
-        monkeypatch.setattr(db_mod.platform, "system", lambda: "Darwin")
-        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: "/opt/homebrew/bin/brew")
-        monkeypatch.setattr(db_mod, "run", lambda cmd, **kw: calls.append(cmd))
+class TestEnsureDatabricksCli:
+    def test_passes_when_cli_on_path(self, monkeypatch):
+        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: "/usr/local/bin/databricks")
+        ensure_databricks_cli()
 
-        _run_databricks_cli_installer(brew_subcommand=brew_subcommand)
+    def test_raises_with_install_instructions_when_missing(self, monkeypatch):
+        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: None)
+        with pytest.raises(RuntimeError, match="was not found on PATH"):
+            ensure_databricks_cli()
 
-        # The fully-qualified formula forces Homebrew to the Databricks CLI in
-        # databricks/tap and fails if absent, rather than falling back to the
-        # unrelated `databricks` cask.
-        assert calls == [["brew", brew_subcommand, "databricks/tap/databricks"]]
+    def test_never_installs_the_cli(self, monkeypatch):
+        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: None)
+        monkeypatch.setattr(
+            db_mod, "run", lambda *a, **kw: pytest.fail("ucode must not install the CLI")
+        )
+        with pytest.raises(RuntimeError):
+            ensure_databricks_cli()
 
 
 class TestIsUsageTableAccessError:

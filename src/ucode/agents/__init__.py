@@ -19,9 +19,9 @@ import subprocess
 from ucode.config_io import ToolSpec
 from ucode.databricks import (
     BEDROCK_PROVIDER_TYPES,
+    ensure_databricks_cli,
     get_databricks_token,
     install_ai_tools,
-    install_databricks_cli,
     map_bedrock_claude_models,
     resolve_provider_service,
 )
@@ -254,7 +254,7 @@ def ensure_bootstrap_dependencies(
     update_existing: bool = False,
     prompt_optional_updates: bool = True,
 ) -> None:
-    install_databricks_cli()
+    ensure_databricks_cli()
     install_tool_binary(
         tool,
         strict=True,

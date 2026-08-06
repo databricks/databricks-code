@@ -5,6 +5,7 @@
 ## Requirements
 
 - Python 3.12+ — install with `uv` ([uv.astral.sh](https://docs.astral.sh/uv/getting-started/installation/))
+- The Databricks CLI on your `PATH` ([install guide](https://docs.databricks.com/aws/en/dev-tools/cli/install)) — `ucode` never installs or upgrades it for you. Keep it current (`brew upgrade databricks/tap/databricks`); features like `ucode configure` rely on recent subcommands such as `databricks aitools`.
 - `npm` if tool CLIs need to be installed automatically
 
 ## Installation
