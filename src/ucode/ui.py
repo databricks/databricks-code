@@ -13,6 +13,7 @@ from datetime import timedelta
 
 import questionary
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 
@@ -381,8 +382,17 @@ def prompt_for_text(prompt: str, *, default: str | None = None) -> str | None:
 
     Returns the trimmed input, ``default`` on an empty answer, or None when there is no
     default and the user submits nothing (or closes stdin).
+
+    A default is shown as ``[value] (enter to accept)`` rather than the bare ``[value]``: bracketed
+    text alone reads as a format example as easily as a value that will be used, so it invited
+    retyping what pressing enter would already pick.
+
+    The whole bracketed hint is markup-escaped, brackets included. Rich reads
+    ``[coding-agents-tiered-routing]`` as a style tag and prints nothing for it, so an unescaped
+    word-like default vanished from the prompt entirely — numeric ones like ``[80]`` are not valid
+    tags and survived, which is why this looked fine wherever it was checked.
     """
-    hint = f" [{default}]" if default else ""
+    hint = f" {escape(f'[{default}]')} (enter to accept)" if default else ""
     while True:
         try:
             raw_value = console.input(f"{label(prompt)}{muted(hint)} {muted('›')} ").strip()
@@ -401,8 +411,13 @@ def prompt_for_percentage(prompt: str, *, default: float | None = None) -> float
     Budget tiers are fractions in the API (the server validates 0..1), but admins think in
     percent — and the spec's own prose says "80%". Prompting in percent and converting here
     keeps that mismatch in one place instead of at every call site.
+
+    No caller passes ``default`` today, and tier thresholds deliberately have none: a threshold
+    decides when developers get downgraded, so it should be typed rather than accepted by accident.
+    The hint is still formatted (and escaped) the same way :func:`prompt_for_text` formats its own,
+    so the two cannot drift if a default is ever introduced.
     """
-    hint = f" [{default * 100:g}]" if default is not None else ""
+    hint = f" {escape(f'[{default * 100:g}]')} (enter to accept)" if default is not None else ""
     while True:
         try:
             raw_value = console.input(f"{label(prompt)}{muted(hint)} {muted('› ')}").strip()
