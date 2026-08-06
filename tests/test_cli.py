@@ -100,6 +100,23 @@ class TestHelp:
         assert "--workspaces" in output
 
 
+class TestVersion:
+    @pytest.mark.parametrize("flag", ["--version", "-V"])
+    def test_prints_version_and_exits(self, flag):
+        result = runner.invoke(app, [flag])
+        assert result.exit_code == 0
+        # Matches the derived version reported by importlib.metadata — either a
+        # real string like "0.1.0" / "0.1.0+2.g93986a8" or the "unknown" fallback.
+        assert _strip_ansi(result.output).strip() != ""
+
+    def test_matches_telemetry_version(self):
+        from ucode.telemetry import ucode_version
+
+        result = runner.invoke(app, ["--version"])
+        assert result.exit_code == 0
+        assert ucode_version() in _strip_ansi(result.output)
+
+
 def _patch_launch(tool: str):
     """Return a context-manager stack that makes _launch_tool a no-op.
 

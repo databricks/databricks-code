@@ -880,6 +880,30 @@ app.add_typer(
 )
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        from ucode.telemetry import ucode_version
+
+        print(ucode_version())
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            "-V",
+            help="Show the ucode version and exit.",
+            callback=_version_callback,
+            is_eager=True,
+        ),
+    ] = False,
+) -> None:
+    """Configure and launch coding agents through Databricks AI Gateway."""
+
+
 @mcp_app.command("web-search")
 def mcp_web_search_cmd() -> None:
     """Run the web_search MCP server over stdio. Invoked as a subprocess by Claude Code."""

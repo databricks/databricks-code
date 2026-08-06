@@ -13,6 +13,10 @@
 uv tool install git+https://github.com/databricks/ucode
 ```
 
+Check your version with `ucode --version`. Between releases this looks like
+`0.1.0+14.g93986a8` — the trailing `g<hash>` is the exact commit the build came
+from, so include it when reporting a bug.
+
 ---
 
 ## Usage
