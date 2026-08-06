@@ -16,6 +16,7 @@ from ucode.managed_resolve import (
     managed_provider_service,
     managed_state_overrides,
     managed_supplies_models,
+    managed_unservable_models,
     resolve_state,
 )
 from ucode.state import MANAGED_OVERLAY_KEY
@@ -435,9 +436,29 @@ class TestManagedStateOverrides:
 
     def test_unclassifiable_models_are_dropped_from_buckets(self):
         # A model whose family can't be identified has no provider to route through, so guessing a
-        # bucket would produce a selector OpenCode can't resolve.
+        # bucket would produce a selector OpenCode can't resolve. It is dropped, but the models that
+        # do classify still apply.
+        managed = {
+            "enabled_agents": {
+                "opencode": {
+                    "model_config": {"models": ["mystery-model", "system.ai.claude-opus-4-8"]}
+                }
+            }
+        }
+        assert managed_state_overrides(managed, "opencode") == {
+            "opencode_models": {"anthropic": ["system.ai.claude-opus-4-8"]}
+        }
+
+    def test_no_override_when_nothing_is_servable(self):
+        # An all-unservable list must not replace the developer's buckets with an empty dict —
+        # that would leave OpenCode with no models at all.
         managed = {"enabled_agents": {"opencode": {"model_config": {"models": ["mystery-model"]}}}}
-        assert managed_state_overrides(managed, "opencode") == {"opencode_models": {}}
+        state = _state(opencode_models={"anthropic": ["local-opus"]})
+        assert managed_state_overrides(managed, "opencode") == {}
+        assert resolve_state(managed, state, "opencode")["opencode_models"] == {
+            "anthropic": ["local-opus"]
+        }
+        assert managed_unservable_models(managed, "opencode") == ["mystery-model"]
 
 
 class TestManagedDefaultModelStateOverrides:
@@ -481,3 +502,35 @@ class TestManagedEnabledTools:
     def test_empty_when_the_config_names_no_agents(self):
         # Callers treat this as "no opinion", so a budget-only config blocks nothing.
         assert managed_enabled_tools({"budget_policy": {}}) == []
+
+
+class TestManagedUnservableModels:
+    """Warn when the admin's list names only models the agent has no provider for."""
+
+    @staticmethod
+    def _managed(tool, models):
+        return {"enabled_agents": {tool: {"model_config": {"models": models}}}}
+
+    def test_pi_oss_only_is_unservable(self):
+        # Pi has no OSS provider block.
+        assert managed_unservable_models(
+            self._managed("pi", ["system.ai.kimi-k2-7-code"]), "pi"
+        ) == ["system.ai.kimi-k2-7-code"]
+
+    def test_opencode_gpt_only_is_unservable(self):
+        # OpenCode has no OpenAI provider block.
+        managed = self._managed("opencode", ["system.ai.gpt-5"])
+        assert managed_unservable_models(managed, "opencode") == ["system.ai.gpt-5"]
+
+    @pytest.mark.parametrize(
+        ("tool", "models"),
+        [
+            ("pi", ["system.ai.kimi-k2-7-code", "system.ai.claude-opus-4-8"]),
+            ("opencode", ["system.ai.gpt-5", "system.ai.claude-opus-4-8"]),
+        ],
+    )
+    def test_no_warning_when_anything_is_servable(self, tool, models):
+        assert managed_unservable_models(self._managed(tool, models), tool) == []
+
+    def test_agents_that_pass_models_through_never_warn(self):
+        assert managed_unservable_models(self._managed("codex", ["anything"]), "codex") == []

@@ -217,7 +217,8 @@ def _managed_model_families(state: dict) -> tuple[dict[str, str], list[str], lis
     """Split a managed config's ``pi_models`` into the per-family inputs Pi's providers need.
 
     Pi builds one provider block per family, so a flat list has to be classified back out. Returns
-    None when no managed models are set, leaving the workspace-wide discovery lists in play.
+    None when the managed models yield no family Pi can serve, leaving the workspace-wide discovery
+    lists in play rather than writing a config with no usable provider.
     """
     managed = state.get("pi_models")
     if not isinstance(managed, list) or not managed:
@@ -235,6 +236,8 @@ def _managed_model_families(state: dict) -> tuple[dict[str, str], list[str], lis
             codex.append(model)
         elif family == "gemini":
             gemini.append(model)
+    if not (claude or codex or gemini):
+        return None
     return claude, codex, gemini
 
 

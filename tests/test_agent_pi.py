@@ -446,6 +446,17 @@ class TestManagedModels:
     def test_no_split_without_managed_models(self):
         assert pi._managed_model_families({"claude_models": {"opus": "x"}}) is None
 
+    def test_none_when_no_managed_model_is_servable(self):
+        # Pi has no OSS provider, so an oss-only list yields no families. Returning an all-empty
+        # tuple would be truthy and suppress the fallback, writing a config with zero providers.
+        assert pi._managed_model_families({"pi_models": ["system.ai.kimi-k2-7-code"]}) is None
+
+    def test_partially_servable_list_still_splits(self):
+        families = pi._managed_model_families(
+            {"pi_models": ["system.ai.kimi-k2-7-code", "system.ai.claude-opus-4-8"]}
+        )
+        assert families == ({"opus": "system.ai.claude-opus-4-8"}, [], [])
+
 
 class TestManagedDefaultModel:
     """A managed config's `pi_default_model` takes priority over the allowlist."""

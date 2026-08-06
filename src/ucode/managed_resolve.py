@@ -73,13 +73,42 @@ def managed_state_overrides(managed: dict, tool: str) -> dict[str, object]:
             overrides["claude_models"] = models
         elif tool == "opencode" and isinstance(models, list):
             # OpenCode selects `provider/model`, so its state is bucketed by provider rather than flat.
-            overrides["opencode_models"] = _bucket_by_provider(models)
+            # No override when nothing buckets: an empty dict would replace the developer's own
+            # models, leaving opencode with none at all.
+            buckets = _bucket_by_provider(models)
+            if buckets:
+                overrides["opencode_models"] = buckets
         else:
             overrides[f"{tool}_models"] = models
     default_model = _str(_agent_model_config(managed, tool).get("default_model"))
     if default_model:
         overrides[f"{tool}_default_model"] = default_model
     return overrides
+
+
+def managed_unservable_models(managed: dict, tool: str) -> list[str]:
+    """The models the manifest names for ``tool`` when it has no provider to serve any of them.
+
+    Only non-empty when *every* named model is unservable, which is when the translation yields
+    nothing and the developer's own models stand — so the caller can say why the admin's list had no
+    effect. opencode has no OpenAI provider and pi has no OSS provider, so each can be handed a
+    valid model FQN it cannot route.
+    """
+    if tool not in ("opencode", "pi"):
+        return []
+    models = _manifest_models(managed, tool)
+    if not isinstance(models, list):
+        return []
+    servable = (
+        _bucket_by_provider(models)
+        if tool == "opencode"
+        else [
+            m
+            for m in models
+            if classify_model_family(m) in (*ANTHROPIC_FAMILIES, "codex", "gemini")
+        ]
+    )
+    return [] if servable else models
 
 
 def _manifest_models(managed: dict, tool: str) -> dict | list | None:

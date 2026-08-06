@@ -65,6 +65,7 @@ from ucode.managed_resolve import (
     managed_enabled_tools,
     managed_provider_service,
     managed_supplies_models,
+    managed_unservable_models,
     resolve_state,
 )
 from ucode.mcp import (
@@ -1244,6 +1245,12 @@ def _launch_tool(
         if managed is not None:
             state = resolve_state(managed, state, tool)
             print_success("Applied your workspace's managed coding agent config")
+            unservable = managed_unservable_models(managed, tool)
+            if unservable:
+                print_warning(
+                    f"Your workspace's managed config lists no {TOOL_SPECS[tool]['display']}-servable "
+                    f"models ({', '.join(unservable)}); using your discovered models instead."
+                )
             # The enterprise scope outranks the --settings file ucode writes, so a model pinned
             # there quietly beats the admin's — point at the file rather than let the mismatch
             # look like a ucode bug.
