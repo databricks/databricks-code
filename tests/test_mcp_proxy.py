@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import tomllib
+from pathlib import Path
+
 import anyio
 import httpx
 import pytest
@@ -10,6 +13,13 @@ from ucode import mcp_proxy
 
 WS = "https://example.databricks.com"
 URL = f"{WS}/api/2.0/mcp/functions/system/ai"
+
+
+def test_httpx_is_a_direct_runtime_dependency():
+    project = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())[
+        "project"
+    ]
+    assert any(dependency.startswith("httpx") for dependency in project["dependencies"])
 
 
 class TestDatabricksTokenAuth:

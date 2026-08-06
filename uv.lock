@@ -3159,6 +3159,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "databricks-sql-connector" },
+    { name = "httpx" },
     { name = "mcp" },
     { name = "questionary" },
     { name = "tomlkit" },
@@ -3180,6 +3181,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "databricks-sql-connector", specifier = ">=3.6.0" },
+    { name = "httpx", specifier = ">=0.27.1" },
     { name = "mcp", specifier = ">=1.28.0" },
     { name = "mlflow", extras = ["databricks"], marker = "extra == 'tracing'", specifier = ">=3.4" },
     { name = "questionary", specifier = ">=2.0.0" },
