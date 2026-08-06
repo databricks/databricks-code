@@ -331,14 +331,44 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
         return None, f"network error: {exc.reason}"
 
 
+WORKSPACE_ADMIN_GROUP = "admins"
+
+
+def _scim_me(workspace: str, token: str) -> dict | None:
+    """Return the SCIM `Me` payload for the caller, or None on failure."""
+    hostname = workspace_hostname(workspace)
+    payload, _ = _http_get_json(f"https://{hostname}/api/2.0/preview/scim/v2/Me", token)
+    return payload if isinstance(payload, dict) else None
+
+
+def is_workspace_admin(workspace: str, token: str) -> bool | None:
+    """Whether the caller is a workspace admin, via their SCIM `Me` group membership.
+
+    Returns True/False, or None when the check itself could not be made (SCIM unreachable or a
+    malformed response), so callers can say "unknown" rather than misreport an admin as a
+    non-admin.
+    """
+    payload = _scim_me(workspace, token)
+    if payload is None:
+        return None
+    groups = payload.get("groups")
+    if not isinstance(groups, list):
+        # A well-formed `Me` for a user in no groups omits `groups`, so this is a definitive
+        # "not an admin" rather than a failed check.
+        return False
+    return any(
+        isinstance(group, dict) and group.get("display") == WORKSPACE_ADMIN_GROUP
+        for group in groups
+    )
+
+
 def get_current_user_name(workspace: str, token: str) -> str | None:
     """Return the current user's login (email) via SCIM `Me`, or None on failure.
 
     Databricks puts the workspace login in `userName`; fall back to the first
     `emails` entry for workspaces that diverge."""
-    hostname = workspace_hostname(workspace)
-    payload, _ = _http_get_json(f"https://{hostname}/api/2.0/preview/scim/v2/Me", token)
-    if not isinstance(payload, dict):
+    payload = _scim_me(workspace, token)
+    if payload is None:
         return None
     user_name = payload.get("userName")
     if isinstance(user_name, str) and user_name.strip():
