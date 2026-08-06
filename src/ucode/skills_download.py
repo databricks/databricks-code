@@ -29,6 +29,8 @@ SKILL_BASE_DIR_NAMES = (".claude/skills", ".agents/skills")
 
 SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
 
+SKILL_FILES_API_PREFIX = "Skills"
+
 # Parallel skill fetches per schema; writes stay sequential (they prompt).
 _MAX_FETCH_WORKERS = 8
 
@@ -86,15 +88,15 @@ def list_skill_files(
 ) -> tuple[list[str], str | None]:
     """List a skill bundle's files, as paths relative to the skill directory.
 
-    Recursively walks the skill's UC Volume directory (including ``SKILL.md``).
+    Recursively walks the skill's Files API directory (including ``SKILL.md``).
     A non-None reason indicates the listing call itself failed.
     """
     hostname = workspace_hostname(workspace)
     dirs_base = f"https://{hostname}/api/2.0/fs/directories"
-    volume_prefix = f"/Volumes/{catalog}/{schema}/{leaf}/"
+    skill_prefix = f"/{SKILL_FILES_API_PREFIX}/{catalog}/{schema}/{leaf}/"
 
     relative_paths: list[str] = []
-    pending = [f"Volumes/{catalog}/{schema}/{leaf}"]
+    pending = [f"{SKILL_FILES_API_PREFIX}/{catalog}/{schema}/{leaf}"]
     while pending:
         directory = pending.pop()
         page_token: str | None = None
@@ -113,7 +115,7 @@ def list_skill_files(
                 if entry.get("is_directory"):
                     pending.append(path.strip("/"))
                 else:
-                    relative_paths.append(path.removeprefix(volume_prefix))
+                    relative_paths.append(path.removeprefix(skill_prefix))
             page_token = data.get("next_page_token")
             if not page_token:
                 break
@@ -123,9 +125,12 @@ def list_skill_files(
 def fetch_skill_file(
     workspace: str, token: str, catalog: str, schema: str, leaf: str, relative_path: str
 ) -> tuple[bytes | None, str | None]:
-    """Fetch one skill bundle file's raw bytes from its UC Volume."""
+    """Fetch one skill bundle file's raw bytes from the Files API."""
     hostname = workspace_hostname(workspace)
-    url = f"https://{hostname}/api/2.0/fs/files/Volumes/{catalog}/{schema}/{leaf}/{relative_path}"
+    url = (
+        f"https://{hostname}/api/2.0/fs/files/"
+        f"{SKILL_FILES_API_PREFIX}/{catalog}/{schema}/{leaf}/{relative_path}"
+    )
     return _http_get_bytes(url, token, timeout=30)
 
 

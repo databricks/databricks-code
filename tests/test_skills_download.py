@@ -101,18 +101,31 @@ class TestListSchemaSkills:
 
 
 class TestListSkillFiles:
+    def test_lists_under_the_skills_place(self, monkeypatch):
+        captured = {}
+
+        def fake_get(url, token, timeout=30):
+            captured["url"] = url
+            return {"contents": []}, None
+
+        monkeypatch.setattr(sd, "_http_get_json", fake_get)
+
+        sd.list_skill_files(WS, "token", "main", "default", "triage")
+
+        assert captured["url"] == f"{WS}/api/2.0/fs/directories/Skills/main/default/triage"
+
     def test_walks_nested_directories_into_relative_paths(self, monkeypatch):
-        # The Files API returns absolute `/Volumes/...` paths.
-        vol = "/Volumes/main/default/triage"
+        # The Files API returns absolute paths.
+        skill = "/Skills/main/default/triage"
         listings = {
-            "Volumes/main/default/triage": {
+            "Skills/main/default/triage": {
                 "contents": [
-                    {"path": f"{vol}/SKILL.md", "is_directory": False},
-                    {"path": f"{vol}/references/", "is_directory": True},
+                    {"path": f"{skill}/SKILL.md", "is_directory": False},
+                    {"path": f"{skill}/references/", "is_directory": True},
                 ]
             },
-            "Volumes/main/default/triage/references": {
-                "contents": [{"path": f"{vol}/references/primary.md", "is_directory": False}]
+            "Skills/main/default/triage/references": {
+                "contents": [{"path": f"{skill}/references/primary.md", "is_directory": False}]
             },
         }
 
@@ -128,13 +141,13 @@ class TestListSkillFiles:
         assert sorted(paths) == ["SKILL.md", "references/primary.md"]
 
     def test_follows_pagination(self, monkeypatch):
-        vol = "/Volumes/main/default/triage"
+        skill = "/Skills/main/default/triage"
         pages = [
             {
-                "contents": [{"path": f"{vol}/a.md", "is_directory": False}],
+                "contents": [{"path": f"{skill}/a.md", "is_directory": False}],
                 "next_page_token": "tok",
             },
-            {"contents": [{"path": f"{vol}/b.md", "is_directory": False}]},
+            {"contents": [{"path": f"{skill}/b.md", "is_directory": False}]},
         ]
 
         monkeypatch.setattr(
@@ -171,7 +184,7 @@ class TestFetchSkillFile:
 
         assert reason is None
         assert body == b"# SKILL\n"
-        assert captured["url"] == f"{WS}/api/2.0/fs/files/Volumes/main/default/triage/SKILL.md"
+        assert captured["url"] == f"{WS}/api/2.0/fs/files/Skills/main/default/triage/SKILL.md"
 
     def test_http_failure_propagates_reason(self, monkeypatch):
         monkeypatch.setattr(
