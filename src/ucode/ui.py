@@ -383,11 +383,18 @@ def prompt_for_multi_selection(
     return None if answer is None else list(answer)
 
 
-def prompt_for_text(prompt: str, *, default: str | None = None) -> str | None:
+def prompt_for_text(
+    prompt: str, *, default: str | None = None, required: bool = False
+) -> str | None:
     """Free-text prompt, used when model discovery found nothing to pick from.
 
     Returns the trimmed input, ``default`` on an empty answer, or None when there is no
     default and the user submits nothing (or closes stdin).
+
+    ``required=True`` raises ``KeyboardInterrupt`` on closed stdin instead of returning None, for
+    callers that loop until they get a value: returning None to such a caller spins forever on a
+    piped or exhausted stdin. Matches :func:`prompt_for_percentage`, which has no default and does
+    the same.
 
     A default is shown as ``[value] (enter to accept)`` rather than the bare ``[value]``: bracketed
     text alone reads as a format example as easily as a value that will be used, so it invited
@@ -402,7 +409,9 @@ def prompt_for_text(prompt: str, *, default: str | None = None) -> str | None:
     while True:
         try:
             raw_value = console.input(f"{label(prompt)}{muted(hint)} {muted('›')} ").strip()
-        except EOFError:
+        except EOFError as exc:
+            if required:
+                raise KeyboardInterrupt from exc
             return default
         if raw_value:
             return raw_value

@@ -662,16 +662,18 @@ class TestModelPrompting:
         assert config["default_model"] == "system.ai.claude-opus-4-8"
         assert "/" not in config["default_model"]
 
-    def test_empty_single_select_is_re_prompted(self):
+    def test_dismissed_single_select_aborts_instead_of_re_prompting(self):
+        # This used to re-prompt. questionary's `ask` swallows Ctrl-C and returns None, so "empty
+        # submission" and "user aborted" are the same value here — and re-asking spun forever.
+        # Asserted on the helper directly: the codex path only reaches the picker when discovery
+        # found models, and falling through to the free-text branch would read real stdin.
         with (
-            patch.object(
-                wizard, "prompt_for_selection", side_effect=[None, "system.ai.gpt-5-6"]
-            ) as picker,
+            patch.object(wizard, "prompt_for_selection", return_value=None) as picker,
             patch.object(wizard, "print_err"),
         ):
-            config = wizard._prompt_models_for_agent("codex", STATE, None)
-        assert picker.call_count == 2
-        assert config == {"default_model": "system.ai.gpt-5-6"}
+            with pytest.raises(KeyboardInterrupt):
+                wizard._require_selection("Select the model:", [("a", "A")])
+        assert picker.call_count == 1
 
     def test_empty_free_text_is_re_prompted(self):
         with (
@@ -1188,6 +1190,79 @@ class TestSummaryPanel:
             },
         )
         assert "[prod] tiered routing" in capsys.readouterr().out
+
+
+class TestCancelledPromptsAbort:
+    """A dismissed prompt must abort, not re-ask an input that can't answer."""
+
+    def test_require_selection_aborts_when_the_picker_is_dismissed(self):
+        # questionary's Question.ask catches KeyboardInterrupt and returns None (v2.1.1), so Ctrl-C
+        # is indistinguishable from an empty submission here. Re-asking looped forever.
+        with patch.object(wizard, "prompt_for_selection", return_value=None) as sel:
+            with pytest.raises(KeyboardInterrupt):
+                wizard._require_selection("pick", [("a", "A")])
+        assert sel.call_count == 1
+
+    def test_require_text_asks_for_a_required_answer(self):
+        # `required=True` is what makes closed stdin raise instead of returning None; without it a
+        # piped/CI run spins re-asking an exhausted stream.
+        with patch.object(wizard, "prompt_for_text", return_value="m") as text:
+            assert wizard._require_text("Default model") == "m"
+        assert text.call_args.kwargs.get("required") is True
+
+    def test_require_text_aborts_on_closed_stdin(self):
+        with patch("ucode.ui.console.input", side_effect=EOFError):
+            with pytest.raises(KeyboardInterrupt):
+                wizard._require_text("Default model")
+
+
+class TestClaudeCandidatesStayValidatable:
+    """Whatever the Claude prompts offer, `validate_manifest` must accept."""
+
+    def _manifest(self, model: str) -> dict:
+        return {
+            "default_agent": "claude",
+            "enabled_agents": {"claude": {"model_config": {"default_model": model}}},
+        }
+
+    def test_listing_path_caches_so_older_versions_validate(self):
+        # The unbucketed listing widens the candidates past `claude_models`, so it must also cache
+        # them — otherwise picking an older Opus is rejected at the end of the flow.
+        state = {
+            "workspace": "https://ws.example.com",
+            "claude_models": {"opus": "system.ai.claude-opus-5"},
+        }
+        with (
+            patch.object(wizard, "get_databricks_token", return_value="t"),
+            patch.object(
+                wizard,
+                "discover_claude_models_unbucketed",
+                return_value=(["system.ai.claude-opus-5", "system.ai.claude-opus-4-8"], None),
+            ),
+        ):
+            candidates = wizard._claude_candidates(state)
+        offered = [m for models in candidates.values() for m in models]
+        assert "system.ai.claude-opus-4-8" in offered
+        for model in offered:
+            assert validate_manifest(self._manifest(model), state) == []
+
+    def test_fallback_path_only_offers_what_already_validates(self):
+        # The fallback caches nothing, so it must not offer anything beyond `claude_models`.
+        state = {
+            "workspace": "https://ws.example.com",
+            "claude_models": {"opus": "system.ai.claude-opus-5"},
+        }
+        with (
+            patch.object(wizard, "get_databricks_token", return_value="t"),
+            patch.object(
+                wizard, "discover_claude_models_unbucketed", side_effect=RuntimeError("boom")
+            ),
+        ):
+            candidates = wizard._claude_candidates(state)
+        assert "all_claude_models" not in state
+        for models in candidates.values():
+            for model in models:
+                assert validate_manifest(self._manifest(model), state) == []
 
 
 class TestSearchablePickers:

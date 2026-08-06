@@ -393,6 +393,15 @@ def _claude_candidates(state: dict) -> dict[str, list[str]]:
     Caches the full listing on ``state["all_claude_models"]`` so `validate_manifest` recognizes the
     older versions these prompts offer — ``claude_models`` alone holds just the newest per family,
     and would reject a legitimately-picked ``claude-opus-4-8``.
+
+    INVARIANT: whatever this returns must be recognizable by ``validate_manifest``, which reads
+    ``all_claude_models`` (falling back to ``claude_models``) via ``_known_models``. The two paths
+    below both satisfy it, for different reasons: the listing path widens the candidates *and* sets
+    the cache, while the fallback path sets nothing but also narrows the candidates to
+    ``claude_models``, which ``_known_models`` already covers. Widening the fallback without also
+    populating the cache breaks the invariant, and the symptom is a confusing rejection at the very
+    end of the flow ("claude: model 'system.ai.claude-opus-4-8' is not available on this
+    workspace") rather than an error at the prompt that offered it.
     """
     cached = state.get("all_claude_models")
     if isinstance(cached, list) and cached:
@@ -421,15 +430,16 @@ def _claude_candidates(state: dict) -> dict[str, list[str]]:
 def _require_selection(prompt: str, options: list[tuple[str, str]]) -> str:
     """Single-select that won't take "nothing" for an answer.
 
-    ``prompt_for_selection`` returns None both for Ctrl-C and for an empty submission. questionary
-    raises KeyboardInterrupt on Ctrl-C before returning, so a None here means the picker was
-    dismissed without a choice — re-ask instead of silently producing a model-less config.
+    ``prompt_for_selection`` returns None for both Ctrl-C and an empty submission, and the two are
+    genuinely indistinguishable here: questionary's ``Question.ask`` catches KeyboardInterrupt
+    internally and returns None (v2.1.1, question.py), so nothing propagates for a caller to see.
+    A None is therefore treated as an abort rather than re-asked — re-asking looped forever on
+    Ctrl-C, printing the error once per keypress and never exiting.
     """
-    while True:
-        answer = prompt_for_selection(prompt, options, searchable=True)
-        if answer:
-            return answer
-        print_err("Please choose one of the options.")
+    answer = prompt_for_selection(prompt, options, searchable=True)
+    if not answer:
+        raise KeyboardInterrupt
+    return answer
 
 
 def _require_multi_selection(
@@ -448,9 +458,15 @@ def _require_multi_selection(
 
 
 def _require_text(prompt: str) -> str:
-    """Free-text prompt that requires a non-empty answer."""
+    """Free-text prompt that requires a non-empty answer.
+
+    ``required=True`` makes closed stdin abort instead of returning None. Without it a
+    non-interactive run (piped stdin, CI) spun here forever: ``prompt_for_text`` returns its default
+    on EOF, the default is None, and the loop re-asked an empty stream. Reachable whenever model
+    discovery finds nothing, which is exactly when a run is most likely to be scripted.
+    """
     while True:
-        answer = prompt_for_text(prompt)
+        answer = prompt_for_text(prompt, required=True)
         if answer:
             return answer
         print_err("Please enter a model id.")
