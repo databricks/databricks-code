@@ -7,6 +7,7 @@ import pytest
 
 import ucode.skills_download as sd
 from ucode.skills_download import (
+    SkillRef,
     existing_skill_on_disk,
     should_download_skill,
     skill_dir_roots,
@@ -16,8 +17,13 @@ from ucode.skills_download import (
 WS = "https://example.databricks.com"
 
 
+def ref(securable: str, bundle: str | None = None) -> SkillRef:
+    """A SkillRef whose two names match unless a differing bundle is given."""
+    return SkillRef(securable=securable, bundle=bundle or securable)
+
+
 class TestListSchemaSkills:
-    def test_keeps_finalized_skills_and_uses_bundle_name(self, monkeypatch):
+    def test_keeps_finalized_skills_only(self, monkeypatch):
         payload = {
             "skills": [
                 {
@@ -35,12 +41,31 @@ class TestListSchemaSkills:
         }
         monkeypatch.setattr(sd, "_http_get_json", lambda url, token, timeout=30: (payload, None))
 
-        leaves, reason = sd.list_schema_skills(WS, "token", "main", "default")
+        refs, reason = sd.list_schema_skills(WS, "token", "main", "default")
 
         assert reason is None
-        assert leaves == ["pii-handling", "triage"]
+        assert refs == [ref("pii-handling"), ref("triage")]
 
-    def test_falls_back_to_resource_name_leaf(self, monkeypatch):
+    def test_keeps_both_names_when_bundle_differs_from_securable(self, monkeypatch):
+        # bundle_name comes from the bundle's SKILL.md frontmatter, so it can
+        # differ from the securable it was created under.
+        payload = {
+            "skills": [
+                {
+                    "name": "skills/main.default.task-prioritizer",
+                    "bundle_name": "task-triage",
+                    "finalize_time": "2026-06-26T05:58:25Z",
+                }
+            ]
+        }
+        monkeypatch.setattr(sd, "_http_get_json", lambda url, token, timeout=30: (payload, None))
+
+        refs, reason = sd.list_schema_skills(WS, "token", "main", "default")
+
+        assert reason is None
+        assert refs == [SkillRef(securable="task-prioritizer", bundle="task-triage")]
+
+    def test_bundle_falls_back_to_securable_leaf(self, monkeypatch):
         payload = {
             "skills": [
                 {
@@ -51,15 +76,27 @@ class TestListSchemaSkills:
         }
         monkeypatch.setattr(sd, "_http_get_json", lambda url, token, timeout=30: (payload, None))
 
-        leaves, reason = sd.list_schema_skills(WS, "token", "main", "default")
+        refs, reason = sd.list_schema_skills(WS, "token", "main", "default")
 
         assert reason is None
-        assert leaves == ["pii-handling"]
+        assert refs == [ref("pii-handling")]
+
+    def test_skips_skills_without_a_resource_name(self, monkeypatch):
+        payload = {"skills": [{"bundle_name": "orphan", "finalize_time": "t"}]}
+        monkeypatch.setattr(sd, "_http_get_json", lambda url, token, timeout=30: (payload, None))
+
+        refs, reason = sd.list_schema_skills(WS, "token", "main", "default")
+
+        assert reason is None
+        assert refs == []
 
     def test_follows_pagination(self, monkeypatch):
         pages = [
-            {"skills": [{"bundle_name": "a", "finalize_time": "t"}], "next_page_token": "tok"},
-            {"skills": [{"bundle_name": "b", "finalize_time": "t"}]},
+            {
+                "skills": [{"name": "skills/main.default.a", "finalize_time": "t"}],
+                "next_page_token": "tok",
+            },
+            {"skills": [{"name": "skills/main.default.b", "finalize_time": "t"}]},
         ]
         captured_tokens = []
 
@@ -69,10 +106,10 @@ class TestListSchemaSkills:
 
         monkeypatch.setattr(sd, "_http_get_json", fake_get)
 
-        leaves, reason = sd.list_schema_skills(WS, "token", "main", "default")
+        refs, reason = sd.list_schema_skills(WS, "token", "main", "default")
 
         assert reason is None
-        assert leaves == ["a", "b"]
+        assert refs == [ref("a"), ref("b")]
         assert captured_tokens == [False, True]
 
     def test_targets_uc_skills_api_for_the_schema(self, monkeypatch):
@@ -259,28 +296,38 @@ class TestShouldDownloadSkill:
     def test_new_skill_is_downloaded(self, tmp_path):
         roots = skill_dir_roots(str(tmp_path))
 
-        assert should_download_skill(roots, "triage", location="main.default")
+        assert should_download_skill(roots, ref("triage"), location="main.default")
 
     def test_existing_skill_prompt_keep(self, tmp_path, monkeypatch):
         roots = skill_dir_roots(str(tmp_path))
-        write_skill(roots, "triage", {"SKILL.md": b"from-main"})
+        write_skill(roots, ref("triage"), {"SKILL.md": b"from-main"})
 
         monkeypatch.setattr(sd, "prompt_yes_no", lambda _: False)
 
-        assert not should_download_skill(roots, "triage", location="ml.prod")
+        assert not should_download_skill(roots, ref("triage"), location="ml.prod")
 
     def test_existing_skill_prompt_overwrite(self, tmp_path, monkeypatch):
         roots = skill_dir_roots(str(tmp_path))
-        write_skill(roots, "triage", {"SKILL.md": b"from-main"})
+        write_skill(roots, ref("triage"), {"SKILL.md": b"from-main"})
 
         monkeypatch.setattr(sd, "prompt_yes_no", lambda _: True)
 
-        assert should_download_skill(roots, "triage", location="ml.prod")
+        assert should_download_skill(roots, ref("triage"), location="ml.prod")
 
     def test_invalid_leaf_is_skipped(self, tmp_path):
         roots = skill_dir_roots(str(tmp_path))
 
-        assert not should_download_skill(roots, "Bad_Name", location="main.default")
+        assert not should_download_skill(roots, ref("Bad_Name"), location="main.default")
+
+    def test_either_unsafe_name_is_skipped(self, tmp_path):
+        # Both names reach the filesystem or a URL, so both must be validated.
+        roots = skill_dir_roots(str(tmp_path))
+
+        unsafe_bundle = SkillRef(securable="ok-name", bundle="../escape")
+        unsafe_securable = SkillRef(securable="../escape", bundle="ok-name")
+
+        assert not should_download_skill(roots, unsafe_bundle, location="main.default")
+        assert not should_download_skill(roots, unsafe_securable, location="main.default")
 
     def test_existing_skill_on_disk_checks_every_root(self, tmp_path):
         roots = skill_dir_roots(str(tmp_path))
@@ -295,7 +342,7 @@ class TestWriteSkill:
         roots = skill_dir_roots(str(tmp_path))
         files = {"SKILL.md": b"# skill", "scripts/run.py": b"print(1)"}
 
-        write_skill(roots, "triage", files)
+        write_skill(roots, ref("triage"), files)
 
         for root in roots:
             assert (root / "triage/SKILL.md").read_bytes() == b"# skill"
@@ -305,7 +352,7 @@ class TestWriteSkill:
         roots = skill_dir_roots(str(tmp_path))
 
         write_skill(
-            roots, "triage", {"SKILL.md": b"ok", "../escape.md": b"nope", "/abs.md": b"nope"}
+            roots, ref("triage"), {"SKILL.md": b"ok", "../escape.md": b"nope", "/abs.md": b"nope"}
         )
 
         assert (roots[0] / "triage/SKILL.md").read_bytes() == b"ok"
@@ -322,7 +369,7 @@ class TestFetchBundles:
 class TestDownloadSkills:
     def test_fetches_and_writes_each_leaf(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            sd, "list_schema_skills", lambda *a, **k: (["pii-handling", "triage"], None)
+            sd, "list_schema_skills", lambda *a, **k: ([ref("pii-handling"), ref("triage")], None)
         )
         bundles = {
             "pii-handling": {"SKILL.md": b"pii"},
@@ -337,6 +384,38 @@ class TestDownloadSkills:
         assert (tmp_path / ".claude/skills/pii-handling/SKILL.md").read_bytes() == b"pii"
         assert (tmp_path / ".agents/skills/triage/SKILL.md").read_bytes() == b"triage"
 
+    def test_fetches_by_securable_and_writes_under_bundle_name(self, tmp_path, monkeypatch):
+        # The Files API resolves only the securable, while an agent loads the
+        # directory matching the bundle's SKILL.md `name:`.
+        diverging = SkillRef(securable="task-prioritizer", bundle="task-triage")
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([diverging], None))
+        fetched = []
+        monkeypatch.setattr(
+            sd,
+            "fetch_skill_bundle",
+            lambda ws, tok, c, s, securable: (
+                fetched.append(securable) or ({"SKILL.md": b"name: task-triage"}, None)
+            ),
+        )
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
+
+        assert fetched == ["task-prioritizer"]
+        for base in (".claude/skills", ".agents/skills"):
+            assert (tmp_path / base / "task-triage/SKILL.md").read_bytes() == b"name: task-triage"
+            assert not (tmp_path / base / "task-prioritizer").exists()
+
+    def test_skill_filter_matches_either_name(self, tmp_path, monkeypatch):
+        diverging = SkillRef(securable="task-prioritizer", bundle="task-triage")
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([diverging], None))
+        monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"ok"}, None))
+
+        for requested in ("task-prioritizer", "task-triage"):
+            target = tmp_path / requested
+            target.mkdir()
+            sd.download_skills(WS, "token", ["main.default"], str(target), {requested})
+            assert (target / ".claude/skills/task-triage/SKILL.md").exists()
+
     def test_list_failure_skips_location(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([], "HTTP 404 Not Found"))
         called = []
@@ -350,8 +429,8 @@ class TestDownloadSkills:
 
     def test_declined_skill_is_not_fetched(self, tmp_path, monkeypatch):
         roots = skill_dir_roots(str(tmp_path))
-        write_skill(roots, "triage", {"SKILL.md": b"kept"})
-        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["triage"], None))
+        write_skill(roots, ref("triage"), {"SKILL.md": b"kept"})
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([ref("triage")], None))
         monkeypatch.setattr(sd, "prompt_yes_no", lambda _: False)
         fetched = []
         monkeypatch.setattr(
@@ -366,7 +445,9 @@ class TestDownloadSkills:
         assert (roots[0] / "triage/SKILL.md").read_bytes() == b"kept"
 
     def test_bundle_failure_skips_that_skill_only(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["good", "bad"], None))
+        monkeypatch.setattr(
+            sd, "list_schema_skills", lambda *a, **k: ([ref("good"), ref("bad")], None)
+        )
         monkeypatch.setattr(
             sd,
             "fetch_skill_bundle",
@@ -381,7 +462,9 @@ class TestDownloadSkills:
         assert not (tmp_path / ".claude/skills/bad").exists()
 
     def test_prints_downloaded_count_and_roots_summary(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["a", "b", "c"], None))
+        monkeypatch.setattr(
+            sd, "list_schema_skills", lambda *a, **k: ([ref("a"), ref("b"), ref("c")], None)
+        )
         monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
 
         sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
@@ -393,7 +476,9 @@ class TestDownloadSkills:
         assert "".join(expected.split()) in printed
 
     def test_summary_counts_only_written_skills(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["good", "bad"], None))
+        monkeypatch.setattr(
+            sd, "list_schema_skills", lambda *a, **k: ([ref("good"), ref("bad")], None)
+        )
         monkeypatch.setattr(
             sd,
             "fetch_skill_bundle",
@@ -408,7 +493,7 @@ class TestDownloadSkills:
 
     def test_skill_filter_downloads_only_matching_leaves(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            sd, "list_schema_skills", lambda *a, **k: (["pii-handling", "triage"], None)
+            sd, "list_schema_skills", lambda *a, **k: ([ref("pii-handling"), ref("triage")], None)
         )
         monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
 
@@ -418,7 +503,7 @@ class TestDownloadSkills:
         assert not (tmp_path / ".claude/skills/pii-handling").exists()
 
     def test_skill_filter_warns_on_unknown_and_downloads_rest(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["triage"], None))
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([ref("triage")], None))
         monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
 
         sd.download_skills(WS, "token", ["main.default"], str(tmp_path), {"triage", "ghost"})
@@ -428,7 +513,7 @@ class TestDownloadSkills:
         assert (tmp_path / ".claude/skills/triage/SKILL.md").read_bytes() == b"x"
 
     def test_empty_skill_filter_downloads_nothing(self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["triage"], None))
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([ref("triage")], None))
         called = []
         monkeypatch.setattr(
             sd, "fetch_skill_bundle", lambda *a, **k: called.append(1) or ({"SKILL.md": b"x"}, None)
@@ -452,7 +537,7 @@ class TestDownloadSkills:
         assert "No skills found in `main.default`." in capsys.readouterr().out
 
     def test_none_skill_filter_downloads_everything(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (["a", "b"], None))
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([ref("a"), ref("b")], None))
         monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"x"}, None))
 
         sd.download_skills(WS, "token", ["main.default"], str(tmp_path), None)
