@@ -189,7 +189,7 @@ def _reject_configure_under_managed_config() -> None:
     """Refuse ``ucode configure`` when the workspace publishes a managed config.
 
     Configuring locally would be overridden at launch anyway, so it is an error rather than a
-    silently-ignored run. Without a managed config the command still works, but is deprecated.
+    silently-ignored run. Without a managed config the command still runs unchanged.
     """
     if not managed_agent_config_enabled():
         return
@@ -198,7 +198,6 @@ def _reject_configure_under_managed_config() -> None:
             "The ucode configure command is being deprecated. Please run `ucode` to launch "
             "with your admin's managed config applied"
         )
-    print_warning("The ucode configure command is being deprecated")
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
