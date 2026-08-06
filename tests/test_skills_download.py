@@ -65,38 +65,57 @@ class TestListSchemaSkills:
         assert reason is None
         assert refs == [SkillRef(securable_name="task-prioritizer", bundle_name="task-triage")]
 
-    def test_bundle_falls_back_to_securable_leaf(self, monkeypatch):
-        payload = {
-            "skills": [
-                {
-                    "name": "skills/main.default.pii-handling",
-                    "finalize_time": "2026-06-26T05:58:25Z",
-                }
-            ]
-        }
+    @pytest.mark.parametrize(
+        ("skill", "expected_missing"),
+        [
+            ({"name": "skills/main.default.pii-handling"}, "bundle_name"),
+            ({"name": "skills/main.default.pii-handling", "bundle_name": ""}, "bundle_name"),
+            ({"bundle_name": "orphan"}, "name"),
+            ({}, "name or bundle_name"),
+        ],
+        ids=["no-bundle-name", "blank-bundle-name", "no-resource-name", "neither"],
+    )
+    def test_skips_and_warns_when_a_name_is_missing(self, skill, expected_missing, monkeypatch):
+        # Finalize owns bundle_name and `name` is immutable from creation, so a
+        # finalized skill missing either is an anomaly worth surfacing.
+        payload = {"skills": [{**skill, "finalize_time": "2026-06-26T05:58:25Z"}]}
         monkeypatch.setattr(sd, "_http_get_json", lambda url, token, timeout=30: (payload, None))
-
-        refs, reason = sd.list_schema_skills(WS, "token", "main", "default")
-
-        assert reason is None
-        assert refs == [ref("pii-handling")]
-
-    def test_skips_skills_without_a_resource_name(self, monkeypatch):
-        payload = {"skills": [{"bundle_name": "orphan", "finalize_time": "t"}]}
-        monkeypatch.setattr(sd, "_http_get_json", lambda url, token, timeout=30: (payload, None))
+        warnings = []
+        monkeypatch.setattr(sd, "print_warning", warnings.append)
 
         refs, reason = sd.list_schema_skills(WS, "token", "main", "default")
 
         assert reason is None
         assert refs == []
+        assert len(warnings) == 1
+        assert f"no {expected_missing}." in warnings[0]
+
+    def test_unfinalized_skill_is_skipped_without_a_warning(self, monkeypatch):
+        # An unfinalized skill simply has no bundle yet, which is not an anomaly.
+        payload = {"skills": [{"name": "skills/main.default.draft"}]}
+        monkeypatch.setattr(sd, "_http_get_json", lambda url, token, timeout=30: (payload, None))
+        warnings = []
+        monkeypatch.setattr(sd, "print_warning", warnings.append)
+
+        refs, reason = sd.list_schema_skills(WS, "token", "main", "default")
+
+        assert reason is None
+        assert refs == []
+        assert warnings == []
 
     def test_follows_pagination(self, monkeypatch):
         pages = [
             {
-                "skills": [{"name": "skills/main.default.a", "finalize_time": "t"}],
+                "skills": [
+                    {"name": "skills/main.default.a", "bundle_name": "a", "finalize_time": "t"}
+                ],
                 "next_page_token": "tok",
             },
-            {"skills": [{"name": "skills/main.default.b", "finalize_time": "t"}]},
+            {
+                "skills": [
+                    {"name": "skills/main.default.b", "bundle_name": "b", "finalize_time": "t"}
+                ]
+            },
         ]
         captured_tokens = []
 

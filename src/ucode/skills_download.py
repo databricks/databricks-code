@@ -46,32 +46,50 @@ class SkillRef:
     ``securable_name`` is the UC leaf of ``skills/<cat>.<sch>.<leaf>`` and is the
     only name the Files API resolves, so it addresses the bytes and identifies the
     skill. ``bundle_name`` is the ``name:`` an agent reads from the bundle's
-    SKILL.md frontmatter, so it names the on-disk directory. They differ whenever
-    a skill was created under a securable that doesn't match its frontmatter.
+    SKILL.md frontmatter, so it names the on-disk directory. Finalize does not
+    require the two to match, so a skill created under a securable that differs
+    from its frontmatter carries both.
     """
 
     securable_name: str
     bundle_name: str
 
 
-def _skill_ref(skill: dict) -> SkillRef | None:
-    """A finalized skill's ``SkillRef``, or None if it has no bundle to download.
+def _non_empty_str(value: object) -> str | None:
+    """``value`` when it is a non-empty string, else None."""
+    return value if isinstance(value, str) and value else None
 
-    Only finalized skills (those with a ``finalize_time``) have bundle content.
-    ``bundle_name`` is set at finalize from the SKILL.md frontmatter; when it is
-    absent, the securable name doubles as the directory name.
+
+def _skill_ref(skill: dict) -> SkillRef | None:
+    """A finalized skill's ``SkillRef``, or None if it cannot be downloaded.
+
+    A skill without a ``finalize_time`` has no bundle content yet and is skipped
+    quietly, since that is a normal in-progress state.
+
+    A finalized skill is expected to carry both names: ``name`` is immutable from
+    creation, and finalize is the sole writer of ``bundle_name``. One missing is
+    therefore an anomaly, so warn and skip rather than substituting the other
+    name -- the two are not interchangeable, and guessing a directory name that
+    doesn't match the bundle's SKILL.md ``name:`` would hide the skill from the
+    agent meant to load it.
     """
     if not skill.get("finalize_time"):
         return None
-    name = skill.get("name")
-    if not isinstance(name, str) or not name:
+
+    name = _non_empty_str(skill.get("name"))
+    bundle_name = _non_empty_str(skill.get("bundle_name"))
+    if name is None or bundle_name is None:
+        missing = " or ".join(
+            field
+            for field, value in (("name", name), ("bundle_name", bundle_name))
+            if value is None
+        )
+        print_warning(
+            f"Skipping `{name or '<unnamed skill>'}`: the skills API returned no {missing}."
+        )
         return None
-    securable_name = name.rsplit(".", 1)[-1]
-    bundle_name = skill.get("bundle_name")
-    return SkillRef(
-        securable_name=securable_name,
-        bundle_name=bundle_name if isinstance(bundle_name, str) and bundle_name else securable_name,
-    )
+
+    return SkillRef(securable_name=name.rsplit(".", 1)[-1], bundle_name=bundle_name)
 
 
 def list_schema_skills(
