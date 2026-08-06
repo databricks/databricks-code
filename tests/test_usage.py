@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -570,7 +571,7 @@ class TestRunQueryOnFirstWorkingWarehouse:
         monkeypatch.setattr(usage_mod, "print_warning", warnings.append)
         attempted: list[str] = []
 
-        def flaky(workspace, http_path, token, query):
+        def flaky(workspace, http_path, token, query, on_connected=None):
             attempted.append(http_path)
             if http_path.endswith("dead"):
                 raise RuntimeError("ENDPOINT_NOT_FOUND")
@@ -589,7 +590,7 @@ class TestRunQueryOnFirstWorkingWarehouse:
         monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
         monkeypatch.setattr(usage_mod, "print_warning", lambda *a: None)
 
-        def always_fail(workspace, http_path, token, query):
+        def always_fail(workspace, http_path, token, query, on_connected=None):
             raise RuntimeError(f"boom {http_path[-1]}")
 
         monkeypatch.setattr(usage_mod, "run_usage_query", always_fail)
@@ -624,3 +625,44 @@ class TestUsageWarehouseIdPassthrough:
 
         assert usage(warehouse_id="xyz") == 0
         assert captured["warehouse_id"] == "xyz"
+
+
+class TestQueryProgressMessage:
+    def _messages(self, monkeypatch, state: str, connect: bool) -> list[str]:
+        """Spinner messages rendered for a warehouse in `state`."""
+        seen: list[str] = []
+
+        @contextlib.contextmanager
+        def fake_spinner(message):
+            seen.append(message() if callable(message) else message)
+            yield
+            seen.append(message() if callable(message) else message)
+
+        def fake_query(workspace, http_path, token, query, on_connected=None):
+            if connect and on_connected is not None:
+                on_connected()
+            return ["c"], []
+
+        monkeypatch.setattr(usage_mod, "spinner", fake_spinner)
+        monkeypatch.setattr(usage_mod, "run_usage_query", fake_query)
+        usage_mod._query_with_progress(
+            "https://ws", "token", SqlWarehouse("/p", "wh", state), "SELECT 1"
+        )
+        return seen
+
+    def test_running_shows_query_message(self, monkeypatch):
+        assert self._messages(monkeypatch, "RUNNING", connect=True) == [
+            usage_mod.QUERY_MESSAGE,
+            usage_mod.QUERY_MESSAGE,
+        ]
+
+    def test_requested_shows_query_message(self, monkeypatch):
+        # An explicit --warehouse-id; its real state was never looked up.
+        assert self._messages(monkeypatch, "REQUESTED", connect=True)[0] == usage_mod.QUERY_MESSAGE
+
+    def test_stopped_starts_with_startup_message(self, monkeypatch):
+        assert self._messages(monkeypatch, "STOPPED", connect=False)[0] == usage_mod.STARTUP_MESSAGE
+
+    def test_stopped_switches_to_query_once_connected(self, monkeypatch):
+        seen = self._messages(monkeypatch, "STOPPED", connect=True)
+        assert seen == [usage_mod.STARTUP_MESSAGE, usage_mod.QUERY_MESSAGE]

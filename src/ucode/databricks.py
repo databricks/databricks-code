@@ -2652,7 +2652,14 @@ def run_usage_query(
     http_path: str,
     token: str,
     query: str,
+    on_connected: Callable[[], None] | None = None,
 ) -> tuple[list[str], list[tuple]]:
+    """Run `query` on one warehouse.
+
+    `on_connected` fires once the connection opens — the point a stopped
+    warehouse has finished starting — so callers can update their progress
+    message.
+    """
     try:
         logging.getLogger("databricks.sql").setLevel(logging.ERROR)
         from databricks import sql
@@ -2668,6 +2675,8 @@ def run_usage_query(
             http_path=http_path,
             access_token=token,
         ) as connection:
+            if on_connected is not None:
+                on_connected()
             with connection.cursor() as cursor:
                 cursor.execute(query)
                 columns = [desc[0] for desc in (cursor.description or [])]

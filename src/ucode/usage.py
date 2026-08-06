@@ -41,6 +41,11 @@ from ucode.ui import (
 USAGE_BREAKDOWN_DAYS = 7
 USAGE_SUMMARY_DAYS = 30
 
+QUERY_MESSAGE = "Querying system.ai_gateway.usage..."
+STARTUP_MESSAGE = "Starting up warehouse..."
+# `REQUESTED` is an explicit --warehouse-id, whose state we never looked up.
+WARM_WAREHOUSE_STATES = ("RUNNING", "REQUESTED")
+
 
 def build_usage_report_query() -> str:
     return f"""
@@ -478,14 +483,34 @@ def run_query_on_first_working_warehouse(
         print_note(f"Using SQL warehouse `{warehouse.label}` ({warehouse.state}).")
         try:
             # Inside the loop so the spinner stops before any warning prints.
-            with spinner("Querying system.ai_gateway.usage..."):
-                columns, rows = run_usage_query(workspace, warehouse.http_path, token, query)
+            columns, rows = _query_with_progress(workspace, token, warehouse, query)
         except RuntimeError as exc:
             last_error = exc
             print_warning(f"SQL warehouse `{warehouse.label}` is unusable: {exc}")
             continue
         return warehouse.http_path, columns, rows
     raise last_error or RuntimeError("No SQL warehouse could run the usage query.")
+
+
+def _query_with_progress(
+    workspace: str,
+    token: str,
+    warehouse: SqlWarehouse,
+    query: str,
+) -> tuple[list[str], list[tuple]]:
+    """Run the query, reporting a cold start until the connection opens.
+
+    A warehouse that isn't already up costs minutes to start, so the spinner
+    says that until `run_usage_query` reports it connected.
+    """
+    connected = warehouse.state in WARM_WAREHOUSE_STATES
+
+    def mark_connected() -> None:
+        nonlocal connected
+        connected = True
+
+    with spinner(lambda: QUERY_MESSAGE if connected else STARTUP_MESSAGE):
+        return run_usage_query(workspace, warehouse.http_path, token, query, mark_connected)
 
 
 def usage(warehouse_id: str | None = None) -> int:
