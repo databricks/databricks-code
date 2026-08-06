@@ -155,21 +155,20 @@ def test_spawn_rewrite_injects_routed_model(monkeypatch):
 
     hook = output["hookSpecificOutput"]
     # The rationale is surfaced in the systemMessage (shown to the user), not
-    # only in permissionDecisionReason.
+    # only in permissionDecisionReason. The model field is the short family
+    # name ("opus") that Claude Code's Agent tool schema accepts.
     assert output["systemMessage"] == (
-        "Using Smart Routing. Routing to system.ai.claude-opus-4-8. "
-        "Deep exploration needs the strongest model."
+        "Using Smart Routing. Routing to opus. Deep exploration needs the strongest model."
     )
     assert hook["permissionDecision"] == "allow"
     assert hook["updatedInput"] == {
         "subagent_type": "Explore",
         "prompt": "map the codebase",
         "description": "explore",
-        "model": "system.ai.claude-opus-4-8",
+        "model": "opus",
     }
     assert hook["permissionDecisionReason"] == (
-        "Using Smart Routing. Routing to system.ai.claude-opus-4-8. "
-        "Deep exploration needs the strongest model."
+        "Using Smart Routing. Routing to opus. Deep exploration needs the strongest model."
     )
 
 
@@ -192,7 +191,7 @@ def test_task_tool_alias_is_routed(monkeypatch):
         available_models=["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
     )
 
-    assert output["hookSpecificOutput"]["updatedInput"]["model"] == "system.ai.claude-sonnet-5"
+    assert output["hookSpecificOutput"]["updatedInput"]["model"] == "sonnet"
 
 
 def test_non_spawn_tool_has_no_opinion():
@@ -255,11 +254,11 @@ def test_decision_is_reconciled_with_actual_subagent_model(tmp_path, monkeypatch
         audit_decision=True,
     )
     record = claude_routing.record_subagent_start(
-        {"session_id": "s1", "agent_id": "a1", "model": "system.ai.claude-opus-4-8"}
+        {"session_id": "s1", "agent_id": "a1", "model": "opus"}
     )
 
     assert record["router_model"] == "claude-opus-4-8"
-    assert record["requested_model"] == "system.ai.claude-opus-4-8"
+    assert record["requested_model"] == "opus"
     assert record["matches_router_decision"] is True
 
 
