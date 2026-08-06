@@ -31,6 +31,7 @@ from typing import cast
 import ucode.config_io as config_io
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
+    model_version_sort_key,
     tool_supports_provider_type,
 )
 from ucode.managed_config import (
@@ -61,8 +62,9 @@ _AGENT_MODEL_CONFIG_VARIANT: dict[str, str] = {
 # (`ClaudeDefaultModels`), and Codex has no model list at all — it selects exactly one model.
 _FLAT_MODEL_LIST_AGENTS = frozenset({"opencode", "pi", "gemini", "copilot"})
 
-# Claude family slot names in `ClaudeDefaultModels`, keyed by ucode's family name.
-_CLAUDE_SLOT_FOR_FAMILY: dict[str, str] = {
+# Claude family slot names in `ClaudeDefaultModels`, keyed by ucode's family name. Public because
+# the wizard prompts one slot at a time.
+CLAUDE_SLOT_FOR_FAMILY: dict[str, str] = {
     family: f"default_{family}_model" for family in ANTHROPIC_FAMILIES
 }
 
@@ -144,6 +146,39 @@ def claude_family_for_model(model: str) -> str | None:
     return next((family for family in ANTHROPIC_FAMILIES if f"claude-{family}-" in lowered), None)
 
 
+def claude_family_candidates(
+    all_claude_models: list[str], state: dict | None = None
+) -> dict[str, list[str]]:
+    """Group Claude model ids by family, newest first.
+
+    ``state["claude_models"]`` holds only one id per family — the newest, chosen by
+    ``discover_model_services`` for the launch path, which pins exactly one model per family alias.
+    An admin authoring a managed config needs the alternatives too: pinning ``default_opus_model``
+    to a known-good ``claude-opus-4-8`` rather than whatever happens to be newest is a normal thing
+    to want, and impossible if only the newest is offered.
+
+    ``all_claude_models`` is the unbucketed listing (see
+    :func:`ucode.databricks.discover_claude_family_candidates`). When it is empty, falls back to the
+    per-family picks already in ``state`` so the per-slot prompts still work — with one candidate
+    each. Families with no models are omitted.
+    """
+    models = list(all_claude_models)
+    if not models and state:
+        claude_models = state.get("claude_models")
+        if isinstance(claude_models, dict):
+            models = [m for m in claude_models.values() if isinstance(m, str) and m]
+
+    candidates: dict[str, list[str]] = {}
+    for model in models:
+        family = claude_family_for_model(model)
+        if family:
+            candidates.setdefault(family, []).append(model)
+    for family, found in candidates.items():
+        # model_version_sort_key negates version components, so plain ascending is newest-first.
+        candidates[family] = sorted(set(found), key=model_version_sort_key)
+    return candidates
+
+
 def claude_model_slots(models: list[str]) -> dict[str, str]:
     """Group picked Claude model ids into ``ClaudeDefaultModels`` slots.
 
@@ -157,7 +192,7 @@ def claude_model_slots(models: list[str]) -> dict[str, str]:
         family = claude_family_for_model(model)
         if family is None:
             continue
-        slot = _CLAUDE_SLOT_FOR_FAMILY[family]
+        slot = CLAUDE_SLOT_FOR_FAMILY[family]
         slots.setdefault(slot, model)
     return slots
 
@@ -342,12 +377,16 @@ def _known_models(state: dict) -> set[str]:
 
     Empty when discovery found nothing (or no state was passed), which callers treat as "can't
     check" rather than "nothing is valid".
+
+    ``claude_models`` holds only the newest id per family (the launch path pins one model per family
+    alias), so on its own it would reject the older versions the per-family prompts legitimately
+    offer. ``all_claude_models`` carries the full listing when the caller has it.
     """
     known: set[str] = set()
     claude_models = state.get("claude_models")
     if isinstance(claude_models, dict):
         known.update(m for m in claude_models.values() if isinstance(m, str) and m)
-    for key in ("codex_models", "gemini_models", "oss_models"):
+    for key in ("codex_models", "gemini_models", "oss_models", "all_claude_models"):
         models = state.get(key)
         if isinstance(models, list):
             known.update(m for m in models if isinstance(m, str) and m)
@@ -470,6 +509,28 @@ def validate_manifest(manifest: dict, state: dict | None = None) -> list[str]:
     return errors
 
 
+def _agent_model_ids(agent_config: dict) -> set[str]:
+    """Every model id an agent is configured with — its list plus its default.
+
+    Claude's ``models`` is a family-slot dict and the others' a flat list; codex has no list at all,
+    only ``default_model``. Returns an empty set when nothing is configured, which callers treat as
+    "can't check" rather than "nothing is allowed".
+    """
+    model_config = agent_config.get("model_config")
+    if not isinstance(model_config, dict):
+        return set()
+    ids: set[str] = set()
+    raw = model_config.get("models")
+    if isinstance(raw, dict):
+        ids.update(v for v in raw.values() if isinstance(v, str) and v)
+    elif isinstance(raw, list):
+        ids.update(m for m in raw if isinstance(m, str) and m)
+    default_model = model_config.get("default_model")
+    if isinstance(default_model, str) and default_model:
+        ids.add(default_model)
+    return ids
+
+
 def _validate_budget_policy(budget_policy: dict, enabled_agents: dict[str, dict]) -> list[str]:
     """Validate a ``budget_policy`` against the agents the manifest enables."""
     errors: list[str] = []
@@ -493,6 +554,7 @@ def _validate_budget_policy(budget_policy: dict, enabled_agents: dict[str, dict]
         else:
             percentages.append(float(pct))
         tier_agent = tier.get("default_agent")
+        tier_model = tier.get("default_model")
         if not tier_agent:
             errors.append(f"budget_policy.tiers[{index}]: default_agent is required.")
         elif tier_agent not in enabled_agents:
@@ -500,7 +562,18 @@ def _validate_budget_policy(budget_policy: dict, enabled_agents: dict[str, dict]
                 f"budget_policy.tiers[{index}]: default_agent '{tier_agent}' must appear "
                 "in enabled_agents."
             )
-        if not tier.get("default_model"):
+        elif tier_model:
+            # The server only checks that the tier's agent is enabled, not that it has the model —
+            # so without this a tier can activate and hand the developer a model their agent was
+            # never configured with. Skipped when the agent lists no models (it then has only a
+            # default, or routes through a provider service whose catalog isn't enumerable).
+            available = _agent_model_ids(enabled_agents[tier_agent])
+            if available and tier_model not in available:
+                errors.append(
+                    f"budget_policy.tiers[{index}]: default_model '{tier_model}' is not one of the "
+                    f"models configured for '{tier_agent}' ({', '.join(sorted(available))})."
+                )
+        if not tier_model:
             errors.append(f"budget_policy.tiers[{index}]: default_model is required.")
 
     if len(set(percentages)) != len(percentages):
