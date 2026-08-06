@@ -194,6 +194,40 @@ def test_task_tool_alias_is_routed(monkeypatch):
     assert output["hookSpecificOutput"]["updatedInput"]["model"] == "sonnet"
 
 
+def test_spawn_routes_on_prompt_not_generic_label(monkeypatch):
+    # Claude Code's Agent tool puts the subagent task in `prompt`/`description`,
+    # not `message`. The router should receive the real prompt, not the generic
+    # "Claude Code subagent task" fallback.
+    captured = {}
+
+    def fake_decision(workspace, token, task, models, **kwargs):
+        captured["task"] = task
+        return (
+            claude_routing.RoutingDecision(
+                model="system.ai.claude-sonnet-5", raw_model="claude-sonnet-5"
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(claude_routing, "request_routing_decision", fake_decision)
+
+    claude_routing.route_pre_tool_use(
+        {
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "Explore",
+                "prompt": "find all Python entry points",
+                "description": "explore the repo",
+            },
+        },
+        workspace=WS,
+        token="token",
+        available_models=["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
+    )
+
+    assert captured["task"] == "find all Python entry points"
+
+
 def test_non_spawn_tool_has_no_opinion():
     assert (
         claude_routing.route_pre_tool_use(
