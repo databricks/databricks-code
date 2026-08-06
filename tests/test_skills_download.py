@@ -17,9 +17,9 @@ from ucode.skills_download import (
 WS = "https://example.databricks.com"
 
 
-def ref(securable: str, bundle: str | None = None) -> SkillRef:
-    """A SkillRef whose two names match unless a differing bundle is given."""
-    return SkillRef(securable=securable, bundle=bundle or securable)
+def ref(securable_name: str, bundle_name: str | None = None) -> SkillRef:
+    """A SkillRef whose two names match unless a differing bundle name is given."""
+    return SkillRef(securable_name=securable_name, bundle_name=bundle_name or securable_name)
 
 
 class TestListSchemaSkills:
@@ -63,7 +63,7 @@ class TestListSchemaSkills:
         refs, reason = sd.list_schema_skills(WS, "token", "main", "default")
 
         assert reason is None
-        assert refs == [SkillRef(securable="task-prioritizer", bundle="task-triage")]
+        assert refs == [SkillRef(securable_name="task-prioritizer", bundle_name="task-triage")]
 
     def test_bundle_falls_back_to_securable_leaf(self, monkeypatch):
         payload = {
@@ -323,8 +323,8 @@ class TestShouldDownloadSkill:
         # Both names reach the filesystem or a URL, so both must be validated.
         roots = skill_dir_roots(str(tmp_path))
 
-        unsafe_bundle = SkillRef(securable="ok-name", bundle="../escape")
-        unsafe_securable = SkillRef(securable="../escape", bundle="ok-name")
+        unsafe_bundle = SkillRef(securable_name="ok-name", bundle_name="../escape")
+        unsafe_securable = SkillRef(securable_name="../escape", bundle_name="ok-name")
 
         assert not should_download_skill(roots, unsafe_bundle, location="main.default")
         assert not should_download_skill(roots, unsafe_securable, location="main.default")
@@ -387,14 +387,14 @@ class TestDownloadSkills:
     def test_fetches_by_securable_and_writes_under_bundle_name(self, tmp_path, monkeypatch):
         # The Files API resolves only the securable, while an agent loads the
         # directory matching the bundle's SKILL.md `name:`.
-        diverging = SkillRef(securable="task-prioritizer", bundle="task-triage")
+        diverging = SkillRef(securable_name="task-prioritizer", bundle_name="task-triage")
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([diverging], None))
         fetched = []
         monkeypatch.setattr(
             sd,
             "fetch_skill_bundle",
-            lambda ws, tok, c, s, securable: (
-                fetched.append(securable) or ({"SKILL.md": b"name: task-triage"}, None)
+            lambda ws, tok, c, s, securable_name: (
+                fetched.append(securable_name) or ({"SKILL.md": b"name: task-triage"}, None)
             ),
         )
 
@@ -405,16 +405,22 @@ class TestDownloadSkills:
             assert (tmp_path / base / "task-triage/SKILL.md").read_bytes() == b"name: task-triage"
             assert not (tmp_path / base / "task-prioritizer").exists()
 
-    def test_skill_filter_matches_either_name(self, tmp_path, monkeypatch):
-        diverging = SkillRef(securable="task-prioritizer", bundle="task-triage")
+    def test_skill_filter_matches_securable_name_only(self, tmp_path, monkeypatch):
+        # `--skill` selects by the name that identifies the skill in UC, so the
+        # bundle name is not a selector even when it differs.
+        diverging = SkillRef(securable_name="task-prioritizer", bundle_name="task-triage")
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([diverging], None))
         monkeypatch.setattr(sd, "fetch_skill_bundle", lambda *a, **k: ({"SKILL.md": b"ok"}, None))
 
-        for requested in ("task-prioritizer", "task-triage"):
-            target = tmp_path / requested
-            target.mkdir()
-            sd.download_skills(WS, "token", ["main.default"], str(target), {requested})
-            assert (target / ".claude/skills/task-triage/SKILL.md").exists()
+        selected = tmp_path / "by-securable"
+        selected.mkdir()
+        sd.download_skills(WS, "token", ["main.default"], str(selected), {"task-prioritizer"})
+        assert (selected / ".claude/skills/task-triage/SKILL.md").exists()
+
+        ignored = tmp_path / "by-bundle"
+        ignored.mkdir()
+        sd.download_skills(WS, "token", ["main.default"], str(ignored), {"task-triage"})
+        assert not (ignored / ".claude/skills").exists()
 
     def test_list_failure_skips_location(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: ([], "HTTP 404 Not Found"))

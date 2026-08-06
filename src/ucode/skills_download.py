@@ -43,15 +43,15 @@ _MAX_FETCH_WORKERS = 8
 class SkillRef:
     """A downloadable skill's two names, which are not interchangeable.
 
-    ``securable`` is the UC leaf of ``skills/<cat>.<sch>.<leaf>`` and is the only
-    name the Files API resolves, so it addresses the bytes. ``bundle`` is the
-    ``name:`` an agent reads from the bundle's SKILL.md frontmatter, so it names
-    the on-disk directory. They differ whenever a skill was created under a
-    securable that doesn't match its frontmatter.
+    ``securable_name`` is the UC leaf of ``skills/<cat>.<sch>.<leaf>`` and is the
+    only name the Files API resolves, so it addresses the bytes and identifies the
+    skill. ``bundle_name`` is the ``name:`` an agent reads from the bundle's
+    SKILL.md frontmatter, so it names the on-disk directory. They differ whenever
+    a skill was created under a securable that doesn't match its frontmatter.
     """
 
-    securable: str
-    bundle: str
+    securable_name: str
+    bundle_name: str
 
 
 def _skill_ref(skill: dict) -> SkillRef | None:
@@ -59,17 +59,19 @@ def _skill_ref(skill: dict) -> SkillRef | None:
 
     Only finalized skills (those with a ``finalize_time``) have bundle content.
     ``bundle_name`` is set at finalize from the SKILL.md frontmatter; when it is
-    absent, the securable leaf doubles as the directory name.
+    absent, the securable name doubles as the directory name.
     """
     if not skill.get("finalize_time"):
         return None
     name = skill.get("name")
     if not isinstance(name, str) or not name:
         return None
-    securable = name.rsplit(".", 1)[-1]
+    securable_name = name.rsplit(".", 1)[-1]
     bundle_name = skill.get("bundle_name")
-    bundle = bundle_name if isinstance(bundle_name, str) and bundle_name else securable
-    return SkillRef(securable=securable, bundle=bundle)
+    return SkillRef(
+        securable_name=securable_name,
+        bundle_name=bundle_name if isinstance(bundle_name, str) and bundle_name else securable_name,
+    )
 
 
 def list_schema_skills(
@@ -223,9 +225,9 @@ def _write_bundle(skill_dir: Path, leaf: str, files: dict[str, bytes]) -> None:
         destination.write_bytes(content)
 
 
-def existing_skill_on_disk(roots: list[Path], bundle: str) -> bool:
-    """Whether ``bundle`` already has a skill directory under any root."""
-    return any((root / bundle).exists() for root in roots)
+def existing_skill_on_disk(roots: list[Path], bundle_name: str) -> bool:
+    """Whether ``bundle_name`` already has a skill directory under any root."""
+    return any((root / bundle_name).exists() for root in roots)
 
 
 def should_download_skill(roots: list[Path], ref: SkillRef, *, location: str) -> bool:
@@ -238,16 +240,16 @@ def should_download_skill(roots: list[Path], ref: SkillRef, *, location: str) ->
     prompt). Dedup keys on the bundle name, since that is the directory an agent
     would load.
     """
-    for name in (ref.securable, ref.bundle):
+    for name in (ref.securable_name, ref.bundle_name):
         if not _is_valid_leaf(name):
             print_warning(f"Skipping `{name}`: not a valid skill name (lowercase a-z, 0-9, -).")
             return False
 
-    if existing_skill_on_disk(roots, ref.bundle) and not prompt_yes_no(
-        f"A skill named `{ref.bundle}` already exists. "
-        f"Overwrite it with `{location}.{ref.securable}`?"
+    if existing_skill_on_disk(roots, ref.bundle_name) and not prompt_yes_no(
+        f"A skill named `{ref.bundle_name}` already exists. "
+        f"Overwrite it with `{location}.{ref.securable_name}`?"
     ):
-        print_note(f"Kept existing `{ref.bundle}`.")
+        print_note(f"Kept existing `{ref.bundle_name}`.")
         return False
 
     return True
@@ -260,7 +262,7 @@ def write_skill(roots: list[Path], ref: SkillRef, files: dict[str, bytes]) -> No
     reads from the written SKILL.md.
     """
     for root in roots:
-        _write_bundle(root / ref.bundle, ref.bundle, files)
+        _write_bundle(root / ref.bundle_name, ref.bundle_name, files)
 
 
 # --- Orchestration ---------------------------------------------------------
@@ -282,8 +284,8 @@ def _fetch_bundles(
     ):
         futures = {
             pool.submit(
-                fetch_skill_bundle, workspace, token, catalog, schema, ref.securable
-            ): ref.securable
+                fetch_skill_bundle, workspace, token, catalog, schema, ref.securable_name
+            ): ref.securable_name
             for ref in refs
         }
         for future in as_completed(futures):
@@ -304,9 +306,9 @@ def download_skills(
     Locations are processed one at a time, and each runs three stages:
 
     1. **List** the schema's finalized skills. When ``skills`` is given, restrict
-       to those names, matching either the securable leaf or the bundle name so
-       whichever a user knows works; names matching neither warn and are skipped,
-       and ``None`` keeps the whole schema.
+       to those securable names (the name that identifies a skill in UC); names
+       absent from the schema warn and are skipped, and ``None`` keeps the whole
+       schema.
     2. **Decide** which to download via ``should_download_skill`` (skips invalid
        names and prompts before overwriting a skill already on disk), so a
        declined skill is never fetched.
@@ -327,13 +329,13 @@ def download_skills(
             print_warning(f"Skipping `{location}`: {reason}.")
             continue
         if skills is not None:
-            unknown = skills - {name for ref in refs for name in (ref.securable, ref.bundle)}
+            unknown = skills - {ref.securable_name for ref in refs}
             if unknown:
                 print_warning(
                     f"Skipping requested skill(s) not found in `{location}`: "
                     f"{', '.join(sorted(unknown))}."
                 )
-            refs = [ref for ref in refs if skills & {ref.securable, ref.bundle}]
+            refs = [ref for ref in refs if ref.securable_name in skills]
             if not refs:
                 print_note(f"No requested skills to download from `{location}`.")
                 continue
@@ -345,9 +347,9 @@ def download_skills(
         bundles = _fetch_bundles(workspace, token, catalog, schema, to_download)
         written = 0
         for ref in to_download:
-            files, reason = bundles[ref.securable]
+            files, reason = bundles[ref.securable_name]
             if reason or files is None:
-                print_warning(f"Skipping `{location}.{ref.securable}`: {reason}.")
+                print_warning(f"Skipping `{location}.{ref.securable_name}`: {reason}.")
                 continue
             write_skill(roots, ref, files)
             written += 1

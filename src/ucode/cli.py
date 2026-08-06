@@ -2229,9 +2229,9 @@ def configure_skills(
         str | None,
         typer.Option(
             "--skill",
-            help="(download) Download only this comma-separated subset of skills (by leaf "
-            "name, e.g. `my-skill`) from the schema, instead of every skill. Requires a "
-            "single --location; not valid with --mcp.",
+            help="(download) Download only this comma-separated subset of skills (by "
+            "securable name, e.g. `my-skill`) from the schema, instead of every skill. "
+            "Requires a single --location; not valid with --mcp.",
         ),
     ] = None,
 ) -> None:
