@@ -3180,7 +3180,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "databricks-sql-connector", specifier = ">=3.6.0" },
-    { name = "mcp", specifier = ">=1.28.0" },
+    { name = "mcp", specifier = ">=1.28.0,<2" },
     { name = "mlflow", extras = ["databricks"], marker = "extra == 'tracing'", specifier = ">=3.4" },
     { name = "questionary", specifier = ">=2.0.0" },
     { name = "tomlkit", specifier = ">=0.13.0" },
