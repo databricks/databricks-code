@@ -105,6 +105,22 @@ class TestDefaultsAreLabelledAsAcceptable:
             assert prompt_for_text("Policy name", default="tiered") == "mine"
 
 
+class TestClosedStdinAborts:
+    """Ctrl-D must reach the CLI as an abort, not as a traceback."""
+
+    def test_percentage_without_a_default_raises_keyboard_interrupt(self):
+        # `ucode setup`'s tier prompt passes no default. EOFError has no handler above this call —
+        # the setup command catches only RuntimeError and KeyboardInterrupt — so a bare EOFError
+        # reached the admin as a raw traceback.
+        with patch("ucode.ui.console.input", side_effect=EOFError):
+            with pytest.raises(KeyboardInterrupt):
+                prompt_for_percentage("Tier 1: activates at what percent of budget?")
+
+    def test_percentage_with_a_default_still_takes_it(self):
+        with patch("ucode.ui.console.input", side_effect=EOFError):
+            assert prompt_for_percentage("at what percent?", default=0.8) == 0.8
+
+
 class TestNormalizeWorkspaceUrl:
     def test_adds_https_when_missing(self):
         assert normalize_workspace_url("example.databricks.com") == "https://example.databricks.com"

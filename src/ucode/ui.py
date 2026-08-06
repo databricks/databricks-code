@@ -53,8 +53,14 @@ def print_kv(key: str, val: str) -> None:
 
 
 def kv_line(key: str, val: str) -> str:
-    """A `print_kv`-styled line, returned instead of printed, for collecting into a panel."""
-    return f"[bold]{key}:[/bold] [cyan]{val}[/cyan]"
+    """A `print_kv`-styled line, returned instead of printed, for collecting into a panel.
+
+    The value is markup-escaped. Rich reads bracketed text as a style tag and renders nothing for
+    it, so a policy name of ``[prod] tiered routing`` displayed as ``tiered routing`` in the config
+    summary — the one block an admin reads to confirm what they are about to publish workspace-wide.
+    Values here include admin-typed free text (policy name, skills locations, tracing table).
+    """
+    return f"[bold]{escape(key)}:[/bold] [cyan]{escape(val)}[/cyan]"
 
 
 def print_panel(title: str, lines: list[str]) -> None:
@@ -416,15 +422,21 @@ def prompt_for_percentage(prompt: str, *, default: float | None = None) -> float
     decides when developers get downgraded, so it should be typed rather than accepted by accident.
     The hint is still formatted (and escaped) the same way :func:`prompt_for_text` formats its own,
     so the two cannot drift if a default is ever introduced.
+
+    Raises ``KeyboardInterrupt`` on closed stdin when there is no default — see the handler below.
     """
     hint = f" {escape(f'[{default * 100:g}]')} (enter to accept)" if default is not None else ""
     while True:
         try:
             raw_value = console.input(f"{label(prompt)}{muted(hint)} {muted('› ')}").strip()
-        except EOFError:
+        except EOFError as exc:
             if default is not None:
                 return default
-            raise
+            # Closed stdin with no default to fall back on is the admin abandoning the prompt, which
+            # is what Ctrl-C means here too. Raised as KeyboardInterrupt so the CLI's existing
+            # handler prints "Interrupted." and exits 130; a bare EOFError has no handler anywhere
+            # above this and reached the admin as a traceback.
+            raise KeyboardInterrupt from exc
         if not raw_value and default is not None:
             return default
         try:

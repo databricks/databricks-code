@@ -1169,6 +1169,26 @@ class TestSummaryPanel:
         assert "╭" in out and "╰" in out
         assert "system.ai.claude-opus-5" in out
 
+    def test_a_bracketed_policy_name_survives_the_summary(self, capsys):
+        # Rich reads bracketed text as a style tag and renders nothing for it, so an unescaped
+        # `[prod] tiered routing` displayed as `tiered routing` — in the block whose whole purpose
+        # is confirming what the admin is about to publish workspace-wide.
+        wizard._render_summary(
+            WORKSPACE,
+            {
+                "default_agent": "claude",
+                "enabled_agents": {
+                    "claude": {"model_config": {"default_model": "system.ai.claude-opus-5"}}
+                },
+                "budget_policy": {
+                    "budget_id": "19165ea4-ff8d-4fbb-b6ce-fc5abe7e1c57",
+                    "display_name": "[prod] tiered routing",
+                    "tiers": [],
+                },
+            },
+        )
+        assert "[prod] tiered routing" in capsys.readouterr().out
+
 
 class TestSearchablePickers:
     """Long lists (models, provider services, budgets) filter as you type."""
