@@ -385,15 +385,17 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
 def default_model(state: dict) -> str | None:
     """Pick the newest GPT model when multiple are available.
 
-    The discovery list is alphabetically sorted, which can put
-    "databricks-gpt-5" ahead of "databricks-gpt-5-5". Prefer the
-    highest semantic version instead.
+    A managed config's ``codex_default_model`` takes priority. The discovery list
+    is alphabetically sorted, which can put "databricks-gpt-5" ahead of
+    "databricks-gpt-5-5". Prefer the highest semantic version instead.
 
     Only GPT-parseable ids are considered. Codex routes the chosen ``model``
     through the gateway as-is, so a non-GPT entry (e.g. ``moonshotai/kimi-k2.5``)
     would be rejected with a Unity Catalog endpoint-name error. When no
     candidate parses as GPT we return None rather than pinning an unroutable id.
     """
+    if isinstance(state.get("codex_default_model"), str):
+        return state.get("codex_default_model")
     codex_models = state.get("codex_models") or []
     parsed: list[tuple[str, tuple[int, int | None, int | None, str]]] = [
         (mid, gpt) for mid in codex_models if (gpt := _parse_gpt(mid)) is not None

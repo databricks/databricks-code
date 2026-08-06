@@ -1204,6 +1204,27 @@ _OSS_MODEL_FAMILIES = ("kimi-", "glm-")
 # model-services listing and `databricks-claude-<family>-*` via the AI Gateway).
 ANTHROPIC_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 
+
+def classify_model_family(model_id: str) -> str | None:
+    """Bucket a model FQN into the family ucode keys its state by, or None if unrecognized.
+
+    Mirrors how discovery buckets a model-services listing (see `discover_model_services`), so a
+    model named in a managed config lands in the same bucket it would have from discovery. Returns
+    one of ``ANTHROPIC_FAMILIES``, ``"codex"``, ``"gemini"``, or ``"oss"``. Matching is by name
+    substring because neither the listing nor the config records a model's API dialect.
+    """
+    for family in ANTHROPIC_FAMILIES:
+        if f"claude-{family}-" in model_id:
+            return family
+    if "gpt-" in model_id:
+        return "codex"
+    if "gemini-" in model_id:
+        return "gemini"
+    if any(oss in model_id for oss in _OSS_MODEL_FAMILIES):
+        return "oss"
+    return None
+
+
 # Per-family token limits (context window + max output tokens). These are a
 # property of the model + its `/ai-gateway/mlflow/v1` route (the gateway rejects
 # requests whose output exceeds the cap), not of any one agent — so every agent

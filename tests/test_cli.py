@@ -143,10 +143,7 @@ def _patch_launch(tool: str):
             "ucode.cli.configure_tool",
             return_value=MINIMAL_STATE,
         ),
-        patch(
-            "ucode.cli.managed_launch_state",
-            side_effect=lambda state, tool: (state, None),
-        ),
+        patch("ucode.cli._fetch_managed_config", return_value=None),
         patch("ucode.cli.launch_agent"),
     ]
 
@@ -270,10 +267,7 @@ class TestSubcommandRouting:
                 return_value=(decision, None),
             ),
             patch("ucode.cli.configure_tool", return_value=state) as mock_configure,
-            patch(
-                "ucode.cli.managed_launch_state",
-                side_effect=lambda state, tool: (state, None),
-            ),
+            patch("ucode.cli._fetch_managed_config", return_value=None),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["codex"])
@@ -740,10 +734,7 @@ class TestAutoConfigureOnFirstRun:
                 return_value=(configured_state, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=configured_state),
-            patch(
-                "ucode.cli.managed_launch_state",
-                side_effect=lambda state, tool: (state, None),
-            ),
+            patch("ucode.cli._fetch_managed_config", return_value=None),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["claude"])
@@ -768,10 +759,7 @@ class TestAutoConfigureOnFirstRun:
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch(
-                "ucode.cli.managed_launch_state",
-                side_effect=lambda state, tool: (state, None),
-            ),
+            patch("ucode.cli._fetch_managed_config", return_value=None),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["claude"])
@@ -795,10 +783,7 @@ class TestAutoConfigureOnFirstRun:
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch(
-                "ucode.cli.managed_launch_state",
-                side_effect=lambda state, tool: (state, None),
-            ),
+            patch("ucode.cli._fetch_managed_config", return_value=None),
             patch("ucode.cli.launch_agent"),
         ):
             runner.invoke(app, ["claude"])
@@ -2095,10 +2080,7 @@ class TestSkipPreflightFlag:
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch(
-                "ucode.cli.managed_launch_state",
-                side_effect=lambda state, tool: (state, None),
-            ),
+            patch("ucode.cli._fetch_managed_config", return_value=None),
             patch("ucode.cli.launch_agent"),
         ]
 
@@ -2121,3 +2103,107 @@ class TestSkipPreflightFlag:
             result = runner.invoke(app, [tool])
         assert result.exit_code == 0, result.output
         assert cfg.call_args.kwargs["skip_preflight"] is False
+
+
+class TestRejectDisabledAgent:
+    """`enabled_agents` is an allowlist: an agent the admin didn't enable would launch unmanaged."""
+
+    @staticmethod
+    def _reject(managed, tool):
+        import ucode.cli as cli_mod
+
+        cli_mod._reject_disabled_agent(managed, tool)
+
+    def test_raises_naming_the_enabled_agents(self):
+        managed = {"enabled_agents": {"claude": {}, "opencode": {}}}
+        with pytest.raises(RuntimeError, match="doesn't enable Gemini CLI") as exc:
+            self._reject(managed, "gemini")
+        assert "Claude Code, OpenCode" in str(exc.value)
+
+    def test_allows_an_enabled_agent(self):
+        self._reject({"enabled_agents": {"claude": {}}}, "claude")
+
+    @pytest.mark.parametrize("managed", [None, {}, {"budget_policy": {}}])
+    def test_a_config_naming_no_agents_blocks_nothing(self, managed):
+        # No managed config, or one that only sets a budget policy, expresses no opinion on agents.
+        self._reject(managed, "gemini")
+
+
+class TestFetchManagedConfig:
+    """The launch path's managed-config read, which gates both the allowlist and model discovery."""
+
+    @staticmethod
+    def _fetch(state, *, skip_preflight=False):
+        import ucode.cli as cli_mod
+
+        return cli_mod._fetch_managed_config(state, skip_preflight=skip_preflight)
+
+    def test_fetches_fresh_when_enabled(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr(
+            "ucode.cli.refresh_managed_config", lambda state: {"enabled_agents": {}}
+        )
+        assert self._fetch({"workspace": "https://w"}) == {"enabled_agents": {}}
+
+    @pytest.mark.parametrize("env_value", [None, "", "0", "off", "no"])
+    def test_disabled_reads_nothing_at_all(self, monkeypatch, env_value):
+        """While the feature is opt-in, a disabled launch must not read the config or the network."""
+        if env_value is None:
+            monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
+        else:
+            monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", env_value)
+        for name in ("refresh_managed_config", "load_managed_state"):
+            monkeypatch.setattr(
+                f"ucode.cli.{name}",
+                lambda *a, called=name, **k: pytest.fail(f"{called} must not run when disabled"),
+            )
+        assert self._fetch({"workspace": "https://w"}) is None
+
+    def test_skip_preflight_reads_the_cache_without_fetching(self, monkeypatch):
+        # Headless launchers pass --skip-preflight to avoid per-launch network calls.
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr(
+            "ucode.cli.refresh_managed_config", lambda state: pytest.fail("should not fetch")
+        )
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: {"enabled_agents": {}})
+        assert self._fetch({"workspace": "https://w"}, skip_preflight=True) == {
+            "enabled_agents": {}
+        }
+
+    def test_skip_preflight_with_an_empty_cache_is_none(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: {})
+        assert self._fetch({"workspace": "https://w"}, skip_preflight=True) is None
+
+
+class TestManagedConfigDecidesDiscoveryFromFreshRead:
+    def test_a_removed_model_list_no_longer_skips_discovery(self, monkeypatch):
+        """The sweep decision must come from the fetched config, not the cached one.
+
+        An admin who removes a previously published model list leaves a cache that still names
+        models. Deciding from that cache would skip discovery for a config that no longer supplies
+        models, so the launch would have neither.
+        """
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        stale_cache = {
+            "enabled_agents": {"claude": {"model_config": {"models": {"default_opus_model": "m"}}}}
+        }
+        fresh = {"enabled_agents": {"claude": {"model_config": {}}}}
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: stale_cache)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: fresh)
+
+        state = dict(MINIMAL_STATE)
+        with (
+            patch("ucode.cli.normalize_tool", return_value="claude"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.apply_pat_environment"),
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state) as mock_shared,
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, ["claude"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_shared.call_args.kwargs["skip_model_discovery"] is False

@@ -23,6 +23,7 @@ from ucode.databricks import (
     build_shared_base_urls,
     build_skills_mcp_url,
     build_tool_base_url,
+    classify_model_family,
     ensure_databricks_cli_version,
     ensure_pat_bearer,
     get_databricks_token,
@@ -2070,3 +2071,25 @@ class TestInstallAiTools:
         install_ai_tools(["copilot"])
         assert len(warnings) == 1
         assert "copilot: cli-not-on-path: could not resolve copilot" in warnings[0]
+
+
+class TestClassifyModelFamily:
+    """Recovers the bucket a model would land in from discovery, so a managed config's flat list
+    can be translated into the per-family state each agent reads."""
+
+    @pytest.mark.parametrize(
+        ("model_id", "expected"),
+        [
+            ("system.ai.claude-opus-4-8", "opus"),
+            ("system.ai.claude-sonnet-5", "sonnet"),
+            ("databricks-claude-haiku-4-5", "haiku"),
+            ("system.ai.claude-fable-5", "fable"),
+            ("system.ai.gpt-5-3-codex", "codex"),
+            ("system.ai.gemini-3-flash", "gemini"),
+            ("system.ai.kimi-k2-7-code", "oss"),
+            ("system.ai.glm-4-6", "oss"),
+            ("something-unrecognized", None),
+        ],
+    )
+    def test_buckets_by_family(self, model_id, expected):
+        assert classify_model_family(model_id) == expected

@@ -58,12 +58,15 @@ from ucode.databricks import (
 from ucode.managed_config import (
     load_managed_state,
     managed_agent_config_enabled,
-    managed_launch_state,
+    refresh_managed_config,
 )
 from ucode.managed_resolve import (
     managed_default_model,
+    managed_enabled_tools,
     managed_provider_service,
     managed_supplies_models,
+    managed_unservable_models,
+    resolve_state,
 )
 from ucode.mcp import (
     MCP_CLIENTS,
@@ -1177,6 +1180,36 @@ _ROUTING_AGENTS = {"codex": codex_agent, "claude": claude_agent}
 _ROUTING_MODULES = {"codex": codex_routing, "claude": claude_routing}
 
 
+def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
+    """Refuse to launch ``tool`` when the managed config enables other agents but not this one.
+
+    ``enabled_agents`` is an allowlist: launching an agent the admin didn't enable would run
+    unmanaged, with none of their models or provider applied. A config that names no agents at all
+    expresses no opinion, so it blocks nothing.
+    """
+    enabled = managed_enabled_tools(managed or {})
+    if enabled and tool not in enabled:
+        names = ", ".join(TOOL_SPECS[name]["display"] for name in enabled)
+        raise RuntimeError(
+            f"Your workspace's managed config doesn't enable {TOOL_SPECS[tool]['display']}. "
+            f"Enabled: {names}."
+        )
+
+
+def _fetch_managed_config(state: dict, *, skip_preflight: bool) -> dict | None:
+    """The workspace's managed config for this launch, or None when there is none.
+
+    ``skip_preflight`` mirrors the launch flag: it reads the last persisted copy instead of
+    re-fetching, so the config can be stale until a normal launch refreshes it.
+    """
+    if not managed_agent_config_enabled():
+        return None
+    if skip_preflight:
+        return load_managed_state(state.get("workspace")) or None
+    with spinner("Checking for a managed coding agent config..."):
+        return refresh_managed_config(state)
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -1211,10 +1244,13 @@ def _launch_tool(
         # back to whatever `ucode configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
         routing_agent = _ROUTING_AGENTS.get(tool)
+        # Fetched before `configure_shared_state` because it decides whether this agent may launch
+        # at all and whether the model discovery below can be skipped.
+        managed = _fetch_managed_config(state, skip_preflight=skip_preflight)
+        # Checked before discovery, which can take tens of seconds, so a blocked launch fails fast.
+        _reject_disabled_agent(managed, tool)
         # Discovery exists to find models and isn't needed for managed config that already names them.
-        managed_models_known = managed_agent_config_enabled() and managed_supplies_models(
-            load_managed_state(state.get("workspace")), tool
-        )
+        managed_models_known = managed_supplies_models(managed, tool)
         # Re-fetch model lists on every launch so newly-added Databricks
         # endpoints show up without a manual `ucode configure` (and so that
         # tools like pi which read multiple model bundles never run on
@@ -1227,29 +1263,30 @@ def _launch_tool(
             skip_model_discovery=bool(provider) or managed_models_known,
             skip_preflight=skip_preflight,
         )
-        # An admin-published managed config wins over the developer's own settings. Resolved before
-        # the provider and model are settled below, so each is decided once against the values that
-        # will actually be written — the two state files are never merged on disk.
-        managed = None
-        if managed_agent_config_enabled():
-            # The spinner covers the read; the outcome is printed after it so the line survives
-            # (a spinner erases itself, leaving nothing to explain which settings won).
-            with spinner("Checking for a managed coding agent config..."):
-                state, managed = managed_launch_state(state, tool, skip_preflight=skip_preflight)
-            if managed is not None:
-                print_success("Applied your workspace's managed coding agent config")
-                # The enterprise scope outranks the --settings file ucode writes, so a model pinned
-                # there quietly beats the admin's — point at the file rather than let the mismatch
-                # look like a ucode bug.
-                if tool == "claude":
-                    overrides = claude_agent.managed_settings_model_overrides()
-                    if overrides is not None:
-                        print_warning(
-                            f"Default models are set in your enterprise managed settings at "
-                            f"{overrides}, which may override your admin's managed config."
-                        )
-            else:
-                print_note("No managed coding agent config found; using your own settings")
+        # An admin-published managed config wins over the developer's own settings. Layered on after
+        # `configure_shared_state`, whose returned state it overrides, and before the provider and
+        # model are settled below — the two state files are never merged on disk.
+        if managed is not None:
+            state = resolve_state(managed, state, tool)
+            print_success("Applied your workspace's managed coding agent config")
+            unservable = managed_unservable_models(managed, tool)
+            if unservable:
+                print_warning(
+                    f"Your workspace's managed config lists no {TOOL_SPECS[tool]['display']}-servable "
+                    f"models ({', '.join(unservable)}); using your discovered models instead."
+                )
+            # The enterprise scope outranks the --settings file ucode writes, so a model pinned
+            # there quietly beats the admin's — point at the file rather than let the mismatch
+            # look like a ucode bug.
+            if tool == "claude":
+                overrides = claude_agent.managed_settings_model_overrides()
+                if overrides is not None:
+                    print_warning(
+                        f"Default models are set in your enterprise managed settings at "
+                        f"{overrides}, which may override your admin's managed config."
+                    )
+        elif managed_agent_config_enabled():
+            print_note("No managed coding agent config found; using your own settings")
         if managed is not None:
             managed_provider = managed_provider_service(managed, tool)
             if explicit_provider and managed_provider and managed_provider != explicit_provider:

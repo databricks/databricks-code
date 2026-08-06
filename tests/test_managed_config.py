@@ -12,7 +12,6 @@ import ucode.managed_config as mc_mod
 from ucode.managed_config import (
     get_managed_config,
     load_managed_state,
-    managed_launch_state,
     normalize_managed_config,
     refresh_managed_config,
     save_managed_state,
@@ -393,87 +392,3 @@ class TestRefreshManagedConfig:
             mc_mod, "get_managed_config", lambda ws, tok: pytest.fail("should not fetch")
         )
         assert refresh_managed_config({}) is None
-
-
-class TestManagedLaunchState:
-    @pytest.fixture(autouse=True)
-    def _stub_token(self, monkeypatch):
-        monkeypatch.setattr(mc_mod, "get_databricks_token", lambda ws, profile: "tok")
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
-        monkeypatch.setenv(mc_mod.MANAGED_CONFIG_ENV_VAR, "1")
-
-    def test_layers_managed_models_when_a_config_exists(self, monkeypatch):
-        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (MANAGED, None))
-        state = _state(claude_models={"opus": "local-opus"})
-        resolved, managed = managed_launch_state(state, "claude")
-        assert managed == MANAGED
-        assert resolved["claude_models"]["opus"] == "system.ai.claude-opus-5"
-        # The developer's own state is untouched — precedence is resolved in memory.
-        assert state["claude_models"]["opus"] == "local-opus"
-
-    def test_state_untouched_when_no_managed_config(self, monkeypatch):
-        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
-        state = _state(claude_models={"opus": "local-opus"})
-        resolved, managed = managed_launch_state(state, "claude")
-        assert managed is None
-        assert resolved is state
-
-    @pytest.mark.parametrize("env_value", [None, "", "0", "off", "no"])
-    def test_disabled_does_nothing_at_all(self, monkeypatch, env_value):
-        """While the feature is opt-in, a disabled launch must behave exactly as it did before.
-
-        Every side effect the managed path can have is trip-wired, so this fails if any future
-        change reaches the network, the cache, or the developer's state without the env var set.
-        """
-        if env_value is None:
-            monkeypatch.delenv(mc_mod.MANAGED_CONFIG_ENV_VAR, raising=False)
-        else:
-            monkeypatch.setenv(mc_mod.MANAGED_CONFIG_ENV_VAR, env_value)
-        for name in (
-            "get_databricks_token",
-            "fetch_managed_coding_agent_configs",
-            "get_managed_config",
-            "load_managed_state",
-            "save_managed_state",
-            "resolve_state",
-            "print_warning",
-        ):
-            monkeypatch.setattr(
-                mc_mod,
-                name,
-                lambda *a, called=name, **k: pytest.fail(f"{called} must not run when disabled"),
-            )
-
-        assert mc_mod.managed_agent_config_enabled() is False
-        state = _state(claude_models={"opus": "local-opus"})
-        resolved, managed = managed_launch_state(state, "claude")
-        assert managed is None
-        # Same object back, so nothing downstream can see a layered value.
-        assert resolved is state
-        assert state["claude_models"] == {"opus": "local-opus"}
-
-    @pytest.mark.parametrize("env_value", ["1", "true", "TRUE", "yes"])
-    def test_enabled_values(self, monkeypatch, env_value):
-        monkeypatch.setenv(mc_mod.MANAGED_CONFIG_ENV_VAR, env_value)
-        assert mc_mod.managed_agent_config_enabled() is True
-
-    def test_skip_preflight_reads_the_cache_without_fetching(self, monkeypatch):
-        # Headless launchers pass --skip-preflight to avoid per-launch network calls, so the config
-        # comes from the last persisted copy rather than a fresh read.
-        monkeypatch.setattr(
-            mc_mod, "get_managed_config", lambda ws, tok: pytest.fail("should not fetch")
-        )
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: MANAGED)
-        resolved, managed = managed_launch_state(_state(), "claude", skip_preflight=True)
-        assert managed == MANAGED
-        assert resolved["claude_models"]["opus"] == "system.ai.claude-opus-5"
-
-    def test_skip_preflight_with_no_cache_is_a_noop(self, monkeypatch):
-        monkeypatch.setattr(
-            mc_mod, "get_managed_config", lambda ws, tok: pytest.fail("should not fetch")
-        )
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
-        state = _state()
-        resolved, managed = managed_launch_state(state, "claude", skip_preflight=True)
-        assert managed is None
-        assert resolved is state

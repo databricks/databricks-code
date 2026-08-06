@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import cast
 
+from ucode.databricks import ANTHROPIC_FAMILIES, classify_model_family
 from ucode.state import MANAGED_OVERLAY_KEY
 
 # Proto model-config slot -> the family key `claude.py`'s render_overlay reads. The manifest keeps
@@ -57,37 +58,98 @@ def _agent_model_config(managed: dict, tool: str) -> dict[str, object]:
     return _as_dict(_agent_entry(managed, tool).get("model_config"))
 
 
-def effective_agent_models(managed: dict, state: dict, tool: str) -> dict | list | None:
-    """Resolve ``tool``'s model list/slots from the manifest, falling back to ucode state.
+def managed_state_overrides(managed: dict, tool: str) -> dict[str, object]:
+    """The state keys to layer over local state so ``tool``'s writer sees the admin's models.
 
-    Once the manifest says anything about ``tool``'s models it is the whole allowlist: the
-    developer's discovered models drop out entirely, so a launch can only reach models the admin
-    named. Each claude family resolves only to its own slot — a family the manifest leaves out stays
-    unset rather than inheriting ``default_model``, so ucode writes no
-    ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` for it and the agent falls back to its own default. Omitting
-    a family is how an admin steers people off it, and filling it in with ``default_model`` would
-    quietly re-enable what they left out. Every other agent stores a flat list, which has no per-key
-    identity — there the manifest's list replaces the local one outright. Only when the manifest
-    names nothing for ``tool`` does the developer's own list stand.
+    Each agent reads its models from a different shape, so the manifest's list has to be translated
+    rather than dropped into one key: opencode wants provider-bucketed lists, and pi/copilot compose
+    from their own per-agent keys. Returns ``{state_key: value}`` — empty when the manifest names
+    nothing for ``tool``, in which case the developer's own state stands.
     """
-    model_config = _agent_model_config(managed, tool)
-    manifest_models = model_config.get("models")
+    overrides: dict[str, object] = {}
+    models = _manifest_models(managed, tool)
+    if models:
+        if tool == "claude":
+            overrides["claude_models"] = models
+        elif tool == "opencode" and isinstance(models, list):
+            # OpenCode selects `provider/model`, so its state is bucketed by provider rather than flat.
+            # No override when nothing buckets: an empty dict would replace the developer's own
+            # models, leaving opencode with none at all.
+            buckets = _bucket_by_provider(models)
+            if buckets:
+                overrides["opencode_models"] = buckets
+        else:
+            overrides[f"{tool}_models"] = models
+    default_model = _str(_agent_model_config(managed, tool).get("default_model"))
+    if default_model:
+        overrides[f"{tool}_default_model"] = default_model
+    return overrides
+
+
+def managed_unservable_models(managed: dict, tool: str) -> list[str]:
+    """The models the manifest names for ``tool`` when it has no provider to serve any of them.
+
+    Only non-empty when *every* named model is unservable, which is when the translation yields
+    nothing and the developer's own models stand — so the caller can say why the admin's list had no
+    effect. opencode has no OpenAI provider and pi has no OSS provider, so each can be handed a
+    valid model FQN it cannot route.
+    """
+    if tool not in ("opencode", "pi"):
+        return []
+    models = _manifest_models(managed, tool)
+    if not isinstance(models, list):
+        return []
+    servable = (
+        _bucket_by_provider(models)
+        if tool == "opencode"
+        else [
+            m
+            for m in models
+            if classify_model_family(m) in (*ANTHROPIC_FAMILIES, "codex", "gemini")
+        ]
+    )
+    return [] if servable else models
+
+
+def _manifest_models(managed: dict, tool: str) -> dict | list | None:
+    """The manifest's models for ``tool`` in its own vocabulary, or None when it names none."""
+    manifest_models = _agent_model_config(managed, tool).get("models")
     if tool == "claude":
         slots: dict[str, str] = {}
         for slot, family in _CLAUDE_FAMILY_SLOTS.items():
             model = _str(_as_dict(manifest_models).get(slot))
             if model:
                 slots[family] = model
-        if slots:
-            return slots
-        local = _as_dict(state.get("claude_models"))
-        return dict(local) if local else None
+        return slots or None
     if isinstance(manifest_models, list):
-        models = [m for m in (_str(item) for item in manifest_models) if m]
-        if models:
-            return models
-    local_list = state.get(f"{tool}_models")
-    return local_list if local_list else None
+        listed = [model for model in (_str(item) for item in manifest_models) if model]
+        return listed or None
+    return None
+
+
+def _bucket_by_provider(models: list[str]) -> dict[str, list[str]]:
+    """Group model FQNs into OpenCode's provider buckets, mirroring how discovery builds them.
+
+    Discovery derives these from the per-family lists (claude -> anthropic, and gemini/oss as-is), so
+    the same family classification recovers them from a flat manifest list. Models whose family
+    can't be identified are dropped.
+    """
+    buckets: dict[str, list[str]] = {}
+    for model in models:
+        family = classify_model_family(model)
+        if family in ANTHROPIC_FAMILIES:
+            buckets.setdefault("anthropic", []).append(model)
+        elif family in ("gemini", "oss"):
+            buckets.setdefault(family, []).append(model)
+    return buckets
+
+
+def managed_enabled_tools(managed: dict) -> list[str]:
+    """The tools the managed config enables, in the config's own order.
+
+    Every entry is an agent ucode recognizes: ``normalize_managed_config`` drops enum values this
+    build doesn't know, so an unrecognized agent never reaches here."""
+    return list(_as_dict(_as_dict(managed).get("enabled_agents")))
 
 
 def managed_supplies_models(managed: dict | None, tool: str) -> bool:
@@ -116,7 +178,7 @@ def managed_provider_service(managed: dict, tool: str) -> str | None:
 def managed_default_model(managed: dict, tool: str) -> str | None:
     """Return the model the managed config wants ``tool`` to launch on, if it names one.
 
-    Distinct from the family slots :func:`effective_agent_models` resolves: those set what each
+    Distinct from the family slots :func:`managed_state_overrides` resolves: those set what each
     family shortcut maps to, while this is the model the session actually starts on. The launch path
     pins it explicitly, so the admin's choice holds even for agents that would otherwise pick their
     own default."""
@@ -135,11 +197,10 @@ def resolve_state(managed: dict, state: dict, tool: str) -> dict:
     """
     resolved = dict(state)
     overlay: dict[str, object] = {}
-    models = effective_agent_models(managed, state, tool)
-    models_key = f"{tool}_models"
-    if models is not None and models != state.get(models_key):
-        overlay[models_key] = state.get(models_key)
-        resolved[models_key] = models
+    for key, value in managed_state_overrides(managed, tool).items():
+        if value != state.get(key):
+            overlay[key] = state.get(key)
+            resolved[key] = value
     provider = managed_provider_service(managed, tool)
     if provider:
         providers = dict(_as_dict(state.get("provider_services")))
