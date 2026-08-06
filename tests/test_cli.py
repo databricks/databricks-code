@@ -198,6 +198,21 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         mock_set.assert_not_called()
 
+    def test_pi_accepts_provider_and_threads_it_through(self):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, ["pi", "--provider", "main.gateway.custom-svc"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.kwargs["provider"] == "main.gateway.custom-svc"
+
+    def test_pi_declares_provider_option(self):
+        # Asserted on the registered option rather than `--help` text, which Rich
+        # truncates at the terminal width.
+        import typer
+
+        pi_command = typer.main.get_command(app).commands["pi"]
+        assert "--provider" in [opt for p in pi_command.params for opt in (p.opts or [])]
+
     def test_codex_enable_smart_routing_is_consumed_by_ucode(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
             result = runner.invoke(app, ["codex", "--enable-smart-routing"])
@@ -1348,6 +1363,31 @@ class TestConfigureAgentsSelection:
         cli_mod.configure_workspace_command()
         assert picked_for == ["claude"]
 
+    def test_provider_picker_probes_for_pi_but_not_gemini(self, monkeypatch):
+        # pi can route to a custom Model Provider Service, so the interactive
+        # picker must actually probe for one instead of skipping it.
+        import ucode.cli as cli_mod
+
+        state = {**MINIMAL_STATE, "available_tools": []}
+        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "tok")
+        monkeypatch.setattr(cli_mod, "save_state", lambda s: None)
+        monkeypatch.setattr(cli_mod, "set_provider_service", lambda s, tool, name: s)
+        probed: list[str] = []
+
+        def fake_list(tool, workspace, token):
+            probed.append(tool)
+            # No services on the workspace: falls back to Databricks.
+            return [], None
+
+        monkeypatch.setattr(cli_mod, "list_tool_provider_services", fake_list)
+
+        cli_mod._maybe_select_provider_service("pi", state)
+        assert probed == ["pi"]
+
+        # gemini has no dialect for any provider type, so it stays a pass-through.
+        cli_mod._maybe_select_provider_service("gemini", state)
+        assert probed == ["pi"]
+
     def test_unavailable_selected_tool_errors_before_configure(self, monkeypatch):
         import ucode.cli as cli_mod
 
@@ -1386,6 +1426,7 @@ class TestConfigureAgentsSelection:
             use_pat=False,
             fable_enabled=None,
             databricks_ai_tools_enabled=None,
+            provider_context_window=None,
         ):
             configured_shared.append(
                 (workspace, profile, tuple(tools) if tools is not None else None, force_login)
@@ -1779,6 +1820,36 @@ class TestConfigureSharedStateUsePat:
 
         assert "fable_enabled" not in state
         assert "fable" not in state["claude_models"]
+
+    def test_provider_context_window_persists(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        state = cli_mod.configure_shared_state(
+            self.WS, profile="DEFAULT", provider_context_window=327680
+        )
+        assert state["provider_context_window"] == 327680
+
+    def test_provider_context_window_absent_by_default(self, monkeypatch):
+        # Absent means "use the conservative default" in agents/pi.py.
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+        assert "provider_context_window" not in state
+
+    def test_launch_inherits_persisted_provider_context_window(self, monkeypatch):
+        # A launch passes None; the same workspace's stored override still applies,
+        # so the background token refresh keeps writing the right window.
+        cli_mod, *_ = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": self.WS,
+                "profile": "DEFAULT",
+                "provider_context_window": 327680,
+            },
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert state["provider_context_window"] == 327680
 
     def test_ai_tools_disable_persists(self, monkeypatch):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")

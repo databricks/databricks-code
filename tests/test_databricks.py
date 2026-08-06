@@ -390,6 +390,29 @@ class TestListModelProviderServices:
                     "targets": [{"model": "amazon.titan-text-express-v1"}],
                 },
             },
+            {
+                "name": "model-provider-services/main.schema3.custom-svc",
+                "config": {
+                    "provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_CUSTOM",
+                    "targets": [
+                        {
+                            "model": "deepseek-v4-flash",
+                            "native_api_types": ["openai/v1/chat/completions"],
+                        },
+                        # A dialect ucode has no gateway path for, plus a target
+                        # that declares none at all — neither is routable.
+                        {"model": "responses-only", "native_api_types": ["openai/v1/responses"]},
+                        {"model": "undeclared"},
+                    ],
+                },
+            },
+            {
+                "name": "model-provider-services/main.schema3.custom-unroutable-svc",
+                "config": {
+                    "provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_CUSTOM",
+                    "targets": [{"model": "mystery", "native_api_types": "not-a-list"}],
+                },
+            },
         ]
     }
 
@@ -403,6 +426,7 @@ class TestListModelProviderServices:
             "name": "main.schema1.anthropic-svc",
             "provider_type": "anthropic",
             "targets": [],
+            "target_api_types": {},
             "allow_all_targets": False,
             "relayed": False,
         }
@@ -410,7 +434,31 @@ class TestListModelProviderServices:
             "anthropic",
             "openai",
             "amazon_bedrock",
+            "custom",
         }
+
+    def test_keeps_per_target_native_api_types(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (self._PAYLOAD, None)
+        )
+        services, _ = db_mod.list_model_provider_services(WS, "token")
+        custom = next(s for s in services if s["name"] == "main.schema3.custom-svc")
+        assert custom["target_api_types"] == {
+            "deepseek-v4-flash": ["openai/v1/chat/completions"],
+            "responses-only": ["openai/v1/responses"],
+            # Declared nothing: an empty list, not a missing key.
+            "undeclared": [],
+        }
+        # The plain id list keeps its shape for callers like map_bedrock_claude_models.
+        assert custom["targets"] == ["deepseek-v4-flash", "responses-only", "undeclared"]
+
+    def test_tolerates_non_list_native_api_types(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (self._PAYLOAD, None)
+        )
+        services, _ = db_mod.list_model_provider_services(WS, "token")
+        unroutable = next(s for s in services if s["name"] == "main.schema3.custom-unroutable-svc")
+        assert unroutable["target_api_types"] == {"mystery": []}
 
     def test_flags_relayed_anthropic(self, monkeypatch):
         monkeypatch.setattr(
@@ -461,6 +509,67 @@ class TestListModelProviderServices:
         )
         names, _ = db_mod.list_tool_provider_services("codex", WS, "token")
         assert names == ["main.schema1.openai-svc"]
+
+    def test_pi_filters_to_routable_custom(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (self._PAYLOAD, None)
+        )
+        names, _ = db_mod.list_tool_provider_services("pi", WS, "token")
+        # The custom service with no chat-completions target is hidden, so the
+        # interactive picker never offers something that would fail at launch.
+        assert names == ["main.schema3.custom-svc"]
+
+
+class TestBuildNativeApiBaseUrl:
+    def test_openai_chat_completions(self):
+        # Stops before the `/chat/completions` pi's openai-completions appends.
+        assert (
+            db_mod.build_native_api_base_url(WS, "openai/v1/chat/completions")
+            == f"{WS}/ai-gateway/openai/v1"
+        )
+
+    def test_unrouted_dialect_returns_none(self):
+        assert db_mod.build_native_api_base_url(WS, "anthropic/v1/messages") is None
+
+
+class TestCustomProviderSupport:
+    _CUSTOM = {
+        "name": "main.schema3.custom-svc",
+        "provider_type": "custom",
+        "targets": ["chat-model", "responses-model"],
+        "target_api_types": {
+            "chat-model": ["openai/v1/chat/completions"],
+            "responses-model": ["openai/v1/responses"],
+        },
+    }
+
+    def test_pi_supports_custom(self):
+        assert db_mod.tool_supports_provider_type("pi", "custom")
+
+    def test_claude_does_not_support_custom(self):
+        assert not db_mod.tool_supports_provider_type("claude", "custom")
+
+    def test_pi_does_not_support_openai(self):
+        # pi speaks chat completions to a custom service, not a vendor OpenAI one.
+        assert not db_mod.tool_supports_provider_type("pi", "openai")
+
+    def test_targets_filtered_to_chat_completions(self):
+        assert db_mod.custom_openai_chat_targets(self._CUSTOM) == ["chat-model"]
+
+    def test_no_chat_targets_yields_empty(self):
+        service = {**self._CUSTOM, "target_api_types": {"responses-model": []}}
+        assert db_mod.custom_openai_chat_targets(service) == []
+
+    def test_usable_for_pi_when_a_chat_target_exists(self):
+        assert db_mod.service_usable_for_tool("pi", self._CUSTOM)
+
+    def test_not_usable_for_pi_without_a_chat_target(self):
+        service = {
+            **self._CUSTOM,
+            "targets": ["responses-model"],
+            "target_api_types": {"responses-model": ["openai/v1/responses"]},
+        }
+        assert not db_mod.service_usable_for_tool("pi", service)
 
 
 class TestMapBedrockClaudeModels:
@@ -668,6 +777,32 @@ class TestResolveProviderService:
         )
         assert service is None
         assert "no Claude models" in error
+
+    def test_custom_for_pi_ok(self, monkeypatch):
+        self._patch(monkeypatch)
+        service, error = db_mod.resolve_provider_service(
+            "pi", "main.schema3.custom-svc", WS, "token"
+        )
+        assert error is None
+        assert service["provider_type"] == "custom"
+        assert db_mod.custom_openai_chat_targets(service) == ["deepseek-v4-flash"]
+
+    def test_custom_without_chat_target_rejected(self, monkeypatch):
+        self._patch(monkeypatch)
+        service, error = db_mod.resolve_provider_service(
+            "pi", "main.schema3.custom-unroutable-svc", WS, "token"
+        )
+        assert service is None
+        assert "openai/v1/chat/completions" in error
+
+    def test_pi_rejects_non_custom_type(self, monkeypatch):
+        self._patch(monkeypatch)
+        service, error = db_mod.resolve_provider_service(
+            "pi", "main.schema1.openai-svc", WS, "token"
+        )
+        assert service is None
+        assert "can't route to" in error
+        assert "supported: custom" in error
 
     def test_not_found_lists_usable(self, monkeypatch):
         self._patch(monkeypatch)

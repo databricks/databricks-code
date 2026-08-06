@@ -576,6 +576,14 @@ class TestModelProviderLaunch:
         if "USE CONNECTION" in combined or "EXECUTE" in combined:
             pytest.skip(f"no permission on provider {provider}: {combined[:200]}")
 
+    @staticmethod
+    def _skip_if_upstream_unavailable(combined: str, provider: str) -> None:
+        """A custom service fronts a caller-operated endpoint, which can be down
+        independently of ucode. The gateway surfaces that as a 502/503, so treat it
+        as an environment skip rather than a ucode failure."""
+        if "502" in combined or "503" in combined or "temporarily unavailable" in combined:
+            pytest.skip(f"provider {provider} upstream is unavailable: {combined[:200]}")
+
     def test_launch_claude_through_provider(
         self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
     ):
@@ -650,6 +658,67 @@ class TestModelProviderLaunch:
             pytest.fail(f"provider={provider} timed out after {timeout_seconds}s")
         combined = (result.stdout + result.stderr).strip()
         self._skip_if_no_permission(combined, provider)
+        assert result.returncode == 0 and combined, (
+            f"provider={provider} rc={result.returncode} "
+            f"stdout={result.stdout[:300]!r} stderr={result.stderr[:300]!r}"
+        )
+
+    def test_launch_pi_through_custom_provider(
+        self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
+    ):
+        """A `custom` service exercises a path no vendor service covers: the
+        request is OpenAI chat completions on /ai-gateway/openai/v1, selected by
+        header, with the bare target name as the body's `model`."""
+        import ucode.config_io as config_io_mod
+        from ucode.agents import pi, resolve_provider_models
+
+        _require_binary("pi")
+        provider = self._first_service("pi", e2e_workspace, e2e_token)
+        state = {**e2e_state, "workspace": e2e_workspace}
+        # A custom service pins no Databricks model — its targets are the models,
+        # and only those declaring the chat-completions dialect are routable.
+        provider_models, error, _relayed = resolve_provider_models("pi", state, provider)
+        assert error is None, f"provider={provider} could not resolve models: {error}"
+        assert provider_models, f"provider={provider} exposed no routable targets"
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        # Pi reads models.json below HOME/.pi/agent; point its runtime HOME and
+        # our writer at the same isolated tmp home.
+        pi_home = tmp_path / "pi-home"
+        pi_dir = pi_home / ".pi" / "agent"
+        monkeypatch.setattr(pi, "PI_UCODE_HOME", pi_home)
+        monkeypatch.setattr(pi, "PI_CONFIG_PATH", pi_dir / "models.json")
+        monkeypatch.setattr(pi, "PI_SETTINGS_PATH", pi_dir / "settings.json")
+        monkeypatch.setattr(pi, "PI_BACKUP_PATH", tmp_path / "pi-models.backup.json")
+        monkeypatch.setattr(pi, "PI_SETTINGS_BACKUP_PATH", tmp_path / "pi-settings.backup.json")
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr("ucode.state.save_state", lambda s: None)
+            mp.setattr(
+                "ucode.agents.pi.get_databricks_token",
+                lambda ws, profile=None, **kwargs: e2e_token,
+            )
+            pi.write_tool_config(
+                state,
+                None,
+                token=e2e_token,
+                provider=provider,
+                provider_models=provider_models,
+            )
+
+        written = json.loads((pi_dir / "models.json").read_text())
+        custom = written["providers"][pi.CUSTOM_PROVIDER_NAME]
+        assert custom["headers"]["Databricks-Model-Provider-Service"] == provider
+        assert custom["baseUrl"] == f"{e2e_workspace}/ai-gateway/openai/v1"
+        # `--print` with no --model resolves through the pinned defaults, so the
+        # settings pin is what makes the launch below exercise the provider.
+        settings = json.loads((pi_dir / "settings.json").read_text())
+        assert settings["defaultProvider"] == pi.CUSTOM_PROVIDER_NAME
+
+        result = _run_agent(pi.validate_cmd("pi"), env=pi.build_runtime_env(e2e_token), timeout=120)
+        combined = (result.stdout + result.stderr).strip()
+        self._skip_if_no_permission(combined, provider)
+        self._skip_if_upstream_unavailable(combined, provider)
         assert result.returncode == 0 and combined, (
             f"provider={provider} rc={result.returncode} "
             f"stdout={result.stdout[:300]!r} stderr={result.stderr[:300]!r}"

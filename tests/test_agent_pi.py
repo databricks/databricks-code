@@ -207,6 +207,133 @@ class TestRenderOverlayModelSelector:
         assert overlay["model"] == "custom/whatever"
 
 
+PROVIDER = "main.gateway.custom-svc"
+PROVIDER_BASE_URL = f"{WS}/ai-gateway/openai/v1"
+
+
+def _provider_overlay(model: str | None = None, token: str = "tok", **kwargs):
+    """render_overlay under a custom Model Provider Service.
+
+    Separate from `_overlay` so the provider-specific keyword arguments stay in
+    one place.
+    """
+    bundle = {**_empty(), **kwargs}
+    return pi.render_overlay(
+        model,
+        token,
+        _base_urls(),
+        bundle["claude_models"],
+        bundle["codex_models"],
+        bundle["gemini_models"],
+        provider=kwargs.get("provider", PROVIDER),
+        provider_models=kwargs.get("provider_models", ["deepseek-v4-flash"]),
+        provider_base_url=kwargs.get("provider_base_url", PROVIDER_BASE_URL),
+        context_window=kwargs.get("context_window"),
+    )
+
+
+class TestRenderOverlayCustomProvider:
+    def _provider(self, **kwargs) -> dict:
+        overlay, _ = _provider_overlay(**kwargs)
+        return overlay["providers"][pi.CUSTOM_PROVIDER_NAME]
+
+    def test_uses_openai_completions_on_the_openai_gateway_path(self):
+        provider = self._provider()
+        assert provider["api"] == "openai-completions"
+        assert provider["baseUrl"] == PROVIDER_BASE_URL
+
+    def test_routes_by_provider_service_header(self):
+        # The header selects the service; without it the gateway can't tell which
+        # provider to forward to.
+        headers = self._provider()["headers"]
+        assert headers["Databricks-Model-Provider-Service"] == PROVIDER
+        assert headers["User-Agent"].startswith("ucode/")
+
+    def test_compat_is_exactly_the_behavior_changing_flags(self):
+        # Pinned deliberately: pi already auto-detects supportsReasoningEffort,
+        # supportsUsageInStreaming and supportsStrictMode correctly for an
+        # unrecognized base URL, and `thinkingFormat` has a closed enum that
+        # "reasoning_effort" is not a member of. Restating either would be dead
+        # config at best and invalid at worst.
+        assert self._provider()["compat"] == {
+            "maxTokensField": "max_tokens",
+            "supportsDeveloperRole": False,
+            "supportsStore": False,
+        }
+
+    def test_targets_become_models_with_conservative_context_window(self):
+        assert self._provider()["models"] == [
+            {
+                "id": "deepseek-v4-flash",
+                "contextWindow": pi.PROVIDER_CONTEXT_WINDOW,
+                "maxTokens": pi.PROVIDER_MAX_OUTPUT_TOKENS,
+            }
+        ]
+
+    def test_explicit_context_window_is_honored(self):
+        models = self._provider(context_window=327680)["models"]
+        assert models[0]["contextWindow"] == 327680
+        assert models[0]["maxTokens"] == pi.PROVIDER_MAX_OUTPUT_TOKENS
+
+    def test_max_tokens_clamped_for_a_small_window(self):
+        models = self._provider(context_window=8192)["models"]
+        assert models[0]["maxTokens"] == 2048
+
+    def test_no_reasoning_claimed_without_capability_metadata(self):
+        # The service exposes no capability metadata, and claiming reasoning would
+        # make pi send `reasoning_effort` to a server that may reject it.
+        model = self._provider()["models"][0]
+        assert "reasoning" not in model
+        assert "thinkingLevelMap" not in model
+
+    def test_all_chat_targets_are_exposed(self):
+        provider = self._provider(provider_models=["model-a", "model-b"])
+        assert [m["id"] for m in provider["models"]] == ["model-a", "model-b"]
+
+    def test_databricks_providers_absent_when_workspace_has_no_models(self):
+        overlay, _ = _provider_overlay()
+        assert set(overlay["providers"]) == {pi.CUSTOM_PROVIDER_NAME}
+
+    def test_coexists_with_databricks_providers(self):
+        overlay, _ = _provider_overlay(claude_models={"sonnet": "claude-sonnet"})
+        assert set(overlay["providers"]) == {
+            pi.CUSTOM_PROVIDER_NAME,
+            "databricks-claude",
+        }
+
+    def test_provider_is_a_managed_key(self):
+        _, keys = _provider_overlay()
+        assert ["providers", pi.CUSTOM_PROVIDER_NAME] in keys
+
+    def test_provider_name_is_always_stripped_on_write(self):
+        # Membership in PROVIDER_NAMES is what removes a stale provider on a
+        # later launch without --provider.
+        assert pi.CUSTOM_PROVIDER_NAME in pi.PROVIDER_NAMES
+
+    def test_omitted_without_a_routable_base_url(self):
+        overlay, keys = _provider_overlay(provider_base_url=None)
+        assert pi.CUSTOM_PROVIDER_NAME not in overlay.get("providers", {})
+        assert ["providers", pi.CUSTOM_PROVIDER_NAME] not in keys
+
+
+class TestRenderOverlayCustomProviderSelector:
+    def test_defaults_to_first_target_when_no_model_resolved(self):
+        # Under a provider no Databricks model is resolved, so the selector has to
+        # come from the service's targets.
+        overlay, _ = _provider_overlay(None, provider_models=["model-a", "model-b"])
+        assert overlay["model"] == f"{pi.CUSTOM_PROVIDER_NAME}/model-a"
+
+    def test_prefixes_a_bare_target_id(self):
+        # A bare id would match pi's own built-in provider of the same name and
+        # fail with "No API key found for <provider>".
+        overlay, _ = _provider_overlay("deepseek-v4-flash")
+        assert overlay["model"] == f"{pi.CUSTOM_PROVIDER_NAME}/deepseek-v4-flash"
+
+    def test_preserves_already_prefixed_target(self):
+        overlay, _ = _provider_overlay(f"{pi.CUSTOM_PROVIDER_NAME}/deepseek-v4-flash")
+        assert overlay["model"] == f"{pi.CUSTOM_PROVIDER_NAME}/deepseek-v4-flash"
+
+
 class TestPiDefaultModel:
     def test_prefers_claude_opus(self):
         state = {"claude_models": {"opus": "o4", "sonnet": "s4", "haiku": "h4"}}
@@ -390,6 +517,113 @@ class TestWriteToolConfig:
         merged = json.loads(settings_file.read_text())
         assert merged["defaultProvider"] == "databricks-claude"
         assert merged["theme"] == "Default Dark"
+
+    def _write_with_provider(self, pi_mod, state):
+        with (
+            patch("ucode.agents.pi.get_databricks_token", return_value="tok"),
+            patch("ucode.agents.pi.save_state"),
+        ):
+            return pi_mod.write_tool_config(
+                state,
+                None,
+                token="tok",
+                provider=PROVIDER,
+                provider_models=["deepseek-v4-flash"],
+            )
+
+    def test_provider_write_emits_custom_provider_and_pins_settings(self, tmp_path, monkeypatch):
+        pi_mod, config_file, settings_file, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(claude_models={}, codex_models=[], gemini_models=[])
+
+        self._write_with_provider(pi_mod, state)
+
+        providers = json.loads(config_file.read_text())["providers"]
+        assert pi_mod.CUSTOM_PROVIDER_NAME in providers
+        settings = json.loads(settings_file.read_text())
+        assert settings["defaultProvider"] == pi_mod.CUSTOM_PROVIDER_NAME
+        assert settings["defaultModel"] == "deepseek-v4-flash"
+
+    def test_provider_write_persists_state_for_the_refresh_thread(self, tmp_path, monkeypatch):
+        pi_mod, _, _, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state()
+
+        new_state, _ = self._write_with_provider(pi_mod, state)
+
+        assert new_state["pi_provider"] == PROVIDER
+        assert new_state["pi_provider_models"] == ["deepseek-v4-flash"]
+
+    def test_context_window_override_flows_from_state(self, tmp_path, monkeypatch):
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(provider_context_window=327680)
+
+        self._write_with_provider(pi_mod, state)
+
+        providers = json.loads(config_file.read_text())["providers"]
+        models = providers[pi_mod.CUSTOM_PROVIDER_NAME]["models"]
+        assert models[0]["contextWindow"] == 327680
+
+    def test_later_launch_without_provider_clears_it(self, tmp_path, monkeypatch):
+        """A stale custom provider would keep routing to the old service's header,
+        so a plain `ucode pi` has to remove it and clear the persisted state."""
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state()
+        state, _ = self._write_with_provider(pi_mod, state)
+        # A hand-added provider must survive; only ucode's own are managed.
+        written = json.loads(config_file.read_text())
+        written["providers"]["user-provider"] = {"keep": True}
+        config_file.write_text(json.dumps(written), encoding="utf-8")
+
+        with (
+            patch("ucode.agents.pi.get_databricks_token", return_value="tok"),
+            patch("ucode.agents.pi.save_state"),
+        ):
+            state, _ = pi_mod.write_tool_config(state, "claude-sonnet", token="tok")
+
+        providers = json.loads(config_file.read_text())["providers"]
+        assert pi_mod.CUSTOM_PROVIDER_NAME not in providers
+        assert providers["user-provider"] == {"keep": True}
+        assert "pi_provider" not in state
+        assert "pi_provider_models" not in state
+
+
+class TestRefreshTokenOnce:
+    def _state(self, **overrides) -> dict:
+        state = {
+            "workspace": WS,
+            "base_urls": {"pi": _base_urls()},
+            "claude_models": {},
+            "codex_models": [],
+            "gemini_models": [],
+            "managed_configs": {},
+        }
+        state.update(overrides)
+        return state
+
+    def test_succeeds_under_a_provider_with_no_databricks_models(self, tmp_path, monkeypatch):
+        """The regression this guards: requiring a Databricks model here raised
+        RuntimeError, `_refresh_forever` swallowed it, and a provider-only session
+        silently stopped refreshing until the token expired mid-session."""
+        import ucode.agents.pi as pi_mod
+
+        monkeypatch.setattr(pi_mod, "PI_CONFIG_PATH", tmp_path / "models.json")
+        monkeypatch.setattr(pi_mod, "PI_SETTINGS_PATH", tmp_path / "settings.json")
+        monkeypatch.setattr(pi_mod, "PI_BACKUP_PATH", tmp_path / "backup.json")
+        monkeypatch.setattr(pi_mod, "PI_SETTINGS_BACKUP_PATH", tmp_path / "s-backup.json")
+        state = self._state(pi_provider=PROVIDER, pi_provider_models=["deepseek-v4-flash"])
+
+        with (
+            patch("ucode.agents.pi.get_databricks_token", return_value="fresh-tok"),
+            patch("ucode.agents.pi.save_state"),
+        ):
+            assert pi_mod._refresh_token_once(state) == "fresh-tok"
+
+    def test_raises_without_a_model_or_a_provider(self):
+        import pytest
+
+        import ucode.agents.pi as pi_mod
+
+        with pytest.raises(RuntimeError, match="No Pi model is available"):
+            pi_mod._refresh_token_once(self._state())
 
 
 class TestValidateAllToolsPiRollback:

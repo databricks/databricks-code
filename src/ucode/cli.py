@@ -32,7 +32,11 @@ from ucode.agents import (
     launch as launch_agent,
 )
 from ucode.agents.codex import revert_legacy_shared_config
-from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
+from ucode.agents.pi import (
+    PI_SETTINGS_BACKUP_PATH,
+    PI_SETTINGS_PATH,
+    PROVIDER_CONTEXT_WINDOW,
+)
 from ucode.config_io import restore_file, set_dry_run
 from ucode.databricks import (
     apply_pat_environment,
@@ -257,6 +261,7 @@ def configure_shared_state(
     skip_preflight: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    provider_context_window: int | None = None,
 ) -> dict:
     """Log into Databricks, enforce AI Gateway v2, fetch model lists, persist state.
 
@@ -288,6 +293,8 @@ def configure_shared_state(
         use_pat = bool(prior_state.get("use_pat")) and previous_workspace == workspace
     if fable_enabled is None:
         fable_enabled = bool(prior_state.get("fable_enabled")) and previous_workspace == workspace
+    if provider_context_window is None and previous_workspace == workspace:
+        provider_context_window = prior_state.get("provider_context_window")
     if databricks_ai_tools_enabled is None:
         # Opt-out: on by default. With no flag, keep this workspace's prior
         # choice but don't inherit another workspace's opt-out.
@@ -325,6 +332,13 @@ def configure_shared_state(
         state["fable_enabled"] = True
     else:
         state.pop("fable_enabled", None)
+    # Persist the custom-provider context window so both launches and the
+    # background token refresh reuse it; the API exposes no such metadata, so
+    # this override is the only way past the conservative default.
+    if provider_context_window:
+        state["provider_context_window"] = provider_context_window
+    else:
+        state.pop("provider_context_window", None)
     state["databricks_ai_tools_enabled"] = databricks_ai_tools_enabled
     state["base_urls"] = build_shared_base_urls(workspace)
 
@@ -485,6 +499,7 @@ def _configure_shared_workspace_states(
     use_pat: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    provider_context_window: int | None = None,
 ) -> list[dict]:
     if not workspaces:
         raise RuntimeError("At least one workspace must be provided.")
@@ -499,6 +514,7 @@ def _configure_shared_workspace_states(
                 use_pat=use_pat,
                 fable_enabled=fable_enabled,
                 databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+                provider_context_window=provider_context_window,
             )
         )
     return states
@@ -514,13 +530,15 @@ def _provider_summary(tool: str, state: dict) -> str:
 
 
 def _maybe_select_provider_service(tool: str, state: dict) -> dict:
-    """Interactively let the user route claude/codex through a Model Provider
+    """Interactively let the user route claude/codex/pi through a Model Provider
     Service instead of Databricks models, and persist (or clear) the choice.
 
-    No-op for tools other than claude/codex. Falls back to Databricks when no
-    matching provider services are found or the listing fails.
+    No-op for tools other than claude/codex/pi. Falls back to Databricks when no
+    matching provider services are found or the listing fails. The listing is
+    already filtered to services each tool can route to, so pi only ever sees
+    custom services with a routable target.
     """
-    if tool not in ("claude", "codex"):
+    if tool not in ("claude", "codex", "pi"):
         return state
     display = TOOL_SPECS[tool]["display"]
 
@@ -580,6 +598,7 @@ def configure_workspace_command(
     skip_validate: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    provider_context_window: int | None = None,
 ) -> int:
     if tool is not None and selected_tools is not None:
         raise RuntimeError("Use either --agent or --agents, not both.")
@@ -599,6 +618,7 @@ def configure_workspace_command(
             use_pat=use_pat,
             fable_enabled=fable_enabled,
             databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+            provider_context_window=provider_context_window,
         )
         state = states[0]
         state = configure_single_tool(tool, state)
@@ -637,6 +657,7 @@ def configure_workspace_command(
         use_pat=use_pat,
         fable_enabled=fable_enabled,
         databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+        provider_context_window=provider_context_window,
     )
     state = states[0]
     save_state(state)
@@ -1317,6 +1338,16 @@ def _launch_tool(
             print_kv("Config", "workspace-managed")
         if provider:
             print_kv("Provider", provider)
+            if tool == "pi":
+                # Say the guess out loud: the Model Provider Service API exposes
+                # no context window, so an unannounced assumption would surface
+                # later as an unexplained mid-session overflow.
+                window = state.get("provider_context_window") or PROVIDER_CONTEXT_WINDOW
+                print_note(
+                    f"Assuming a {window}-token context window (the Model Provider Service "
+                    "API exposes none). Change it with "
+                    "`ucode configure --provider-context-window`."
+                )
         elif route_root_model:
             print_kv("Model", route_root_model)
         elif resolved_model:
@@ -1371,19 +1402,23 @@ WorkspaceOption = Annotated[
     ),
 ]
 
+# Route this launch through an external Model Provider Service rather than
+# Databricks-hosted models. Shared by every tool that can route to one.
+ProviderOption = Annotated[
+    str | None,
+    typer.Option(
+        "--provider",
+        help="Route through a Unity Catalog Model Provider Service "
+        "(<catalog>.<schema>.<name>). Skips Databricks model pinning; pass "
+        "before any `--` separator.",
+    ),
+]
+
 
 @app.command("codex", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def codex_cmd(
     ctx: typer.Context,
-    provider: Annotated[
-        str | None,
-        typer.Option(
-            "--provider",
-            help="Route through a Unity Catalog Model Provider Service "
-            "(<catalog>.<schema>.<name>). Skips Databricks model pinning; pass "
-            "before any `--` separator.",
-        ),
-    ] = None,
+    provider: ProviderOption = None,
     skip_preflight: SkipPreflightOption = False,
     workspace: WorkspaceOption = None,
     enable_smart_routing_flag: Annotated[
@@ -1422,15 +1457,7 @@ def codex_cmd(
 @app.command("claude", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def claude_cmd(
     ctx: typer.Context,
-    provider: Annotated[
-        str | None,
-        typer.Option(
-            "--provider",
-            help="Route through a Unity Catalog Model Provider Service "
-            "(<catalog>.<schema>.<name>). Skips Databricks model pinning; pass "
-            "before any `--` separator.",
-        ),
-    ] = None,
+    provider: ProviderOption = None,
     skip_preflight: SkipPreflightOption = False,
     workspace: WorkspaceOption = None,
     enable_smart_routing_flag: Annotated[
@@ -1487,9 +1514,13 @@ def copilot_cmd(ctx: typer.Context, skip_preflight: SkipPreflightOption = False)
 
 
 @app.command("pi", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
-def pi_cmd(ctx: typer.Context, skip_preflight: SkipPreflightOption = False) -> None:
+def pi_cmd(
+    ctx: typer.Context,
+    provider: ProviderOption = None,
+    skip_preflight: SkipPreflightOption = False,
+) -> None:
     """Launch Pi coding agent via Databricks."""
-    _launch_tool("pi", ctx, skip_preflight=skip_preflight)
+    _launch_tool("pi", ctx, provider=provider, skip_preflight=skip_preflight)
 
 
 @app.command("cursor", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -1602,6 +1633,16 @@ def configure(
             "--disable-databricks-ai-tools to opt out.",
         ),
     ] = None,
+    provider_context_window: Annotated[
+        int | None,
+        typer.Option(
+            "--provider-context-window",
+            help="Context window, in tokens, to assume for a custom Model Provider Service "
+            "(the API exposes none). Defaults to a conservative 32768. Setting this above "
+            "the endpoint's real limit makes long sessions fail unrecoverably, so raise it "
+            "only to a value the endpoint actually supports.",
+        ),
+    ] = None,
     mcp: Annotated[
         str | None,
         typer.Option(
@@ -1680,6 +1721,10 @@ def configure(
             agent = "claude"
         if enable_databricks_ai_tools is not None:
             skip_kwargs["databricks_ai_tools_enabled"] = enable_databricks_ai_tools
+        # Same inherit-on-None rule: only forward an explicitly passed window so a
+        # plain re-configure keeps the workspace's existing override.
+        if provider_context_window is not None:
+            skip_kwargs["provider_context_window"] = provider_context_window
         # Set True only in the fully-interactive branch below; gates the optional
         # MCP setup prompt so flag-driven / scripted runs are never interrupted.
         fully_interactive = False

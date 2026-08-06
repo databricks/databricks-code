@@ -19,6 +19,8 @@ import subprocess
 from ucode.config_io import ToolSpec
 from ucode.databricks import (
     BEDROCK_PROVIDER_TYPES,
+    CUSTOM_PROVIDER_TYPES,
+    custom_openai_chat_targets,
     get_databricks_token,
     install_ai_tools,
     install_databricks_cli,
@@ -282,16 +284,18 @@ def resolve_launch_model(
 
 def resolve_provider_models(
     tool: str, state: dict, provider: str | None
-) -> tuple[dict | None, str | None, bool]:
+) -> tuple[dict[str, str] | list[str] | None, str | None, bool]:
     """Validate ``provider`` for ``tool`` and return the model ids to pin.
 
     Returns ``(provider_models, error, relayed)``. ``provider_models`` is a
     ``{family: model_id}`` dict for a Bedrock-backed claude service (whose
-    provider-side ids must be pinned explicitly), or None for an Anthropic/
-    canonical service or when ``provider`` is None. ``relayed`` is True for a
-    credential-less Anthropic subscription relay, which the launch path wires
-    with the relayed overlay + refresh proxy. A non-None ``error`` means the
-    provider is invalid for the tool and the caller should not launch.
+    provider-side ids must be pinned explicitly), a list of target ids for a
+    custom-backed service (routed by header, with the bare target name as the
+    request body's `model`), or None for an Anthropic/canonical service or when
+    ``provider`` is None. ``relayed`` is True for a credential-less Anthropic
+    subscription relay, which the launch path wires with the relayed overlay +
+    refresh proxy. A non-None ``error`` means the provider is invalid for the
+    tool and the caller should not launch.
     """
     if not provider:
         return None, None, False
@@ -302,6 +306,8 @@ def resolve_provider_models(
     relayed = bool(service.get("relayed"))
     if service["provider_type"] in BEDROCK_PROVIDER_TYPES:
         return map_bedrock_claude_models(service.get("targets") or []), None, relayed
+    if service["provider_type"] in CUSTOM_PROVIDER_TYPES:
+        return custom_openai_chat_targets(service), None, relayed
     return None, None, relayed
 
 
@@ -310,7 +316,7 @@ def configure_tool(
     state: dict,
     model: str | None = None,
     provider: str | None = None,
-    provider_models: dict[str, str] | None = None,
+    provider_models: dict[str, str] | list[str] | None = None,
     relayed: bool = False,
     route_root_model: str | None = None,
 ) -> dict:
@@ -326,20 +332,29 @@ def configure_tool(
             state,
             model,
             provider=provider,
-            provider_models=provider_models,
+            provider_models=provider_models if isinstance(provider_models, dict) else None,
             relayed=relayed,
             route_root_model=route_root_model,
         )
+    elif tool == "pi":
+        # As with claude, a Model Provider Service pins no Databricks model —
+        # the service's targets are the models.
+        if not model and not provider:
+            raise RuntimeError(f"A {tool} model must be selected before configuration.")
+        result = pi.write_tool_config(
+            state,
+            model,
+            provider=provider,
+            provider_models=provider_models if isinstance(provider_models, list) else None,
+        )
     else:
-        # provider routing is claude/codex-only; every other tool needs a model.
+        # provider routing is claude/codex/pi-only; every other tool needs a model.
         if not model:
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         if tool == "gemini":
             result = gemini.write_tool_config(state, model)
         elif tool == "copilot":
             result = copilot.write_tool_config(state, model)
-        elif tool == "pi":
-            result = pi.write_tool_config(state, model)
         else:
             result = opencode.write_tool_config(state, model)
     # gemini/opencode/copilot/pi return (state, token); codex/claude return state

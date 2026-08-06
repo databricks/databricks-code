@@ -325,6 +325,62 @@ class TestResolveProviderModels:
         assert error == "boom"
         assert relayed is False
 
+    def test_custom_returns_chat_completion_targets(self, monkeypatch):
+        # A custom service is routed by header with the bare target name as
+        # `model`, so the routable targets are returned as a list.
+        service = {
+            "provider_type": "custom",
+            "targets": ["chat-model", "responses-model"],
+            "target_api_types": {
+                "chat-model": ["openai/v1/chat/completions"],
+                "responses-model": ["openai/v1/responses"],
+            },
+        }
+        self._patch(monkeypatch, service, None)
+        models, error, relayed = agents_mod.resolve_provider_models("pi", self._STATE, "main.c.svc")
+        assert error is None
+        assert relayed is False
+        assert models == ["chat-model"]
+
+
+class TestConfigureToolPiProvider:
+    _STATE = {"workspace": "https://ws.databricks.com", "profile": None}
+
+    def test_forwards_provider_and_targets_without_a_model(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_write(state, model, **kwargs):
+            captured["model"] = model
+            captured.update(kwargs)
+            return state, "tok"
+
+        monkeypatch.setattr(agents_mod.pi, "write_tool_config", fake_write)
+        agents_mod.configure_tool(
+            "pi", dict(self._STATE), None, provider="main.c.svc", provider_models=["chat-model"]
+        )
+        assert captured["model"] is None
+        assert captured["provider"] == "main.c.svc"
+        assert captured["provider_models"] == ["chat-model"]
+
+    def test_ignores_a_bedrock_style_dict(self, monkeypatch):
+        # claude's Bedrock path passes a {family: id} dict; pi must not treat it
+        # as a target list.
+        captured: dict = {}
+
+        def fake_write(state, model, **kwargs):
+            captured.update(kwargs)
+            return state, "tok"
+
+        monkeypatch.setattr(agents_mod.pi, "write_tool_config", fake_write)
+        agents_mod.configure_tool(
+            "pi", dict(self._STATE), None, provider="main.c.svc", provider_models={"opus": "x"}
+        )
+        assert captured["provider_models"] is None
+
+    def test_still_requires_a_model_without_a_provider(self):
+        with pytest.raises(RuntimeError, match="model must be selected"):
+            agents_mod.configure_tool("pi", dict(self._STATE), None)
+
 
 class TestInstallToolBinary:
     def test_non_strict_returns_false_when_npm_missing(self, monkeypatch):

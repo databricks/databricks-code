@@ -1473,12 +1473,23 @@ def build_skills_mcp_url(workspace: str, locations: list[str]) -> str:
 _TOOL_PROVIDER_TYPES: dict[str, tuple[str, ...]] = {
     "claude": ("anthropic", "amazon_bedrock"),
     "codex": ("openai",),
+    # pi speaks OpenAI chat completions to a `custom` service (a self-hosted,
+    # OpenAI-compatible model). Which dialect a target actually serves is
+    # declared per-target in `native_api_types`, so usability is narrowed
+    # further by `custom_openai_chat_targets`.
+    "pi": ("custom",),
 }
 
 # Provider types that expose Bedrock-style model ids (e.g.
 # `us.anthropic.claude-sonnet-4-6`) instead of the agent's canonical model
 # names, so ucode must pin them explicitly.
 BEDROCK_PROVIDER_TYPES: tuple[str, ...] = ("amazon_bedrock",)
+
+# Provider types backed by a caller-supplied endpoint rather than a known vendor
+# API. The service is selected by the `Databricks-Model-Provider-Service` header
+# and the request body's `model` carries the bare target name, so the target ids
+# must be pinned explicitly (the fully-qualified service name is not routable).
+CUSTOM_PROVIDER_TYPES: tuple[str, ...] = ("custom",)
 
 
 def tool_supports_provider_type(tool: str, provider_type: str) -> bool:
@@ -1559,7 +1570,12 @@ def list_model_provider_services(
 
 
 def _provider_service_entry(raw_service: object) -> dict | None:
-    """Normalize one listing entry, or None when it isn't usable."""
+    """Normalize one listing entry, or None when it isn't usable.
+
+    ``target_api_types`` maps each target model id to the request dialects it
+    declares (``native_api_types``), which is how ucode picks the gateway path
+    for a `custom` service. A target that declares none maps to an empty list.
+    """
     if not isinstance(raw_service, dict):
         return None
     # A bare isinstance narrows to dict[Never, Never], which rejects string keys.
@@ -1572,13 +1588,25 @@ def _provider_service_entry(raw_service: object) -> dict | None:
     raw_config = service.get("config")
     config = cast("dict[str, object]", raw_config) if isinstance(raw_config, dict) else {}
     targets: list[str] = []
+    # Per-target `native_api_types` kept alongside `targets` (rather than folded
+    # into it) because callers like `map_bedrock_claude_models` take the plain id
+    # list. It's the only signal for which request dialect a target serves.
+    target_api_types: dict[str, list[str]] = {}
     raw_targets = config.get("targets")
     for target in raw_targets if isinstance(raw_targets, list) else []:
         if not isinstance(target, dict):
             continue
-        model_id = cast("dict[str, object]", target).get("model")
-        if isinstance(model_id, str) and model_id:
-            targets.append(model_id)
+        entry = cast("dict[str, object]", target)
+        model_id = entry.get("model")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        targets.append(model_id)
+        raw_api_types = entry.get("native_api_types")
+        target_api_types[model_id] = [
+            api_type
+            for api_type in (raw_api_types if isinstance(raw_api_types, list) else [])
+            if isinstance(api_type, str)
+        ]
     # Relayed = credential-less Anthropic (subscription relay). Only whether
     # it's relayed matters here; the tier (Max vs Team/Enterprise) is governed
     # server-side, so both launch identically.
@@ -1589,6 +1617,7 @@ def _provider_service_entry(raw_service: object) -> dict | None:
         "name": full_name,
         "provider_type": _provider_type_tag(raw_type if isinstance(raw_type, str) else None),
         "targets": targets,
+        "target_api_types": target_api_types,
         "allow_all_targets": bool(config.get("allow_all_targets")),
         "relayed": relayed,
     }
@@ -1643,13 +1672,16 @@ def service_usable_for_tool(tool: str, service: dict) -> bool:
     Beyond the provider-type match, a Bedrock service is only usable for claude
     if it exposes at least one Claude model in its targets — otherwise there's no
     routable model id to pin. (Anthropic services use canonical names, so any
-    match is usable.)
+    match is usable.) A custom service likewise needs at least one target serving
+    a dialect ucode can route.
     """
     provider_type = service.get("provider_type", "")
     if not tool_supports_provider_type(tool, provider_type):
         return False
     if provider_type in BEDROCK_PROVIDER_TYPES:
         return bool(map_bedrock_claude_models(service.get("targets") or []))
+    if provider_type in CUSTOM_PROVIDER_TYPES:
+        return bool(custom_openai_chat_targets(service))
     return True
 
 
@@ -1696,7 +1728,31 @@ def resolve_provider_service(
             f"Model provider service '{service_name}' exposes no Claude models — "
             f"add Claude targets to it or pick a different service."
         )
+    if provider_type in CUSTOM_PROVIDER_TYPES and not custom_openai_chat_targets(match):
+        return None, (
+            f"Model provider service '{service_name}' exposes no targets serving "
+            f"'{OPENAI_CHAT_NATIVE_API_TYPE}' — add one, or pick a different service."
+        )
     return match, None
+
+
+def custom_openai_chat_targets(service: dict) -> list[str]:
+    """Target model ids on a `custom` service that serve OpenAI chat completions.
+
+    A custom service routes by header and takes the bare target name as the
+    request body's `model`, so these ids are what an agent has to pin — the
+    fully-qualified service name is not routable.
+
+    Targets that declare a different dialect, or declare none at all, are
+    skipped: ucode only routes dialects it has a gateway path for, and guessing
+    turns a clear configure-time error into a 404 mid-session.
+    """
+    api_types = service.get("target_api_types") or {}
+    return [
+        target
+        for target in (service.get("targets") or [])
+        if OPENAI_CHAT_NATIVE_API_TYPE in (api_types.get(target) or [])
+    ]
 
 
 # Bedrock exposes Claude under provider-side ids like
@@ -2444,6 +2500,29 @@ def _is_usage_table_access_error(exc: BaseException) -> bool:
 # ---------------------------------------------------------------------------
 # URL builders (AI Gateway v2 only — no fallback to /serving-endpoints)
 # ---------------------------------------------------------------------------
+
+# A Model Provider Service target advertises the request dialect it serves in
+# `native_api_types`, and each dialect has one AI Gateway path that speaks it.
+# This mapping is per-dialect rather than per-tool because the service is
+# addressed the same way whichever agent is routing: the
+# `Databricks-Model-Provider-Service` header selects the service and the body's
+# `model` carries the bare target name. Add an entry to route another dialect.
+OPENAI_CHAT_NATIVE_API_TYPE = "openai/v1/chat/completions"
+_NATIVE_API_GATEWAY_PATHS: dict[str, str] = {
+    OPENAI_CHAT_NATIVE_API_TYPE: "/ai-gateway/openai/v1",
+}
+
+
+def build_native_api_base_url(workspace: str, native_api_type: str) -> str | None:
+    """Gateway base URL for a target's ``native_api_types`` entry.
+
+    Returns None when ucode has no path for that dialect, so callers can reject
+    the service with an actionable error instead of emitting a config that 404s
+    on the first request. The URL stops before the suffix the client appends
+    (pi's ``openai-completions`` appends ``/chat/completions``).
+    """
+    path = _NATIVE_API_GATEWAY_PATHS.get(native_api_type)
+    return f"{workspace}{path}" if path else None
 
 
 def build_tool_base_url(tool: str, workspace: str) -> str:
