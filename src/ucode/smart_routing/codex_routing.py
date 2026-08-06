@@ -31,11 +31,6 @@ CANARY_PATH = APP_DIR / "codex-smart-routing-canary.json"
 AUDIT_PATH = APP_DIR / "codex-smart-routing-audit.jsonl"
 DECISIONS_PATH = APP_DIR / "codex-smart-routing-decisions.jsonl"
 
-GLM_SUBAGENT_SKIP_MESSAGE = (
-    "Smart Routing selected GLM 5.2, which is not enabled for Codex "
-    "subagents. Keeping the original subagent model."
-)
-
 _GPT_RE = re.compile(r"gpt-(\d+)(?:[.-](\d+))?(?:[.-](\d+))?(-.+|[a-z].*)?")
 
 _normalize_model = routing.normalize_model
@@ -158,7 +153,6 @@ def route_pre_tool_use(
         ),
         default_task_label="Codex subagent task",
         model_id_mapper=_codex_model_id,
-        skip_arms={GLM_ROUTE_ARM: GLM_SUBAGENT_SKIP_MESSAGE},
         record_decision=record,
     )
 
