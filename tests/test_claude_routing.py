@@ -262,6 +262,44 @@ def test_decision_is_reconciled_with_actual_subagent_model(tmp_path, monkeypatch
     assert record["matches_router_decision"] is True
 
 
+def test_subagent_start_without_model_reports_unknown_not_mismatch(tmp_path, monkeypatch):
+    # Claude Code's SubagentStart event does not include the subagent's model,
+    # so reconciliation can't verify the match — record None (unknown) rather
+    # than a false mismatch. The PreToolUse hook already injected the model.
+    decisions = tmp_path / "decisions.jsonl"
+    audit = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(claude_routing, "DECISIONS_PATH", decisions)
+    monkeypatch.setattr(claude_routing, "AUDIT_PATH", audit)
+    monkeypatch.setattr(
+        claude_routing,
+        "request_routing_decision",
+        lambda *args, **kwargs: (
+            claude_routing.RoutingDecision(
+                model="system.ai.claude-sonnet-5", raw_model="claude-sonnet-5"
+            ),
+            None,
+        ),
+    )
+
+    claude_routing.route_pre_tool_use(
+        {
+            "session_id": "s2",
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "Explore", "prompt": "x"},
+        },
+        workspace=WS,
+        token="token",
+        available_models=["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
+        audit_decision=True,
+    )
+    record = claude_routing.record_subagent_start(
+        {"session_id": "s2", "agent_id": "a2", "model": None}
+    )
+
+    assert record["requested_model"] == "sonnet"
+    assert record["matches_router_decision"] is None
+
+
 def test_launch_task_uses_positional_prompt():
     assert claude_routing._launch_routing_task(["fix the parser"]) == "fix the parser"
 
