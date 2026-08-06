@@ -547,7 +547,7 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
         return _use_databricks()
     if not names:
         # Feature is on but no service matches this tool's provider type.
-        print_note(f"No model provider services available for {display}; using Databricks models.")
+        print_note(f"Using Databricks models for {display}.")
         return _use_databricks()
 
     choice = prompt_for_selection(

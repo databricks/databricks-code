@@ -68,13 +68,6 @@ LEGACY_MANAGED_KEYS: list[list[str]] = [
 
 _GPT_RE = re.compile(r"(?:databricks-)?gpt-(\d+)(?:[.-](\d+))?(?:[.-](\d+))?(-.+|[a-z].*)?")
 
-# These models should use the Databricks ID, not the OpenAI ID, as the OpenAI
-# ID is incompatible with Codex.
-CODEX_OPENAI_ID_INCOMPATIBLE_MODELS = {
-    "databricks-gpt-5-2-codex",
-    "databricks-gpt-5-4-nano",
-}
-
 
 def is_update_available() -> tuple[str, str] | None:
     return available_npm_package_update(SPEC["package"])
@@ -274,30 +267,6 @@ def revert_legacy_shared_config() -> bool:
     return _strip_legacy_ucode_entries(_legacy_config_path())
 
 
-def _openai_model_id(model: str | None) -> str | None:
-    """Map Databricks GPT endpoint ids to OpenAI model ids for Codex metadata."""
-    parsed = _parse_gpt(model)
-    if parsed is None:
-        return model
-    major, minor, patch, suffix = parsed
-    version = str(major)
-    if minor is not None:
-        version += f".{minor}"
-    if patch is not None:
-        version += f".{patch}"
-    return f"gpt-{version}{suffix}"
-
-
-def _codex_model_id(model: str | None) -> str | None:
-    # UC model-services ids (`system.ai.gpt-5`) route by name through the
-    # gateway, so they must be sent verbatim — not rewritten to an OpenAI id.
-    if model and model.startswith("system.ai."):
-        return model
-    if model in CODEX_OPENAI_ID_INCOMPATIBLE_MODELS:
-        return model
-    return _openai_model_id(model)
-
-
 def _parse_gpt(model: str | None) -> tuple[int, int | None, int | None, str] | None:
     if not model:
         return None
@@ -322,8 +291,12 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     workspace = state["workspace"]
     # With a Model Provider Service the gateway routes by header and Codex sends
     # its own canonical model name (e.g. `gpt-5`) — leave `model` unset so no
-    # Databricks endpoint id is pinned.
-    chosen_model = None if provider else _codex_model_id(model or default_model(state))
+    # Databricks endpoint id is pinned. Otherwise pin the discovered endpoint id
+    # verbatim: the gateway routes by that exact name (whether `databricks-gpt-5`
+    # from the AI Gateway listing or `system.ai.gpt-5` from UC model-services), so
+    # rewriting it to an OpenAI id (`gpt-5`) makes the gateway resolve a
+    # non-existent `system.ai.*` alias and 404.
+    chosen_model = None if provider else (model or default_model(state))
     databricks_profile = state.get("profile")
 
     if _use_legacy_layout():

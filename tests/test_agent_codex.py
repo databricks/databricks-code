@@ -109,7 +109,10 @@ class TestCodexWriteConfig:
         assert doc["model"] == "gpt-5"
         assert "profiles" not in doc
 
-    def test_writes_openai_model_id_for_databricks_gpt_endpoint(self, tmp_path, monkeypatch):
+    def test_pins_discovered_databricks_model_id_verbatim(self, tmp_path, monkeypatch):
+        # The gateway routes by the discovered endpoint name, so the id is
+        # written as-is (not rewritten to an OpenAI id like `gpt-5.5`, which the
+        # gateway would resolve to a non-existent `system.ai.*` alias and 404).
         config_path = tmp_path / ".codex" / "ucode.config.toml"
         backup_path = tmp_path / "codex-ucode-config.backup.toml"
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
@@ -122,11 +125,9 @@ class TestCodexWriteConfig:
         )
 
         doc = read_toml_safe(config_path)
-        assert doc["model"] == "gpt-5.5"
+        assert doc["model"] == "databricks-gpt-5-5"
 
-    def test_preserves_databricks_model_id_when_openai_id_is_incompatible(
-        self, tmp_path, monkeypatch
-    ):
+    def test_pins_uc_model_services_id_verbatim(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
         backup_path = tmp_path / "codex-ucode-config.backup.toml"
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
@@ -135,12 +136,11 @@ class TestCodexWriteConfig:
         monkeypatch.setattr(codex, "save_state", lambda state: None)
 
         codex.write_tool_config(
-            {"workspace": WS, "codex_models": ["databricks-gpt-5-2-codex"]},
-            "databricks-gpt-5-2-codex",
+            {"workspace": WS, "codex_models": ["system.ai.gpt-5", "system.ai.gpt-5-5"]}
         )
 
         doc = read_toml_safe(config_path)
-        assert doc["model"] == "databricks-gpt-5-2-codex"
+        assert doc["model"] == "system.ai.gpt-5-5"
 
     def test_provider_writes_header_and_drops_stale_model(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
@@ -522,28 +522,10 @@ class TestCodexDefaultModel:
         }
         assert codex.default_model(state) == "admin-chosen-default"
 
-    def test_openai_model_id_maps_databricks_naming(self):
-        assert codex._openai_model_id("databricks-gpt-5-5") == "gpt-5.5"
-        assert codex._openai_model_id("databricks-gpt-5-5-mini") == "gpt-5.5-mini"
-        assert codex._openai_model_id("databricks-gpt-4o") == "gpt-4o"
-        assert codex._openai_model_id("served-models/databricks-gpt-5-5") == "gpt-5.5"
-        assert codex._openai_model_id("gpt-5.5") == "gpt-5.5"
-
-    def test_codex_model_id_preserves_openai_incompatible_models(self):
-        assert codex._codex_model_id("databricks-gpt-5-2-codex") == "databricks-gpt-5-2-codex"
-        assert codex._codex_model_id("databricks-gpt-5-4-nano") == "databricks-gpt-5-4-nano"
-
-    def test_codex_model_id_passes_model_services_id_verbatim(self):
-        # UC model-services ids route by name, so they must not be rewritten
-        # to the OpenAI id form.
-        assert codex._codex_model_id("system.ai.gpt-5") == "system.ai.gpt-5"
-        assert codex._codex_model_id("system.ai.gpt-5-2-codex") == "system.ai.gpt-5-2-codex"
-
     def test_default_model_selects_model_services_gpt(self):
         models = ["system.ai.gpt-5", "system.ai.gpt-5-5", "system.ai.claude-opus-4-8"]
 
         assert codex.default_model({"codex_models": models}) == "system.ai.gpt-5-5"
-        assert codex._codex_model_id("databricks-gpt-5-5") == "gpt-5.5"
 
 
 class TestCodexValidateCmd:
