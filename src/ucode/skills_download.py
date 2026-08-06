@@ -312,6 +312,31 @@ def _fetch_bundles(
     return results
 
 
+def _reject_bundle_name_collisions(refs: list[SkillRef], *, location: str) -> list[SkillRef]:
+    """``refs`` with any later skill that repeats an earlier one's bundle name dropped.
+
+    Only the securable name is unique within a schema; ``bundle_name`` comes from
+    each bundle's SKILL.md frontmatter and is never checked against its siblings,
+    so one schema can hold two skills claiming the same directory. Writing both
+    would land them on top of each other, leaving whichever finished last with no
+    sign the other was lost, so keep the first and warn about the rest.
+    """
+    kept: list[SkillRef] = []
+    claimed: dict[str, str] = {}
+    for ref in refs:
+        winner = claimed.get(ref.bundle_name)
+        if winner is not None:
+            print_warning(
+                f"Skipping `{location}.{ref.securable_name}`: its bundle name "
+                f"`{ref.bundle_name}` is already claimed by `{location}.{winner}`. "
+                "Rename one skill's SKILL.md `name:` to download both."
+            )
+            continue
+        claimed[ref.bundle_name] = ref.securable_name
+        kept.append(ref)
+    return kept
+
+
 def download_skills(
     workspace: str,
     token: str,
@@ -326,7 +351,8 @@ def download_skills(
     1. **List** the schema's finalized skills. When ``skills`` is given, restrict
        to those securable names (the name that identifies a skill in UC); names
        absent from the schema warn and are skipped, and ``None`` keeps the whole
-       schema.
+       schema. Siblings claiming one directory are then reduced to the first (see
+       ``_reject_bundle_name_collisions``).
     2. **Decide** which to download via ``should_download_skill`` (skips invalid
        names and prompts before overwriting a skill already on disk), so a
        declined skill is never fetched.
@@ -360,6 +386,9 @@ def download_skills(
         if not refs:
             print_note(f"No skills found in `{location}`.")
             continue
+        # Before the decide stage, so a dropped sibling is never fetched and the
+        # summary's denominator counts only skills that can reach disk.
+        refs = _reject_bundle_name_collisions(refs, location=location)
 
         to_download = [ref for ref in refs if should_download_skill(roots, ref, location=location)]
         bundles = _fetch_bundles(workspace, token, catalog, schema, to_download)

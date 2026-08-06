@@ -403,6 +403,56 @@ class TestDownloadSkills:
         assert (tmp_path / ".claude/skills/pii-handling/SKILL.md").read_bytes() == b"pii"
         assert (tmp_path / ".agents/skills/triage/SKILL.md").read_bytes() == b"triage"
 
+    def test_sibling_bundle_name_collision_keeps_the_first(self, tmp_path, monkeypatch):
+        # Only the securable name is unique in a schema, so two siblings can claim
+        # one directory. Writing both would silently lose one.
+        colliding = [SkillRef("skill-a", "foo"), SkillRef("skill-b", "foo")]
+        monkeypatch.setattr(sd, "list_schema_skills", lambda *a, **k: (colliding, None))
+        bodies = {"skill-a": b"FROM A", "skill-b": b"FROM B"}
+        fetched = []
+        monkeypatch.setattr(
+            sd,
+            "fetch_skill_bundle",
+            lambda ws, tok, c, s, securable_name: (
+                fetched.append(securable_name) or ({"SKILL.md": bodies[securable_name]}, None)
+            ),
+        )
+        warnings = []
+        monkeypatch.setattr(sd, "print_warning", warnings.append)
+        monkeypatch.setattr(
+            sd, "prompt_yes_no", lambda msg: pytest.fail(f"unexpected prompt: {msg}")
+        )
+
+        sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
+
+        # The loser is dropped before the fetch, not after paying for it.
+        assert fetched == ["skill-a"]
+        assert (tmp_path / ".claude/skills/foo/SKILL.md").read_bytes() == b"FROM A"
+        assert [d.name for d in (tmp_path / ".claude/skills").iterdir()] == ["foo"]
+        assert len(warnings) == 1
+        assert "skill-b" in warnings[0] and "already claimed by" in warnings[0]
+
+    def test_same_bundle_name_across_locations_still_prompts(self, tmp_path, monkeypatch):
+        # The collision guard is per location, so a later location's same-named
+        # skill must still reach the overwrite prompt rather than being dropped.
+        by_location = {
+            "main.default": [SkillRef("skill-a", "foo")],
+            "ml.prod": [SkillRef("skill-b", "foo")],
+        }
+        monkeypatch.setattr(
+            sd, "list_schema_skills", lambda ws, tok, c, s: (by_location[f"{c}.{s}"], None)
+        )
+        monkeypatch.setattr(
+            sd, "fetch_skill_bundle", lambda ws, tok, c, s, sn: ({"SKILL.md": sn.encode()}, None)
+        )
+        prompts = []
+        monkeypatch.setattr(sd, "prompt_yes_no", lambda msg: bool(prompts.append(msg)) or True)
+
+        sd.download_skills(WS, "token", ["main.default", "ml.prod"], str(tmp_path))
+
+        assert len(prompts) == 1
+        assert (tmp_path / ".claude/skills/foo/SKILL.md").read_bytes() == b"skill-b"
+
     def test_fetches_by_securable_and_writes_under_bundle_name(self, tmp_path, monkeypatch):
         # The Files API resolves only the securable, while an agent loads the
         # directory matching the bundle's SKILL.md `name:`.
