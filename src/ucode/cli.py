@@ -43,11 +43,11 @@ from ucode.databricks import (
     discover_model_services,
     ensure_ai_gateway_v2,
     ensure_databricks_auth,
+    ensure_databricks_cli,
     ensure_pat_bearer,
     find_profile_name_for_host,
     get_databricks_profiles,
     get_databricks_token,
-    install_databricks_cli,
     is_model_provider_feature_unavailable,
     list_profile_entries,
     list_tool_provider_services,
@@ -1648,7 +1648,7 @@ def configure(
     set_verbosity(verbose)
     prompt_optional_updates = not skip_upgrade
     try:
-        install_databricks_cli()
+        ensure_databricks_cli()
         if agent is not None and agents is not None:
             raise RuntimeError("Use either --agent or --agents, not both.")
         if workspaces is not None and profiles is not None:
@@ -1927,7 +1927,7 @@ def configure_tracing(
 ) -> None:
     """Send coding-session traces to an MLflow experiment in your workspace."""
     try:
-        install_databricks_cli()
+        ensure_databricks_cli()
         configure_tracing_command(disable=disable)
     except RuntimeError as exc:
         print_err(str(exc))
@@ -1961,7 +1961,7 @@ def revert_cmd() -> None:
 def usage_cmd() -> None:
     """Show Databricks AI Gateway usage summary (last 7 days)."""
     try:
-        install_databricks_cli()
+        ensure_databricks_cli()
         usage_report()
     except RuntimeError as exc:
         print_err(str(exc))

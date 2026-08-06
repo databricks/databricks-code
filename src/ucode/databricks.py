@@ -43,15 +43,8 @@ from ucode.ui import (
     spinner,
 )
 
-UNIX_DATABRICKS_INSTALL_URL = (
-    "https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh"
-)
-WINDOWS_DATABRICKS_INSTALL_URL = (
-    "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
-)
 AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
-# v1.0.0 is the release that ships `databricks aitools`.
-MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
+DATABRICKS_CLI_INSTALL_DOCS_URL = "https://docs.databricks.com/aws/en/dev-tools/cli/install"
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 
 
@@ -517,75 +510,26 @@ def workspace_hostname(workspace: str) -> str:
     return parsed.hostname
 
 
-def _parse_databricks_cli_version(output: str) -> tuple[int, int, int] | None:
-    # Example output: "Databricks CLI v0.299.2"
-    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", output)
-    if not match:
-        return None
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-
-
-def _run_databricks_cli_installer(brew_subcommand: str = "install") -> None:
-    system = platform.system()
-    try:
-        if system == "Windows":
-            run(
-                ["powershell", "-Command", f"irm {WINDOWS_DATABRICKS_INSTALL_URL} | iex"],
-                timeout=240,
-            )
-        elif system == "Darwin" and shutil.which("brew"):
-            run(["brew", brew_subcommand, "databricks/tap/databricks"], timeout=240)
-        elif shutil.which("curl"):
-            run(["sh", "-c", f"curl -fsSL {UNIX_DATABRICKS_INSTALL_URL} | sudo sh"], timeout=240)
-        elif shutil.which("wget"):
-            run(["sh", "-c", f"wget -qO- {UNIX_DATABRICKS_INSTALL_URL} | sudo sh"], timeout=240)
-        else:
-            raise RuntimeError("Neither curl nor wget is available.")
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
-        raise RuntimeError("Failed to install/upgrade Databricks CLI automatically.") from exc
-
-
 def ensure_databricks_cli_version() -> None:
-    try:
-        result = run(
-            ["databricks", "--version"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("Failed to read Databricks CLI version.") from exc
+    """Intentionally a no-op: ucode no longer checks or upgrades the installed
+    Databricks CLI version.
 
-    raw = result.stdout or result.stderr or ""
-    output = (raw if isinstance(raw, str) else raw.decode(errors="replace")).strip()
-    version = _parse_databricks_cli_version(output)
-    if version is None:
-        raise RuntimeError(
-            f"Could not parse Databricks CLI version from `databricks --version` output: {output!r}"
-        )
-    if version < MIN_DATABRICKS_CLI_VERSION:
-        current = ".".join(str(n) for n in version)
-        required = ".".join(str(n) for n in MIN_DATABRICKS_CLI_VERSION)
-        print_warning(
-            f"Databricks CLI v{current} is too old (need v{required} or newer). Upgrading..."
-        )
-        _run_databricks_cli_installer(brew_subcommand="upgrade")
-        ensure_databricks_cli_version()
+    Kept as a seam so callers don't have to care whether a version policy
+    exists. Managing the CLI is the user's (or their package manager's) job --
+    silently replacing a working install, including a locally built one, is
+    more disruptive than a feature failing with the CLI's own error."""
+    return
 
 
-def install_databricks_cli() -> None:
-    if shutil.which("databricks"):
-        ensure_databricks_cli_version()
-        return
+def ensure_databricks_cli() -> None:
+    """Verify `databricks` is on PATH, raising with install instructions if not.
 
-    print_section("Bootstrap")
-    print_warning("`databricks` was not found. Installing Databricks CLI...")
-    _run_databricks_cli_installer(brew_subcommand="install")
-
+    ucode never installs or upgrades the CLI on the user's behalf."""
     if not shutil.which("databricks"):
         raise RuntimeError(
-            "Databricks CLI install completed, but `databricks` is still not on PATH."
+            "Databricks CLI was not found on PATH. Install it, then re-run this command: "
+            f"see {DATABRICKS_CLI_INSTALL_DOCS_URL} "
+            "(on macOS: `brew install databricks/tap/databricks`)."
         )
     ensure_databricks_cli_version()
 
@@ -612,9 +556,9 @@ def install_ai_tools(agent_tokens: list[str], profile: str | None = None) -> Non
                 timeout=300,
             )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-        # The CLI version is already guaranteed by ensure_databricks_cli_version,
-        # so any failure here is something else (e.g. an agent binary missing
-        # from PATH). Surface the CLI's own error rather than guessing a cause.
+        # ucode doesn't police the CLI version, so this may be a CLI too old to
+        # know `aitools` just as easily as something else (e.g. an agent binary
+        # missing from PATH). Surface the CLI's own error rather than guessing.
         detail = getattr(exc, "stderr", None) or ""
         if isinstance(detail, bytes):  # TimeoutExpired.stderr is bytes even with text=True
             detail = detail.decode(errors="replace")

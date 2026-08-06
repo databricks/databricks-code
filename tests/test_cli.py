@@ -838,7 +838,7 @@ class TestPassthroughArgs:
 class TestConfigureAgentFlag:
     def test_no_flag_calls_configure_all(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
             # Fully-interactive configure ends by offering the MCP step; decline it.
@@ -855,7 +855,7 @@ class TestConfigureAgentFlag:
 
     def test_interactive_accepting_mcp_prompt_runs_mcp_config(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command"),
             patch("ucode.cli.prompt_yes_no", return_value=True),
@@ -868,7 +868,7 @@ class TestConfigureAgentFlag:
     def test_agents_flag_skips_mcp_prompt(self):
         # Flag-driven (non-interactive) runs must stay scriptable: no MCP prompt.
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command"),
             patch("ucode.cli.prompt_yes_no") as mock_prompt,
@@ -881,7 +881,7 @@ class TestConfigureAgentFlag:
 
     def test_agents_flag_calls_configure_with_tools(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary") as mock_install,
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -895,7 +895,7 @@ class TestConfigureAgentFlag:
 
     def test_agents_flag_normalizes_aliases_and_dedupes(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -908,7 +908,7 @@ class TestConfigureAgentFlag:
 
     def test_workspaces_flag_calls_configure_with_workspaces(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -931,7 +931,7 @@ class TestConfigureAgentFlag:
 
     def test_agents_and_workspaces_flags_call_configure_with_both(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -948,7 +948,7 @@ class TestConfigureAgentFlag:
 
     def test_agent_and_workspaces_flags_call_configure_with_both(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary") as mock_install,
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -964,7 +964,7 @@ class TestConfigureAgentFlag:
 
     def test_agent_flag_calls_configure_with_tool(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary") as mock_install,
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -979,7 +979,7 @@ class TestConfigureAgentFlag:
         # Fable is Claude-only, so `--disable-fable` on its own should configure
         # claude directly instead of dropping into the interactive agent picker.
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary") as mock_install,
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -992,7 +992,7 @@ class TestConfigureAgentFlag:
 
     def test_enable_fable_alone_implicitly_targets_claude(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary") as mock_install,
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -1007,7 +1007,7 @@ class TestConfigureAgentFlag:
         # An explicit --agents selection wins; the fable flag rides along without
         # forcing the claude-only single-agent path.
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -1021,7 +1021,7 @@ class TestConfigureAgentFlag:
 
     def test_skip_upgrade_flag_disables_optional_update_prompt(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
             # Fully-interactive configure ends by offering the MCP step; decline it.
@@ -1035,7 +1035,7 @@ class TestConfigureAgentFlag:
     def test_disable_databricks_ai_tools_forwards_false_and_skips_prompt(self):
         # An explicit flag suppresses the interactive prompt and forwards the choice.
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
             patch("ucode.cli.prompt_yes_no_default") as mock_prompt,
@@ -1052,7 +1052,7 @@ class TestConfigureAgentFlag:
 
     def test_enable_databricks_ai_tools_with_agents_forwards_true(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -1113,7 +1113,7 @@ class TestConfigureAgentFlag:
 
     def test_skip_upgrade_flag_with_agent_skips_optional_update(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary") as mock_install,
             patch("ucode.cli.configure_workspace_command"),
         ):
@@ -1125,7 +1125,7 @@ class TestConfigureAgentFlag:
 
     def test_skip_upgrade_flag_with_agents_forwards_to_configure(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -1138,7 +1138,7 @@ class TestConfigureAgentFlag:
 
     def test_agent_flag_normalizes_alias(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -1164,7 +1164,7 @@ class TestConfigureAgentFlag:
 
     def test_agent_flag_rejects_unknown(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -1174,7 +1174,7 @@ class TestConfigureAgentFlag:
 
     def test_agents_flag_rejects_unknown(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -1186,7 +1186,7 @@ class TestConfigureAgentFlag:
 
     def test_agents_flag_rejects_empty_list(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -1196,7 +1196,7 @@ class TestConfigureAgentFlag:
 
     def test_agent_and_agents_flags_are_mutually_exclusive(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -1206,7 +1206,7 @@ class TestConfigureAgentFlag:
 
     def test_workspaces_flag_rejects_empty_list(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
@@ -1218,7 +1218,7 @@ class TestConfigureAgentFlag:
 class TestConfigureMcpFlag:
     def test_mcp_with_agents_configures_then_registers_services(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
             patch("ucode.cli.configure_mcp_command") as mock_mcp,
@@ -1238,7 +1238,7 @@ class TestConfigureMcpFlag:
         # `--mcp` with no --agents (e.g. Cursor): configure the workspace directly,
         # never the interactive agent picker, then register the MCP service.
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
             patch("ucode.cli._configure_shared_workspace_states") as mock_shared,
             patch("ucode.cli.configure_mcp_command") as mock_mcp,
@@ -1265,7 +1265,7 @@ class TestConfigureMcpFlag:
 
     def test_mcp_rejects_bare_short_name(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.configure_workspace_command"),
             patch("ucode.cli._configure_shared_workspace_states"),
             patch("ucode.cli.configure_mcp_command") as mock_mcp,
@@ -1475,7 +1475,7 @@ class TestConfigureProfilesFlag:
 
     def test_profiles_flag_resolves_workspaces(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.list_profile_entries", return_value=self.PROFILE_ENTRIES),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
@@ -1491,7 +1491,7 @@ class TestConfigureProfilesFlag:
 
     def test_profiles_flag_with_agents(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.list_profile_entries", return_value=self.PROFILE_ENTRIES),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
@@ -1508,7 +1508,7 @@ class TestConfigureProfilesFlag:
 
     def test_profiles_flag_with_agent(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.list_profile_entries", return_value=self.PROFILE_ENTRIES),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
@@ -1522,7 +1522,7 @@ class TestConfigureProfilesFlag:
 
     def test_use_pat_and_skip_validate_are_forwarded(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.list_profile_entries", return_value=self.PROFILE_ENTRIES),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
@@ -1550,7 +1550,7 @@ class TestConfigureProfilesFlag:
 
     def test_use_pat_requires_profiles(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
             result = runner.invoke(
@@ -1563,7 +1563,7 @@ class TestConfigureProfilesFlag:
 
     def test_profiles_and_workspaces_are_mutually_exclusive(self):
         with (
-            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.ensure_databricks_cli"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
         ):
             result = runner.invoke(
