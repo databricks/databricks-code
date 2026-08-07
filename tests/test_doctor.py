@@ -10,8 +10,11 @@ from ucode.doctor import (
     Check,
     Suggestion,
     _check_agent_clis,
+    _check_anthropic_env_collision,
+    _check_databricks_auth,
     _check_databricks_cli,
     _check_npm,
+    _check_tracing_mlflow,
     _check_uv,
     _check_workspace,
     doctor,
@@ -134,6 +137,98 @@ class TestAgentCliChecks:
         state = {"available_tools": ["not-a-real-tool"]}
         with patch.object(doctor_mod, "load_state", return_value=state):
             assert _check_agent_clis() == []
+
+
+class TestDatabricksAuthCheck:
+    def test_none_when_no_workspace(self):
+        with patch.object(doctor_mod, "load_state", return_value={}):
+            assert _check_databricks_auth() is None
+
+    def test_ok_when_valid(self):
+        with (
+            patch.object(doctor_mod, "load_state", return_value={"workspace": "https://ws"}),
+            patch.object(doctor_mod, "has_valid_databricks_auth", return_value=True),
+        ):
+            check = _check_databricks_auth()
+        assert check.status == "ok"
+        assert check.suggestion is None
+
+    def test_warn_and_login_suggestion_when_invalid(self):
+        with (
+            patch.object(doctor_mod, "load_state", return_value={"workspace": "https://ws"}),
+            patch.object(doctor_mod, "has_valid_databricks_auth", return_value=False),
+        ):
+            check = _check_databricks_auth()
+        assert check.status == "warn"
+        assert check.suggestion is not None
+        assert "Log in" in check.suggestion.prompt
+
+    def test_login_fix_reports_success(self):
+        with (
+            patch.object(doctor_mod, "load_state", return_value={"workspace": "https://ws"}),
+            # invalid at first, then valid after login
+            patch.object(doctor_mod, "has_valid_databricks_auth", side_effect=[False, True]),
+            patch.object(doctor_mod, "run_databricks_login") as login,
+        ):
+            check = _check_databricks_auth()
+            assert check.suggestion.apply() is True
+        login.assert_called_once()
+
+    def test_login_fix_reports_failure_when_login_raises(self):
+        with (
+            patch.object(doctor_mod, "load_state", return_value={"workspace": "https://ws"}),
+            patch.object(doctor_mod, "has_valid_databricks_auth", return_value=False),
+            patch.object(doctor_mod, "run_databricks_login", side_effect=RuntimeError("nope")),
+        ):
+            check = _check_databricks_auth()
+            assert check.suggestion.apply() is False
+
+
+class TestAnthropicEnvCollision:
+    def test_none_when_unset(self, monkeypatch):
+        for var in doctor_mod._CLAUDE_TOKEN_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        assert _check_anthropic_env_collision() is None
+
+    def test_warns_when_set(self, monkeypatch):
+        for var in doctor_mod._CLAUDE_TOKEN_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "secret")
+        check = _check_anthropic_env_collision()
+        assert check.status == "warn"
+        assert "ANTHROPIC_AUTH_TOKEN" in check.detail
+        # Advisory only — no auto-fix for a parent shell's env.
+        assert check.suggestion is None
+
+    def test_blank_value_is_ignored(self, monkeypatch):
+        for var in doctor_mod._CLAUDE_TOKEN_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "   ")
+        assert _check_anthropic_env_collision() is None
+
+
+class TestTracingMlflowCheck:
+    def test_none_when_tracing_disabled(self):
+        with patch.object(doctor_mod, "tracing_config", return_value=None):
+            assert _check_tracing_mlflow() is None
+
+    def test_ok_when_mlflow_present(self):
+        with (
+            patch.object(doctor_mod, "tracing_config", return_value={"enabled": True}),
+            patch.object(doctor_mod, "tracing_mlflow_ok", return_value=True),
+        ):
+            check = _check_tracing_mlflow()
+        assert check.status == "ok"
+        assert check.suggestion is None
+
+    def test_warn_and_install_suggestion_when_missing(self):
+        with (
+            patch.object(doctor_mod, "tracing_config", return_value={"enabled": True}),
+            patch.object(doctor_mod, "tracing_mlflow_ok", return_value=False),
+        ):
+            check = _check_tracing_mlflow()
+        assert check.status == "warn"
+        assert check.suggestion is not None
 
 
 class TestDoctorFlow:

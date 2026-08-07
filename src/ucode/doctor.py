@@ -9,6 +9,7 @@ suggestion, and a declined or piped run (no tty) changes nothing.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -16,18 +17,23 @@ from dataclasses import dataclass
 
 from ucode.agents import (
     TOOL_SPECS,
+    ensure_tracing_mlflow_cli,
     tool_binary_installed,
     tool_update_available,
+    tracing_mlflow_ok,
     update_tool_binary,
 )
 from ucode.databricks import (
     MIN_DATABRICKS_CLI_VERSION,
     databricks_cli_version,
+    has_valid_databricks_auth,
     install_databricks_cli,
+    run_databricks_login,
     upgrade_databricks_cli,
 )
 from ucode.state import load_state
 from ucode.telemetry import ucode_version
+from ucode.tracing import tracing_config
 from ucode.ui import (
     console,
     heading,
@@ -39,6 +45,10 @@ from ucode.ui import (
     spinner,
     status_badge,
 )
+
+# Env vars that shadow the credential ucode configures for Claude Code. Claude
+# warns when its own token and one of these are both set, so we surface them.
+_CLAUDE_TOKEN_ENV_VARS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
 
 UCODE_GIT_URL = "git+https://github.com/databricks/ucode"
 
@@ -177,6 +187,77 @@ def _check_agent_clis() -> list[Check]:
     return checks
 
 
+def _check_databricks_auth() -> Check | None:
+    """Validate the configured workspace's Databricks credentials.
+
+    The most common ucode failure at launch is an expired/invalid token
+    surfacing as a `403 Invalid Token` from the agent. Checking auth up front
+    (and offering to re-run `databricks auth login`) catches it before launch.
+    Returns None when there's no workspace yet — `_check_workspace` covers that.
+    """
+    state = load_state()
+    workspace = state.get("workspace")
+    if not workspace:
+        return None
+    profile = state.get("profile")
+    with spinner("Verifying Databricks credentials..."):
+        ok = has_valid_databricks_auth(workspace, profile)
+    if ok:
+        return Check("Databricks auth", "ok", "credentials are valid")
+
+    def _login() -> bool:
+        try:
+            run_databricks_login(workspace, profile)
+        except RuntimeError:
+            return False
+        return has_valid_databricks_auth(workspace, profile)
+
+    return Check(
+        "Databricks auth",
+        "warn",
+        "no valid credentials for this workspace (launches will fail to authenticate)",
+        Suggestion("Log in to Databricks now?", _login),
+    )
+
+
+def _check_anthropic_env_collision() -> Check | None:
+    """Warn when a Claude token env var is set that collides with ucode's own.
+
+    ucode authenticates Claude Code through the gateway; a stray
+    `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` in the environment shadows that
+    and makes Claude complain. We can't unset a parent shell's env, so this is
+    advisory (no fix). Returns None when nothing collides.
+    """
+    set_vars = [name for name in _CLAUDE_TOKEN_ENV_VARS if os.environ.get(name, "").strip()]
+    if not set_vars:
+        return None
+    joined = ", ".join(set_vars)
+    return Check(
+        "Claude auth env",
+        "warn",
+        f"{joined} is set and can collide with ucode's Claude auth; unset it in your shell",
+    )
+
+
+def _check_tracing_mlflow() -> Check | None:
+    """When tracing is enabled, check the `mlflow` CLI it needs is installed.
+
+    Only relevant if the user turned on tracing (`ucode configure tracing`);
+    otherwise there's nothing to check. A missing/out-of-range mlflow is offered
+    as an install. Returns None when tracing is disabled.
+    """
+    if tracing_config(load_state()) is None:
+        return None
+    if tracing_mlflow_ok():
+        return Check("Tracing (mlflow CLI)", "ok", "installed and in the supported range")
+    return Check(
+        "Tracing (mlflow CLI)",
+        "warn",
+        "tracing is enabled but the required `mlflow` CLI is missing or out of range",
+        Suggestion("Install the mlflow CLI for tracing?", ensure_tracing_mlflow_cli),
+    )
+
+
 def _upgrade_ucode() -> bool:
     if not shutil.which("uv"):
         print_warning("`uv` is not on PATH; cannot upgrade ucode.")
@@ -206,6 +287,10 @@ def _check_ucode() -> Check:
 
 def _gather_checks() -> list[Check]:
     checks: list[Check] = [_check_uv(), _check_npm(), _check_databricks_cli(), _check_workspace()]
+    # These return None when they don't apply (no workspace, no env collision,
+    # tracing disabled), so drop the Nones before display.
+    optional = [_check_databricks_auth(), _check_anthropic_env_collision(), _check_tracing_mlflow()]
+    checks.extend(c for c in optional if c is not None)
     checks.extend(_check_agent_clis())
     checks.append(_check_ucode())
     return checks
