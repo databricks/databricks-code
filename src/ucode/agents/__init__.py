@@ -248,6 +248,23 @@ def ensure_tool_binary_available(tool: str) -> None:
     )
 
 
+def tool_binary_installed(tool: str) -> bool:
+    """True when the agent's CLI binary is on PATH. Read-only — for ``ucode doctor``."""
+    return bool(shutil.which(TOOL_SPECS[tool]["binary"]))
+
+
+def tool_update_available(tool: str) -> tuple[str, str] | None:
+    """Return ``(current, latest)`` when a newer agent CLI is published, else None.
+    Read-only wrapper over the per-agent update check — for ``ucode doctor``."""
+    return _MODULES[tool].is_update_available()
+
+
+def update_tool_binary(tool: str) -> bool:
+    """Install the latest agent CLI, returning True on success. Public entry
+    point over the internal updater so ``ucode doctor`` can apply the fix."""
+    return _update_installed_tool_binary(tool)
+
+
 def ensure_bootstrap_dependencies(
     tool: str,
     *,

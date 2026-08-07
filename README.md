@@ -210,6 +210,7 @@ skipped in a re-run is dropped.
 | Command | Description |
 |---------|-------------|
 | `ucode status` | Show current workspace, base URLs, managed config files, and selected models |
+| `ucode doctor` | Diagnose the local setup (uv, npm, Databricks CLI, workspace, agent CLIs) and offer to fix any problems found |
 | `ucode usage` | Show AI Gateway usage summary |
 | `ucode revert` | Clear saved state and restore backed-up config files |
 | `ucode configure --dry-run` | Preview config files without writing them |
