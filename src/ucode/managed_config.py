@@ -24,7 +24,7 @@ from typing import cast
 
 import ucode.config_io as config_io
 from ucode.databricks import fetch_managed_coding_agent_configs, get_databricks_token
-from ucode.ui import print_warning
+from ucode.ui import console, print_warning
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
 
@@ -301,9 +301,13 @@ def save_managed_state(workspace: str, config: dict) -> None:
     file doubles as the fallback when a later read fails: without it, removing a config server-side
     would leave the old one on disk to be reapplied after a transient outage.
     """
-    if config_io.is_dry_run():
-        return
     payload = {"workspace": workspace, "config": config}
+    if config_io.is_dry_run():
+        # Print rather than write, matching how the agent config writers behave under --dry-run.
+        console.print(
+            f"\n[bold]\\[dry run] {MANAGED_STATE_PATH}[/bold]\n{json.dumps(payload, indent=2)}\n"
+        )
+        return
     config_io.ensure_parent_dir(MANAGED_STATE_PATH)
     try:
         MANAGED_STATE_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

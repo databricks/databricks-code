@@ -2258,3 +2258,31 @@ class TestModelProviderServicesCache:
         hit.pop()
         again, _ = db_mod.list_model_provider_services(WS, "tok")
         assert [s["name"] for s in again] == ["main.j.ant", "main.j.oai"]
+
+
+class TestIsWorkspaceAdmin:
+    """Admin detection reuses the SCIM `Me` payload, which carries group membership."""
+
+    @staticmethod
+    def _stub(monkeypatch, payload):
+        monkeypatch.setattr(db_mod, "_scim_me", lambda ws, tok: payload)
+
+    def test_true_when_in_the_admins_group(self, monkeypatch):
+        self._stub(monkeypatch, {"groups": [{"display": "users"}, {"display": "admins"}]})
+        assert db_mod.is_workspace_admin("https://w", "tok") is True
+
+    def test_false_without_the_admins_group(self, monkeypatch):
+        self._stub(monkeypatch, {"groups": [{"display": "users"}]})
+        assert db_mod.is_workspace_admin("https://w", "tok") is False
+
+    def test_none_when_the_check_could_not_be_made(self, monkeypatch):
+        # An unreachable SCIM is "unknown", not "not an admin" — the caller must not send a real
+        # admin down the non-admin dead end.
+        self._stub(monkeypatch, None)
+        assert db_mod.is_workspace_admin("https://w", "tok") is None
+
+    @pytest.mark.parametrize("payload", [{}, {"groups": "not-a-list"}])
+    def test_false_when_the_payload_names_no_groups(self, monkeypatch, payload):
+        # A well-formed `Me` for a user in no groups omits `groups` entirely.
+        self._stub(monkeypatch, payload)
+        assert db_mod.is_workspace_admin("https://w", "tok") is False

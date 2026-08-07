@@ -44,19 +44,21 @@ ucode codex --full-auto
 
 All agents route through Databricks AI Gateway using your workspace credentials — no API keys required.
 
-Codex intelligent routing is opt-in. Enabling it asks the AI Gateway router to select the
-root-session model before launch and installs profile-scoped hooks that route future
-`spawn_agent` calls. Codex may require one-time review of the installed hooks through `/hooks`.
+Smart routing is opt-in for Codex and Claude Code. Enabling it asks the AI Gateway router
+to select the root-session model before launch and installs profile-scoped hooks that route
+future subagent calls. Codex may require one-time review of the installed hooks through `/hooks`.
 
 ```bash
-ucode codex --enable-intelligent-routing
+ucode codex --enable-smart-routing
+ucode claude --enable-smart-routing
 ```
 
-The setting persists for the current workspace. Disable it and remove only ucode's routing
+The setting persists per workspace for each agent. Disable and remove only ucode's routing
 hooks with:
 
 ```bash
-ucode codex --disable-intelligent-routing
+ucode codex --disable-smart-routing
+ucode claude --disable-smart-routing
 ```
 
 To configure all tools at once:
@@ -215,8 +217,10 @@ skipped in a re-run is dropped.
 | `ucode configure --workspaces https://first.databricks.com,https://second.databricks.com` | Configure workspaces without the interactive picker |
 | `ucode configure --profiles DEFAULT` | Configure using existing Databricks CLI profiles (hosts come from `~/.databrickscfg`) |
 | `ucode configure --profiles DEFAULT --use-pat` | Authenticate with the profile's personal access token — no browser login |
-| `ucode codex --enable-intelligent-routing` | Enable AI Gateway routing for Codex sessions and subagents |
-| `ucode codex --disable-intelligent-routing` | Disable routing and remove ucode's Codex routing hooks |
+| `ucode codex --enable-smart-routing` | Enable AI Gateway routing for Codex sessions and subagents |
+| `ucode codex --disable-smart-routing` | Disable routing and remove ucode's Codex routing hooks |
+| `ucode claude --enable-smart-routing` | Enable AI Gateway routing for Claude Code sessions and subagents |
+| `ucode claude --disable-smart-routing` | Disable routing and remove ucode's Claude Code routing hooks |
 | `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
 | `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
 | `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
