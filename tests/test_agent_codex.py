@@ -488,8 +488,13 @@ class TestCodexLaunch:
         # execvp replaces the process, so the warning must already be out by then.
         assert len(warned_before_handoff) == 1
         captured = warned_before_handoff[0]
-        assert "--profile" in captured.err
-        assert str(codex.LEGACY_CODEX_CONFIG_PATH) in captured.err
+        err = " ".join(captured.err.split())  # unwrap Rich's width-based wrapping
+        assert "--profile" in err
+        # Disowns codex's own error, which names a flag the user never typed.
+        assert "not about your command" in err
+        # Names the fallback config and that Databricks routing is lost.
+        assert str(codex.LEGACY_CODEX_CONFIG_PATH) in err
+        assert "does NOT go through the Databricks gateway" in err
         assert captured.out == ""
 
     def test_slow_failure_does_not_retry(self, monkeypatch):

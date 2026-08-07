@@ -439,9 +439,11 @@ def launch(state: dict, tool_args: list[str]) -> None:
         # stdout is a JSON-RPC stream its caller parses. Emit before handing off,
         # since execvp replaces this process.
         print_warning_err(
-            f"`{binary}` rejected --profile here; retrying without it. "
-            f"This run uses your local Codex settings ({LEGACY_CODEX_CONFIG_PATH}), "
-            "not ucode's Databricks routing."
+            "The error above is not about your command — ucode adds `--profile` "
+            f"to route {SPEC['display']} through Databricks, and this subcommand "
+            "doesn't accept it. Retrying without it now, which means this run "
+            f"uses your local Codex settings ({LEGACY_CODEX_CONFIG_PATH}) and "
+            "does NOT go through the Databricks gateway."
         )
         exec_or_spawn([binary, *tool_args])
         return  # unreachable in production (exec replaces the process)
