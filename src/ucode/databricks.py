@@ -1675,9 +1675,21 @@ def update_coding_agent_config(
     Preferred over delete-then-create: the server applies the mask inside a single entity-store
     update, so the workspace is never left without a config if the write fails partway. ``name``
     identifies the config and is echoed in the body, which is what the API's path template expects.
+
+    ``update_mask`` goes in the query string, not the body. The RPC's HTTP binding is
+    ``patch: "…/{coding_agent_config.name=coding-agent-configs/*}"`` with ``body:
+    "coding_agent_config"`` — the config *is* the whole body, so a mask nested inside it is parsed
+    as an unknown config field and the server reports the mask as missing:
+
+        Field 'update_mask' is required and must contain at least one subfield with a non-default
+        value!
+
+    It is also a ``google.protobuf.FieldMask``, whose JSON/query form is one comma-separated string
+    rather than a ``{"paths": [...]}`` object.
     """
-    url = _coding_agent_config_url(workspace, name)
-    body = {**config, "name": name, "update_mask": {"paths": list(update_mask)}}
+    query = urlencode({"update_mask": ",".join(update_mask)})
+    url = f"{_coding_agent_config_url(workspace, name)}?{query}"
+    body = {**config, "name": name}
     payload, reason = _http_patch_json(url, token, body, timeout=30)
     if reason is not None:
         return None, reason

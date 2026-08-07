@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -2434,11 +2435,17 @@ class TestCodingAgentConfigCrudClients:
         )
         assert reason is None
         assert config == {"name": "coding-agent-configs/abc"}
-        assert seen["url"] == f"{WS}/api/ai-gateway/v2/coding-agent-configs/abc"
-        # The server rejects a missing or empty mask, and needs `name` in the body for its path
-        # template — both must be present alongside the config's own fields.
+        # The mask rides in the query string: the RPC binds `body: "coding_agent_config"`, so the
+        # config is the whole body and a mask nested inside it is read as an unknown config field —
+        # the server then reports the mask as missing. A FieldMask's JSON form is one
+        # comma-separated string, not a `{"paths": [...]}` object.
+        url, _, query = seen["url"].partition("?")
+        assert url == f"{WS}/api/ai-gateway/v2/coding-agent-configs/abc"
+        mask = parse_qs(query)["update_mask"][0].split(",")
+        assert mask == list(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS)
+        assert "update_mask" not in seen["payload"]
+        # `name` still goes in the body: the API's path template reads it from the config.
         assert seen["payload"]["name"] == "coding-agent-configs/abc"
-        assert seen["payload"]["update_mask"]["paths"]
         assert seen["payload"]["default_agent"] == "CODING_AGENT_CLAUDE_CODE"
 
     def test_update_mask_never_names_a_field_the_server_rejects(self):
