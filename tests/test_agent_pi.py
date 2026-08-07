@@ -89,6 +89,34 @@ class TestRenderOverlayProviders:
         assert entry["reasoning"] is True
         assert entry["input"] == ["text", "image"]
 
+    def test_gpt_entries_pin_off_thinking_level_to_none(self):
+        # `reasoning: True` without an off-state makes Pi send
+        # `reasoning: {effort: "none"}`, which gpt-5 / -mini / -nano / -5-5-pro
+        # reject with a 400. `{"off": None}` makes Pi omit `reasoning`.
+        overlay, _ = _overlay(
+            "system.ai.gpt-5",
+            codex_models=[
+                "system.ai.gpt-5",
+                "system.ai.gpt-5-mini",
+                "system.ai.gpt-5-nano",
+                "system.ai.gpt-5-5-pro",
+                "system.ai.gpt-5-6-luna",
+            ],
+        )
+        entries = overlay["providers"]["databricks-openai"]["models"]
+        assert entries, "expected gpt entries"
+        for entry in entries:
+            assert entry["reasoning"] is True
+            assert entry["thinkingLevelMap"] == {"off": None}, entry["id"]
+
+    def test_non_gpt_codex_entry_has_no_thinking_level_map(self):
+        # Only the gpt-5 family declares `reasoning`, so only it needs the
+        # off-state override.
+        overlay, _ = _overlay("gpt-oss-120b", codex_models=["gpt-oss-120b"])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+        assert "reasoning" not in entry
+        assert "thinkingLevelMap" not in entry
+
     def test_gpt_model_entries_use_model_specific_windows(self):
         overlay, _ = _overlay(
             "system.ai.gpt-5-2",
