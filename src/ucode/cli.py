@@ -2345,13 +2345,13 @@ def apply_cmd(
         bool,
         typer.Option("--yes", "-y", help="Publish without the confirmation prompt."),
     ] = False,
-    dry_run: Annotated[
-        bool,
-        typer.Option("--dry-run", help="Validate and preview without publishing."),
-    ] = False,
 ) -> None:
-    """Publish this workspace's managed coding config (workspace admins only)."""
-    set_dry_run(dry_run)
+    """Publish this workspace's managed coding config (workspace admins only).
+
+    Always validates the manifest before publishing (and shows what would change, then confirms), so
+    there is no separate dry-run: `ucode setup` only ever writes a valid manifest, and a
+    hand-editing admin sees any error here before anything reaches the workspace.
+    """
     # See the `setup` callback: `typer.Exit` subclasses RuntimeError, so it must be raised after
     # the try block or the handler below would report a successful exit as an error.
     try:
