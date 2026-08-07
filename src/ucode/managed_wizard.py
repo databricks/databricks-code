@@ -876,20 +876,10 @@ def setup_command(from_file: str | None = None) -> int:
 
     manifest: dict = {"default_agent": default_agent, "enabled_agents": enabled_agents}
 
-    print_section("Tracing")
-    if prompt_yes_no_default(
-        "Send coding-session traces to an MLflow experiment in this workspace?",
-        default=bool(_tracing_table_from_state(state)),
-    ):
-        from ucode.tracing import configure_tracing_command
-
-        configure_tracing_command(workspaces=[(workspace, profile)])
-        tracing_table = _tracing_table_from_state(load_state())
-        if tracing_table:
-            manifest["tracing_table"] = tracing_table
-            print_success(f"Tracing configured ({tracing_table})")
-        else:
-            print_warning("Tracing was not enabled, so it is left out of the managed config.")
+    # Tracing is intentionally not prompted here: the managed-tracing path isn't working yet, so
+    # asking would author a `tracing_table` the workspace can't honor. The manifest field and its
+    # serialize/validate support stay in place, so a hand-written `--from-file` config can still set
+    # it once the backend is ready. Re-add the section below when it is.
 
     print_section("MCP servers")
     if prompt_yes_no_default("Set up managed MCP servers for this workspace?", default=False):
