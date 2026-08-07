@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,8 +26,6 @@ from ucode.ui import (
 
 # `.claude/skills` (Claude) + `.agents/skills` (the alias other agents read).
 SKILL_BASE_DIR_NAMES = (".claude/skills", ".agents/skills")
-
-SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
 
 SKILL_FILES_API_PREFIX = "Skills"
 
@@ -216,10 +213,6 @@ def skill_dir_roots(project_dir: str | None) -> list[Path]:
     return [base / name for name in SKILL_BASE_DIR_NAMES]
 
 
-def _is_valid_leaf(leaf: str) -> bool:
-    return bool(SKILL_NAME_PATTERN.match(leaf))
-
-
 def _safe_relative_path(relative_path: str) -> Path | None:
     """A bundle file's path within its skill dir, or None if it escapes the dir.
 
@@ -251,18 +244,14 @@ def existing_skill_on_disk(roots: list[Path], bundle_name: str) -> bool:
 def should_download_skill(roots: list[Path], ref: SkillRef, *, location: str) -> bool:
     """Whether ``ref`` should be fetched and written into ``roots``.
 
-    Applies the disk-only checks that need no bundle bytes, so a declined or
-    invalid skill is never downloaded: skips names that are unsafe to use as a
-    URL or directory segment, and prompts before overwriting a skill already on
-    disk (``location`` is the source ``<catalog>.<schema>`` shown in that
-    prompt). Dedup keys on the bundle name, since that is the directory an agent
-    would load.
+    Applies the disk-only check that needs no bundle bytes: prompts before
+    overwriting a skill already on disk (``location`` is the source
+    ``<catalog>.<schema>`` shown in that prompt), so a declined skill is never
+    fetched. Dedup keys on the bundle name, since that is the directory an agent
+    would load. Name validity is the server's job -- FinalizeSkill enforces the
+    Agent Skills naming rules on ``bundle_name`` before we ever see it -- so
+    ucode does not re-check it here.
     """
-    for name in (ref.securable_name, ref.bundle_name):
-        if not _is_valid_leaf(name):
-            print_warning(f"Skipping `{name}`: not a valid skill name (lowercase a-z, 0-9, -).")
-            return False
-
     if existing_skill_on_disk(roots, ref.bundle_name) and not prompt_yes_no(
         f"A skill named `{ref.bundle_name}` already exists. "
         f"Overwrite it with `{location}.{ref.securable_name}`?"

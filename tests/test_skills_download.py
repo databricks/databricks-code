@@ -333,21 +333,6 @@ class TestShouldDownloadSkill:
 
         assert should_download_skill(roots, ref("triage"), location="ml.prod")
 
-    def test_invalid_leaf_is_skipped(self, tmp_path):
-        roots = skill_dir_roots(str(tmp_path))
-
-        assert not should_download_skill(roots, ref("Bad_Name"), location="main.default")
-
-    def test_either_unsafe_name_is_skipped(self, tmp_path):
-        # Both names reach the filesystem or a URL, so both must be validated.
-        roots = skill_dir_roots(str(tmp_path))
-
-        unsafe_bundle = SkillRef(securable_name="ok-name", bundle_name="../escape")
-        unsafe_securable = SkillRef(securable_name="../escape", bundle_name="ok-name")
-
-        assert not should_download_skill(roots, unsafe_bundle, location="main.default")
-        assert not should_download_skill(roots, unsafe_securable, location="main.default")
-
     def test_existing_skill_on_disk_checks_every_root(self, tmp_path):
         roots = skill_dir_roots(str(tmp_path))
         assert not existing_skill_on_disk(roots, "triage")
