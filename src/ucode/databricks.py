@@ -253,28 +253,37 @@ def _http_get_json(
         return None, f"network error: {exc}"
 
 
-def _http_post_json(
-    url: str, token: str, payload: dict, *, timeout: int = 10
+def _http_send_json(
+    method: str,
+    url: str,
+    token: str,
+    payload: dict | None,
+    *,
+    timeout: int = 10,
+    allow_empty_body: bool = False,
 ) -> tuple[dict | list | None, str | None]:
-    """POST a JSON body to an endpoint. Returns (payload, None) on success,
-    (None, reason) on failure. Mirrors `_http_get_json`."""
-    body_bytes = json.dumps(payload).encode("utf-8")
-    request = urllib_request.Request(
-        url,
-        data=body_bytes,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        },
-    )
+    """Send a request that may carry a JSON body, and decode a JSON response.
+
+    Shared by `_http_post_json`, `_http_patch_json`, and `_http_delete` — the three differ only in
+    verb, whether they send a body, and whether an empty response is success. Returns
+    ``(payload, None)`` on success and ``(None, reason)`` on failure, like `_http_get_json`.
+
+    ``allow_empty_body`` is for DELETE, whose success response is ``google.protobuf.Empty`` — an
+    empty body there is the expected result, not a decode failure.
+    """
+    body_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if body_bytes is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib_request.Request(url, data=body_bytes, method=method, headers=headers)
     try:
         with urllib_request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
-        _debug(f"POST {url}", f"HTTP {response.status}, {len(body)} bytes")
+        _debug(f"{method} {url}", f"HTTP {response.status}, {len(body)} bytes")
         if _debug_enabled():
             _debug("body", body[:4000])
+        if allow_empty_body and not body.strip():
+            return None, None
         try:
             return json.loads(body), None
         except json.JSONDecodeError as exc:
@@ -285,7 +294,7 @@ def _http_post_json(
             body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
         except Exception:
             body = ""
-        _debug(f"POST {url}", f"HTTP {exc.code} {exc.reason}")
+        _debug(f"{method} {url}", f"HTTP {exc.code} {exc.reason}")
         if _debug_enabled() and body:
             _debug("body", body[:4000])
         reason = f"HTTP {exc.code} {exc.reason}"
@@ -294,13 +303,41 @@ def _http_post_json(
             reason = f"{reason}: {body_excerpt}"
         return None, reason
     except urllib_error.URLError as exc:
-        _debug(f"POST {url}", f"URLError: {exc.reason}")
+        _debug(f"{method} {url}", f"URLError: {exc.reason}")
         return None, f"network error: {exc.reason}"
     except OSError as exc:
         # See `_http_get_json`: a bare socket timeout is an OSError, not a
         # URLError, and would otherwise escape the caller's error handling.
-        _debug(f"POST {url}", f"OSError: {exc}")
+        _debug(f"{method} {url}", f"OSError: {exc}")
         return None, f"network error: {exc}"
+
+
+def _http_post_json(
+    url: str, token: str, payload: dict, *, timeout: int = 10
+) -> tuple[dict | list | None, str | None]:
+    """POST a JSON body to an endpoint. Returns (payload, None) on success,
+    (None, reason) on failure. Mirrors `_http_get_json`."""
+    return _http_send_json("POST", url, token, payload, timeout=timeout)
+
+
+def _http_patch_json(
+    url: str, token: str, payload: dict, *, timeout: int = 10
+) -> tuple[dict | list | None, str | None]:
+    """PATCH a JSON body to an endpoint. Returns (payload, None) on success,
+    (None, reason) on failure."""
+    return _http_send_json("PATCH", url, token, payload, timeout=timeout)
+
+
+def _http_delete(
+    url: str, token: str, *, timeout: int = 10
+) -> tuple[dict | list | None, str | None]:
+    """DELETE a resource. Returns (payload, None) on success, (None, reason) on failure.
+
+    A successful delete returns ``google.protobuf.Empty``, which serializes as ``{}`` or an empty
+    body depending on the gateway, so both count as success and yield ``(None, None)``. Callers
+    should test ``reason`` rather than the payload.
+    """
+    return _http_send_json("DELETE", url, token, None, timeout=timeout, allow_empty_body=True)
 
 
 def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes | None, str | None]:
@@ -1574,6 +1611,103 @@ def fetch_model_recommendation(workspace: str, token: str) -> tuple[dict, str | 
     if not isinstance(payload, dict):
         return {}, "recommendModel returned an unexpected response shape"
     return payload, None
+
+
+# Every field ucode's manifest can set, as `update_mask` paths for a PATCH. The server rejects a
+# missing or empty mask, and rejects paths outside its own mutable set — this is that set minus the
+# fields ucode doesn't author: `budget_id` (deprecated in favour of `budget_policy.budget_id`, and
+# rejected on write) and `default_options`/`tiers` (the legacy model-only shape superseded by
+# `enabled_agents`/`budget_policy`). Sending every path ucode owns, rather than only the ones
+# currently populated, is what lets a re-run *clear* a field the admin removed: the server merges
+# per path, so an omitted path leaves the old value in place.
+MANAGED_CONFIG_UPDATE_MASK_PATHS: tuple[str, ...] = (
+    "display_name",
+    "default_agent",
+    "enabled_agents",
+    "mcp_servers",
+    "skills",
+    "tracing",
+    "budget_policy",
+)
+
+
+def _coding_agent_config_url(workspace: str, name: str | None = None) -> str:
+    """The collection URL, or one config's resource URL when ``name`` is given.
+
+    ``name`` is the server-assigned resource name (``coding-agent-configs/{id}``), which the Get and
+    Update paths template directly, so it is appended as-is rather than rebuilt from an id.
+    """
+    hostname = workspace_hostname(workspace)
+    base = f"https://{hostname}{_CODING_AGENT_CONFIGS_API_PATH}"
+    if name is None:
+        return base
+    # The resource name already carries the collection segment, so join on the API root.
+    root = base.rsplit("/coding-agent-configs", 1)[0]
+    return f"{root}/{name.strip().strip('/')}"
+
+
+def create_coding_agent_config(
+    workspace: str, token: str, config: dict
+) -> tuple[dict | None, str | None]:
+    """Create the workspace's managed CodingAgentConfig.
+
+    v0 allows at most one config per workspace, so this fails with ALREADY_EXISTS when one is
+    already defined; callers should update that one instead of creating a second.
+    """
+    url = _coding_agent_config_url(workspace)
+    payload, reason = _http_post_json(url, token, config, timeout=30)
+    if reason is not None:
+        return None, reason
+    if not isinstance(payload, dict):
+        return None, "coding-agent-config create returned an unexpected response shape"
+    return payload, None
+
+
+def update_coding_agent_config(
+    workspace: str,
+    token: str,
+    name: str,
+    config: dict,
+    *,
+    update_mask: tuple[str, ...] = MANAGED_CONFIG_UPDATE_MASK_PATHS,
+) -> tuple[dict | None, str | None]:
+    """Update an existing managed CodingAgentConfig in place.
+
+    Preferred over delete-then-create: the server applies the mask inside a single entity-store
+    update, so the workspace is never left without a config if the write fails partway. ``name``
+    identifies the config and is echoed in the body, which is what the API's path template expects.
+
+    ``update_mask`` goes in the query string, not the body. The RPC's HTTP binding is
+    ``patch: "…/{coding_agent_config.name=coding-agent-configs/*}"`` with ``body:
+    "coding_agent_config"`` — the config *is* the whole body, so a mask nested inside it is parsed
+    as an unknown config field and the server reports the mask as missing:
+
+        Field 'update_mask' is required and must contain at least one subfield with a non-default
+        value!
+
+    It is also a ``google.protobuf.FieldMask``, whose JSON/query form is one comma-separated string
+    rather than a ``{"paths": [...]}`` object.
+    """
+    query = urlencode({"update_mask": ",".join(update_mask)})
+    url = f"{_coding_agent_config_url(workspace, name)}?{query}"
+    body = {**config, "name": name}
+    payload, reason = _http_patch_json(url, token, body, timeout=30)
+    if reason is not None:
+        return None, reason
+    if not isinstance(payload, dict):
+        return None, "coding-agent-config update returned an unexpected response shape"
+    return payload, None
+
+
+def delete_coding_agent_config(workspace: str, token: str, name: str) -> str | None:
+    """Delete a managed CodingAgentConfig by resource name. Returns None on success, else a reason.
+
+    Returns only the failure reason: a successful delete responds with ``Empty``, so there is no
+    payload worth handing back.
+    """
+    url = _coding_agent_config_url(workspace, name)
+    _, reason = _http_delete(url, token, timeout=30)
+    return reason
 
 
 # --- MCP services (parallel to model services) -----------------------------

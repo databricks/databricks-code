@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import cast
 
@@ -46,17 +47,6 @@ MANAGED_SETTINGS_PATH = config_io.APP_DIR / "managed-settings.json"
 # `managed_config._AGENT_ENUM_TO_TOOL` makes it serializable here automatically.
 AGENT_TOOL_TO_ENUM: dict[str, str] = {tool: enum for enum, tool in AGENT_ENUM_TO_TOOL.items()}
 MCP_TAG_TO_TYPE_ENUM: dict[str, str] = {tag: enum for enum, tag in MCP_TYPE_ENUM_TO_TAG.items()}
-
-# `AgentModelConfig` oneof variant key per agent. The server rejects a config whose variant doesn't
-# match its agent (`validateAgentModelConfig`), so this mapping is not cosmetic.
-_AGENT_MODEL_CONFIG_VARIANT: dict[str, str] = {
-    "claude": "claude",
-    "codex": "codex",
-    "opencode": "opencode",
-    "pi": "pi",
-    "gemini": "gemini",
-    "copilot": "copilot",
-}
 
 # Agents whose model config carries a flat `models` list. Claude instead uses per-family slots
 # (`ClaudeDefaultModels`), and Codex has no model list at all — it selects exactly one model.
@@ -249,8 +239,11 @@ def _enabled_agent_payload(tool: str, agent_config: dict) -> dict:
     if isinstance(model_config, dict):
         body = _model_config_payload(tool, model_config)
         if body:
-            variant = _AGENT_MODEL_CONFIG_VARIANT[tool]
-            config["model_config"] = {variant: body}
+            # The `AgentModelConfig` oneof field names are ucode's tool names verbatim (claude,
+            # codex, opencode, pi, gemini, copilot), so the tool doubles as the variant key. The
+            # server rejects a variant that doesn't match its agent (`validateAgentModelConfig`),
+            # and the round-trip through `normalize_managed_config` pins that alignment in tests.
+            config["model_config"] = {tool: body}
 
     entry: dict = {"agent": AGENT_TOOL_TO_ENUM[tool]}
     if config:
@@ -532,14 +525,30 @@ def _agent_model_ids(agent_config: dict) -> set[str]:
 
 
 def _validate_budget_policy(budget_policy: dict, enabled_agents: dict[str, dict]) -> list[str]:
-    """Validate a ``budget_policy`` against the agents the manifest enables."""
+    """Validate a ``budget_policy`` against the agents the manifest enables.
+
+    Tier positions are reported 0-based to match the server's own messages, which index with
+    ``zipWithIndex`` — an admin comparing the two error sources should see the same number.
+    """
     errors: list[str] = []
-    if not budget_policy.get("budget_id"):
+    budget_id = budget_policy.get("budget_id")
+    if not budget_id:
         errors.append("budget_policy.budget_id is required.")
+    else:
+        # The server requires a parseable UUID here. The wizard can only offer real
+        # `budget_configuration_id`s, but `--from-file` and hand-edited manifests can carry
+        # anything, and catching it locally beats an INVALID_PARAMETER_VALUE round-trip.
+        try:
+            uuid.UUID(str(budget_id))
+        except ValueError:
+            errors.append(
+                f"budget_policy.budget_id must be a UUID (got '{budget_id}'). Use the "
+                "budget_configuration_id from the workspace's AI Gateway budgets."
+            )
 
     percentages: list[float] = []
     tiers = budget_policy.get("tiers")
-    for index, tier in enumerate(tiers if isinstance(tiers, list) else [], start=1):
+    for index, tier in enumerate(tiers if isinstance(tiers, list) else []):
         if not isinstance(tier, dict):
             errors.append(f"budget_policy.tiers[{index}] must be an object.")
             continue

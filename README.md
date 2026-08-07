@@ -200,8 +200,23 @@ ucode setup --dry-run
 ucode setup --from-file ./managed-settings.json
 ```
 
-Publishing replaces the workspace's config outright — there is no partial update yet, so anything
-skipped in a re-run is dropped.
+Once the manifest looks right, publish it:
+
+```bash
+# Validate, show what would change, and ask before publishing.
+ucode apply
+
+# Preview without publishing.
+ucode apply --dry-run
+
+# Publish without the confirmation prompt (for CI).
+ucode apply --yes
+```
+
+`apply` updates the workspace's existing config in place rather than replacing it, so a failed
+publish leaves the current config intact. It is still a whole-manifest write: every field ucode
+authors is sent, so anything skipped in a re-run is cleared rather than carried over. Developers
+pick the new config up on their next ucode run.
 
 ---
 
@@ -231,6 +246,8 @@ skipped in a re-run is dropped.
 | `ucode setup` | Author the workspace's managed coding config (workspace admins only) |
 | `ucode setup show` | Print the authored config and the payload `ucode apply` would publish |
 | `ucode setup --from-file <file>` | Load a hand-written managed config instead of running the prompts |
+| `ucode apply` | Publish the authored managed config to the workspace (workspace admins only) |
+| `ucode apply --yes` | Publish without the confirmation prompt |
 
 ## Managed Local Files
 

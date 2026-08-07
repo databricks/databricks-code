@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 from decimal import Decimal
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -2306,6 +2307,216 @@ class TestIsWorkspaceAdmin:
         # A well-formed `Me` for a user in no groups omits `groups` entirely.
         self._stub(monkeypatch, payload)
         assert db_mod.is_workspace_admin("https://w", "tok") is False
+
+
+class TestCodingAgentConfigUrls:
+    def test_collection_url(self):
+        assert db_mod._coding_agent_config_url(WS) == f"{WS}/api/ai-gateway/v2/coding-agent-configs"
+
+    def test_resource_url_appends_the_server_assigned_name(self):
+        # The API templates Get/Update/Delete on `{name=coding-agent-configs/*}`, so the resource
+        # name already carries the collection segment and must not be duplicated.
+        url = db_mod._coding_agent_config_url(WS, "coding-agent-configs/abc123")
+        assert url == f"{WS}/api/ai-gateway/v2/coding-agent-configs/abc123"
+
+    def test_stray_slashes_are_tolerated(self):
+        url = db_mod._coding_agent_config_url(WS, "/coding-agent-configs/abc123/")
+        assert url == f"{WS}/api/ai-gateway/v2/coding-agent-configs/abc123"
+
+
+class TestHttpDelete:
+    """A successful delete returns `google.protobuf.Empty`, so an empty body is success."""
+
+    @staticmethod
+    def _empty_response(body: str = ""):
+        from unittest.mock import MagicMock
+
+        response = MagicMock()
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
+        response.read.return_value = body.encode("utf-8")
+        response.status = 200
+        return response
+
+    def test_empty_body_is_success_not_a_decode_error(self, monkeypatch):
+        # Without `allow_empty_body` this would fail with "response was not valid JSON".
+        monkeypatch.setattr(
+            db_mod.urllib_request, "urlopen", lambda request, timeout=None: self._empty_response()
+        )
+        payload, reason = db_mod._http_delete(f"{WS}/api/anything", "tok")
+        assert reason is None
+        assert payload is None
+
+    def test_empty_json_object_is_also_success(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod.urllib_request,
+            "urlopen",
+            lambda request, timeout=None: self._empty_response("{}"),
+        )
+        payload, reason = db_mod._http_delete(f"{WS}/api/anything", "tok")
+        assert reason is None
+        assert payload == {}
+
+    def test_uses_the_delete_verb_and_sends_no_body(self, monkeypatch):
+        seen = {}
+
+        def capture(request, timeout=None):
+            seen["method"] = request.get_method()
+            seen["data"] = request.data
+            return self._empty_response()
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", capture)
+        db_mod._http_delete(f"{WS}/api/anything", "tok")
+        assert seen["method"] == "DELETE"
+        assert seen["data"] is None
+
+    def test_http_error_surfaces_the_body(self, monkeypatch):
+        import io
+        from unittest.mock import MagicMock
+        from urllib.error import HTTPError
+
+        body = '{"error_code":"PERMISSION_DENIED","message":"admin required"}'
+
+        def raise_http_error(request, timeout=None):
+            raise HTTPError(
+                url="", code=403, msg="Forbidden", hdrs=MagicMock(), fp=io.BytesIO(body.encode())
+            )
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", raise_http_error)
+        _, reason = db_mod._http_delete(f"{WS}/api/anything", "tok")
+        assert reason is not None
+        assert "403" in reason
+        assert "PERMISSION_DENIED" in reason
+
+
+class TestHttpPatchJson:
+    def test_uses_the_patch_verb_and_sends_the_body(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        seen = {}
+
+        def capture(request, timeout=None):
+            seen["method"] = request.get_method()
+            seen["data"] = request.data
+            seen["content_type"] = request.get_header("Content-type")
+            response = MagicMock()
+            response.__enter__ = lambda s: s
+            response.__exit__ = MagicMock(return_value=False)
+            response.read.return_value = b'{"name":"coding-agent-configs/x"}'
+            response.status = 200
+            return response
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", capture)
+        payload, reason = db_mod._http_patch_json(f"{WS}/api/anything", "tok", {"k": "v"})
+        assert reason is None
+        assert payload == {"name": "coding-agent-configs/x"}
+        assert seen["method"] == "PATCH"
+        assert json.loads(seen["data"]) == {"k": "v"}
+        assert seen["content_type"] == "application/json"
+
+
+class TestCodingAgentConfigCrudClients:
+    CONFIG = {"default_agent": "CODING_AGENT_CLAUDE_CODE"}
+
+    def test_create_posts_the_config_to_the_collection(self, monkeypatch):
+        seen = {}
+
+        def fake_post(url, token, payload, *, timeout=10):
+            seen.update(url=url, payload=payload)
+            return {"name": "coding-agent-configs/new"}, None
+
+        monkeypatch.setattr(db_mod, "_http_post_json", fake_post)
+        config, reason = db_mod.create_coding_agent_config(WS, "tok", self.CONFIG)
+        assert reason is None
+        assert config == {"name": "coding-agent-configs/new"}
+        assert seen["url"] == f"{WS}/api/ai-gateway/v2/coding-agent-configs"
+        assert seen["payload"] == self.CONFIG
+
+    def test_create_surfaces_the_failure_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda *a, **k: (None, 'HTTP 400: {"error_code":"ALREADY_EXISTS"}'),
+        )
+        config, reason = db_mod.create_coding_agent_config(WS, "tok", self.CONFIG)
+        assert config is None
+        assert "ALREADY_EXISTS" in reason
+
+    def test_update_patches_the_resource_with_a_mask(self, monkeypatch):
+        seen = {}
+
+        def fake_patch(url, token, payload, *, timeout=10):
+            seen.update(url=url, payload=payload)
+            return {"name": "coding-agent-configs/abc"}, None
+
+        monkeypatch.setattr(db_mod, "_http_patch_json", fake_patch)
+        config, reason = db_mod.update_coding_agent_config(
+            WS, "tok", "coding-agent-configs/abc", self.CONFIG
+        )
+        assert reason is None
+        assert config == {"name": "coding-agent-configs/abc"}
+        # The mask rides in the query string: the RPC binds `body: "coding_agent_config"`, so the
+        # config is the whole body and a mask nested inside it is read as an unknown config field —
+        # the server then reports the mask as missing. A FieldMask's JSON form is one
+        # comma-separated string, not a `{"paths": [...]}` object.
+        url, _, query = seen["url"].partition("?")
+        assert url == f"{WS}/api/ai-gateway/v2/coding-agent-configs/abc"
+        mask = parse_qs(query)["update_mask"][0].split(",")
+        assert mask == list(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS)
+        assert "update_mask" not in seen["payload"]
+        # `name` still goes in the body: the API's path template reads it from the config.
+        assert seen["payload"]["name"] == "coding-agent-configs/abc"
+        assert seen["payload"]["default_agent"] == "CODING_AGENT_CLAUDE_CODE"
+
+    def test_update_mask_never_names_a_field_the_server_rejects(self):
+        # The server's mutable set is the upper bound; `budget_id` is in it but deprecated and
+        # rejected on write, so ucode must not name it. `default_options`/`tiers` are the legacy
+        # model-only shape ucode never authors.
+        assert "budget_id" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
+        assert "default_options" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
+        assert "tiers" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
+
+    def test_update_mask_covers_every_field_the_manifest_can_set(self):
+        # A path ucode omits is a field a re-run silently cannot clear, since the server merges per
+        # path. Derive the expectation from the serializer rather than restating it, so adding a
+        # manifest field fails here instead of shipping a mask that can't clear it.
+        from ucode.managed_setup import serialize_managed_config
+
+        emitted = set(
+            serialize_managed_config(
+                {
+                    "display_name": "org config",
+                    "default_agent": "claude",
+                    "enabled_agents": {
+                        "claude": {"model_config": {"default_model": "system.ai.claude-opus-5"}}
+                    },
+                    "mcp_servers": [{"name": "databricks-sql", "type": "sql"}],
+                    "skills": {"names": ["main.default"]},
+                    "tracing_table": "main.default.traces",
+                    "budget_policy": {
+                        "budget_id": "11111111-1111-1111-1111-111111111111",
+                        "tiers": [],
+                    },
+                }
+            )
+        )
+        assert emitted == set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS)
+
+    def test_delete_returns_only_a_reason(self, monkeypatch):
+        seen = {}
+
+        def fake_delete(url, token, *, timeout=10):
+            seen["url"] = url
+            return None, None
+
+        monkeypatch.setattr(db_mod, "_http_delete", fake_delete)
+        assert db_mod.delete_coding_agent_config(WS, "tok", "coding-agent-configs/abc") is None
+        assert seen["url"] == f"{WS}/api/ai-gateway/v2/coding-agent-configs/abc"
+
+    def test_delete_surfaces_the_failure_reason(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "_http_delete", lambda *a, **k: (None, "HTTP 404 Not Found"))
+        reason = db_mod.delete_coding_agent_config(WS, "tok", "coding-agent-configs/abc")
+        assert reason == "HTTP 404 Not Found"
 
 
 class TestResolveCurrentBudgetSpend:

@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 from ucode.agents import TOOL_SPECS, check_gateway_endpoint
+from ucode.config_io import is_dry_run
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
+    create_coding_agent_config,
     discover_claude_models_unbucketed,
     ensure_databricks_auth,
     get_databricks_token,
@@ -28,6 +31,7 @@ from ucode.databricks import (
     list_model_provider_services,
     list_workspace_budgets,
     service_usable_for_tool,
+    update_coding_agent_config,
 )
 from ucode.managed_config import get_managed_config
 from ucode.managed_setup import (
@@ -897,4 +901,159 @@ def show_command() -> int:
     return 0
 
 
-__all__ = ["setup_command", "setup_from_file", "show_command"]
+# Server-side failures an admin is actually likely to hit, mapped to something they can act on. The
+# raw reasons are `HTTP <code> <reason>: <body>` strings from the transport, and the body carries the
+# API's `error_code`, so matching on that is more robust than on status codes alone.
+def _explain_publish_failure(reason: str) -> str:
+    lowered = reason.lower()
+    if "feature_disabled" in lowered:
+        return (
+            "Managed coding-agent configs aren't enabled on this workspace yet. Ask your Databricks "
+            "contact to enable the `codingAgentConfigCrudEnabled` flag for it, then re-run "
+            "`ucode apply`."
+        )
+    if "permission_denied" in lowered or "http 403" in lowered:
+        return (
+            "Publishing a managed config requires workspace admin. Your account can read the "
+            "workspace but not author its coding config."
+        )
+    if "already_exists" in lowered:
+        return (
+            "This workspace already has a managed config, but ucode couldn't read it to update in "
+            "place. Run `ucode apply` again — if it keeps failing, the existing config may need to "
+            "be deleted by hand."
+        )
+    if "invalid_parameter_value" in lowered:
+        # The server names the offending field; passing it through beats paraphrasing.
+        return f"The workspace rejected the config: {reason}"
+    return f"Could not publish the managed config: {reason}"
+
+
+def _with_claude_inventory(state: dict, workspace: str, profile: str | None) -> dict:
+    """``state`` plus the full Claude listing, for validating a manifest against the workspace.
+
+    ``state["claude_models"]`` holds only the newest id per family (the launch path pins one model
+    per family alias), but `ucode setup` deliberately offers the older versions too — pinning
+    ``default_opus_model`` to a known-good ``claude-opus-4-8`` is a normal thing for an admin to
+    want. Validating against ``claude_models`` alone therefore rejected a model the wizard itself
+    had just offered:
+
+        claude: model 'system.ai.claude-opus-4-8' is not available on this workspace.
+
+    The wizard stashes the full listing on ``state["all_claude_models"]`` mid-run, but that is never
+    persisted — `setup` saves the manifest, not the state — so a separate `ucode apply` process
+    starts from a fresh ``load_state()`` without it. Re-fetching here makes the check independent of
+    what the wizard happened to leave behind, which also covers a hand-edited or ``--from-file``
+    manifest authored on another machine.
+
+    Best-effort: a failed listing returns ``state`` untouched, leaving validation on the narrower
+    inventory rather than blocking a publish on a transient API error.
+    """
+    if isinstance(state.get("all_claude_models"), list) and state["all_claude_models"]:
+        return state
+    try:
+        token = get_databricks_token(workspace, profile)
+        all_claude, _ = discover_claude_models_unbucketed(workspace, token)
+    except (RuntimeError, OSError):
+        # OSError covers a missing `databricks` binary: `get_databricks_token` shells out, so a
+        # machine without the CLI on PATH raises FileNotFoundError rather than RuntimeError.
+        return state
+    if not all_claude:
+        return state
+    return {**state, "all_claude_models": all_claude}
+
+
+def apply_command(*, yes: bool = False) -> int:
+    """Publish the authored manifest to the workspace.
+
+    Updates the existing config in place when there is one, rather than deleting and recreating it:
+    a failed recreate would leave the workspace with no managed config at all, and every developer
+    would silently fall back to their own settings. Returns a process exit code.
+    """
+    from ucode.cli import _prompt_for_configuration
+
+    print_section("ucode apply")
+
+    state = load_state()
+    workspace = state.get("workspace")
+    profile = state.get("profile")
+    if not workspace:
+        workspace, profile = _prompt_for_configuration()
+
+    manifest = load_managed_settings(workspace)
+    if manifest is None:
+        raise RuntimeError(
+            "No managed config has been authored for this workspace. Run `ucode setup` first "
+            "(or `ucode setup --from-file <json>`)."
+        )
+
+    # Auth first: validating a Claude manifest needs the workspace's full model listing, and that
+    # listing needs a token. Nothing is written until well below this point.
+    ensure_databricks_auth(workspace, profile)
+
+    errors = validate_manifest(manifest, _with_claude_inventory(state, workspace, profile))
+    if errors:
+        print_err("The authored config is not valid, so it was not published:")
+        for error in errors:
+            print_note(error)
+        print_note("Re-run `ucode setup` to fix it, or edit ~/.ucode/managed-settings.json.")
+        return 1
+
+    token = get_databricks_token(workspace, profile)
+    _require_admin(workspace, token)
+
+    payload = serialize_managed_config(manifest)
+    _render_summary(workspace, manifest)
+
+    # Read before writing: the resource name tells us whether to create or update, and shows the
+    # admin what they are about to overwrite.
+    with spinner("Checking for an existing managed config..."):
+        existing, reason = get_managed_config(workspace, token)
+    if reason is not None:
+        raise RuntimeError(
+            f"Could not check whether {workspace} already has a managed config: {reason}. "
+            "Refusing to publish without knowing, since that could overwrite a config silently."
+        )
+
+    existing_name = (existing or {}).get("name")
+    if existing is not None and not isinstance(existing_name, str):
+        raise RuntimeError(
+            "This workspace has a managed config but the API didn't return its resource name, so "
+            "ucode can't update it in place. Delete it in the workspace and re-run `ucode apply`."
+        )
+
+    console.print()
+    if existing is None:
+        print_note(f"This will create a new managed config on {workspace}.")
+    else:
+        agents = ", ".join((existing.get("enabled_agents") or {}).keys()) or "no agents"
+        print_warning(
+            f"This will replace the config already published on {workspace} (currently: {agents}). "
+            "Every developer picks the new one up on their next ucode run."
+        )
+    if not yes and not prompt_yes_no_default("Publish this config?", default=False):
+        print_note("Nothing was published.")
+        return 1
+
+    if is_dry_run():
+        print_success("Dry run: the config was validated but not published.")
+        return 0
+
+    if existing is None:
+        with spinner("Publishing the managed config..."):
+            published, publish_reason = create_coding_agent_config(workspace, token, payload)
+    else:
+        with spinner("Updating the managed config..."):
+            published, publish_reason = update_coding_agent_config(
+                workspace, token, cast("str", existing_name), payload
+            )
+    if publish_reason is not None:
+        raise RuntimeError(_explain_publish_failure(publish_reason))
+
+    name = (published or {}).get("name") or existing_name or "coding-agent-configs/?"
+    print_success(f"Published {name} to {workspace}")
+    print_note("Developers pick this up on their next ucode run.")
+    return 0
+
+
+__all__ = ["apply_command", "setup_command", "setup_from_file", "show_command"]
