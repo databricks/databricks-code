@@ -546,6 +546,7 @@ def _prompt_budget_policy(
 
     tiers: list[dict] = []
     seen_percentages: set[float] = set()
+    seen_combos: set[tuple[str, str]] = set()
     print_note(
         "Add one tier per step-down. Each tier activates once spend reaches its percentage, and "
         "the highest activated tier wins."
@@ -575,7 +576,17 @@ def _prompt_budget_policy(
             model = prompt_for_text(f"Tier {index}: which model?")
         if not model:
             break
+        if (agent, model) in seen_combos:
+            # The highest crossed tier wins, so a second tier on the same agent+model never changes
+            # what the lower one already selected — it is a step-down that doesn't step down. Reject
+            # it here rather than let the admin build a policy with a silently inert tier.
+            print_err(
+                f"{TOOL_SPECS[agent]['display']} / {model} is already used by another tier; a "
+                "repeated agent/model makes this tier a no-op. Pick a different one."
+            )
+            continue
         seen_percentages.add(fraction)
+        seen_combos.add((agent, model))
         tiers.append(
             {
                 "spending_percentage": fraction,

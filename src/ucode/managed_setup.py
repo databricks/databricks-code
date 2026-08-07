@@ -547,6 +547,7 @@ def _validate_budget_policy(budget_policy: dict, enabled_agents: dict[str, dict]
             )
 
     percentages: list[float] = []
+    combos: list[tuple[str, str]] = []
     tiers = budget_policy.get("tiers")
     for index, tier in enumerate(tiers if isinstance(tiers, list) else []):
         if not isinstance(tier, dict):
@@ -584,9 +585,19 @@ def _validate_budget_policy(budget_policy: dict, enabled_agents: dict[str, dict]
                 )
         if not tier_model:
             errors.append(f"budget_policy.tiers[{index}]: default_model is required.")
+        if tier_agent and tier_model:
+            combos.append((str(tier_agent), str(tier_model)))
 
     if len(set(percentages)) != len(percentages):
         errors.append("budget_policy tier spending_percentage values must be unique.")
+    # Two tiers with the same agent+model are a no-op: the server picks the highest crossed tier, so
+    # the second never changes what the lower one already selected. Flagging it catches a tier the
+    # admin meant to be a real step-down but left unchanged.
+    if len(set(combos)) != len(combos):
+        errors.append(
+            "budget_policy tiers must each route to a different agent/model — two tiers with the "
+            "same pair make the higher one a no-op."
+        )
     return errors
 
 
