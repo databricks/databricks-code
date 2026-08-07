@@ -19,6 +19,10 @@ Per-provider `compat` flags work around fields the gateway translators reject:
 - mlflow: `supportsStore: false` and `supportsStrictMode: false` — the MLflow
   chat-completions gateway rejects OpenAI's `store` field and
   `tools[].function.strict`.
+- openai: no `compat` flags needed, but the per-model `thinkingLevelMap`
+  matters — see `_pi_gpt_model_entry`. Declaring `reasoning: true` without an
+  off-state makes Pi send `reasoning: {effort: "none"}`, which `gpt-5`,
+  `gpt-5-mini`, `gpt-5-nano` and `gpt-5-5-pro` reject with a 400.
 
 The `databricks-mlflow` provider carries the validated OSS coding models
 (GLM and Kimi) discovered upstream. Per model it sets
@@ -158,7 +162,18 @@ def _pi_gpt_model_entry(model_id: str) -> dict:
     """Build a Pi openai (codex) model entry with `contextWindow`/`maxTokens`
     from `databricks.gpt_model_token_limits`. GPT ids aren't in Pi's built-in
     catalog, so without an explicit window Pi falls back to a small default and
-    truncates long sessions."""
+    truncates long sessions.
+
+    `thinkingLevelMap: {"off": None}` is required alongside `reasoning: True`.
+    When a model declares `reasoning` but no off-state, Pi's Responses builder
+    falls back to `reasoning: {effort: "none"}` for the thinking-off case
+    (`pi-ai/dist/api/openai-responses.js`, the `thinkingLevelMap?.off !== null`
+    branch). `"none"` is only valid on gpt-5.1+, so `gpt-5`, `gpt-5-mini`,
+    `gpt-5-nano` and `gpt-5-5-pro` reject every request with
+    `BAD_REQUEST: Unsupported value: 'none' is not supported with the 'gpt-5'
+    model`. An explicit `None` makes Pi omit `reasoning` entirely, which the
+    gateway accepts for all ids (verified against /ai-gateway/codex/v1).
+    """
     limits = gpt_model_token_limits(model_id)
     entry: dict = {
         "id": model_id,
@@ -168,6 +183,7 @@ def _pi_gpt_model_entry(model_id: str) -> dict:
     if "gpt-5" in model_id.lower().replace(".", "-"):
         entry["reasoning"] = True
         entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {"off": None}
     return entry
 
 
