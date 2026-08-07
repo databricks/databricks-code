@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import timedelta
+from decimal import ROUND_HALF_UP, Decimal
 
 import questionary
 from rich.console import Console
@@ -225,6 +226,20 @@ def format_token_count(token_count: int) -> str:
     if token_count >= 1_000:
         return f"{value_float / 1_000:.1f}K"
     return str(token_count)
+
+
+def format_usd(amount: Decimal) -> str:
+    return f"${amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,}"
+
+
+def format_meter(fraction: float, width: int = 30) -> str:
+    """Text meter for `fraction` of a whole, clamped to [0, 1]."""
+    clamped = min(max(fraction, 0.0), 1.0)
+    filled = int(clamped * width)
+    # A small-but-real fraction shouldn't read as empty.
+    if clamped > 0:
+        filled = max(filled, 1)
+    return "[" + "█" * filled + "░" * (width - filled) + "]"
 
 
 def format_duration(duration_value: timedelta | None) -> str:
