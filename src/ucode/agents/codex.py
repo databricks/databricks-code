@@ -26,6 +26,7 @@ from ucode.databricks import (
 from ucode.launcher import exec_or_spawn
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
+from ucode.ui import print_warning_err
 
 CODEX_CONFIG_DIR = Path.home() / ".codex"
 CODEX_PROFILE_NAME = "ucode"
@@ -433,6 +434,15 @@ def launch(state: dict, tool_args: list[str]) -> None:
         # Relaunch without it, handing over the terminal. (A fast failure for
         # any other reason — e.g. a bad flag — just re-fails the same way here,
         # with no ucode routing to lose since the subcommand had none.)
+        #
+        # Warn on *stderr*: this path is reached by `codex app-server`, whose
+        # stdout is a JSON-RPC stream its caller parses. Emit before handing off,
+        # since execvp replaces this process.
+        print_warning_err(
+            f"`{binary}` rejected --profile here; retrying without it. "
+            f"This run uses your local Codex settings ({LEGACY_CODEX_CONFIG_PATH}), "
+            "not ucode's Databricks routing."
+        )
         exec_or_spawn([binary, *tool_args])
         return  # unreachable in production (exec replaces the process)
     sys.exit(returncode)

@@ -472,6 +472,26 @@ class TestCodexLaunch:
             assert runs == [["codex", "--profile", "ucode", *args]]
             assert fallbacks == [["codex", *args]]
 
+    def test_fallback_warns_on_stderr_before_handoff(self, monkeypatch, capsys):
+        # The fallback drops ucode's Databricks routing, so it must say so. The
+        # warning goes to *stderr*: `codex app-server` speaks JSON-RPC on stdout,
+        # and a warning there would corrupt the stream its caller parses.
+        warned_before_handoff = []
+        runs, fallbacks = self._patch(monkeypatch, returncode=1, elapsed=0.15)
+        monkeypatch.setattr(
+            codex,
+            "exec_or_spawn",
+            lambda argv: warned_before_handoff.append(capsys.readouterr()),
+        )
+        codex.launch({"workspace": WS}, ["app-server"])
+
+        # execvp replaces the process, so the warning must already be out by then.
+        assert len(warned_before_handoff) == 1
+        captured = warned_before_handoff[0]
+        assert "--profile" in captured.err
+        assert str(codex.LEGACY_CODEX_CONFIG_PATH) in captured.err
+        assert captured.out == ""
+
     def test_slow_failure_does_not_retry(self, monkeypatch):
         # A session that started and then failed (seconds) must NOT be re-run
         # without --profile — that would silently drop ucode's Databricks routing
