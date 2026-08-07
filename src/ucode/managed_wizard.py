@@ -929,6 +929,40 @@ def _explain_publish_failure(reason: str) -> str:
     return f"Could not publish the managed config: {reason}"
 
 
+def _with_claude_inventory(state: dict, workspace: str, profile: str | None) -> dict:
+    """``state`` plus the full Claude listing, for validating a manifest against the workspace.
+
+    ``state["claude_models"]`` holds only the newest id per family (the launch path pins one model
+    per family alias), but `ucode setup` deliberately offers the older versions too — pinning
+    ``default_opus_model`` to a known-good ``claude-opus-4-8`` is a normal thing for an admin to
+    want. Validating against ``claude_models`` alone therefore rejected a model the wizard itself
+    had just offered:
+
+        claude: model 'system.ai.claude-opus-4-8' is not available on this workspace.
+
+    The wizard stashes the full listing on ``state["all_claude_models"]`` mid-run, but that is never
+    persisted — `setup` saves the manifest, not the state — so a separate `ucode apply` process
+    starts from a fresh ``load_state()`` without it. Re-fetching here makes the check independent of
+    what the wizard happened to leave behind, which also covers a hand-edited or ``--from-file``
+    manifest authored on another machine.
+
+    Best-effort: a failed listing returns ``state`` untouched, leaving validation on the narrower
+    inventory rather than blocking a publish on a transient API error.
+    """
+    if isinstance(state.get("all_claude_models"), list) and state["all_claude_models"]:
+        return state
+    try:
+        token = get_databricks_token(workspace, profile)
+        all_claude, _ = discover_claude_models_unbucketed(workspace, token)
+    except (RuntimeError, OSError):
+        # OSError covers a missing `databricks` binary: `get_databricks_token` shells out, so a
+        # machine without the CLI on PATH raises FileNotFoundError rather than RuntimeError.
+        return state
+    if not all_claude:
+        return state
+    return {**state, "all_claude_models": all_claude}
+
+
 def apply_command(*, yes: bool = False) -> int:
     """Publish the authored manifest to the workspace.
 
@@ -953,7 +987,11 @@ def apply_command(*, yes: bool = False) -> int:
             "(or `ucode setup --from-file <json>`)."
         )
 
-    errors = validate_manifest(manifest, state)
+    # Auth first: validating a Claude manifest needs the workspace's full model listing, and that
+    # listing needs a token. Nothing is written until well below this point.
+    ensure_databricks_auth(workspace, profile)
+
+    errors = validate_manifest(manifest, _with_claude_inventory(state, workspace, profile))
     if errors:
         print_err("The authored config is not valid, so it was not published:")
         for error in errors:
@@ -961,7 +999,6 @@ def apply_command(*, yes: bool = False) -> int:
         print_note("Re-run `ucode setup` to fix it, or edit ~/.ucode/managed-settings.json.")
         return 1
 
-    ensure_databricks_auth(workspace, profile)
     token = get_databricks_token(workspace, profile)
     _require_admin(workspace, token)
 

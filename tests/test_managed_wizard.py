@@ -1418,6 +1418,66 @@ class TestApplyCommand:
         assert self._run(create_coding_agent_config=fake_create) == 1
         assert created["called"] is False
 
+    def test_an_older_family_version_the_wizard_offered_still_publishes(self):
+        # `setup` offers every version of a Claude family, but `claude_models` keeps only the newest
+        # per family and the wizard's `all_claude_models` stash is never persisted — so a separate
+        # `apply` process used to reject a model it had just offered:
+        #   claude: model 'system.ai.claude-opus-4-1' is not available on this workspace.
+        # `apply` re-fetches the full listing rather than trusting what `setup` left in state.
+        managed_setup_mod.save_managed_settings(
+            WORKSPACE,
+            {
+                "default_agent": "claude",
+                "enabled_agents": {
+                    "claude": {
+                        "model_config": {
+                            "default_model": "system.ai.claude-opus-4-1",
+                            "models": {"default_opus_model": "system.ai.claude-opus-4-1"},
+                        }
+                    }
+                },
+            },
+        )
+        published: dict = {}
+
+        def fake_create(workspace, token, payload):
+            published["payload"] = payload
+            return {"name": "coding-agent-configs/new"}, None
+
+        # State carries only the newest Opus, as a fresh `load_state()` would.
+        narrow = {"workspace": WORKSPACE, "profile": "p", "claude_models": {"opus": "newest"}}
+        assert (
+            self._run(
+                load_state=lambda: dict(narrow),
+                discover_claude_models_unbucketed=lambda *a, **k: (
+                    ["system.ai.claude-opus-4-1", "newest"],
+                    None,
+                ),
+                create_coding_agent_config=fake_create,
+            )
+            == 0
+        )
+        assert published, "the manifest should have been published"
+
+    def test_a_failed_inventory_fetch_does_not_block_publishing(self):
+        # The re-fetch is best-effort: a transient listing failure must not turn into a refusal to
+        # publish a manifest that validates against what state already knows.
+        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        published: dict = {}
+
+        def fake_create(workspace, token, payload):
+            published["payload"] = payload
+            return {"name": "coding-agent-configs/new"}, None
+
+        assert (
+            self._run(
+                discover_claude_models_unbucketed=lambda *a, **k: ([], "HTTP 500"),
+                create_coding_agent_config=fake_create,
+            )
+            == 0
+        )
+        assert published
+
     def test_declining_the_prompt_publishes_nothing(self):
         managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
         created = {"called": False}
