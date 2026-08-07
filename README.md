@@ -200,8 +200,23 @@ ucode setup --dry-run
 ucode setup --from-file ./managed-settings.json
 ```
 
-Publishing replaces the workspace's config outright — there is no partial update yet, so anything
-skipped in a re-run is dropped.
+Once the manifest looks right, publish it:
+
+```bash
+# Validate, show what would change, and ask before publishing.
+ucode apply
+
+# Preview without publishing.
+ucode apply --dry-run
+
+# Publish without the confirmation prompt (for CI).
+ucode apply --yes
+```
+
+`apply` updates the workspace's existing config in place rather than replacing it, so a failed
+publish leaves the current config intact. It is still a whole-manifest write: every field ucode
+authors is sent, so anything skipped in a re-run is cleared rather than carried over. Developers
+pick the new config up on their next ucode run.
 
 ---
 
@@ -211,7 +226,8 @@ skipped in a re-run is dropped.
 |---------|-------------|
 | `ucode status` | Show current workspace, base URLs, managed config files, and selected models |
 | `ucode doctor` | Diagnose the local setup (uv, npm, Databricks CLI, workspace, credentials, agent CLIs, tracing) and offer to fix any problems found |
-| `ucode usage` | Show AI Gateway usage summary |
+| `ucode usage` | Show AI Gateway usage summary, plus your budget spend against its alert threshold when the workspace reports one |
+| `ucode usage --warehouse-id <id>` | Query a specific SQL warehouse instead of discovering one |
 | `ucode revert` | Clear saved state and restore backed-up config files |
 | `ucode configure --dry-run` | Preview config files without writing them |
 | `ucode configure --agents claude,codex` | Configure specific agents without the interactive picker |
@@ -231,6 +247,8 @@ skipped in a re-run is dropped.
 | `ucode setup` | Author the workspace's managed coding config (workspace admins only) |
 | `ucode setup show` | Print the authored config and the payload `ucode apply` would publish |
 | `ucode setup --from-file <file>` | Load a hand-written managed config instead of running the prompts |
+| `ucode apply` | Publish the authored managed config to the workspace (workspace admins only) |
+| `ucode apply --yes` | Publish without the confirmation prompt |
 
 ## Managed Local Files
 

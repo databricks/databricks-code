@@ -23,8 +23,9 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal, cast, overload
+from typing import Literal, NamedTuple, cast, overload
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlencode, urlparse
@@ -252,28 +253,37 @@ def _http_get_json(
         return None, f"network error: {exc}"
 
 
-def _http_post_json(
-    url: str, token: str, payload: dict, *, timeout: int = 10
+def _http_send_json(
+    method: str,
+    url: str,
+    token: str,
+    payload: dict | None,
+    *,
+    timeout: int = 10,
+    allow_empty_body: bool = False,
 ) -> tuple[dict | list | None, str | None]:
-    """POST a JSON body to an endpoint. Returns (payload, None) on success,
-    (None, reason) on failure. Mirrors `_http_get_json`."""
-    body_bytes = json.dumps(payload).encode("utf-8")
-    request = urllib_request.Request(
-        url,
-        data=body_bytes,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        },
-    )
+    """Send a request that may carry a JSON body, and decode a JSON response.
+
+    Shared by `_http_post_json`, `_http_patch_json`, and `_http_delete` — the three differ only in
+    verb, whether they send a body, and whether an empty response is success. Returns
+    ``(payload, None)`` on success and ``(None, reason)`` on failure, like `_http_get_json`.
+
+    ``allow_empty_body`` is for DELETE, whose success response is ``google.protobuf.Empty`` — an
+    empty body there is the expected result, not a decode failure.
+    """
+    body_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if body_bytes is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib_request.Request(url, data=body_bytes, method=method, headers=headers)
     try:
         with urllib_request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
-        _debug(f"POST {url}", f"HTTP {response.status}, {len(body)} bytes")
+        _debug(f"{method} {url}", f"HTTP {response.status}, {len(body)} bytes")
         if _debug_enabled():
             _debug("body", body[:4000])
+        if allow_empty_body and not body.strip():
+            return None, None
         try:
             return json.loads(body), None
         except json.JSONDecodeError as exc:
@@ -284,7 +294,7 @@ def _http_post_json(
             body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
         except Exception:
             body = ""
-        _debug(f"POST {url}", f"HTTP {exc.code} {exc.reason}")
+        _debug(f"{method} {url}", f"HTTP {exc.code} {exc.reason}")
         if _debug_enabled() and body:
             _debug("body", body[:4000])
         reason = f"HTTP {exc.code} {exc.reason}"
@@ -293,13 +303,41 @@ def _http_post_json(
             reason = f"{reason}: {body_excerpt}"
         return None, reason
     except urllib_error.URLError as exc:
-        _debug(f"POST {url}", f"URLError: {exc.reason}")
+        _debug(f"{method} {url}", f"URLError: {exc.reason}")
         return None, f"network error: {exc.reason}"
     except OSError as exc:
         # See `_http_get_json`: a bare socket timeout is an OSError, not a
         # URLError, and would otherwise escape the caller's error handling.
-        _debug(f"POST {url}", f"OSError: {exc}")
+        _debug(f"{method} {url}", f"OSError: {exc}")
         return None, f"network error: {exc}"
+
+
+def _http_post_json(
+    url: str, token: str, payload: dict, *, timeout: int = 10
+) -> tuple[dict | list | None, str | None]:
+    """POST a JSON body to an endpoint. Returns (payload, None) on success,
+    (None, reason) on failure. Mirrors `_http_get_json`."""
+    return _http_send_json("POST", url, token, payload, timeout=timeout)
+
+
+def _http_patch_json(
+    url: str, token: str, payload: dict, *, timeout: int = 10
+) -> tuple[dict | list | None, str | None]:
+    """PATCH a JSON body to an endpoint. Returns (payload, None) on success,
+    (None, reason) on failure."""
+    return _http_send_json("PATCH", url, token, payload, timeout=timeout)
+
+
+def _http_delete(
+    url: str, token: str, *, timeout: int = 10
+) -> tuple[dict | list | None, str | None]:
+    """DELETE a resource. Returns (payload, None) on success, (None, reason) on failure.
+
+    A successful delete returns ``google.protobuf.Empty``, which serializes as ``{}`` or an empty
+    body depending on the gateway, so both count as success and yield ``(None, None)``. Callers
+    should test ``reason`` rather than the payload.
+    """
+    return _http_send_json("DELETE", url, token, None, timeout=timeout, allow_empty_body=True)
 
 
 def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes | None, str | None]:
@@ -1607,6 +1645,103 @@ def fetch_model_recommendation(workspace: str, token: str) -> tuple[dict, str | 
     return payload, None
 
 
+# Every field ucode's manifest can set, as `update_mask` paths for a PATCH. The server rejects a
+# missing or empty mask, and rejects paths outside its own mutable set — this is that set minus the
+# fields ucode doesn't author: `budget_id` (deprecated in favour of `budget_policy.budget_id`, and
+# rejected on write) and `default_options`/`tiers` (the legacy model-only shape superseded by
+# `enabled_agents`/`budget_policy`). Sending every path ucode owns, rather than only the ones
+# currently populated, is what lets a re-run *clear* a field the admin removed: the server merges
+# per path, so an omitted path leaves the old value in place.
+MANAGED_CONFIG_UPDATE_MASK_PATHS: tuple[str, ...] = (
+    "display_name",
+    "default_agent",
+    "enabled_agents",
+    "mcp_servers",
+    "skills",
+    "tracing",
+    "budget_policy",
+)
+
+
+def _coding_agent_config_url(workspace: str, name: str | None = None) -> str:
+    """The collection URL, or one config's resource URL when ``name`` is given.
+
+    ``name`` is the server-assigned resource name (``coding-agent-configs/{id}``), which the Get and
+    Update paths template directly, so it is appended as-is rather than rebuilt from an id.
+    """
+    hostname = workspace_hostname(workspace)
+    base = f"https://{hostname}{_CODING_AGENT_CONFIGS_API_PATH}"
+    if name is None:
+        return base
+    # The resource name already carries the collection segment, so join on the API root.
+    root = base.rsplit("/coding-agent-configs", 1)[0]
+    return f"{root}/{name.strip().strip('/')}"
+
+
+def create_coding_agent_config(
+    workspace: str, token: str, config: dict
+) -> tuple[dict | None, str | None]:
+    """Create the workspace's managed CodingAgentConfig.
+
+    v0 allows at most one config per workspace, so this fails with ALREADY_EXISTS when one is
+    already defined; callers should update that one instead of creating a second.
+    """
+    url = _coding_agent_config_url(workspace)
+    payload, reason = _http_post_json(url, token, config, timeout=30)
+    if reason is not None:
+        return None, reason
+    if not isinstance(payload, dict):
+        return None, "coding-agent-config create returned an unexpected response shape"
+    return payload, None
+
+
+def update_coding_agent_config(
+    workspace: str,
+    token: str,
+    name: str,
+    config: dict,
+    *,
+    update_mask: tuple[str, ...] = MANAGED_CONFIG_UPDATE_MASK_PATHS,
+) -> tuple[dict | None, str | None]:
+    """Update an existing managed CodingAgentConfig in place.
+
+    Preferred over delete-then-create: the server applies the mask inside a single entity-store
+    update, so the workspace is never left without a config if the write fails partway. ``name``
+    identifies the config and is echoed in the body, which is what the API's path template expects.
+
+    ``update_mask`` goes in the query string, not the body. The RPC's HTTP binding is
+    ``patch: "…/{coding_agent_config.name=coding-agent-configs/*}"`` with ``body:
+    "coding_agent_config"`` — the config *is* the whole body, so a mask nested inside it is parsed
+    as an unknown config field and the server reports the mask as missing:
+
+        Field 'update_mask' is required and must contain at least one subfield with a non-default
+        value!
+
+    It is also a ``google.protobuf.FieldMask``, whose JSON/query form is one comma-separated string
+    rather than a ``{"paths": [...]}`` object.
+    """
+    query = urlencode({"update_mask": ",".join(update_mask)})
+    url = f"{_coding_agent_config_url(workspace, name)}?{query}"
+    body = {**config, "name": name}
+    payload, reason = _http_patch_json(url, token, body, timeout=30)
+    if reason is not None:
+        return None, reason
+    if not isinstance(payload, dict):
+        return None, "coding-agent-config update returned an unexpected response shape"
+    return payload, None
+
+
+def delete_coding_agent_config(workspace: str, token: str, name: str) -> str | None:
+    """Delete a managed CodingAgentConfig by resource name. Returns None on success, else a reason.
+
+    Returns only the failure reason: a successful delete responds with ``Empty``, so there is no
+    payload worth handing back.
+    """
+    url = _coding_agent_config_url(workspace, name)
+    _, reason = _http_delete(url, token, timeout=30)
+    return reason
+
+
 # --- MCP services (parallel to model services) -----------------------------
 
 
@@ -2561,12 +2696,73 @@ def _looks_like_auth_failure(reason: str) -> bool:
     return False
 
 
-def discover_sql_warehouse_http_path(
+CODING_AGENT_RECOMMEND_MODEL_PATH = "/api/ai-gateway/v2/coding-agent-configs:recommendModel"
+
+
+def resolve_current_budget_spend(
     workspace: str,
     token: str,
     *,
-    quiet: bool = False,
-) -> str:
+    timeout: int = 10,
+) -> tuple[tuple[Decimal, Decimal] | None, str | None]:
+    """Fetch the caller's coding-agent budget spend and alert threshold.
+
+    Reads them off `recommendModel`, which returns the spend its model
+    recommendation was based on. `available_models` is empty since we want the
+    spend, not the recommendation.
+
+    Returns `((spend, threshold), None)` or `(None, reason)`. Absence is
+    routine — the endpoint needs a per-org SAFE flag (default off) and a
+    coding-agent config — so it never raises.
+    """
+    url = f"https://{workspace_hostname(workspace)}{CODING_AGENT_RECOMMEND_MODEL_PATH}"
+    payload, reason = _http_post_json(url, token, {"available_models": []}, timeout=timeout)
+    if payload is None:
+        return None, reason or "unknown error"
+    if not isinstance(payload, dict):
+        return None, "response was not a JSON object"
+
+    # Per the server's BudgetSpend.fromProto, a spend with no threshold to
+    # measure against counts as no spend.
+    spend = _parse_decimal(payload.get("current_spend"))
+    threshold = _parse_decimal(payload.get("effective_threshold"))
+    if spend is None or threshold is None:
+        return None, "workspace reported no coding-agent budget spend"
+    return (spend, threshold), None
+
+
+def _parse_decimal(value: object) -> Decimal | None:
+    if isinstance(value, str) and value.strip():
+        try:
+            return Decimal(value.strip())
+        except InvalidOperation:
+            return None
+    if isinstance(value, int):
+        return Decimal(value)
+    return None
+
+
+class SqlWarehouse(NamedTuple):
+    http_path: str
+    label: str
+    state: str
+
+
+def discover_sql_warehouses(
+    workspace: str,
+    token: str,
+    *,
+    warehouse_id: str | None = None,
+) -> list[SqlWarehouse]:
+    """Candidate warehouses to run the usage query against, RUNNING ones first.
+
+    Several are returned because a warehouse can report RUNNING and still refuse
+    connections, so callers fall through to the next one. An explicit
+    `warehouse_id` skips discovery entirely.
+    """
+    if warehouse_id:
+        return [SqlWarehouse(_warehouse_http_path(warehouse_id), warehouse_id, "REQUESTED")]
+
     hostname = workspace_hostname(workspace)
     request = urllib_request.Request(
         f"https://{hostname}/api/2.0/sql/warehouses",
@@ -2591,33 +2787,30 @@ def discover_sql_warehouse_http_path(
     warehouses = payload.get("warehouses")
     if not isinstance(warehouses, list) or not warehouses:
         raise RuntimeError(
-            "No SQL warehouses found in this workspace. Create one or pass `--http-path`."
+            "No SQL warehouses found in this workspace. Create one or pass `--warehouse-id`."
         )
 
-    running = [w for w in warehouses if isinstance(w, dict) and w.get("state") == "RUNNING"]
-    chosen = (
-        running[0]
-        if running
-        else next(
-            (w for w in warehouses if isinstance(w, dict) and w.get("id")),
-            None,
-        )
-    )
-    if not chosen:
+    candidates: list[SqlWarehouse] = []
+    for entry in warehouses:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            continue
+        name = entry.get("name")
+        state = entry.get("state", "UNKNOWN")
+        label = name if isinstance(name, str) and name else entry_id
+        candidates.append(SqlWarehouse(_warehouse_http_path(entry_id), label, str(state)))
+
+    if not candidates:
         raise RuntimeError("No usable SQL warehouse was returned by Databricks.")
+    # Stopped warehouses work too, but cold-starting one costs minutes.
+    candidates.sort(key=lambda w: w.state != "RUNNING")
+    return candidates
 
-    warehouse_id = chosen.get("id")
-    if not isinstance(warehouse_id, str) or not warehouse_id.strip():
-        raise RuntimeError("Databricks returned a warehouse without an ID.")
 
-    warehouse_name = chosen.get("name")
-    warehouse_state = chosen.get("state", "UNKNOWN")
-    label_value = (
-        warehouse_name if isinstance(warehouse_name, str) and warehouse_name else warehouse_id
-    )
-    if not quiet:
-        print_note(f"Using SQL warehouse `{label_value}` ({warehouse_state}).")
-    return f"/sql/1.0/warehouses/{warehouse_id}"
+def _warehouse_http_path(warehouse_id: str) -> str:
+    return f"/sql/1.0/warehouses/{warehouse_id.strip()}"
 
 
 def run_usage_query(
@@ -2625,7 +2818,14 @@ def run_usage_query(
     http_path: str,
     token: str,
     query: str,
+    on_connected: Callable[[], None] | None = None,
 ) -> tuple[list[str], list[tuple]]:
+    """Run `query` on one warehouse.
+
+    `on_connected` fires once the connection opens — the point a stopped
+    warehouse has finished starting — so callers can update their progress
+    message.
+    """
     try:
         logging.getLogger("databricks.sql").setLevel(logging.ERROR)
         from databricks import sql
@@ -2641,6 +2841,8 @@ def run_usage_query(
             http_path=http_path,
             access_token=token,
         ) as connection:
+            if on_connected is not None:
+                on_connected()
             with connection.cursor() as cursor:
                 cursor.execute(query)
                 columns = [desc[0] for desc in (cursor.description or [])]

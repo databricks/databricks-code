@@ -36,6 +36,10 @@ from ucode.managed_setup import (
 
 WORKSPACE = "https://ws.example.com"
 
+# The server requires `budget_policy.budget_id` to parse as a UUID, so fixtures that aren't
+# *testing* that rule need a real one.
+BUDGET_ID = "11111111-1111-1111-1111-111111111111"
+
 # A workspace state shaped like `configure_shared_state` produces.
 STATE = {
     "workspace": WORKSPACE,
@@ -255,6 +259,19 @@ class TestSerialize:
         tiers = payload["budget_policy"]["tiers"]
         assert [tier["spending_percentage"] for tier in tiers] == [0.8, 1.0]
         assert tiers[1]["default_agent"] == "CODING_AGENT_OPENCODE"
+
+    def test_the_deprecated_top_level_budget_id_is_never_emitted(self):
+        # `CodingAgentConfig.budget_id` (field 3) is deprecated in favour of
+        # `budget_policy.budget_id`, and the CRUD handler rejects a write that sets it. The budget
+        # id must appear only under the policy.
+        payload = serialize_managed_config(_full_manifest())
+        assert "budget_id" not in payload
+        assert payload["budget_policy"]["budget_id"] == "c6563b45-df9a-4b19-afb2-d42dc2b52576"
+
+    def test_a_manifest_carrying_a_top_level_budget_id_still_omits_it(self):
+        # A hand-written `--from-file` manifest could set it; the serializer must not pass it on.
+        payload = serialize_managed_config({**_full_manifest(), "budget_id": BUDGET_ID})
+        assert "budget_id" not in payload
 
     def test_unknown_agent_is_dropped(self):
         payload = serialize_managed_config(
@@ -633,7 +650,7 @@ class TestValidate:
         manifest = {
             **_minimal_manifest(),
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": pct,
@@ -654,7 +671,7 @@ class TestValidate:
         }
         manifest = {
             **_minimal_manifest(),
-            "budget_policy": {"budget_id": "b", "tiers": [tier, dict(tier)]},
+            "budget_policy": {"budget_id": BUDGET_ID, "tiers": [tier, dict(tier)]},
         }
         errors = validate_manifest(manifest, STATE)
         assert any("must be unique" in e for e in errors)
@@ -663,7 +680,7 @@ class TestValidate:
         manifest = {
             **_minimal_manifest(),
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": 0.5,
@@ -680,7 +697,7 @@ class TestValidate:
         manifest = {
             **_minimal_manifest(),
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [{"spending_percentage": 0.5, "default_agent": "claude"}],
             },
         }
@@ -701,7 +718,7 @@ class TestValidate:
                 }
             },
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": 0.8,
@@ -726,7 +743,7 @@ class TestValidate:
                 }
             },
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": 0.8,
@@ -750,7 +767,7 @@ class TestValidate:
                 }
             },
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": 0.8,
@@ -775,7 +792,7 @@ class TestValidate:
                 }
             },
             "budget_policy": {
-                "budget_id": "b",
+                "budget_id": BUDGET_ID,
                 "tiers": [
                     {
                         "spending_percentage": 0.8,
@@ -788,8 +805,40 @@ class TestValidate:
         assert validate_manifest(manifest, STATE) == []
 
     def test_budget_policy_alone_still_requires_a_default_agent(self):
-        errors = validate_manifest({"budget_policy": {"budget_id": "b"}})
+        errors = validate_manifest({"budget_policy": {"budget_id": BUDGET_ID}})
         assert any("default_agent is required" in e for e in errors)
+
+    @pytest.mark.parametrize("bad_id", ["not-a-uuid", "b", "1111", "11111111-1111-1111-1111"])
+    def test_budget_id_must_be_a_uuid(self, bad_id):
+        # The server requires a parseable UUID. The wizard can only offer real ids, but
+        # `--from-file` can carry anything, and rejecting it here beats a round-trip failure.
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {"budget_id": bad_id, "tiers": []},
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("must be a UUID" in e for e in errors), errors
+
+    def test_a_real_uuid_is_accepted(self):
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {"budget_id": "c6563b45-df9a-4b19-afb2-d42dc2b52576", "tiers": []},
+        }
+        assert validate_manifest(manifest, STATE) == []
+
+    def test_tier_positions_are_reported_zero_based(self):
+        # The server indexes tiers with `zipWithIndex`, so an admin comparing ucode's message with
+        # the API's must see the same number for the same tier.
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {
+                "budget_id": BUDGET_ID,
+                "tiers": [{"spending_percentage": 0.5, "default_agent": "claude"}],
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("tiers[0]" in e for e in errors), errors
+        assert not any("tiers[1]" in e for e in errors), errors
 
     def test_errors_accumulate(self):
         manifest = {
