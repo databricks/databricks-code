@@ -2419,3 +2419,135 @@ class TestBareUcode:
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 0, result.output
+
+
+class TestBudgetRecommendationAtLaunch:
+    """The budget read informs the launch; it never blocks it."""
+
+    @staticmethod
+    def _launch(monkeypatch, *, tool="claude", managed, recommendation=None, reason=None):
+        state = dict(MINIMAL_STATE)
+        calls: list[str] = []
+
+        def fake_recommendation(workspace, token):
+            calls.append(workspace)
+            return recommendation, reason
+
+        monkeypatch.setattr("ucode.cli.get_model_recommendation", fake_recommendation)
+        with (
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.apply_pat_environment"),
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.configure_tool", return_value=state) as cfg,
+            patch("ucode.cli.get_databricks_token", return_value="tok"),
+            patch("ucode.cli._fetch_managed_config", return_value=managed),
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, [tool])
+        return result, calls, cfg
+
+    def test_not_checked_without_a_managed_config(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        result, calls, _ = self._launch(monkeypatch, managed=None)
+        assert result.exit_code == 0, result.output
+        assert calls == []
+
+    def test_the_recommended_agent_gets_the_recommended_model(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        managed = {
+            "enabled_agents": {
+                "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}}
+            }
+        }
+        _result, _calls, cfg = self._launch(
+            monkeypatch,
+            managed=managed,
+            recommendation={"agent": "claude", "model": "system.ai.claude-haiku-4-5"},
+        )
+        assert cfg.call_args.args[2] == "system.ai.claude-haiku-4-5"
+
+    def test_another_agent_keeps_its_own_model_and_is_told_why(self, monkeypatch):
+        # A tier's model belongs to the tier's agent; pinning it on claude would land a Kimi id in
+        # ANTHROPIC_MODEL, which the Anthropic-dialect endpoint cannot serve.
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        managed = {
+            "enabled_agents": {
+                "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}},
+                "opencode": {},
+            }
+        }
+        result, _calls, cfg = self._launch(
+            monkeypatch,
+            managed=managed,
+            recommendation={
+                "agent": "opencode",
+                "model": "system.ai.kimi-k2-7-code",
+                "current_spend": 412.5,
+                "effective_threshold": 500.0,
+            },
+        )
+        assert result.exit_code == 0, result.output
+        assert cfg.call_args.args[2] == "system.ai.claude-opus-4-8"
+        assert "recommends OpenCode" in result.output
+
+    def test_a_failed_read_does_not_block_the_launch(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        result, _calls, _cfg = self._launch(
+            monkeypatch,
+            managed={"enabled_agents": {"claude": {}}},
+            recommendation=None,
+            reason="HTTP 500",
+        )
+        assert result.exit_code == 0, result.output
+        assert "Could not check your budget" in result.output
+
+    def test_a_token_failure_does_not_block_the_launch(self, monkeypatch):
+        # Auth can lapse between the config refresh and the budget check.
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        state = dict(MINIMAL_STATE)
+        monkeypatch.setattr("ucode.cli.get_model_recommendation", lambda ws, tok: (None, None))
+        with (
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.apply_pat_environment"),
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli.get_databricks_token", side_effect=RuntimeError("token expired")),
+            patch(
+                "ucode.cli._fetch_managed_config",
+                return_value={"enabled_agents": {"claude": {}}},
+            ),
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, ["claude"])
+        assert result.exit_code == 0, result.output
+        assert "Could not check your budget" in result.output
+
+    def test_shows_the_budget_bar(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        result, _calls, _cfg = self._launch(
+            monkeypatch,
+            managed={"enabled_agents": {"claude": {}}},
+            recommendation={
+                "agent": "claude",
+                "model": "m",
+                "current_spend": 412.5,
+                "effective_threshold": 500.0,
+            },
+        )
+        assert result.exit_code == 0, result.output
+        assert "83% used" in result.output
+        assert "█" in result.output
+
+    @pytest.mark.parametrize("env_value", [None, "", "0"])
+    def test_not_checked_when_the_env_var_is_off(self, monkeypatch, env_value):
+        if env_value is None:
+            monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
+        else:
+            monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", env_value)
+        result, calls, _ = self._launch(monkeypatch, managed=None)
+        assert result.exit_code == 0, result.output
+        assert calls == []

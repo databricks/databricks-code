@@ -185,6 +185,33 @@ def managed_default_model(managed: dict, tool: str) -> str | None:
     return _str(_agent_model_config(managed, tool).get("default_model"))
 
 
+def recommended_agent(recommendation: dict | None, managed: dict) -> str | None:
+    """The agent the budget tier recommends, or the config's ``default_agent`` when it names none.
+
+    The server resolves the agent before the model, so a tier can move a developer to a cheaper
+    agent without restating a model.
+    """
+    agent = _str(_as_dict(recommendation).get("agent"))
+    return agent or _str(_as_dict(managed).get("default_agent"))
+
+
+def managed_launch_model(managed: dict, recommendation: dict | None, tool: str) -> str | None:
+    """The model the admin's policy wants ``tool`` to start on, or None.
+
+    A budget recommendation supersedes the config's own ``default_model``, since it additionally
+    reflects which spend tier the developer has reached — but only for the agent it was recommended
+    for. A tier that moves the org to another agent names that agent's model, which the one being
+    launched may not be able to serve.
+    """
+    recommended = _as_dict(recommendation)
+    agent = _str(recommended.get("agent"))
+    if agent is None or agent == tool:
+        model = _str(recommended.get("model"))
+        if model:
+            return model
+    return managed_default_model(managed, tool)
+
+
 def resolve_state(managed: dict, state: dict, tool: str) -> dict:
     """Return a copy of ``state`` with ``tool``'s managed values layered on top.
 

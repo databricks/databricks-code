@@ -1450,6 +1450,22 @@ def fetch_managed_coding_agent_configs(workspace: str, token: str) -> tuple[list
     return [c for c in configs if isinstance(c, dict)], None
 
 
+def fetch_model_recommendation(workspace: str, token: str) -> tuple[dict, str | None]:
+    """Ask the AI Gateway which agent and model the caller's budget tier allows.
+
+    The request takes no parameters: the server matches the caller's live spend against the managed
+    config's budget tiers and resolves the agent first, then that agent's model.
+    """
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}{_CODING_AGENT_CONFIGS_API_PATH}:recommendModel"
+    payload, reason = _http_post_json(url, token, {}, timeout=30)
+    if reason is not None:
+        return {}, reason
+    if not isinstance(payload, dict):
+        return {}, "recommendModel returned an unexpected response shape"
+    return payload, None
+
+
 # --- MCP services (parallel to model services) -----------------------------
 
 

@@ -13,10 +13,12 @@ import ucode.state as state_mod
 from ucode.managed_resolve import (
     managed_default_model,
     managed_enabled_tools,
+    managed_launch_model,
     managed_provider_service,
     managed_state_overrides,
     managed_supplies_models,
     managed_unservable_models,
+    recommended_agent,
     resolve_state,
 )
 from ucode.state import MANAGED_OVERLAY_KEY
@@ -534,3 +536,47 @@ class TestManagedUnservableModels:
 
     def test_agents_that_pass_models_through_never_warn(self):
         assert managed_unservable_models(self._managed("codex", ["anything"]), "codex") == []
+
+
+class TestRecommendedAgent:
+    """A tier can move the org to a cheaper agent; with none named, default_agent stands."""
+
+    def test_tier_agent_wins(self):
+        assert recommended_agent({"agent": "opencode"}, {"default_agent": "claude"}) == "opencode"
+
+    def test_falls_back_to_default_agent(self):
+        assert recommended_agent({"agent": None}, {"default_agent": "claude"}) == "claude"
+        assert recommended_agent(None, {"default_agent": "claude"}) == "claude"
+
+    def test_none_when_neither_is_set(self):
+        assert recommended_agent(None, {}) is None
+
+
+class TestManagedLaunchModel:
+    """A tier's model supersedes the config default, but only for the tier's own agent."""
+
+    MANAGED = {
+        "enabled_agents": {
+            "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}},
+            "opencode": {"model_config": {"default_model": "system.ai.claude-sonnet-4-6"}},
+        }
+    }
+
+    def test_the_recommended_agent_gets_the_recommended_model(self):
+        rec = {"agent": "opencode", "model": "system.ai.kimi-k2-7-code"}
+        assert managed_launch_model(self.MANAGED, rec, "opencode") == "system.ai.kimi-k2-7-code"
+
+    def test_other_agents_keep_their_own_default(self):
+        # opencode's Kimi model is not servable by claude's Anthropic-dialect endpoint.
+        rec = {"agent": "opencode", "model": "system.ai.kimi-k2-7-code"}
+        assert managed_launch_model(self.MANAGED, rec, "claude") == "system.ai.claude-opus-4-8"
+
+    def test_a_model_without_an_agent_applies_to_any_tool(self):
+        rec = {"agent": None, "model": "system.ai.claude-haiku-4-5"}
+        assert managed_launch_model(self.MANAGED, rec, "claude") == "system.ai.claude-haiku-4-5"
+
+    def test_default_model_stands_without_a_recommendation(self):
+        assert managed_launch_model(self.MANAGED, None, "claude") == "system.ai.claude-opus-4-8"
+
+    def test_none_when_neither_names_a_model(self):
+        assert managed_launch_model({}, None, "pi") is None

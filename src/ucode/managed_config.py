@@ -23,7 +23,11 @@ from pathlib import Path
 from typing import cast
 
 import ucode.config_io as config_io
-from ucode.databricks import fetch_managed_coding_agent_configs, get_databricks_token
+from ucode.databricks import (
+    fetch_managed_coding_agent_configs,
+    fetch_model_recommendation,
+    get_databricks_token,
+)
 from ucode.ui import console, print_warning
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
@@ -239,6 +243,42 @@ def normalize_managed_config(raw: dict) -> dict:
     if budget_policy is not None:
         result["budget_policy"] = budget_policy
     return result
+
+
+def _decimal(value: object) -> float | None:
+    """Parse one of the API's decimal-string money fields, or None when absent/unparseable."""
+    text = _str(value)
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def get_model_recommendation(workspace: str, token: str) -> tuple[dict | None, str | None]:
+    """Fetch the agent and model the caller's budget tier allows, normalized for the launch path.
+
+    Returns ``(recommendation, reason)`` where the recommendation is ``{"agent", "model",
+    "current_spend", "effective_threshold"}``. Every field is optional server-side, so each is
+    normalized independently: an agent this build doesn't recognize is dropped rather than failing
+    the read, and a model can arrive without an agent.
+    """
+    payload, reason = fetch_model_recommendation(workspace, token)
+    if reason is not None:
+        return None, reason
+    agent = _AGENT_ENUM_TO_TOOL.get(_str(payload.get("recommended_agent")) or "")
+    model = _str(payload.get("recommended_model"))
+    spend = _decimal(payload.get("current_spend"))
+    threshold = _decimal(payload.get("effective_threshold"))
+    if agent is None and model is None and spend is None and threshold is None:
+        return None, None
+    return {
+        "agent": agent,
+        "model": model,
+        "current_spend": spend,
+        "effective_threshold": threshold,
+    }, None
 
 
 def get_managed_config(workspace: str, token: str) -> tuple[dict | None, str | None]:

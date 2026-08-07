@@ -392,3 +392,72 @@ class TestRefreshManagedConfig:
             mc_mod, "get_managed_config", lambda ws, tok: pytest.fail("should not fetch")
         )
         assert refresh_managed_config({}) is None
+
+
+class TestGetModelRecommendation:
+    """The budget recommendation read. Every response field is optional server-side."""
+
+    @staticmethod
+    def _stub(monkeypatch, payload, reason=None):
+        monkeypatch.setattr(mc_mod, "fetch_model_recommendation", lambda ws, tok: (payload, reason))
+
+    def test_normalizes_agent_model_and_spend(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "recommended_agent": "CODING_AGENT_OPENCODE",
+                "recommended_model": "system.ai.claude-haiku-4-5",
+                "current_spend": "412.50",
+                "effective_threshold": "500.00",
+            },
+        )
+        rec, reason = mc_mod.get_model_recommendation("https://w", "tok")
+        assert reason is None
+        assert rec == {
+            "agent": "opencode",
+            "model": "system.ai.claude-haiku-4-5",
+            "current_spend": 412.5,
+            "effective_threshold": 500.0,
+        }
+
+    def test_model_without_an_agent(self, monkeypatch):
+        # A model-only tier with no default_agent recommends a model but no agent.
+        self._stub(monkeypatch, {"recommended_model": "system.ai.gpt-5", "current_spend": "1.00"})
+        rec, _ = mc_mod.get_model_recommendation("https://w", "tok")
+        assert rec is not None and rec["agent"] is None and rec["model"] == "system.ai.gpt-5"
+
+    def test_agent_without_a_model(self, monkeypatch):
+        self._stub(monkeypatch, {"recommended_agent": "CODING_AGENT_PI", "current_spend": "1.00"})
+        rec, _ = mc_mod.get_model_recommendation("https://w", "tok")
+        assert rec is not None and rec["agent"] == "pi" and rec["model"] is None
+
+    @pytest.mark.parametrize("agent_enum", ["CODING_AGENT_UNSPECIFIED", "CODING_AGENT_FUTURE", ""])
+    def test_unknown_agent_is_dropped_not_fatal(self, monkeypatch, agent_enum):
+        self._stub(
+            monkeypatch,
+            {"recommended_agent": agent_enum, "recommended_model": "m", "current_spend": "1.00"},
+        )
+        rec, reason = mc_mod.get_model_recommendation("https://w", "tok")
+        assert reason is None
+        assert rec is not None and rec["agent"] is None and rec["model"] == "m"
+
+    def test_threshold_alone_still_reports(self, monkeypatch):
+        # A budget with no spend yet still has a threshold worth showing.
+        self._stub(monkeypatch, {"effective_threshold": "500.00"})
+        rec, _ = mc_mod.get_model_recommendation("https://w", "tok")
+        assert rec is not None and rec["effective_threshold"] == 500.0
+
+    def test_empty_response_is_no_recommendation(self, monkeypatch):
+        self._stub(monkeypatch, {})
+        assert mc_mod.get_model_recommendation("https://w", "tok") == (None, None)
+
+    def test_failed_read_surfaces_the_reason(self, monkeypatch):
+        self._stub(monkeypatch, {}, reason="HTTP 500")
+        assert mc_mod.get_model_recommendation("https://w", "tok") == (None, "HTTP 500")
+
+    def test_unparseable_decimals_become_none(self, monkeypatch):
+        self._stub(
+            monkeypatch, {"recommended_agent": "CODING_AGENT_PI", "current_spend": "not-a-number"}
+        )
+        rec, _ = mc_mod.get_model_recommendation("https://w", "tok")
+        assert rec is not None and rec["current_spend"] is None
