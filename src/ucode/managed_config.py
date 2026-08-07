@@ -41,8 +41,10 @@ MANAGED_CONFIG_ENV_VAR = "ENABLE_MANAGED_AGENT_CONFIG"
 NO_MANAGED_CONFIG_MESSAGE = "No coding-agent config has been set up by your workspace admin yet."
 
 # CodingAgent proto enum -> ucode tool name. Anything unrecognized (e.g. a newer agent this ucode
-# build doesn't know) is dropped during normalization rather than guessed at.
-_AGENT_ENUM_TO_TOOL: dict[str, str] = {
+# build doesn't know) is dropped during normalization rather than guessed at. Public because the
+# admin-write side (``managed_setup``) inverts these maps to serialize, so a new agent or MCP type
+# only has to be declared once.
+AGENT_ENUM_TO_TOOL: dict[str, str] = {
     "CODING_AGENT_CLAUDE_CODE": "claude",
     "CODING_AGENT_CODEX": "codex",
     "CODING_AGENT_GEMINI": "gemini",
@@ -53,7 +55,7 @@ _AGENT_ENUM_TO_TOOL: dict[str, str] = {
 
 # McpServerType proto enum -> ucode's short type tag. Mirrors the selection prefixes in ``mcp.py``;
 # the actual name->URL resolution happens there when the manifest is applied (a later change).
-_MCP_TYPE_ENUM_TO_TAG: dict[str, str] = {
+MCP_TYPE_ENUM_TO_TAG: dict[str, str] = {
     "MCP_SERVER_TYPE_UC_SERVICE": "mcp-service",
     "MCP_SERVER_TYPE_EXTERNAL": "external",
     "MCP_SERVER_TYPE_GENIE": "genie-space",
@@ -135,7 +137,7 @@ def _normalize_enabled_agent(entry: object) -> tuple[str, dict] | None:
     entry_dict = _as_dict(entry)
     if not entry_dict:
         return None
-    tool = _AGENT_ENUM_TO_TOOL.get(_str(entry_dict.get("agent")) or "")
+    tool = AGENT_ENUM_TO_TOOL.get(_str(entry_dict.get("agent")) or "")
     if tool is None:
         return None
     config_in = _as_dict(entry_dict.get("config"))
@@ -170,7 +172,7 @@ def _normalize_mcp_servers(value: object) -> list[dict]:
     for entry in value:
         entry_dict = _as_dict(entry)
         name = _str(entry_dict.get("name"))
-        tag = _MCP_TYPE_ENUM_TO_TAG.get(_str(entry_dict.get("type")) or "")
+        tag = MCP_TYPE_ENUM_TO_TAG.get(_str(entry_dict.get("type")) or "")
         if name and tag:
             out.append({"name": name, "type": tag})
     return out
@@ -195,7 +197,7 @@ def _normalize_budget_policy(value: object) -> dict | None:
         if not isinstance(pct, (int, float)) or isinstance(pct, bool):
             continue
         tier_out: dict = {"spending_percentage": float(pct)}
-        agent = _AGENT_ENUM_TO_TOOL.get(_str(tier_dict.get("default_agent")) or "")
+        agent = AGENT_ENUM_TO_TOOL.get(_str(tier_dict.get("default_agent")) or "")
         if agent:
             tier_out["default_agent"] = agent
         model = _str(tier_dict.get("default_model"))
@@ -218,7 +220,7 @@ def normalize_managed_config(raw: dict) -> dict:
     name = _str(raw.get("name"))
     if name:
         result["name"] = name
-    default_agent = _AGENT_ENUM_TO_TOOL.get(_str(raw.get("default_agent")) or "")
+    default_agent = AGENT_ENUM_TO_TOOL.get(_str(raw.get("default_agent")) or "")
     if default_agent:
         result["default_agent"] = default_agent
     enabled_agents: dict[str, dict] = {}
@@ -267,7 +269,7 @@ def get_model_recommendation(workspace: str, token: str) -> tuple[dict | None, s
     payload, reason = fetch_model_recommendation(workspace, token)
     if reason is not None:
         return None, reason
-    agent = _AGENT_ENUM_TO_TOOL.get(_str(payload.get("recommended_agent")) or "")
+    agent = AGENT_ENUM_TO_TOOL.get(_str(payload.get("recommended_agent")) or "")
     model = _str(payload.get("recommended_model"))
     spend = _decimal(payload.get("current_spend"))
     threshold = _decimal(payload.get("effective_threshold"))

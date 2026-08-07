@@ -44,19 +44,21 @@ ucode codex --full-auto
 
 All agents route through Databricks AI Gateway using your workspace credentials — no API keys required.
 
-Codex intelligent routing is opt-in. Enabling it asks the AI Gateway router to select the
-root-session model before launch and installs profile-scoped hooks that route future
-`spawn_agent` calls. Codex may require one-time review of the installed hooks through `/hooks`.
+Smart routing is opt-in for Codex and Claude Code. Enabling it asks the AI Gateway router
+to select the root-session model before launch and installs profile-scoped hooks that route
+future subagent calls. Codex may require one-time review of the installed hooks through `/hooks`.
 
 ```bash
-ucode codex --enable-intelligent-routing
+ucode codex --enable-smart-routing
+ucode claude --enable-smart-routing
 ```
 
-The setting persists for the current workspace. Disable it and remove only ucode's routing
+The setting persists per workspace for each agent. Disable and remove only ucode's routing
 hooks with:
 
 ```bash
-ucode codex --disable-intelligent-routing
+ucode codex --disable-smart-routing
+ucode claude --disable-smart-routing
 ```
 
 To configure all tools at once:
@@ -167,6 +169,40 @@ ucode configure skills --location main.default,ml.prod --mcp
 Each run prints the registered server, its URL, the configured agents, and its tools, and reminds
 you to run `ucode <agent>` (existing agent sessions need a restart before the MCP tools load).
 
+### Managed config for a workspace (admins)
+
+```bash
+ucode setup
+```
+
+Author the coding config your developers pick up automatically, instead of asking each of them to
+run `ucode configure` by hand. Restricted to workspace admins.
+
+The flow walks through the agents to enable and which one bare `ucode` launches, then per agent:
+Databricks-hosted models or an external Model Provider Service, the models to expose, and whether
+the config applies machine-wide or per user. Claude Code is asked one model per family
+(opus/sonnet/haiku/fable), since Claude Code selects models by family alias; any family can be
+skipped. It then offers tracing, managed MCP servers, skills, and a spend-based budget policy that
+switches the default agent and model as the workspace burns through a budget.
+
+The result is written to `~/.ucode/managed-settings.json`, which `ucode apply` publishes to the
+workspace. Your own agent configs are left alone, with one exception: answering yes to tracing, MCP
+servers, or skills runs the matching `ucode configure` step, which does configure this machine.
+
+```bash
+# Review the manifest and the exact payload `ucode apply` would publish.
+ucode setup show
+
+# Walk the flow without writing anything.
+ucode setup --dry-run
+
+# Skip the prompts and load a hand-written config instead (validated before saving).
+ucode setup --from-file ./managed-settings.json
+```
+
+Publishing replaces the workspace's config outright — there is no partial update yet, so anything
+skipped in a re-run is dropped.
+
 ---
 
 ## Other Commands
@@ -181,14 +217,19 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 | `ucode configure --workspaces https://first.databricks.com,https://second.databricks.com` | Configure workspaces without the interactive picker |
 | `ucode configure --profiles DEFAULT` | Configure using existing Databricks CLI profiles (hosts come from `~/.databrickscfg`) |
 | `ucode configure --profiles DEFAULT --use-pat` | Authenticate with the profile's personal access token — no browser login |
-| `ucode codex --enable-intelligent-routing` | Enable AI Gateway routing for Codex sessions and subagents |
-| `ucode codex --disable-intelligent-routing` | Disable routing and remove ucode's Codex routing hooks |
+| `ucode codex --enable-smart-routing` | Enable AI Gateway routing for Codex sessions and subagents |
+| `ucode codex --disable-smart-routing` | Disable routing and remove ucode's Codex routing hooks |
+| `ucode claude --enable-smart-routing` | Enable AI Gateway routing for Claude Code sessions and subagents |
+| `ucode claude --disable-smart-routing` | Disable routing and remove ucode's Claude Code routing hooks |
 | `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
 | `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
 | `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
 | `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
+| `ucode setup` | Author the workspace's managed coding config (workspace admins only) |
+| `ucode setup show` | Print the authored config and the payload `ucode apply` would publish |
+| `ucode setup --from-file <file>` | Load a hand-written managed config instead of running the prompts |
 
 ## Managed Local Files
 
@@ -203,6 +244,7 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 | `~/.copilot/.env` | GitHub Copilot CLI |
 | `~/.pi/agent/models.json` | Pi |
 | `~/.cursor/mcp.json` | Cursor Agent (MCP servers only) |
+| `~/.ucode/managed-settings.json` | The managed config authored by `ucode setup` (admins) |
 
 Existing files are backed up before being overwritten. `ucode revert` restores backups.
 

@@ -331,6 +331,8 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
         return None, f"network error: {exc.reason}"
 
 
+# Workspace group whose members are workspace admins. `ucode setup` / `ucode apply` are restricted
+# to this group because the coding-agent-config CRUD API enforces the same check server-side.
 WORKSPACE_ADMIN_GROUP = "admins"
 
 
@@ -345,21 +347,64 @@ def is_workspace_admin(workspace: str, token: str) -> bool | None:
     """Whether the caller is a workspace admin, via their SCIM `Me` group membership.
 
     Returns True/False, or None when the check itself could not be made (SCIM unreachable or a
-    malformed response), so callers can say "unknown" rather than misreport an admin as a
-    non-admin.
+    malformed response). Callers should treat None as "unknown" and proceed optimistically rather
+    than blocking: the API enforces the same check server-side, so a false negative here would
+    needlessly stop a legitimate admin, while a false positive just surfaces the server's
+    PERMISSION_DENIED later.
     """
     payload = _scim_me(workspace, token)
     if payload is None:
         return None
     groups = payload.get("groups")
     if not isinstance(groups, list):
-        # A well-formed `Me` for a user in no groups omits `groups`, so this is a definitive
-        # "not an admin" rather than a failed check.
+        # A well-formed `Me` for a user in no groups omits `groups` entirely, so this is a
+        # definitive "not an admin" rather than a failed check.
         return False
     return any(
         isinstance(group, dict) and group.get("display") == WORKSPACE_ADMIN_GROUP
         for group in groups
     )
+
+
+# Workspace-scoped budget listing. Account-level budget APIs need account auth, which ucode does not
+# have; this endpoint resolves the workspace server-side from the caller's token.
+_WORKSPACE_BUDGETS_API_PATH = "/api/ai-gateway/v2/workspace-metrics/budgets"
+
+
+def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str | None]:
+    """List the AI Gateway budgets that apply to this workspace.
+
+    Returns ``(budgets, reason)`` where each budget is ``{"id": ..., "display_name": ...}``.
+    ``reason`` is None on success, otherwise it explains why the list is empty. ucode never creates
+    budgets — an admin picks an existing one to attach a spend-routing policy to.
+    """
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}{_WORKSPACE_BUDGETS_API_PATH}"
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if reason is not None:
+        return [], reason
+    if not isinstance(payload, dict):
+        return [], "workspace budget listing returned an unexpected response shape"
+    raw = payload.get("workspace_ai_gateway_budgets")
+    if not isinstance(raw, list):
+        return [], "workspace budget listing returned no budgets"
+    budgets: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        budget_id = entry.get("budget_configuration_id")
+        if not isinstance(budget_id, str) or not budget_id:
+            continue
+        display_name = entry.get("display_name")
+        budgets.append(
+            {
+                "id": budget_id,
+                "display_name": display_name if isinstance(display_name, str) else "",
+            }
+        )
+    if not budgets:
+        return [], "workspace budget listing returned no budgets"
+    return budgets, None
 
 
 def get_current_user_name(workspace: str, token: str) -> str | None:
@@ -873,12 +918,20 @@ def run_databricks_login(workspace: str, profile: str | None = None) -> None:
     print_success("Databricks authentication complete")
 
 
-def ensure_databricks_auth(workspace: str, profile: str | None = None) -> None:
-    """Check auth and login only if needed (used by launch path)."""
+def ensure_databricks_auth(
+    workspace: str, profile: str | None = None, *, quiet: bool = False
+) -> None:
+    """Check auth and login only if needed (used by launch path).
+
+    ``quiet`` suppresses the "already available" line for a caller that only needs a token before
+    some later step re-authenticates and reports it — otherwise the same success prints twice. A
+    login that actually runs is never silent.
+    """
     with spinner("Checking Databricks auth..."):
         auth_is_valid = has_valid_databricks_auth(workspace, profile)
     if auth_is_valid:
-        print_success(f"Databricks auth already available for {workspace}")
+        if not quiet:
+            print_success(f"Databricks auth already available for {workspace}")
         return
     run_databricks_login(workspace, profile)
 
@@ -1323,12 +1376,44 @@ def _get_model_services_page(
     return payload, reason
 
 
+# Successful model-service listings for this process, keyed by workspace. The listing is a paginated
+# walk of the whole metastore catalog, and several callers want different views of the same result
+# (`discover_model_services` buckets it per family, `discover_claude_models_unbucketed` keeps the raw
+# Claude ids), so a single `ucode setup` run would otherwise page it twice. Cached per process, not
+# persisted: a long-lived process is not a thing here, and a new model appearing mid-command is not
+# worth a second walk. Failures are never cached, so a transient error still retries.
+_MODEL_SERVICES_CACHE: dict[str, list[str]] = {}
+
+# Same idea for the Model Provider Service listing (a different endpoint). It is workspace-wide and
+# filtered per agent afterwards, so `ucode setup` would otherwise re-list it once per MPS-capable
+# agent. Keyed by ``(workspace, parent)`` — a schema-scoped listing is a different result set than
+# the metastore-wide one, so they must not share an entry.
+_MODEL_PROVIDER_SERVICES_CACHE: dict[tuple[str, str], list[dict]] = {}
+
+
+def clear_model_services_cache() -> None:
+    """Forget cached model-service listings (used by tests, and after a workspace switch)."""
+    _MODEL_SERVICES_CACHE.clear()
+    _MODEL_PROVIDER_SERVICES_CACHE.clear()
+
+
+def has_cached_model_provider_services(workspace: str, parent: str | None = None) -> bool:
+    """True when :func:`list_model_provider_services` will answer from cache.
+
+    Lets a caller skip a progress spinner it doesn't need: the cold listing takes over a second, so
+    it deserves one, but repeating it per agent on an instant cache hit is just noise. Takes
+    ``parent`` for the same reason the cache is keyed on it — a scoped listing is a separate entry.
+    """
+    return (workspace, parent or "") in _MODEL_PROVIDER_SERVICES_CACHE
+
+
 def list_model_services(
     workspace: str,
     token: str,
     *,
     page_size: int = _MODEL_SERVICES_PAGE_SIZE,
     max_pages: int = 100,
+    use_cache: bool = True,
 ) -> tuple[list[str], str | None]:
     """List all `system.ai.*` model ids via the UC model-services API.
 
@@ -1337,7 +1422,15 @@ def list_model_services(
     de-duplicated, sorted list of ``system.ai.<model-name>`` ids. Returns
     (ids, reason); reason is None on success, otherwise it describes why the
     list is empty (HTTP/network error or no services).
+
+    A successful result is memoized per workspace for the life of the process; pass
+    ``use_cache=False`` to force a fresh walk.
     """
+    if use_cache:
+        cached = _MODEL_SERVICES_CACHE.get(workspace)
+        if cached is not None:
+            return list(cached), None
+
     hostname = workspace_hostname(workspace)
     ids: list[str] = []
     page_token: str | None = None
@@ -1370,8 +1463,24 @@ def list_model_services(
 
     deduped = sorted(set(ids))
     if deduped:
+        if use_cache:
+            _MODEL_SERVICES_CACHE[workspace] = list(deduped)
         return deduped, None
     return [], last_reason or "model-services listing returned no models"
+
+
+def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """Every `system.ai.claude-*` id on the workspace, unbucketed.
+
+    `discover_model_services` keeps only the newest id per family because the launch path pins one
+    model per Claude family alias. An admin authoring a managed config needs the alternatives too
+    (see `managed_setup.claude_family_candidates`), so this returns the full set without disturbing
+    that shape.
+    """
+    ids, reason = list_model_services(workspace, token)
+    if not ids:
+        return [], reason
+    return [m for m in ids if "claude-" in m.lower()], None
 
 
 def discover_model_services(
@@ -1569,7 +1678,7 @@ _PROVIDER_SERVICES_MAX_PAGES = 50
 
 
 def list_model_provider_services(
-    workspace: str, token: str, *, parent: str | None = None
+    workspace: str, token: str, *, parent: str | None = None, use_cache: bool = True
 ) -> tuple[list[dict], str | None]:
     """List Unity Catalog Model Provider Services on the workspace.
 
@@ -1585,7 +1694,25 @@ def list_model_provider_services(
     remainder silently dropped, so a service that plainly existed looked absent. ``parent`` scopes
     the listing to one ``catalog.schema`` — the metastore-wide default is documented as an internal,
     likely-to-be-deprecated scope, so prefer passing it when the schema is known.
+
+    A successful result is memoized per workspace for the life of the process, like the
+    model-services listing: the listing is workspace-wide (filtered per agent afterwards by
+    :func:`service_usable_for_tool`), so without the memo `ucode setup` re-lists it once per
+    MPS-capable agent. Pass ``use_cache=False`` to force a fresh call.
     """
+    # Keyed by workspace *and* parent: a `parent`-scoped listing holds only that schema's services,
+    # so caching it under the workspace alone would serve a partial list to an unscoped caller (and
+    # vice versa) — a service that plainly exists would look absent, the same failure pagination was
+    # added to fix.
+    cache_key = (workspace, parent or "")
+    if use_cache:
+        cached = _MODEL_PROVIDER_SERVICES_CACHE.get(cache_key)
+        if cached is not None:
+            # A fresh list of fresh dicts each time: callers treat the result as theirs (the wizard
+            # filters it per agent), so handing out the cached objects would let one caller's edit
+            # reach the next.
+            return [dict(service) for service in cached], None
+
     hostname = workspace_hostname(workspace)
     services: list[dict] = []
     page_token: str | None = None
@@ -1622,6 +1749,8 @@ def list_model_provider_services(
     if not services and last_reason is not None:
         return [], last_reason
     services.sort(key=lambda s: s["name"])
+    if use_cache:
+        _MODEL_PROVIDER_SERVICES_CACHE[cache_key] = [dict(service) for service in services]
     return services, None
 
 

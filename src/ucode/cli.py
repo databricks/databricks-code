@@ -77,6 +77,7 @@ from ucode.managed_resolve import (
     recommended_agent,
     resolve_state,
 )
+from ucode.managed_wizard import setup_command, show_command
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
@@ -637,7 +638,7 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
         return _use_databricks()
     if not names:
         # Feature is on but no service matches this tool's provider type.
-        print_note(f"No model provider services available for {display}; using Databricks models.")
+        print_note(f"Using Databricks models for {display}.")
         return _use_databricks()
 
     choice = prompt_for_selection(
@@ -963,6 +964,10 @@ configure_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(configure_app, name="configure", help="Configure workspace and tool settings.")
 mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
+setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
+app.add_typer(
+    setup_app, name="setup", help="Author the workspace's managed coding config (admins only)."
+)
 
 
 def _version_callback(value: bool) -> None:
@@ -2285,6 +2290,53 @@ def configure_tracing(
     except KeyboardInterrupt:
         print_err("Interrupted.")
         raise typer.Exit(130) from None
+
+
+@setup_app.callback(invoke_without_command=True)
+def setup(
+    ctx: typer.Context,
+    from_file: Annotated[
+        str | None,
+        typer.Option(
+            "--from-file",
+            help="Skip the interactive flow and load a hand-written managed config (JSON, in "
+            "ucode's manifest shape) instead. Validated before it is saved.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Walk the flow without writing any files."),
+    ] = False,
+) -> None:
+    """Author the managed coding config for your workspace (workspace admins only)."""
+    if ctx.invoked_subcommand is not None:
+        return
+    set_dry_run(dry_run)
+    # `typer.Exit` subclasses RuntimeError, so it must be raised outside the try — inside, the
+    # `except RuntimeError` below would swallow it and report the exit code as an error message.
+    try:
+        install_databricks_cli()
+        code = setup_command(from_file=from_file)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@setup_app.command("show")
+def setup_show_cmd() -> None:
+    """Print the authored managed config and the payload `ucode apply` would publish."""
+    try:
+        code = show_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    if code:
+        raise typer.Exit(code)
 
 
 @app.command("status")
