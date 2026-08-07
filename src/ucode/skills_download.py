@@ -390,8 +390,10 @@ def download_skills(
             write_skill(roots, ref, files)
             written += 1
         console.print()
+        total = len(refs)
+        skipped = f"; {total - written} skipped" if written < total else ""
         print_success(
-            f"Downloaded {written}/{len(refs)} skill(s) from `{location}` in {roots_display}."
+            f"Downloaded {written}/{total} skill(s){skipped} from `{location}` in {roots_display}."
         )
 
 

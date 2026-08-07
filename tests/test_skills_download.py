@@ -531,9 +531,11 @@ class TestDownloadSkills:
 
         # Rich wraps long paths across lines; strip all whitespace from both sides to compare.
         roots = sd.skill_dir_roots(str(tmp_path))
+        # No skips, so the summary carries no "; N skipped" suffix.
         expected = f"Downloaded 3/3 skill(s) from `main.default` in {roots[0]} and {roots[1]}."
         printed = "".join(capsys.readouterr().out.split())
         assert "".join(expected.split()) in printed
+        assert "skipped" not in printed
 
     def test_summary_counts_only_written_skills(self, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(
@@ -549,7 +551,9 @@ class TestDownloadSkills:
 
         sd.download_skills(WS, "token", ["main.default"], str(tmp_path))
 
-        assert "Downloaded 1/2 skill(s) from `main.default` in" in capsys.readouterr().out
+        assert (
+            "Downloaded 1/2 skill(s); 1 skipped from `main.default` in" in capsys.readouterr().out
+        )
 
     def test_skill_filter_downloads_only_matching_leaves(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
