@@ -33,7 +33,7 @@ from ucode.agents import (
 )
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
-from ucode.config_io import restore_file, set_dry_run
+from ucode.config_io import is_dry_run, restore_file, set_dry_run
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
@@ -1311,7 +1311,9 @@ def _fetch_budget_recommendation(
     Enforcement is server-side, so a failed read only costs the recommendation: the config's own
     ``default_model`` still applies and the launch proceeds.
     """
-    if managed is None or skip_preflight:
+    # --dry-run resolves the agent from the last saved config alone, so it must not reach the
+    # control plane — mirroring the managed-config read, which is likewise skipped under --dry-run.
+    if managed is None or skip_preflight or is_dry_run():
         return None
     reason: str | None = None
     recommendation = None
@@ -1321,8 +1323,9 @@ def _fetch_budget_recommendation(
                 state["workspace"],
                 get_databricks_token(state["workspace"], state.get("profile")),
             )
-        except RuntimeError as exc:
-            # A token that lapsed since the config refresh must not block the launch.
+        except (RuntimeError, OSError) as exc:
+            # A token that lapsed since the config refresh — or a Databricks CLI that isn't
+            # installed or reachable — must not block the launch; the config's default_model stands.
             reason = str(exc)
     if reason is not None:
         print_warning(
