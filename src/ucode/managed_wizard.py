@@ -95,29 +95,47 @@ def _tracing_table_from_state(state: dict) -> str | None:
     return destination if isinstance(destination, str) and destination else None
 
 
-def _mcp_type_for_url(url: str) -> str | None:
-    """Classify a registered MCP server's URL into a managed-config type tag.
+def _mcp_server_from_url(url: str) -> tuple[str, str] | None:
+    """Derive a managed-config ``(name, type)`` entry from a registered server's resolved URL.
 
     ``state.json`` stores each MCP server's resolved URL but not its type, while the managed config
-    stores ``{name, type}`` and lets the developer's ucode rebuild the URL. The URL shape is the only
-    signal available, so map it back. Returns None for a URL that matches nothing known, so unknown
-    servers are skipped rather than published with a guessed type.
+    stores ``{name, type}`` and lets the developer's ucode rebuild the URL. So map the URL back to the
+    type *and* the identifier the ai-gateway ``McpServer.name`` field is meant to hold for that type
+    (a UC name for a UC service, a Genie space id for a genie space, a `<catalog>.<schema>` for
+    vector-search / uc-functions, a connection name for external). Deriving ``name`` from the URL —
+    rather than reusing the local display slug — is what lets the developer's ucode reconstruct the
+    URL on launch. Returns None for a URL that matches nothing reconstructable (e.g. an app's
+    off-workspace host), so those are skipped rather than published unusably.
     """
-    if "/ai-gateway/mcp-services/" in url:
-        return "mcp-service"
+    stripped = url.rstrip("/")
+    marker = "/ai-gateway/mcp-services/"
+    if marker in url:
+        # `.../mcp-services/<catalog>.<schema>.<svc>` — store the dash form the launch path expects.
+        service = url.split(marker, 1)[1].split("/", 1)[0]
+        return service.replace(".", "-"), "mcp-service"
     for fragment, tag in (
         ("/api/2.0/mcp/external/", "external"),
         ("/api/2.0/mcp/genie/", "genie-space"),
+    ):
+        if fragment in url:
+            # external -> connection name; genie -> space id. Both are the single trailing segment.
+            return url.split(fragment, 1)[1].split("/", 1)[0], tag
+    for fragment, tag in (
         ("/api/2.0/mcp/vector-search/", "vector-search"),
         ("/api/2.0/mcp/functions/", "uc-functions"),
     ):
         if fragment in url:
-            return tag
-    if url.rstrip("/").endswith("/api/2.0/mcp/sql"):
-        return "sql"
-    # Databricks apps are the residual case: an arbitrary app host with a /mcp suffix.
-    if url.rstrip("/").endswith("/mcp"):
-        return "app"
+            # `.../<catalog>/<schema>` — store the `<catalog>.<schema>` the launch path splits back.
+            rest = url.split(fragment, 1)[1].split("/")
+            if len(rest) >= 2 and rest[0] and rest[1]:
+                return f"{rest[0]}.{rest[1]}", tag
+            return None
+    if stripped.endswith("/api/2.0/mcp/sql"):
+        return "databricks-sql", "sql"
+    # Databricks apps are the residual case: an arbitrary app host with a /mcp suffix. Its host isn't
+    # reconstructable from the workspace + an id, so it can't be published to the managed config yet.
+    if stripped.endswith("/mcp"):
+        return None
     return None
 
 
@@ -130,6 +148,7 @@ def _mcp_servers_from_state(state: dict) -> list[dict]:
     from ucode.mcp import SKILLS_MCP_KIND
 
     servers: list[dict] = []
+    seen: set[str] = set()
     for entry in state.get("mcp_servers") or []:
         if not isinstance(entry, dict) or entry.get("kind") == SKILLS_MCP_KIND:
             continue
@@ -137,11 +156,18 @@ def _mcp_servers_from_state(state: dict) -> list[dict]:
         url = entry.get("url")
         if not isinstance(name, str) or not name or not isinstance(url, str):
             continue
-        tag = _mcp_type_for_url(url)
-        if tag is None:
-            print_warning(f"Skipping MCP server '{name}': unrecognized URL shape ({url}).")
+        resolved = _mcp_server_from_url(url)
+        if resolved is None:
+            print_warning(
+                f"Skipping MCP server '{name}': ucode can't publish it to a managed config "
+                f"(unrecognized or app-hosted URL: {url})."
+            )
             continue
-        servers.append({"name": name, "type": tag})
+        config_name, tag = resolved
+        if config_name in seen:
+            continue
+        seen.add(config_name)
+        servers.append({"name": config_name, "type": tag})
     return servers
 
 

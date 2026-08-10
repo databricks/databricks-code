@@ -2337,34 +2337,58 @@ class TestPurgeCrossWorkspaceSkillsEntry:
         assert state["mcp_servers"] == []
 
 
-class TestManagedMcpServerUrl:
+class TestManagedMcpServerEntry:
     def test_sql(self):
-        assert mcp.managed_mcp_server_url("databricks-sql", "sql", WS) == f"{WS}/api/2.0/mcp/sql"
+        assert mcp.managed_mcp_server_entry("databricks-sql", "sql", WS) == (
+            "databricks-sql",
+            f"{WS}/api/2.0/mcp/sql",
+        )
 
     def test_external_uses_the_connection_name(self):
-        assert (
-            mcp.managed_mcp_server_url("jira-prod", "external", WS)
-            == f"{WS}/api/2.0/mcp/external/jira-prod"
+        assert mcp.managed_mcp_server_entry("jira-prod", "external", WS) == (
+            "jira-prod",
+            f"{WS}/api/2.0/mcp/external/jira-prod",
         )
 
     def test_mcp_service_undashes_catalog_and_schema_only(self):
         # The manifest stores the dash form; only the first two dashes (catalog.schema) become dots,
-        # so a service name keeps its own dashes/underscores.
-        assert (
-            mcp.managed_mcp_server_url("system-ai-dbsql", "mcp-service", WS)
-            == f"{WS}/ai-gateway/mcp-services/system.ai.dbsql"
+        # so a service name keeps its own dashes/underscores. The entry name stays the dash form.
+        assert mcp.managed_mcp_server_entry("system-ai-dbsql", "mcp-service", WS) == (
+            "system-ai-dbsql",
+            f"{WS}/ai-gateway/mcp-services/system.ai.dbsql",
         )
-        assert (
-            mcp.managed_mcp_server_url("system-ai-google_calendar", "mcp-service", WS)
-            == f"{WS}/ai-gateway/mcp-services/system.ai.google_calendar"
+        assert mcp.managed_mcp_server_entry("system-ai-google_calendar", "mcp-service", WS) == (
+            "system-ai-google_calendar",
+            f"{WS}/ai-gateway/mcp-services/system.ai.google_calendar",
         )
 
     def test_mcp_service_needs_three_parts(self):
-        assert mcp.managed_mcp_server_url("justtwo-parts", "mcp-service", WS) is None
+        assert mcp.managed_mcp_server_entry("justtwo-parts", "mcp-service", WS) is None
 
-    def test_unsupported_types_return_none(self):
-        for mcp_type in ("genie-space", "app", "vector-search", "uc-functions", "bogus"):
-            assert mcp.managed_mcp_server_url("x", mcp_type, WS) is None
+    def test_genie_space_uses_the_space_id(self):
+        assert mcp.managed_mcp_server_entry("01ef9a", "genie-space", WS) == (
+            "databricks-genie-01ef9a",
+            f"{WS}/api/2.0/mcp/genie/01ef9a",
+        )
+
+    def test_uc_functions_splits_catalog_schema(self):
+        # The dot-free entry name is a slug; the URL uses the raw catalog/schema path segments.
+        entry_name, url = mcp.managed_mcp_server_entry("dev_cat.dev_fixture", "uc-functions", WS)
+        assert "." not in entry_name
+        assert url == f"{WS}/api/2.0/mcp/functions/dev_cat/dev_fixture"
+
+    def test_vector_search_splits_catalog_schema(self):
+        entry_name, url = mcp.managed_mcp_server_entry("my_cat.my_schema", "vector-search", WS)
+        assert "." not in entry_name
+        assert url == f"{WS}/api/2.0/mcp/vector-search/my_cat/my_schema"
+
+    def test_catalog_schema_needs_exactly_two_parts(self):
+        assert mcp.managed_mcp_server_entry("onlycatalog", "uc-functions", WS) is None
+        assert mcp.managed_mcp_server_entry("a.b.c", "uc-functions", WS) is None
+
+    def test_app_and_unknown_types_return_none(self):
+        for mcp_type in ("app", "bogus"):
+            assert mcp.managed_mcp_server_entry("x", mcp_type, WS) is None
 
 
 class TestApplyManagedMcpServers:
@@ -2390,18 +2414,37 @@ class TestApplyManagedMcpServers:
         assert {s["name"] for s in registered} == {"system-ai-dbsql", "databricks-sql"}
         assert all(s["clients"] == ["claude"] for s in registered)
 
+    def test_registers_genie_and_catalog_schema_types(self, monkeypatch):
+        applied = {}
+        monkeypatch.setattr(mcp, "load_state", lambda: {})
+        monkeypatch.setattr(
+            mcp,
+            "apply_mcp_server_changes",
+            lambda prev, working, *a, **k: applied.update({"working": working}),
+        )
+        managed = self._managed(
+            {"name": "01ef9a", "type": "genie-space"},
+            {"name": "cat.sch", "type": "uc-functions"},
+        )
+        registered = mcp.apply_managed_mcp_servers(managed, "claude", WS)
+        names = {s["name"] for s in registered}
+        assert "databricks-genie-01ef9a" in names
+        assert any(n.startswith("databricks-functions-") for n in names)
+
     def test_skips_and_warns_on_unsupported_types(self, monkeypatch):
+        # `app` is the remaining type ucode can't rebuild from the config (needs an off-workspace
+        # host); it is skipped with a warning while the supported entry still registers.
         warned: list[str] = []
         monkeypatch.setattr(mcp, "load_state", lambda: {})
         monkeypatch.setattr(mcp, "apply_mcp_server_changes", lambda *a, **k: None)
         monkeypatch.setattr(mcp, "print_warning", lambda msg: warned.append(msg))
         managed = self._managed(
             {"name": "system-ai-dbsql", "type": "mcp-service"},
-            {"name": "my-space", "type": "genie-space"},
+            {"name": "my-app", "type": "app"},
         )
         registered = mcp.apply_managed_mcp_servers(managed, "claude", WS)
         assert {s["name"] for s in registered} == {"system-ai-dbsql"}
-        assert warned and "my-space" in warned[0]
+        assert warned and "my-app" in warned[0]
 
     def test_diffs_against_this_tools_previously_registered_servers(self, monkeypatch):
         seen_prev = {}
@@ -2435,7 +2478,7 @@ class TestApplyManagedMcpServers:
         )
         monkeypatch.setattr(mcp, "print_warning", lambda msg: None)
         registered = mcp.apply_managed_mcp_servers(
-            self._managed({"name": "s", "type": "genie-space"}), "claude", WS
+            self._managed({"name": "s", "type": "app"}), "claude", WS
         )
         assert registered == []
 
