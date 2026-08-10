@@ -250,10 +250,10 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
     if not is_admin:
         return
     print_note(
-        "No managed config exists for this workspace. As a workspace admin you can publish one "
-        "with `ucode setup`, which every developer then picks up automatically."
+        "✨ New: as a workspace admin you can publish a managed config with `ucode setup` — set "
+        "the agents, models, MCPs, and skills once, and every developer picks them up automatically."
     )
-    if prompt_yes_no("Stop here and run `ucode setup` instead?"):
+    if prompt_yes_no("Set one up now with `ucode setup`?"):
         print_note("Run `ucode setup` to author your workspace's managed config, then `ucode apply`.")
         raise typer.Exit(0)
 
