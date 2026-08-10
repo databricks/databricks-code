@@ -19,6 +19,7 @@ from ucode.databricks import (
     _run_databricks_cli_installer,
     _scrub_databrickscfg,
     _scrub_json,
+    all_users_can_use_schema,
     build_auth_shell_command,
     build_auth_token_argv,
     build_databricks_cli_env,
@@ -35,6 +36,7 @@ from ucode.databricks import (
     list_databricks_apps,
     list_databricks_connections,
     list_genie_spaces,
+    list_workspace_budgets,
     resolve_current_budget_spend,
     workspace_hostname,
 )
@@ -2610,6 +2612,18 @@ class TestResolveCurrentBudgetSpend:
         spend, _ = resolve_current_budget_spend("https://ws", "token")
         assert spend is None
 
+    def test_threshold_without_spend_is_zero_spend(self, monkeypatch):
+        # A per-user threshold with no spend yet this period is $0 spent, not "no budget" — the
+        # developer should still see their budget rather than a blank.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: ({"effective_threshold": "100"}, None),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend == (Decimal(0), Decimal("100"))
+        assert reason is None
+
     def test_malformed_decimal_is_no_spend(self, monkeypatch):
         monkeypatch.setattr(
             db_mod,
@@ -2629,6 +2643,55 @@ class TestResolveCurrentBudgetSpend:
         spend, reason = resolve_current_budget_spend("https://ws", "token")
         assert spend is None
         assert "not a JSON object" in reason
+
+
+class TestListWorkspaceBudgets:
+    PER_USER = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
+    SHARED = "ALERT_CONFIGURATION_SCOPE_TYPE_SHARED"
+
+    def _stub(self, monkeypatch, payload):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
+        )
+
+    def test_flags_per_user_alert_presence(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "with",
+                        "display_name": "has per-user",
+                        "alert_configurations": [
+                            {"scope_type": self.SHARED},
+                            {"scope_type": self.PER_USER},
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "without",
+                        "display_name": "shared only",
+                        "alert_configurations": [{"scope_type": self.SHARED}],
+                    },
+                ]
+            },
+        )
+        budgets, reason = list_workspace_budgets("https://ws", "token")
+        assert reason is None
+        by_id = {b["id"]: b for b in budgets}
+        assert by_id["with"]["has_per_user_alert"] is True
+        assert by_id["without"]["has_per_user_alert"] is False
+
+    def test_missing_alert_configs_is_not_per_user(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {"budget_configuration_id": "b", "display_name": "x"}
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        assert budgets[0]["has_per_user_alert"] is False
 
 
 class TestDiscoverSqlWarehouses:
@@ -2696,3 +2759,67 @@ class TestDiscoverSqlWarehouses:
         )
         with pytest.raises(RuntimeError, match="No usable SQL warehouse"):
             discover_sql_warehouses(WS, "token")
+
+
+class TestAllUsersCanUseSchema:
+    def _stub(self, monkeypatch, payload, reason=None):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, reason)
+        )
+
+    def test_true_when_account_users_have_use_schema(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "USE_SCHEMA"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is True
+
+    def test_true_when_account_users_have_all_privileges(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "ALL_PRIVILEGES"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is True
+
+    def test_false_when_no_use_schema(self, monkeypatch):
+        # An empty assignment list is what the API returns when the group has no grant on the schema.
+        self._stub(monkeypatch, {})
+        assert all_users_can_use_schema("https://ws", "tok", "main.tien_le") is False
+
+    def test_false_when_only_unrelated_privileges(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "MANAGE"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is False
+
+    def test_none_when_the_call_fails(self, monkeypatch):
+        self._stub(monkeypatch, None, reason="HTTP 403 Forbidden")
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is None
+
+    def test_none_on_unexpected_shape(self, monkeypatch):
+        self._stub(monkeypatch, [])
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is None
+
+    def test_requests_the_account_users_principal(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (seen.setdefault("url", url), ({}, None))[1],
+        )
+        all_users_can_use_schema("https://ws", "tok", "main.tien_le")
+        assert "effective-permissions/schema/main.tien_le" in seen["url"]
+        assert "principal=account%20users" in seen["url"]

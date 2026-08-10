@@ -16,7 +16,9 @@ from ucode.ui import (
     format_token_count,
     format_usd,
     normalize_workspace_url,
+    prompt_for_multi_selection,
     prompt_for_percentage,
+    prompt_for_selection,
     prompt_for_text,
     prompt_for_workspace,
     prompt_yes_no_default,
@@ -162,6 +164,47 @@ class TestNormalizeWorkspaceUrl:
     def test_whitespace_only_raises(self):
         with pytest.raises(ValueError, match="empty"):
             normalize_workspace_url("   ")
+
+
+class TestScrollHint:
+    """A long picker list scrolls, but questionary doesn't say so — the pickers add the hint."""
+
+    def _opts(self, n):
+        return [(f"m{i}", f"m{i}") for i in range(n)]
+
+    def test_short_list_gets_no_hint(self):
+        with patch("ucode.ui.questionary.select") as sel:
+            sel.return_value.ask.return_value = "m0"
+            prompt_for_selection("pick", self._opts(5))
+        assert "scroll" not in sel.call_args.kwargs["instruction"]
+
+    def test_long_single_select_gets_the_hint(self):
+        with patch("ucode.ui.questionary.select") as sel:
+            sel.return_value.ask.return_value = "m0"
+            prompt_for_selection("pick", self._opts(16))
+        assert "↑/↓ scroll" in sel.call_args.kwargs["instruction"]
+
+    def test_long_multi_select_gets_the_hint(self):
+        with patch("ucode.ui.questionary.checkbox") as chk:
+            chk.return_value.ask.return_value = []
+            prompt_for_multi_selection("pick", self._opts(16))
+        assert "↑/↓ scroll" in chk.call_args.kwargs["instruction"]
+
+    def test_hint_preserves_the_filter_affordance(self):
+        # The hint must extend the instruction, not replace it — a searchable long list keeps both.
+        with patch("ucode.ui.questionary.select") as sel:
+            sel.return_value.ask.return_value = "m0"
+            prompt_for_selection("pick", self._opts(16), searchable=True)
+        instruction = sel.call_args.kwargs["instruction"]
+        assert "type to filter" in instruction
+        assert "↑/↓ scroll" in instruction
+
+    def test_threshold_is_inclusive_of_ten(self):
+        # Exactly the visible-row count still fits, so no hint; one more overflows.
+        with patch("ucode.ui.questionary.select") as sel:
+            sel.return_value.ask.return_value = "m0"
+            prompt_for_selection("pick", self._opts(10))
+        assert "scroll" not in sel.call_args.kwargs["instruction"]
 
 
 class TestFormatTokenCount:

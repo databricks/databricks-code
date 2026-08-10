@@ -21,6 +21,7 @@ from ucode.agents import TOOL_SPECS, check_gateway_endpoint
 from ucode.config_io import is_dry_run
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
+    all_users_can_use_schema,
     create_coding_agent_config,
     delete_coding_agent_config,
     discover_claude_models_unbucketed,
@@ -234,7 +235,30 @@ def _select_provider_service(tool: str, workspace: str, token: str) -> dict | No
     )
     if not selected:
         return None
-    return next(service for service in usable if service["name"] == selected)
+    service = next(service for service in usable if service["name"] == selected)
+    _warn_if_mps_not_broadly_accessible(workspace, token, service["name"])
+    return service
+
+
+def _warn_if_mps_not_broadly_accessible(workspace: str, token: str, service_name: str) -> None:
+    """Warn if the picked MPS's schema isn't granted to all workspace users.
+
+    A developer who pulls a config routing through this MPS needs USE_SCHEMA on its schema, or they
+    hit "User does not have USE_SCHEMA on Schema <catalog>.<schema>" at launch. This only warns
+    (never blocks): access may instead come from a team group the check can't see, and an
+    inconclusive check stays silent.
+    """
+    schema = ".".join(service_name.split(".")[:2])
+    if schema.count(".") != 1:
+        return
+    with spinner("Checking who can use this service..."):
+        accessible = all_users_can_use_schema(workspace, token, schema)
+    if accessible is False:
+        print_warning(
+            f"All workspace users don't appear to have USE_SCHEMA on `{schema}`, so developers "
+            f"who pull this config may not be able to use `{service_name}`. Grant USE_SCHEMA on "
+            f"`{schema}` to the `account users` group (or the teams that need it) in Unity Catalog."
+        )
 
 
 def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | None) -> dict:
@@ -528,11 +552,26 @@ def _prompt_budget_policy(
         )
         return None
 
+    # Spend routing only works on a budget with a per-user threshold; without one the gateway reports
+    # no spend and every tier stays inert. The listing can't reveal the alert's action, so this hides
+    # the clearly-unusable budgets and the server rejects the rest on create.
+    usable = [budget for budget in budgets if budget.get("has_per_user_alert")]
+    if not usable:
+        print_warning(
+            "None of this workspace's AI Gateway budgets have a per-user threshold configured, which "
+            "spend routing requires. Add a per-user alert threshold to a budget in the Databricks "
+            "console, then re-run `ucode setup`."
+        )
+        return None
+    print_note(
+        "Showing only budgets with a per-user threshold configured, which spend routing needs."
+    )
+
     budget_id = prompt_for_selection(
         "Which budget should this policy track?",
         [
             (budget["id"], f"{budget['display_name'] or budget['id']} ({budget['id']})")
-            for budget in budgets
+            for budget in usable
         ],
         searchable=True,
     )
