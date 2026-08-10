@@ -1372,9 +1372,14 @@ def _launch_tool(
     enable_smart_routing_flag: bool = False,
     managed: dict | None = None,
     recommendation: dict | None = None,
+    model: str | None = None,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        # A provider service routes by header and pins no model id, so pairing it with an explicit
+        # model is contradictory — reject rather than silently ignore one.
+        if model and provider:
+            raise RuntimeError("Use either --model or --provider, not both.")
         # An explicit --workspace targets that workspace for this launch (and
         # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
         # works without a prior `ucode configure`.
@@ -1530,6 +1535,16 @@ def _launch_tool(
                     route_root_model = managed_model
                 else:
                     resolved_model = managed_model
+            # An explicit `--model` is the user's own choice and outranks everything above (managed
+            # default, smart-routing pick). For Claude it must be pinned as ANTHROPIC_MODEL — Claude
+            # Code's own `--model` flag validates the name client-side against the models it lists and
+            # rejects a raw Databricks id ("may not exist ... run /model"), whereas ANTHROPIC_MODEL
+            # routes it straight to the gateway (the same path smart routing and managed configs use).
+            if model:
+                if tool == "claude":
+                    route_root_model = model
+                else:
+                    resolved_model = model
         state = configure_tool(
             tool,
             state,
@@ -1789,6 +1804,16 @@ def claude_cmd(
             "before any `--` separator.",
         ),
     ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Launch on a specific Databricks model id (e.g. a UC "
+            "`<catalog>.<schema>.<name>`). Pinned via ANTHROPIC_MODEL so the gateway "
+            "resolves it — unlike Claude Code's own --model, which rejects non-catalog ids. "
+            "Pass before any `--` separator; not usable with --provider.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
     workspace: WorkspaceOption = None,
     enable_smart_routing_flag: Annotated[
@@ -1818,6 +1843,7 @@ def claude_cmd(
         "claude",
         ctx,
         provider=provider,
+        model=model,
         skip_preflight=skip_preflight,
         workspace=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
