@@ -254,7 +254,9 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
         "the agents, models, MCPs, and skills once, and every developer picks them up automatically."
     )
     if prompt_yes_no("Set one up now with `ucode setup`?"):
-        print_note("Run `ucode setup` to author your workspace's managed config, then `ucode apply`.")
+        print_note(
+            "Run `ucode setup` to author your workspace's managed config, then `ucode apply`."
+        )
         raise typer.Exit(0)
 
 
