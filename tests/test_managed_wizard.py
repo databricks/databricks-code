@@ -1171,7 +1171,10 @@ class TestBudgetPolicy:
                 }
             }
         }
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        # `has_per_user_alert` is required since the budget-threshold gate landed on main: spend
+        # routing needs a per-user threshold, so a budget without one is filtered out and the policy
+        # flow returns before the tier loop this test exercises.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
