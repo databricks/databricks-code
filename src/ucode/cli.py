@@ -2169,6 +2169,12 @@ def configure(
         # scriptable), and when --dry-run is set.
         if fully_interactive and not dry_run and prompt_yes_no("Configure MCP servers now?"):
             configure_mcp_command()
+    except typer.Exit:
+        # `typer.Exit` subclasses RuntimeError, so it has to be re-raised ahead of the handler
+        # below. Otherwise a clean exit (e.g. `_reject_configure_under_managed_config` under a
+        # managed config) is followed by `print_err(str(exc))` printing the exit code — a bare,
+        # meaningless "ERROR 0".
+        raise
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

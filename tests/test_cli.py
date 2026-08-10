@@ -2242,6 +2242,20 @@ class TestConfigureDeprecation:
         self._reject()
         assert capsys.readouterr().out == ""
 
+    def test_configure_command_exits_zero_without_erroring(self, monkeypatch):
+        # `typer.Exit(0)` subclasses RuntimeError, so the command's own RuntimeError handler must
+        # not catch the clean exit and print `str(exc)` -> a bare, meaningless "ERROR 0".
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
+        monkeypatch.setattr(
+            "ucode.cli.load_managed_state",
+            lambda ws: {"enabled_agents": {"claude": {}}},
+        )
+        with patch("ucode.cli.install_databricks_cli"):
+            result = runner.invoke(app, ["configure"])
+        assert result.exit_code == 0, result.output
+        assert "ERROR" not in result.output
+
     @pytest.mark.parametrize("env_value", [None, "", "0"])
     def test_silent_when_the_env_var_is_off(self, monkeypatch, capsys, env_value):
         if env_value is None:
