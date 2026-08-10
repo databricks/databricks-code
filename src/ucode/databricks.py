@@ -2055,7 +2055,7 @@ def service_usable_for_tool(tool: str, service: dict) -> bool:
     if not tool_supports_provider_type(tool, provider_type):
         return False
     if provider_type in BEDROCK_PROVIDER_TYPES:
-        return bool(map_bedrock_claude_models(service.get("targets") or []))
+        return bool(map_claude_family_models(service.get("targets") or []))
     return True
 
 
@@ -2095,7 +2095,7 @@ def resolve_provider_service(
             f"Model provider service '{service_name}' is a '{provider_type}' provider, "
             f"which {tool} can't route to (supported: {supported})."
         )
-    if provider_type in BEDROCK_PROVIDER_TYPES and not map_bedrock_claude_models(
+    if provider_type in BEDROCK_PROVIDER_TYPES and not map_claude_family_models(
         match.get("targets") or []
     ):
         return None, (
@@ -2105,12 +2105,11 @@ def resolve_provider_service(
     return match, None
 
 
-# Bedrock exposes Claude under provider-side ids like
-# `us.anthropic.claude-sonnet-4-6`, `global.anthropic.claude-opus-4-8`, or the
-# region-less `anthropic.claude-opus-4-8`. We map each service target to a
-# Claude family and keep the best id per family. Claude Code only takes one
-# default per family; users switch to any other listed region profile at runtime
-# with `/model <full-id>` or `--model`.
+# A Model Provider Service exposes Claude under per-family target ids: Bedrock as provider-side
+# slugs (`us.anthropic.claude-sonnet-4-6`, `global.anthropic.claude-opus-4-8`, region-less
+# `anthropic.claude-opus-4-8`), Anthropic as canonical names (`claude-sonnet-5`). Either way we map
+# each target to a Claude family and keep the best id per family. Claude Code takes one default per
+# family; users switch to any other listed id at runtime with `/model <full-id>` or `--model`.
 _BEDROCK_CLAUDE_FAMILIES = ("opus", "sonnet", "haiku")
 # When the same model/version is offered under several cross-region inference
 # profiles, prefer the broadest-routing one as the pinned default.
@@ -2137,11 +2136,14 @@ def _bedrock_sort_key(model_id: str) -> tuple:
     return (version, _bedrock_region_rank(model_id))
 
 
-def map_bedrock_claude_models(targets: list[str]) -> dict[str, str]:
-    """Map Bedrock service targets to ``{family: model_id}`` for opus/sonnet/
-    haiku, choosing the highest-versioned id per family and, on a version tie,
-    the broadest-routing region profile. Targets that don't name a Claude family
-    are ignored."""
+def map_claude_family_models(targets: list[str]) -> dict[str, str]:
+    """Map a service's Claude targets to ``{family: model_id}`` for opus/sonnet/haiku.
+
+    Chooses the highest-versioned id per family and, on a version tie, the broadest-routing region
+    profile (Bedrock targets carry a region prefix; canonical Anthropic ids rank equal, so version
+    alone decides). Targets that don't name a Claude family are ignored, so a mixed catalog (e.g. a
+    Bedrock service also exposing Titan embeddings) yields only the Claude families.
+    """
     best_key: dict[str, tuple] = {}
     result: dict[str, str] = {}
     for model_id in targets:

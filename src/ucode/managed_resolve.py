@@ -185,6 +185,44 @@ def managed_default_model(managed: dict, tool: str) -> str | None:
     return _str(_agent_model_config(managed, tool).get("default_model"))
 
 
+def managed_provider_family_models(managed: dict) -> dict[str, str] | None:
+    """Claude's authored per-family models for launch, when a managed config routes it through a
+    Model Provider Service.
+
+    The launch path pins each ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` from this so a *managed* launch
+    uses exactly the versions the admin chose in ``ucode setup`` — rather than
+    ``resolve_provider_models`` re-deriving "newest per family" from the service's live targets. It
+    returns the manifest's own family slots (``{opus: id, sonnet: id, ...}``), i.e. what the wizard's
+    per-family prompt authored.
+
+    Falls back to the single ``default_model`` (mapped to its family) when the manifest carries no
+    slots — the case where the service is ``allow_all_targets`` so setup could only ask for one
+    overall default. Returns None when neither is present, leaving the launch path to its usual
+    provider handling.
+
+    TODO: when the service is ``allow_all_targets`` an admin can't enumerate a per-family choice yet.
+    A list-models API for provider services would let the wizard offer the full catalog per family;
+    until then the single default is the best the manifest can express.
+    """
+    from ucode.managed_setup import claude_family_for_model
+
+    config = _agent_model_config(managed, "claude")
+    slots: dict[str, str] = {}
+    raw_slots = _as_dict(config.get("models"))
+    for slot, family in _CLAUDE_FAMILY_SLOTS.items():
+        model = _str(raw_slots.get(slot))
+        if model:
+            slots[family] = model
+    if slots:
+        return slots
+    default_model = _str(config.get("default_model"))
+    if default_model:
+        family = claude_family_for_model(default_model)
+        if family:
+            return {family: default_model}
+    return None
+
+
 def recommended_agent(recommendation: dict | None, managed: dict) -> str | None:
     """The agent the budget tier recommends, or the config's ``default_agent`` when it names none.
 

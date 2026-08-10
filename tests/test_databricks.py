@@ -487,9 +487,9 @@ class TestListModelProviderServices:
         assert names == ["main.schema1.openai-svc"]
 
 
-class TestMapBedrockClaudeModels:
+class TestMapClaudeFamilyModels:
     def test_maps_families(self):
-        models = db_mod.map_bedrock_claude_models(
+        models = db_mod.map_claude_family_models(
             [
                 "us.anthropic.claude-sonnet-4-6",
                 "global.anthropic.claude-opus-4-8",
@@ -504,13 +504,13 @@ class TestMapBedrockClaudeModels:
         }
 
     def test_prefers_highest_version(self):
-        models = db_mod.map_bedrock_claude_models(
+        models = db_mod.map_claude_family_models(
             ["us.anthropic.claude-sonnet-4-5", "us.anthropic.claude-sonnet-4-6"]
         )
         assert models["sonnet"] == "us.anthropic.claude-sonnet-4-6"
 
     def test_region_tie_break_prefers_global(self):
-        models = db_mod.map_bedrock_claude_models(
+        models = db_mod.map_claude_family_models(
             [
                 "us.anthropic.claude-opus-4-8",
                 "global.anthropic.claude-opus-4-8",
@@ -519,8 +519,20 @@ class TestMapBedrockClaudeModels:
         )
         assert models["opus"] == "global.anthropic.claude-opus-4-8"
 
+    def test_maps_canonical_anthropic_ids(self):
+        # An Anthropic service publishes canonical ids (no region prefix); the same mapper groups
+        # them by family and picks the highest version, so per-family pinning works there too.
+        models = db_mod.map_claude_family_models(
+            ["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-4-8"]
+        )
+        assert models == {
+            "sonnet": "claude-sonnet-5",
+            "haiku": "claude-haiku-4-5",
+            "opus": "claude-opus-4-8",
+        }
+
     def test_empty_when_no_claude(self):
-        assert db_mod.map_bedrock_claude_models(["amazon.titan-text-express-v1"]) == {}
+        assert db_mod.map_claude_family_models(["amazon.titan-text-express-v1"]) == {}
 
 
 class TestProviderServicePagination:

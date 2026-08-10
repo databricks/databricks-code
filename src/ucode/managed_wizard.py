@@ -32,6 +32,7 @@ from ucode.databricks import (
     is_workspace_admin,
     list_model_provider_services,
     list_workspace_budgets,
+    map_claude_family_models,
     service_usable_for_tool,
     update_coding_agent_config,
 )
@@ -39,6 +40,7 @@ from ucode.managed_config import get_managed_config
 from ucode.managed_setup import (
     CLAUDE_SLOT_FOR_FAMILY,
     claude_family_candidates,
+    claude_family_for_model,
     load_managed_settings,
     model_options_for_agent,
     save_managed_settings,
@@ -286,7 +288,17 @@ def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | No
         service_name = provider_service["name"]
         model_config["model_provider_service"] = service_name
         targets = provider_service_model_options(provider_service)
-        if targets:
+        if tool == "claude" and _pins_family_models(targets):
+            # `targets` (not the raw service) publishes explicit Claude models, and `render_overlay`
+            # pins each family to a chosen version from them — Bedrock slugs
+            # (`us.anthropic.claude-opus-4-8-v1:0`) or canonical Anthropic ids (`claude-opus-4-8`).
+            # So Claude needs a default *per family*, not one overall, mirroring the Databricks-hosted
+            # path. (A service with no enumerable targets pins nothing and takes a single default —
+            # handled below.) Keyed on `targets`, the same list the prompt consumes, so the decision
+            # and the prompt can't disagree — `allow_all_targets` zeroes `targets`, so it correctly
+            # falls through to the single-default branch even if the raw service also lists Claude.
+            model_config.update(_prompt_claude_provider_family_models(targets, service_name))
+        elif targets:
             model_config["default_model"] = _require_selection(
                 f"Default model for {display} (from {service_name}):",
                 [(target, target) for target in targets],
@@ -412,6 +424,120 @@ def _prompt_claude_models(state: dict) -> dict:
     else:
         model_config["default_model"] = _require_selection(
             f"Which of those is {display}'s overall default?", [(m, m) for m in chosen]
+        )
+    return model_config
+
+
+def _pins_family_models(targets: list[str]) -> bool:
+    """True when Claude behind a service is pinned per family at launch.
+
+    Keyed on the *behavior*, not the vendor: when a service publishes explicit Claude targets — a
+    Bedrock provider-side slug like ``us.anthropic.claude-opus-4-8-v1:0`` *or* a canonical Anthropic
+    id like ``claude-opus-4-8`` — ``render_overlay`` pins each ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` to
+    a chosen version, so the wizard prompts one model per family, mirroring the Databricks-hosted
+    path. No Claude-family targets (``allow_all_targets`` zeroes the list, or a relayed subscription
+    lists none) means nothing is pinned — Claude Code's canonical names route fine — so it takes a
+    single default.
+
+    Takes the *enumerated* targets (``provider_service_model_options`` output), the exact list the
+    per-family prompt consumes, so the decision and the prompt can't disagree. Reading the raw
+    ``service["targets"]`` here would diverge: an ``allow_all_targets`` service that still lists
+    Claude models would test True but hand the prompt an empty list, aborting the wizard.
+    """
+    return bool(map_claude_family_models(targets))
+
+
+def _prompt_claude_provider_family_models(targets: list[str], service_name: str) -> dict:
+    """Claude family slots (and overall default) chosen from a service's own Claude target ids.
+
+    The Databricks-hosted path (:func:`_prompt_claude_models`) prompts per family because Claude
+    Code addresses models by family alias; the same holds behind a Model Provider Service, except
+    the ids are the service's own — Bedrock provider-side slugs or canonical Anthropic ids rather
+    than ``system.ai.*``. ``render_overlay`` pins each ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` from
+    them, so a single overall default would leave the other families unpinned.
+
+    Targets are grouped by family via :func:`claude_family_for_model`, which matches the
+    ``claude-<family>-`` segment in any spelling (``anthropic.claude-…`` Bedrock or bare
+    ``claude-…`` canonical). A target that names no family is offered only as the overall default.
+    Falls back to a single default when nothing maps to a family at all.
+    """
+    display = TOOL_SPECS["claude"]["display"]
+    by_family: dict[str, list[str]] = {}
+    for target in targets:
+        family = claude_family_for_model(target)
+        if family:
+            by_family.setdefault(family, []).append(target)
+
+    if not by_family:
+        # No target maps to a Claude family (unusual for a Bedrock Claude service); the most this can
+        # honestly ask for is one overall default.
+        return {
+            "default_model": _require_selection(
+                f"Default model for {display} (from {service_name}):",
+                [(t, t) for t in targets],
+            )
+        }
+
+    # Quick setup: fill each family with the service's newest id (highest version, broadest region),
+    # the same pick a developer's own `ucode configure` would make. The alternative is choosing a
+    # specific id per family — e.g. to pin an older, validated version or a particular region.
+    # map_claude_family_models covers opus/sonnet/haiku but not fable, so a fable-only service has
+    # nothing to quick-fill — only offer quick setup when it would actually populate a slot.
+    family_models = map_claude_family_models(targets)
+    if family_models:
+        print_note(
+            "Quick setup fills each Claude family with the newest model this service offers. Answer "
+            "no to choose a specific model per family instead (pin an older version, a region)."
+        )
+    if family_models and prompt_yes_no_default("Quick setup?", default=True):
+        slots = {CLAUDE_SLOT_FOR_FAMILY[family]: model for family, model in family_models.items()}
+        # Overall default = the highest-tier family the service offers, not whichever target happened
+        # to sort first. Fable is last: it's the premium opt-in model, a poor default. `family_models`
+        # is non-empty here, so `next` always finds one.
+        default_family = next(
+            fam for fam in ("opus", "sonnet", "haiku", "fable") if fam in family_models
+        )
+        model_config = {"models": slots, "default_model": family_models[default_family]}
+        summary = ", ".join(
+            f"{fam}={slots[CLAUDE_SLOT_FOR_FAMILY[fam]]}"
+            for fam in ANTHROPIC_FAMILIES
+            if CLAUDE_SLOT_FOR_FAMILY[fam] in slots
+        )
+        print_success(f"{display}: {summary} (default: {default_family})")
+        return model_config
+
+    print_note(
+        f"Claude Code picks a model by family, so set a default per family from {service_name}. "
+        "Skip any family you don't want configured — it falls back to the overall default."
+    )
+    slots: dict[str, str] = {}
+    for family in ANTHROPIC_FAMILIES:
+        family_targets = by_family.get(family)
+        if not family_targets:
+            continue
+        choice = prompt_for_selection(
+            f"Default {family} model:",
+            [(t, t) for t in family_targets] + [(_SKIP_FAMILY, f"(skip {family})")],
+            searchable=True,
+        )
+        if choice is None:
+            raise KeyboardInterrupt
+        if choice != _SKIP_FAMILY:
+            slots[CLAUDE_SLOT_FOR_FAMILY[family]] = choice
+
+    model_config: dict = {}
+    if slots:
+        model_config["models"] = slots
+    chosen = list(dict.fromkeys(slots.values()))
+    if len(chosen) == 1:
+        model_config["default_model"] = chosen[0]
+        print_success(f"Overall default for {display}: {chosen[0]} (the only model configured)")
+    else:
+        # Offered over every target, not just the slots: `default_model` needn't be a family model,
+        # and a mixed-catalog service may expose one an admin wants as the overall default.
+        options = chosen or list(targets)
+        model_config["default_model"] = _require_selection(
+            f"Which of those is {display}'s overall default?", [(m, m) for m in options]
         )
     return model_config
 

@@ -71,6 +71,7 @@ from ucode.managed_resolve import (
     managed_default_model,
     managed_enabled_tools,
     managed_launch_model,
+    managed_provider_family_models,
     managed_provider_service,
     managed_supplies_models,
     managed_unservable_models,
@@ -1486,6 +1487,19 @@ def _launch_tool(
                         f"{TOOL_SPECS[tool]['display']}, which can't be used: {error}"
                     )
                 raise RuntimeError(error)
+            # A managed config launch uses exactly what the admin authored: pin Claude's family
+            # models from the manifest's slots rather than the versions resolve_provider_models
+            # re-derived from the service's live targets. The developer-configured path keeps that
+            # re-derivation (see resolve_provider_models). Only when the manifest actually selected
+            # this provider for claude, and authored something to pin.
+            if (
+                tool == "claude"
+                and managed is not None
+                and provider == managed_provider_service(managed, tool)
+            ):
+                authored = managed_provider_family_models(managed)
+                if authored:
+                    provider_models = authored
         if routing_agent is not None and enable_smart_routing_flag:
             state = routing_agent.enable_smart_routing(state)
         # The router's per-launch pick for the root session. Codex pins it as the

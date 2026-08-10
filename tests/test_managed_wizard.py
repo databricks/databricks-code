@@ -618,28 +618,27 @@ class TestModelPrompting:
 
     def test_provider_service_offers_its_targets(self):
         # The service's own targets are the model vocabulary the manifest must use, so the admin
-        # picks from them rather than typing an id from memory.
+        # picks from them rather than typing an id from memory. Uses codex here: it takes one model
+        # from any service (Claude with explicit targets is prompted per family — see the Bedrock/
+        # Anthropic per-family tests below).
         service = {
-            "name": "main.default.anthropic-mps",
-            "provider_type": "anthropic",
-            "targets": ["claude-sonnet-4-6", "claude-opus-4-8"],
+            "name": "main.default.openai-mps",
+            "provider_type": "openai",
+            "targets": ["gpt-5-6", "gpt-5-6-sol"],
             "allow_all_targets": False,
         }
         with (
-            patch.object(wizard, "prompt_for_selection", return_value="claude-opus-4-8") as select,
+            patch.object(wizard, "prompt_for_selection", return_value="gpt-5-6") as select,
             patch.object(wizard, "prompt_for_text") as text,
         ):
-            config = wizard._prompt_models_for_agent("claude", STATE, service)
+            config = wizard._prompt_models_for_agent("codex", STATE, service)
         assert config == {
-            "model_provider_service": "main.default.anthropic-mps",
-            "default_model": "claude-opus-4-8",
+            "model_provider_service": "main.default.openai-mps",
+            "default_model": "gpt-5-6",
         }
         assert not text.called, "should not fall back to free text when targets are known"
         # Offered sorted, so the picker order is stable run to run.
-        assert [value for value, _ in select.call_args[0][1]] == [
-            "claude-opus-4-8",
-            "claude-sonnet-4-6",
-        ]
+        assert [value for value, _ in select.call_args[0][1]] == ["gpt-5-6", "gpt-5-6-sol"]
 
     def test_provider_service_falls_back_to_text_when_targets_unknown(self):
         # allow_all_targets passes the provider's whole catalog through; there is nothing to list.
@@ -682,6 +681,224 @@ class TestModelPrompting:
         ):
             config = wizard._prompt_models_for_agent("pi", {}, None)
         assert config == {"default_model": "some-model"}
+
+    def test_bedrock_claude_prompts_per_family(self):
+        # render_overlay pins ANTHROPIC_DEFAULT_<FAMILY>_MODEL from a Bedrock service's provider-side
+        # ids (Claude Code can't route its canonical names there), so Claude needs a default per
+        # family — a single overall default would leave the other families unpinned.
+        service = {
+            "name": "main.default.bedrock",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": [
+                "anthropic.claude-opus-4-1",
+                "anthropic.claude-opus-4-8",
+                "anthropic.claude-sonnet-4-6",
+                "anthropic.claude-haiku-4-5",
+            ],
+        }
+        asked: list[str] = []
+
+        def fake_selection(prompt, options, **kwargs):
+            asked.append(prompt)
+            return options[0][0]
+
+        with (
+            # Decline quick setup to exercise the per-family prompts.
+            patch.object(wizard, "prompt_yes_no_default", return_value=False),
+            patch.object(wizard, "prompt_for_selection", side_effect=fake_selection),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert [p for p in asked if p.startswith("Default ")] == [
+            "Default opus model:",
+            "Default sonnet model:",
+            "Default haiku model:",
+        ]
+        assert config["model_provider_service"] == "main.default.bedrock"
+        assert config["models"] == {
+            "default_opus_model": "anthropic.claude-opus-4-1",
+            "default_sonnet_model": "anthropic.claude-sonnet-4-6",
+            "default_haiku_model": "anthropic.claude-haiku-4-5",
+        }
+        # Slots carry the service's own provider-side ids, not workspace `system.ai.*` ids.
+        assert all(m.startswith("anthropic.") for m in config["models"].values())
+        assert config["default_model"] in service["targets"]
+
+    def test_bedrock_claude_skipped_family_is_omitted(self):
+        service = {
+            "name": "main.default.bedrock",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": ["anthropic.claude-opus-4-8", "anthropic.claude-sonnet-4-6"],
+        }
+        # pick=-1 selects the trailing "(skip <family>)" option for every family.
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=False),
+            patch.object(wizard, "prompt_for_selection", side_effect=lambda p, o, **k: o[-1][0]),
+            patch.object(wizard, "print_note"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert "models" not in config
+        assert config["default_model"] in service["targets"]
+
+    def test_bedrock_codex_still_takes_a_single_model(self):
+        # Only Claude pins per family; codex through any provider takes one model.
+        service = {
+            "name": "main.default.bedrock-oai",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": ["gpt-5-6", "gpt-5-6-sol"],
+        }
+        asked: list[str] = []
+        with (
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=lambda p, o, **k: (asked.append(p), o[0][0])[1],
+            ),
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, service)
+        assert len(asked) == 1
+        assert "models" not in config
+
+    def test_anthropic_claude_with_explicit_targets_prompts_per_family(self):
+        # An Anthropic service that publishes explicit canonical targets IS pinned per family by
+        # render_overlay (each ANTHROPIC_DEFAULT_<FAMILY>_MODEL to a chosen version), so the wizard
+        # prompts per family — same as Bedrock, just canonical ids instead of provider slugs.
+        service = {
+            "name": "main.default.ant",
+            "provider_type": "anthropic",
+            "allow_all_targets": False,
+            "targets": ["claude-opus-4-8", "claude-sonnet-4-6"],
+        }
+        asked: list[str] = []
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=False),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=lambda p, o, **k: (asked.append(p), o[0][0])[1],
+            ),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert [p for p in asked if p.startswith("Default ")] == [
+            "Default opus model:",
+            "Default sonnet model:",
+        ]
+        assert config["models"] == {
+            "default_opus_model": "claude-opus-4-8",
+            "default_sonnet_model": "claude-sonnet-4-6",
+        }
+
+    def test_quick_setup_fills_newest_per_family_without_per_family_prompts(self):
+        # Quick setup (default yes) auto-fills each family with the service's newest id — same pick
+        # map_claude_family_models makes — and asks no per-family questions.
+        service = {
+            "name": "main.default.bedrock",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": [
+                "anthropic.claude-opus-4-1",
+                "anthropic.claude-opus-4-8",
+                "anthropic.claude-sonnet-4-6",
+            ],
+        }
+        selections: list[str] = []
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=lambda p, o, **k: selections.append(p) or o[0][0],
+            ),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        # No per-family (or overall-default) picker was shown — quick setup asked nothing.
+        assert selections == []
+        assert config["models"] == {
+            "default_opus_model": "anthropic.claude-opus-4-8",  # newest opus, not 4-1
+            "default_sonnet_model": "anthropic.claude-sonnet-4-6",
+        }
+        # Overall default is opus (the flagship), not sonnet.
+        assert config["default_model"] == "anthropic.claude-opus-4-8"
+
+    def test_quick_setup_default_is_flagship_not_target_order(self):
+        # Regression: the overall default must be the highest-tier family (opus), not whichever
+        # target sorts first — here haiku leads the list but opus must still win.
+        service = {
+            "name": "main.default.bedrock",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": [
+                "us.anthropic.claude-haiku-4-5",
+                "us.anthropic.claude-sonnet-5",
+                "us.anthropic.claude-opus-5",
+            ],
+        }
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert config["default_model"] == "us.anthropic.claude-opus-5"
+
+    def test_quick_setup_default_falls_to_sonnet_without_opus(self):
+        service = {
+            "name": "main.default.bedrock",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": ["us.anthropic.claude-haiku-4-5", "us.anthropic.claude-sonnet-5"],
+        }
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert config["default_model"] == "us.anthropic.claude-sonnet-5"
+
+    def test_anthropic_claude_allow_all_takes_a_single_default(self):
+        # No explicit targets (allow_all) means nothing is pinned — Claude Code's canonical names
+        # route fine — so it falls back to a single free-text default, not per-family slots.
+        service = {
+            "name": "main.default.ant-all",
+            "provider_type": "anthropic",
+            "allow_all_targets": True,
+            "targets": [],
+        }
+        with (
+            patch.object(wizard, "prompt_for_text", return_value="claude-sonnet-5"),
+            patch.object(wizard, "print_note"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert "models" not in config
+        assert config["default_model"] == "claude-sonnet-5"
+
+    def test_allow_all_with_explicit_claude_targets_does_not_abort(self):
+        # Regression: a service that is allow_all_targets AND lists Claude targets. The family
+        # decision must key on the enumerated targets (which allow_all zeroes), not the raw service —
+        # otherwise it takes the per-family branch with an empty list and aborts the wizard.
+        service = {
+            "name": "main.default.weird",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": True,
+            "targets": ["us.anthropic.claude-opus-5", "us.anthropic.claude-sonnet-5"],
+        }
+        with (
+            patch.object(wizard, "prompt_for_text", return_value="typed-model"),
+            patch.object(wizard, "print_note"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        # Falls through to the single free-text default; no per-family slots, no KeyboardInterrupt.
+        assert "models" not in config
+        assert config["default_model"] == "typed-model"
 
     def test_empty_selection_is_re_prompted(self):
         # An agent with no default_model can't be the config's default_agent (the server rejects
