@@ -222,7 +222,12 @@ def _resolve_workspace_then_maybe_reject(
     entries = workspace_entries or [_prompt_for_configuration(None)]
     workspace, profile = entries[0]
     set_current_workspace(workspace)
-    managed = load_managed_state(workspace)
+    # Fetch, don't just read the local cache: on a fresh machine (or right after a reinstall) the
+    # cache is empty until the first launch, so a cache read would miss a config the workspace does
+    # publish and wrongly fall through to the local configure flow. `refresh_managed_config` reaches
+    # the workspace and never raises — it falls back to the persisted copy, then None, on failure.
+    with spinner("Checking for a managed coding agent config..."):
+        managed = refresh_managed_config({"workspace": workspace, "profile": profile})
     if not managed:
         _maybe_offer_admin_setup(workspace, profile)
         return entries

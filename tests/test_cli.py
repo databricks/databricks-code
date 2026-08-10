@@ -2226,8 +2226,8 @@ class TestConfigureDeprecation:
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         monkeypatch.setattr(
-            "ucode.cli.load_managed_state",
-            lambda ws: {"enabled_agents": {"claude": {}}},
+            "ucode.cli.refresh_managed_config",
+            lambda state: {"enabled_agents": {"claude": {}}},
         )
         with pytest.raises(typer.Exit) as exc:
             self._resolve([("https://w", None)])
@@ -2235,6 +2235,24 @@ class TestConfigureDeprecation:
         out = capsys.readouterr().out
         assert "managed config has been detected" in out
         assert "run `ucode`" in out
+
+    def test_fetches_the_config_rather_than_reading_a_cold_cache(self, monkeypatch):
+        # The gap this guards: on a fresh machine the local cache is empty until the first launch,
+        # so a cache read would miss a config the workspace does publish. The resolver must fetch.
+        import typer
+
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
+        # Cold cache — a cache read would wrongly fall through to the local configure flow.
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr(
+            "ucode.cli.refresh_managed_config",
+            lambda state: {"enabled_agents": {"claude": {}}},
+        )
+        with pytest.raises(typer.Exit) as exc:
+            self._resolve([("https://w", None)])
+        assert exc.value.exit_code == 0
 
     @staticmethod
     def _stub_not_admin(monkeypatch):
@@ -2251,7 +2269,7 @@ class TestConfigureDeprecation:
             "ucode.cli._prompt_for_configuration", lambda tool=None: ("https://picked", None)
         )
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: picked.append(ws))
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
         self._stub_not_admin(monkeypatch)
         entries = self._resolve(None)
         assert picked == ["https://picked"]
@@ -2262,7 +2280,7 @@ class TestConfigureDeprecation:
         # workspace back to the caller instead of re-prompting.
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
         self._stub_not_admin(monkeypatch)
         entries = self._resolve([("https://w", None)])
         assert entries == [("https://w", None)]
@@ -2272,7 +2290,7 @@ class TestConfigureDeprecation:
         # normal configure flow and returns the resolved workspace.
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
         monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: False)
@@ -2284,7 +2302,7 @@ class TestConfigureDeprecation:
 
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
         monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: True)
@@ -2295,7 +2313,7 @@ class TestConfigureDeprecation:
     def test_non_admin_is_never_prompted_for_setup(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: False)
         monkeypatch.setattr(
@@ -2309,7 +2327,7 @@ class TestConfigureDeprecation:
         # `is_workspace_admin` returns None when the check itself fails; treat as "don't prompt".
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: None)
         monkeypatch.setattr(
@@ -2326,8 +2344,8 @@ class TestConfigureDeprecation:
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         monkeypatch.setattr(
-            "ucode.cli.load_managed_state",
-            lambda ws: {"enabled_agents": {"claude": {}}},
+            "ucode.cli.refresh_managed_config",
+            lambda state: {"enabled_agents": {"claude": {}}},
         )
         with (
             patch("ucode.cli.install_databricks_cli"),
