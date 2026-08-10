@@ -1610,18 +1610,6 @@ class TestApplyCommand:
         with pytest.raises(RuntimeError, match="resource name"):
             self._run(get_managed_config=lambda *a, **k: ({"enabled_agents": {}}, None))
 
-    def test_dry_run_validates_without_publishing(self, monkeypatch):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
-        monkeypatch.setattr(config_io_mod, "_dry_run", True)
-        created = {"called": False}
-
-        def fake_create(*a, **k):
-            created["called"] = True
-            return {}, None
-
-        assert self._run(create_coding_agent_config=fake_create) == 0
-        assert created["called"] is False
-
 
 class TestPublishFailureMessages:
     """The server's error codes, turned into something an admin can act on."""
@@ -1678,12 +1666,14 @@ class TestCliWiring:
         assert result.exit_code == 0
         assert "apply" in result.output
 
-    def test_apply_declares_yes_and_dry_run(self):
-        # Asserted on the declared options rather than rendered help, which Rich ellipsizes at
-        # narrow terminal widths (see test_setup_help_lists_from_file).
+    def test_apply_declares_yes_and_no_dry_run(self):
+        # `--dry-run` was removed: apply always validates before publishing, so a separate
+        # validate-only mode is redundant. Asserted on declared options rather than rendered help,
+        # which Rich ellipsizes at narrow widths (see test_setup_help_lists_from_file).
         command = typer.main.get_command(app).commands["apply"]  # type: ignore[attr-defined]
         declared = {opt for param in command.params for opt in param.opts}
-        assert {"--yes", "--dry-run"} <= declared
+        assert "--yes" in declared
+        assert "--dry-run" not in declared
 
     def test_apply_error_exits_nonzero_with_a_message(self):
         with patch.object(cli_mod, "apply_command", side_effect=RuntimeError("no config authored")):

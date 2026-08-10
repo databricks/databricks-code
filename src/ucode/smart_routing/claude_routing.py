@@ -187,8 +187,13 @@ def clear_routing_artifacts() -> None:
 def _claude_model_id(model: str) -> str:
     """The model id Claude Code should launch the subagent with.
 
-    The router returns a routable workspace id (e.g.
-    ``system.ai.claude-opus-4-8``); Claude Code's ``Agent`` tool ``model`` field
-    accepts that id verbatim through the gateway, so pass it through unchanged.
+    Claude Code's ``Agent`` tool ``model`` field accepts only short family
+    names (``sonnet``, ``opus``, ``haiku``, ``fable``), not full workspace
+    ids. Map the router's pick (e.g. ``system.ai.claude-sonnet-5``) back to
+    its family name.
     """
+    normalized = _normalize_model(model)
+    for family in ("fable", "opus", "sonnet", "haiku"):
+        if f"claude-{family}-" in normalized:
+            return family
     return model
