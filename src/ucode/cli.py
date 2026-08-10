@@ -672,6 +672,7 @@ def configure_workspace_command(
     prompt_optional_updates: bool = True,
     use_pat: bool = False,
     skip_validate: bool = False,
+    skip_unavailable: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
 ) -> int:
@@ -758,8 +759,13 @@ def configure_workspace_command(
             displays = ", ".join(
                 TOOL_SPECS[tool_name]["display"] for tool_name in unavailable_tools
             )
-            raise RuntimeError(f"Requested agent(s) not available on this workspace: {displays}.")
-        picked = selected_tools
+            if not skip_unavailable:
+                raise RuntimeError(
+                    f"Requested agent(s) not available on this workspace: {displays}. "
+                    "Pass --skip-unavailable to configure the available ones instead."
+                )
+            print_warning(f"Skipping agent(s) not available on this workspace: {displays}.")
+        picked = [tool_name for tool_name in selected_tools if tool_name in available_on_workspace]
 
     if not picked:
         print_note("No coding agents selected — nothing to configure.")
@@ -1978,6 +1984,17 @@ def configure(
             "freshly discovered models.",
         ),
     ] = False,
+    skip_unavailable: Annotated[
+        bool,
+        typer.Option(
+            "--skip-unavailable",
+            help="With --agents, configure the agents that are available on the workspace "
+            "and skip (with a warning) any that aren't, instead of failing the whole run. "
+            "Useful in CI against heterogeneous workspaces — e.g. requesting "
+            "claude,codex,pi where the workspace exposes no OpenAI models still "
+            "configures claude and pi. Exits non-zero only if none are available.",
+        ),
+    ] = False,
     enable_fable: Annotated[
         bool | None,
         typer.Option(
@@ -2056,6 +2073,15 @@ def configure(
                 "--use-pat requires --profiles. Pass the PAT-backed Databricks CLI "
                 "profile(s) explicitly, e.g. `ucode configure --profiles DEFAULT --use-pat`."
             )
+        # Skipping only has meaning against an explicit agent list: the interactive
+        # picker already offers just the available agents, and --agent names a
+        # single agent whose absence is the whole answer.
+        if skip_unavailable and agents is None:
+            raise RuntimeError(
+                "--skip-unavailable requires --agents. It selects the available subset "
+                "of an explicit agent list, e.g. `ucode configure --agents claude,codex,pi "
+                "--skip-unavailable`."
+            )
         workspace_entries = _parse_workspaces_option(workspaces) if workspaces is not None else None
         if profiles is not None:
             workspace_entries = _parse_profiles_option(profiles)
@@ -2110,18 +2136,21 @@ def configure(
             model_agent_names = ",".join(a for a in requested if a != "cursor")
             if model_agent_names:
                 selected_tools = _parse_agents_option(model_agent_names)
+                agents_kwargs = dict(skip_kwargs)
+                if skip_unavailable:
+                    agents_kwargs["skip_unavailable"] = True
                 if workspace_entries is None:
                     configure_workspace_command(
                         selected_tools=selected_tools,
                         prompt_optional_updates=prompt_optional_updates,
-                        **skip_kwargs,
+                        **agents_kwargs,
                     )
                 else:
                     configure_workspace_command(
                         selected_tools=selected_tools,
                         workspaces=workspace_entries,
                         prompt_optional_updates=prompt_optional_updates,
-                        **skip_kwargs,
+                        **agents_kwargs,
                     )
             elif wants_cursor:
                 # Cursor-only: establish workspace state without the model picker.

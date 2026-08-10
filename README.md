@@ -75,6 +75,14 @@ ucode configure --agents claude,codex
 
 Available agent names are `codex`, `claude`, `gemini`, `opencode`, `copilot`, and `pi`. `cursor` is also accepted (MCP-only — it registers Databricks MCP servers but configures no models).
 
+Naming agents explicitly is treated as a request for all of them: if any one isn't available on the workspace, the run fails without configuring the others. Add `--skip-unavailable` to configure the available subset instead and skip the rest with a warning:
+
+```bash
+ucode configure --agents claude,codex,pi --skip-unavailable
+```
+
+This is useful in CI against a mix of workspaces — on a workspace whose AI Gateway exposes no OpenAI models, the command above still configures `claude` and `pi`, and reports Codex as skipped. It exits non-zero only when none of the requested agents are available.
+
 To configure without the workspace picker, pass a comma-separated list of workspaces:
 
 ```bash
@@ -235,6 +243,7 @@ pick the new config up on their next ucode run.
 | `ucode claude --enable-smart-routing` | Enable AI Gateway routing for Claude Code sessions and subagents |
 | `ucode claude --disable-smart-routing` | Disable routing and remove ucode's Claude Code routing hooks |
 | `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
+| `ucode configure --agents claude,codex,pi --skip-unavailable` | Configure the requested agents that are available; skip the rest with a warning |
 | `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
 | `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |

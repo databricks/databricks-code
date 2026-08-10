@@ -1447,6 +1447,79 @@ class TestConfigureAgentsSelection:
         with pytest.raises(RuntimeError, match="Codex"):
             cli_mod.configure_workspace_command(selected_tools=["claude", "codex"])
 
+    def test_strict_error_mentions_skip_unavailable(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        state = {**MINIMAL_STATE, "available_tools": []}
+        monkeypatch.setattr(cli_mod, "configure_shared_state", lambda *a, **k: state)
+        monkeypatch.setattr(cli_mod, "check_gateway_endpoint", lambda state, tool: tool == "claude")
+        monkeypatch.setattr(cli_mod, "install_tool_binary", lambda *a, **k: None)
+
+        with pytest.raises(RuntimeError, match="--skip-unavailable"):
+            cli_mod.configure_workspace_command(
+                selected_tools=["claude", "codex"],
+                workspaces=[("https://example.com", None)],
+            )
+
+    def test_skip_unavailable_configures_available_subset(self, monkeypatch):
+        """A workspace with no OpenAI models still configures claude and pi."""
+        import ucode.cli as cli_mod
+
+        state = {**MINIMAL_STATE, "available_tools": []}
+        monkeypatch.setattr(cli_mod, "configure_shared_state", lambda *a, **k: state)
+        monkeypatch.setattr(
+            cli_mod, "check_gateway_endpoint", lambda state, tool: tool in {"claude", "pi"}
+        )
+        installed: list[str] = []
+        monkeypatch.setattr(
+            cli_mod,
+            "install_tool_binary",
+            lambda tool, **kwargs: installed.append(tool) or True,
+        )
+        configured: list[list[str]] = []
+        monkeypatch.setattr(
+            cli_mod,
+            "configure_selected_tools",
+            lambda state, tools: configured.append(tools) or {**state, "available_tools": tools},
+        )
+        monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
+        warnings: list[str] = []
+        monkeypatch.setattr(cli_mod, "print_warning", lambda msg: warnings.append(msg))
+
+        assert (
+            cli_mod.configure_workspace_command(
+                selected_tools=["claude", "codex", "pi"],
+                workspaces=[("https://example.com", None)],
+                skip_unavailable=True,
+            )
+            == 0
+        )
+        # Order of the original --agents list is preserved, minus codex.
+        assert configured == [["claude", "pi"]]
+        assert installed == ["claude", "pi"]
+        assert any("Codex" in msg for msg in warnings)
+
+    def test_skip_unavailable_still_fails_when_none_available(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        state = {**MINIMAL_STATE, "available_tools": []}
+        monkeypatch.setattr(cli_mod, "configure_shared_state", lambda *a, **k: state)
+        monkeypatch.setattr(cli_mod, "check_gateway_endpoint", lambda state, tool: False)
+        monkeypatch.setattr(
+            cli_mod,
+            "configure_selected_tools",
+            lambda state, tools: pytest.fail("configure_selected_tools should not be called"),
+        )
+
+        assert (
+            cli_mod.configure_workspace_command(
+                selected_tools=["codex"],
+                workspaces=[("https://example.com", None)],
+                skip_unavailable=True,
+            )
+            == 1
+        )
+
     def test_multiple_workspaces_configure_all_and_use_first(self, monkeypatch):
         import ucode.cli as cli_mod
 
@@ -1638,6 +1711,48 @@ class TestConfigureProfilesFlag:
         assert result.exit_code == 1
         assert "--use-pat requires --profiles" in _strip_ansi(result.output)
         mock_cfg.assert_not_called()
+
+    def test_skip_unavailable_requires_agents(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            result = runner.invoke(app, ["configure", "--skip-unavailable"])
+        assert result.exit_code == 1
+        assert "--skip-unavailable requires --agents" in _strip_ansi(result.output)
+        mock_cfg.assert_not_called()
+
+    def test_skip_unavailable_forwarded_with_agents(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "--profiles",
+                    "DEFAULT",
+                    "--agents",
+                    "claude,codex,pi",
+                    "--use-pat",
+                    "--skip-validate",
+                    "--skip-upgrade",
+                    "--skip-unavailable",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert mock_cfg.call_args.kwargs["skip_unavailable"] is True
+        assert mock_cfg.call_args.kwargs["selected_tools"] == ["claude", "codex", "pi"]
+
+    def test_skip_unavailable_absent_by_default(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            result = runner.invoke(app, ["configure", "--agents", "claude,codex"])
+        assert result.exit_code == 0, result.output
+        assert "skip_unavailable" not in mock_cfg.call_args.kwargs
 
     def test_profiles_and_workspaces_are_mutually_exclusive(self):
         with (
