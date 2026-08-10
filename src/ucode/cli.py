@@ -220,15 +220,42 @@ def _resolve_workspace_then_maybe_reject(
     if not managed_agent_config_enabled():
         return workspace_entries
     entries = workspace_entries or [_prompt_for_configuration(None)]
-    workspace = entries[0][0]
+    workspace, profile = entries[0]
     set_current_workspace(workspace)
     managed = load_managed_state(workspace)
     if not managed:
+        _maybe_offer_admin_setup(workspace, profile)
         return entries
     print_success("A managed config has been detected for your workspace — you're all set.")
     _print_managed_summary(managed, load_state(), tool=None)
     print_note("Configuration is complete. Just run `ucode` to launch with it applied.")
     raise typer.Exit(0)
+
+
+def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
+    """When a workspace admin runs ``configure`` on a workspace with no managed config, offer to
+    bail out so they can publish one with ``ucode setup`` instead.
+
+    Admins are the ones who'd want a managed config; a plain developer just gets the normal
+    configure flow. If they accept, exit cleanly (assuming they'll run `ucode setup`); if they
+    decline, fall through to configure their own local settings. The check is best-effort: any
+    failure to determine admin status (auth or SCIM unreachable) silently skips the prompt.
+    """
+    try:
+        token = get_databricks_token(workspace, profile)
+    except RuntimeError:
+        return
+    with spinner("Checking your workspace permissions..."):
+        is_admin = is_workspace_admin(workspace, token)
+    if not is_admin:
+        return
+    print_note(
+        "No managed config exists for this workspace. As a workspace admin you can publish one "
+        "with `ucode setup`, which every developer then picks up automatically."
+    )
+    if prompt_yes_no("Stop here and run `ucode setup` instead?"):
+        print_note("Run `ucode setup` to author your workspace's managed config, then `ucode apply`.")
+        raise typer.Exit(0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:

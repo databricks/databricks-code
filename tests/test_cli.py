@@ -2236,6 +2236,12 @@ class TestConfigureDeprecation:
         assert "managed config has been detected" in out
         assert "run `ucode`" in out
 
+    @staticmethod
+    def _stub_not_admin(monkeypatch):
+        # No managed config -> the resolver now checks admin status; keep the developer case simple.
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: False)
+
     def test_prompts_for_the_workspace_before_checking_the_config(self, monkeypatch):
         # The whole point: even under a managed config the developer can still switch workspaces,
         # so the prompt runs (and the picked workspace is made current) before the config check.
@@ -2246,19 +2252,72 @@ class TestConfigureDeprecation:
         )
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: picked.append(ws))
         monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        self._stub_not_admin(monkeypatch)
         entries = self._resolve(None)
         assert picked == ["https://picked"]
         assert entries == [("https://picked", None)]
 
-    def test_returns_flag_entries_and_proceeds_without_a_managed_config(self, monkeypatch, capsys):
-        # Setting up a new workspace still goes through `ucode configure`, so say nothing and
-        # hand the resolved workspace back to the caller instead of re-prompting.
+    def test_returns_flag_entries_and_proceeds_without_a_managed_config(self, monkeypatch):
+        # Setting up a new workspace still goes through `ucode configure`, so hand the resolved
+        # workspace back to the caller instead of re-prompting.
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
         monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        self._stub_not_admin(monkeypatch)
         entries = self._resolve([("https://w", None)])
         assert entries == [("https://w", None)]
-        assert capsys.readouterr().out == ""
+
+    def test_admin_who_declines_proceeds_with_configure(self, monkeypatch):
+        # An admin on a config-less workspace is offered `ucode setup`; declining continues the
+        # normal configure flow and returns the resolved workspace.
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
+        monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: False)
+        entries = self._resolve([("https://w", None)])
+        assert entries == [("https://w", None)]
+
+    def test_admin_who_accepts_exits_to_run_setup(self, monkeypatch):
+        import typer
+
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
+        monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: True)
+        with pytest.raises(typer.Exit) as exc:
+            self._resolve([("https://w", None)])
+        assert exc.value.exit_code == 0
+
+    def test_non_admin_is_never_prompted_for_setup(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: False)
+        monkeypatch.setattr(
+            "ucode.cli.prompt_yes_no",
+            lambda prompt: pytest.fail("non-admins must not be prompted for setup"),
+        )
+        entries = self._resolve([("https://w", None)])
+        assert entries == [("https://w", None)]
+
+    def test_admin_check_failure_skips_the_setup_prompt(self, monkeypatch):
+        # `is_workspace_admin` returns None when the check itself fails; treat as "don't prompt".
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: None)
+        monkeypatch.setattr(
+            "ucode.cli.prompt_yes_no",
+            lambda prompt: pytest.fail("must not prompt when admin status is unknown"),
+        )
+        entries = self._resolve([("https://w", None)])
+        assert entries == [("https://w", None)]
 
     def test_configure_command_exits_zero_without_erroring(self, monkeypatch):
         # `typer.Exit(0)` subclasses RuntimeError, so the command's own RuntimeError handler must
