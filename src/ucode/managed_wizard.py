@@ -552,11 +552,26 @@ def _prompt_budget_policy(
         )
         return None
 
+    # Spend routing only works on a budget with a per-user threshold; without one the gateway reports
+    # no spend and every tier stays inert. The listing can't reveal the alert's action, so this hides
+    # the clearly-unusable budgets and the server rejects the rest on create.
+    usable = [budget for budget in budgets if budget.get("has_per_user_alert")]
+    if not usable:
+        print_warning(
+            "None of this workspace's AI Gateway budgets have a per-user threshold configured, which "
+            "spend routing requires. Add a per-user alert threshold to a budget in the Databricks "
+            "console, then re-run `ucode setup`."
+        )
+        return None
+    print_note(
+        "Showing only budgets with a per-user threshold configured, which spend routing needs."
+    )
+
     budget_id = prompt_for_selection(
         "Which budget should this policy track?",
         [
             (budget["id"], f"{budget['display_name'] or budget['id']} ({budget['id']})")
-            for budget in budgets
+            for budget in usable
         ],
         searchable=True,
     )

@@ -1000,8 +1000,44 @@ class TestBudgetPolicy:
             assert wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE) is None
         assert warn.called
 
+    def test_no_per_user_budgets_warns_and_yields_none(self):
+        # Spend routing needs a per-user threshold; a workspace whose only budgets lack one has
+        # nothing usable to attach a policy to.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": False}]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(wizard, "print_warning") as warn,
+        ):
+            assert wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE) is None
+        assert warn.called
+
+    def test_only_per_user_budgets_are_offered(self):
+        # The picker hides budgets without a per-user threshold rather than letting the admin pick
+        # one that would leave every tier inert.
+        budgets = [
+            {"id": "no-per-user", "display_name": "shared-only", "has_per_user_alert": False},
+            {"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True},
+        ]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
+            ) as select,
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+        ):
+            policy = wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        # First selection call is the budget picker; only the per-user budget is offered.
+        offered = [value for value, _ in select.call_args_list[0][0][1]]
+        assert offered == [BUDGET_ID]
+        assert policy is not None and policy["budget_id"] == BUDGET_ID
+
     def test_percentages_are_stored_as_fractions(self):
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1036,7 +1072,7 @@ class TestBudgetPolicy:
                 }
             }
         }
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1065,7 +1101,7 @@ class TestBudgetPolicy:
                 }
             }
         }
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1084,7 +1120,7 @@ class TestBudgetPolicy:
     def test_falls_back_to_the_catalog_when_an_agent_lists_nothing(self):
         # An agent configured through a provider service has no enumerable list; better to offer the
         # catalog than nothing at all.
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1101,7 +1137,7 @@ class TestBudgetPolicy:
         assert offered == ["system.ai.gemini-3-flash"]
 
     def test_authored_policy_validates(self):
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1407,7 +1443,7 @@ class TestSearchablePickers:
         assert seen[0].get("searchable") is True
 
     def test_budget_and_tier_pickers_are_searchable(self):
-        budgets = [{"id": "budget-1", "display_name": "eng"}]
+        budgets = [{"id": "budget-1", "display_name": "eng", "has_per_user_alert": True}]
         searchable_prompts: list[str] = []
 
         def fake_sel(prompt, options, **kwargs):

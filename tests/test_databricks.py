@@ -36,6 +36,7 @@ from ucode.databricks import (
     list_databricks_apps,
     list_databricks_connections,
     list_genie_spaces,
+    list_workspace_budgets,
     resolve_current_budget_spend,
     workspace_hostname,
 )
@@ -2153,8 +2154,9 @@ class TestModelServicesCache:
         claude, _codex, _gemini, _oss, _reason = db_mod.discover_model_services(WS, "tok")
         unbucketed, _ = db_mod.discover_claude_models_unbucketed(WS, "tok")
         assert calls["n"] == 1
-        # Both views still come back intact: newest-per-family, and the full list.
-        assert claude["opus"] == "system.ai.claude-opus-5"
+        # Both views still come back intact: newest-per-family (pinned to opus-4-8
+        # for smart-routing compatibility by _prefer_opus_4_8), and the full list.
+        assert claude["opus"] == "system.ai.claude-opus-4-8"
         assert unbucketed == ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]
 
     def test_use_cache_false_forces_a_fresh_walk(self, monkeypatch):
@@ -2610,6 +2612,18 @@ class TestResolveCurrentBudgetSpend:
         spend, _ = resolve_current_budget_spend("https://ws", "token")
         assert spend is None
 
+    def test_threshold_without_spend_is_zero_spend(self, monkeypatch):
+        # A per-user threshold with no spend yet this period is $0 spent, not "no budget" — the
+        # developer should still see their budget rather than a blank.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: ({"effective_threshold": "100"}, None),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend == (Decimal(0), Decimal("100"))
+        assert reason is None
+
     def test_malformed_decimal_is_no_spend(self, monkeypatch):
         monkeypatch.setattr(
             db_mod,
@@ -2629,6 +2643,55 @@ class TestResolveCurrentBudgetSpend:
         spend, reason = resolve_current_budget_spend("https://ws", "token")
         assert spend is None
         assert "not a JSON object" in reason
+
+
+class TestListWorkspaceBudgets:
+    PER_USER = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
+    SHARED = "ALERT_CONFIGURATION_SCOPE_TYPE_SHARED"
+
+    def _stub(self, monkeypatch, payload):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
+        )
+
+    def test_flags_per_user_alert_presence(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "with",
+                        "display_name": "has per-user",
+                        "alert_configurations": [
+                            {"scope_type": self.SHARED},
+                            {"scope_type": self.PER_USER},
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "without",
+                        "display_name": "shared only",
+                        "alert_configurations": [{"scope_type": self.SHARED}],
+                    },
+                ]
+            },
+        )
+        budgets, reason = list_workspace_budgets("https://ws", "token")
+        assert reason is None
+        by_id = {b["id"]: b for b in budgets}
+        assert by_id["with"]["has_per_user_alert"] is True
+        assert by_id["without"]["has_per_user_alert"] is False
+
+    def test_missing_alert_configs_is_not_per_user(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {"budget_configuration_id": "b", "display_name": "x"}
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        assert budgets[0]["has_per_user_alert"] is False
 
 
 class TestDiscoverSqlWarehouses:
