@@ -22,6 +22,7 @@ from ucode.config_io import is_dry_run
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
     create_coding_agent_config,
+    delete_coding_agent_config,
     discover_claude_models_unbucketed,
     ensure_databricks_auth,
     get_databricks_token,
@@ -527,11 +528,26 @@ def _prompt_budget_policy(
         )
         return None
 
+    # Spend routing only works on a budget with a per-user threshold; without one the gateway reports
+    # no spend and every tier stays inert. The listing can't reveal the alert's action, so this hides
+    # the clearly-unusable budgets and the server rejects the rest on create.
+    usable = [budget for budget in budgets if budget.get("has_per_user_alert")]
+    if not usable:
+        print_warning(
+            "None of this workspace's AI Gateway budgets have a per-user threshold configured, which "
+            "spend routing requires. Add a per-user alert threshold to a budget in the Databricks "
+            "console, then re-run `ucode setup`."
+        )
+        return None
+    print_note(
+        "Showing only budgets with a per-user threshold configured, which spend routing needs."
+    )
+
     budget_id = prompt_for_selection(
         "Which budget should this policy track?",
         [
             (budget["id"], f"{budget['display_name'] or budget['id']} ({budget['id']})")
-            for budget in budgets
+            for budget in usable
         ],
         searchable=True,
     )
@@ -674,8 +690,12 @@ def _require_admin(workspace: str, token: str) -> None:
         print_success("Admin permissions verified")
 
 
-def _warn_on_existing_config(workspace: str, token: str) -> None:
-    """Warn when the workspace already has a published config that `ucode apply` would replace.
+def _handle_existing_config(workspace: str, token: str) -> bool:
+    """Decide what to do when the workspace already has a published config.
+
+    Returns True to keep authoring a new config (the wizard continues; publishing later replaces the
+    existing one) and False to stop (no config exists, the check failed, or the admin chose to delete
+    the existing one instead of authoring a replacement).
 
     Deliberately doesn't itemize what the existing config holds. The admin doesn't need an inventory
     to act on this — the instruction is the same either way ("include everything you want to keep")
@@ -685,14 +705,58 @@ def _warn_on_existing_config(workspace: str, token: str) -> None:
         existing, reason = get_managed_config(workspace, token)
     if reason is not None:
         print_note(f"Could not check for an existing config: {reason}")
-        return
+        return True
     if existing is None:
-        return
+        return True
+
     print_warning(
         "This workspace already has a managed configuration — one config covers every agent, MCP "
-        "server, skill, tracing table, and budget policy for the whole workspace. Publishing "
-        "replaces all of it, so make sure this run includes everything you want to keep."
+        "server, skill, tracing table, and budget policy for the whole workspace."
     )
+    choice = prompt_for_selection(
+        "What would you like to do?",
+        [
+            ("create", "Author a new config (replaces the existing one when you publish)"),
+            ("delete", "Delete the existing config (removes it from the workspace, leaves none)"),
+        ],
+    )
+    if choice is None:
+        raise KeyboardInterrupt
+    if choice == "create":
+        print_note("Make sure this run includes everything you want to keep.")
+        return True
+
+    _delete_existing_config(workspace, token, existing)
+    return False
+
+
+def _delete_existing_config(workspace: str, token: str, existing: dict) -> None:
+    """Delete the workspace's published config after confirming. Raises RuntimeError on failure.
+
+    Deleting leaves the workspace with no managed config, so every developer falls back to their own
+    settings on their next ucode run — confirm before doing it, and honor ``--dry-run``.
+    """
+    name = existing.get("name")
+    if not isinstance(name, str):
+        raise RuntimeError(
+            "This workspace has a managed config but the API didn't return its resource name, so "
+            "ucode can't delete it. Delete it in the workspace directly."
+        )
+    print_warning(
+        "Deleting removes the managed config entirely. Every developer falls back to their own "
+        "settings on their next ucode run."
+    )
+    if not prompt_yes_no_default("Delete the existing managed config?", default=False):
+        print_note("Nothing was deleted.")
+        return
+    if is_dry_run():
+        print_success("Dry run: the config was not deleted.")
+        return
+    with spinner("Deleting the managed config..."):
+        delete_reason = delete_coding_agent_config(workspace, token, name)
+    if delete_reason is not None:
+        raise RuntimeError(f"Could not delete the managed config on {workspace}: {delete_reason}.")
+    print_success(f"Deleted the managed config from {workspace}")
 
 
 def setup_from_file(path: str) -> int:
@@ -771,7 +835,8 @@ def setup_command(from_file: str | None = None) -> int:
     token = get_databricks_token(workspace, profile)
 
     _require_admin(workspace, token)
-    _warn_on_existing_config(workspace, token)
+    if not _handle_existing_config(workspace, token):
+        return 0
 
     # Discover the workspace's models and gateway URLs. This also logs in and persists local state,
     # which is what lets the admin dry-run the config on their own machine afterwards.
@@ -1034,10 +1099,6 @@ def apply_command(*, yes: bool = False) -> int:
     if not yes and not prompt_yes_no_default("Publish this config?", default=False):
         print_note("Nothing was published.")
         return 1
-
-    if is_dry_run():
-        print_success("Dry run: the config was validated but not published.")
-        return 0
 
     if existing is None:
         with spinner("Publishing the managed config..."):

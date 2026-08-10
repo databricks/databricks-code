@@ -21,6 +21,23 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 console = Console(highlight=False)
 err_console = Console(stderr=True, highlight=False)
 
+# questionary scrolls a window over a long choice list, but doesn't advertise it. Past this many
+# options the list can't all be on screen, so the pickers append a "↑/↓ scroll" note to their
+# instruction line. Matches mcp.py's MCP_PICKER_VISIBLE_ROWS so both picker families agree.
+_SCROLL_HINT_THRESHOLD = 10
+
+
+def _with_scroll_hint(instruction: str, option_count: int) -> str:
+    """Append a scroll affordance when the option list is too long to fully show at once.
+
+    The hint is discoverability only — questionary already scrolls; users just can't tell there is
+    more below the fold. Short lists are left alone so the instruction stays terse.
+    """
+    if option_count > _SCROLL_HINT_THRESHOLD:
+        return f"{instruction[:-1]}, ↑/↓ scroll)" if instruction.endswith(")") else instruction
+    return instruction
+
+
 # Output verbosity. "normal" (default) renders decorative panels; "low" trades
 # them for terse single-line output. Set once at CLI entry via set_verbosity.
 _verbosity = "normal"
@@ -385,6 +402,7 @@ def prompt_for_multi_selection(
     instruction = "(space to toggle, enter to confirm)"
     if searchable:
         instruction = "(type to filter, space to toggle, enter to confirm)"
+    instruction = _with_scroll_hint(instruction, len(options))
     answer = questionary.checkbox(
         prompt,
         choices=choices,
@@ -494,13 +512,15 @@ def prompt_for_selection(
         ]
     )
     choices = [questionary.Choice(title=label, value=value) for value, label in options]
+    instruction = "(type to filter, arrow keys to move)" if searchable else "(use arrow keys)"
+    instruction = _with_scroll_hint(instruction, len(options))
     answer = questionary.select(
         prompt,
         choices=choices,
         style=style,
         pointer="›",
         qmark="",
-        instruction="(type to filter, arrow keys to move)" if searchable else "(use arrow keys)",
+        instruction=instruction,
         use_search_filter=searchable,
         use_jk_keys=not searchable,
     ).ask()

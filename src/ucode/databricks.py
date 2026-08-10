@@ -409,12 +409,29 @@ def is_workspace_admin(workspace: str, token: str) -> bool | None:
 _WORKSPACE_BUDGETS_API_PATH = "/api/ai-gateway/v2/workspace-metrics/budgets"
 
 
+# Alert-config scope that carries a per-user threshold. A budget's coding-agent spend routing only
+# works when it has one: the gateway's `recommendModel` measures the caller's spend against a
+# per-user threshold, so a budget with only a shared (workspace-wide) alert reports no spend and
+# leaves every tier inert. The listing exposes `scope_type` but not the alert's action, so ucode can
+# only check for the scope's presence; the server enforces the (block) action on config create.
+_PER_USER_ALERT_SCOPE = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
+
+
+def _has_per_user_alert(entry: dict) -> bool:
+    """Whether a raw budget entry carries a per-user alert threshold."""
+    for alert in entry.get("alert_configurations") or []:
+        if isinstance(alert, dict) and alert.get("scope_type") == _PER_USER_ALERT_SCOPE:
+            return True
+    return False
+
+
 def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str | None]:
     """List the AI Gateway budgets that apply to this workspace.
 
-    Returns ``(budgets, reason)`` where each budget is ``{"id": ..., "display_name": ...}``.
+    Returns ``(budgets, reason)`` where each budget is ``{"id", "display_name", "has_per_user_alert"}``.
     ``reason`` is None on success, otherwise it explains why the list is empty. ucode never creates
-    budgets — an admin picks an existing one to attach a spend-routing policy to.
+    budgets — an admin picks an existing one to attach a spend-routing policy to. ``has_per_user_alert``
+    lets the picker hide budgets that can't drive spend routing (see ``_PER_USER_ALERT_SCOPE``).
     """
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}{_WORKSPACE_BUDGETS_API_PATH}"
@@ -438,6 +455,7 @@ def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str 
             {
                 "id": budget_id,
                 "display_name": display_name if isinstance(display_name, str) else "",
+                "has_per_user_alert": _has_per_user_alert(entry),
             }
         )
     if not budgets:
@@ -1521,6 +1539,20 @@ def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[
     return [m for m in ids if "claude-" in m.lower()], None
 
 
+def _prefer_opus_4_8(models: dict[str, str], all_ids: list[str]) -> None:
+    """Swap the opus slot to claude-opus-4-8 when it's available.
+
+    Discovery picks the newest opus (opus-5) but smart routing's
+    CLAUDE_ROUTE_ARMS require claude-opus-4-8. Pin to 4-8 when both
+    exist so the routing availability check passes.
+    """
+    opus = models.get("opus")
+    if opus and "claude-opus-5" in opus:
+        opus_48 = next((m for m in all_ids if "claude-opus-4-8" in m), None)
+        if opus_48:
+            models["opus"] = opus_48
+
+
 def discover_model_services(
     workspace: str, token: str
 ) -> tuple[dict[str, str], list[str], list[str], list[str], str | None]:
@@ -1551,6 +1583,12 @@ def discover_model_services(
         )
         if candidates:
             claude_models[family] = candidates[0]
+    # Smart routing's CLAUDE_ROUTE_ARMS require claude-opus-4-8, but the
+    # newest-wins sort above picks opus-5 when both exist — making the
+    # routing availability check fail. Pin opus-4-8 when it's available so
+    # routing works with the currently-deployed task_v1 router. Revert to
+    # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
+    _prefer_opus_4_8(claude_models, ids)
 
     codex_models = [m for m in ids if "gpt-" in m]
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
@@ -2491,6 +2529,8 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
         )
         if candidates:
             result[family] = candidates[0]
+    # Same opus-4-8 pin as discover_model_services — see comment there.
+    _prefer_opus_4_8(result, raw_ids)
     if result:
         return result, None
     if not raw_ids:
@@ -2690,12 +2730,22 @@ def resolve_current_budget_spend(
     if not isinstance(payload, dict):
         return None, "response was not a JSON object"
 
-    # Per the server's BudgetSpend.fromProto, a spend with no threshold to
-    # measure against counts as no spend.
-    spend = _parse_decimal(payload.get("current_spend"))
+    # The threshold is what anchors the spend: a caller with a per-user threshold but no spend yet
+    # this period gets `effective_threshold` set and `current_spend` omitted (see the server's
+    # per-user spend resolution). Treat an *absent* spend as $0 rather than "no budget", so a
+    # developer who hasn't spent anything still sees their budget instead of a blank. With no
+    # threshold there is nothing to measure against, so that genuinely counts as no spend.
     threshold = _parse_decimal(payload.get("effective_threshold"))
-    if spend is None or threshold is None:
+    if threshold is None:
         return None, "workspace reported no coding-agent budget spend"
+    raw_spend = payload.get("current_spend")
+    if raw_spend is None:
+        spend: Decimal | None = Decimal(0)
+    else:
+        # Present but unparseable is corrupt data, not zero spend — don't silently mask it.
+        spend = _parse_decimal(raw_spend)
+        if spend is None:
+            return None, "workspace reported no coding-agent budget spend"
     return (spend, threshold), None
 
 

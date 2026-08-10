@@ -31,8 +31,8 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     state_dir.mkdir()
     monkeypatch.setattr(state_mod, "STATE_PATH", state_dir / "state.json")
     monkeypatch.setattr(config_io_mod, "APP_DIR", state_dir)
-    # Isolate the managed-config opt-in from the developer's own shell: leaving it set would make
-    # `ucode configure` prompt for a workspace mid-test. Tests that exercise the managed path set it.
+    # Isolate the managed-config opt-in from the developer's own shell: leaving it set changes what
+    # `ucode`/`ucode configure` do mid-test. Tests that exercise the managed path set it explicitly.
     monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
     # The model-services listing is memoized for the life of the process, so without this a cached
     # result would leak into the next test and make a stubbed listing look like it was never called.

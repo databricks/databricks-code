@@ -180,59 +180,134 @@ class TestAdminGate:
         assert warn.called
 
 
-class TestExistingConfigWarning:
-    @staticmethod
-    def _warn(existing: dict) -> str:
-        with (
-            patch.object(wizard, "get_managed_config", return_value=(existing, None)),
-            patch.object(wizard, "print_warning") as warn,
-        ):
-            wizard._warn_on_existing_config(WORKSPACE, "token")
-        assert warn.called
-        return warn.call_args[0][0]
+class TestExistingConfigHandling:
+    RICH_CONFIG = {
+        "name": "coding-agent-configs/abc",
+        "enabled_agents": {"claude": {}, "opencode": {}, "pi": {}},
+        "mcp_servers": [{"name": "a", "type": "sql"}],
+        "skills": {"names": ["main.default"]},
+        "tracing_table": "main.default.traces",
+        "budget_policy": {"display_name": "lillys_budget", "budget_id": "abc"},
+    }
 
-    def test_warns_that_publishing_replaces_the_whole_config(self):
-        message = self._warn({"enabled_agents": {"claude": {}, "codex": {}}})
-        # There is one config per workspace covering everything, so the warning says that rather
-        # than reading like a per-agent notice.
-        assert "one config covers every agent" in message
-        assert "replaces all of it" in message
-        assert "everything you want to keep" in message
-
-    def test_warning_does_not_itemize_the_existing_config(self):
-        # The message is the same whatever the config holds: an inventory doesn't change what the
-        # admin should do, and `ucode setup show` prints the real thing for comparison.
-        rich = self._warn(
-            {
-                "enabled_agents": {"claude": {}, "opencode": {}, "pi": {}},
-                "mcp_servers": [{"name": "a", "type": "sql"}],
-                "skills": {"names": ["main.default"]},
-                "tracing_table": "main.default.traces",
-                "budget_policy": {"display_name": "lillys_budget", "budget_id": "abc"},
-            }
-        )
-        assert rich == self._warn({"enabled_agents": {}})
-        for leaked in ("Claude Code", "OpenCode", "lillys_budget", "main.default"):
-            assert leaked not in rich, leaked
-
-    def test_silent_when_no_config_exists(self):
+    def test_continue_when_no_config_exists(self):
+        # Nothing published, so there is no prompt — the wizard just proceeds.
         with (
             patch.object(wizard, "get_managed_config", return_value=(None, None)),
+            patch.object(wizard, "prompt_for_selection") as select,
             patch.object(wizard, "print_warning") as warn,
         ):
-            wizard._warn_on_existing_config(WORKSPACE, "token")
+            assert wizard._handle_existing_config(WORKSPACE, "token") is True
+        assert not select.called
         assert not warn.called
 
-    def test_read_failure_is_a_note_not_a_warning(self):
-        # Can't check isn't the same as "there is one"; don't imply data loss.
+    def test_read_failure_continues_with_a_note(self):
+        # Can't check isn't the same as "there is one"; don't imply data loss or block the wizard.
         with (
             patch.object(wizard, "get_managed_config", return_value=(None, "HTTP 403 Forbidden")),
-            patch.object(wizard, "print_warning") as warn,
+            patch.object(wizard, "prompt_for_selection") as select,
             patch.object(wizard, "print_note") as note,
         ):
-            wizard._warn_on_existing_config(WORKSPACE, "token")
-        assert not warn.called
+            assert wizard._handle_existing_config(WORKSPACE, "token") is True
+        assert not select.called
         assert note.called
+
+    def test_choosing_create_continues_authoring(self):
+        with (
+            patch.object(
+                wizard,
+                "get_managed_config",
+                return_value=({"name": "x", "enabled_agents": {}}, None),
+            ),
+            patch.object(wizard, "prompt_for_selection", return_value="create"),
+        ):
+            assert wizard._handle_existing_config(WORKSPACE, "token") is True
+
+    def test_warning_does_not_itemize_the_existing_config(self):
+        # The warning is the same whatever the config holds: an inventory doesn't change what the
+        # admin should do, and `ucode setup show` prints the real thing for comparison.
+        with (
+            patch.object(wizard, "get_managed_config", return_value=(self.RICH_CONFIG, None)),
+            patch.object(wizard, "prompt_for_selection", return_value="create"),
+            patch.object(wizard, "print_warning") as warn,
+        ):
+            wizard._handle_existing_config(WORKSPACE, "token")
+        message = warn.call_args[0][0]
+        assert "one config covers every agent" in message
+        for leaked in ("Claude Code", "OpenCode", "lillys_budget", "main.default"):
+            assert leaked not in message, leaked
+
+    def test_choosing_delete_stops_and_deletes(self):
+        with (
+            patch.object(
+                wizard,
+                "get_managed_config",
+                return_value=({"name": "cfg/1", "enabled_agents": {}}, None),
+            ),
+            patch.object(wizard, "prompt_for_selection", return_value="delete"),
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(wizard, "is_dry_run", return_value=False),
+            patch.object(wizard, "delete_coding_agent_config", return_value=None) as delete,
+        ):
+            assert wizard._handle_existing_config(WORKSPACE, "token") is False
+        delete.assert_called_once_with(WORKSPACE, "token", "cfg/1")
+
+    def test_delete_declined_leaves_config_intact(self):
+        with (
+            patch.object(
+                wizard,
+                "get_managed_config",
+                return_value=({"name": "cfg/1", "enabled_agents": {}}, None),
+            ),
+            patch.object(wizard, "prompt_for_selection", return_value="delete"),
+            patch.object(wizard, "prompt_yes_no_default", return_value=False),
+            patch.object(wizard, "delete_coding_agent_config") as delete,
+        ):
+            # Still stops the wizard: the admin chose the delete path, not the author path.
+            assert wizard._handle_existing_config(WORKSPACE, "token") is False
+        assert not delete.called
+
+    def test_delete_honors_dry_run(self):
+        with (
+            patch.object(
+                wizard,
+                "get_managed_config",
+                return_value=({"name": "cfg/1", "enabled_agents": {}}, None),
+            ),
+            patch.object(wizard, "prompt_for_selection", return_value="delete"),
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(wizard, "is_dry_run", return_value=True),
+            patch.object(wizard, "delete_coding_agent_config") as delete,
+        ):
+            assert wizard._handle_existing_config(WORKSPACE, "token") is False
+        assert not delete.called
+
+    def test_delete_failure_raises(self):
+        with (
+            patch.object(
+                wizard,
+                "get_managed_config",
+                return_value=({"name": "cfg/1", "enabled_agents": {}}, None),
+            ),
+            patch.object(wizard, "prompt_for_selection", return_value="delete"),
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(wizard, "is_dry_run", return_value=False),
+            patch.object(wizard, "delete_coding_agent_config", return_value="HTTP 500"),
+            pytest.raises(RuntimeError, match="Could not delete"),
+        ):
+            wizard._handle_existing_config(WORKSPACE, "token")
+
+    def test_cancelling_the_picker_aborts(self):
+        with (
+            patch.object(
+                wizard,
+                "get_managed_config",
+                return_value=({"name": "x", "enabled_agents": {}}, None),
+            ),
+            patch.object(wizard, "prompt_for_selection", return_value=None),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            wizard._handle_existing_config(WORKSPACE, "token")
 
 
 class TestModelPrompting:
@@ -889,8 +964,44 @@ class TestBudgetPolicy:
             assert wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE) is None
         assert warn.called
 
+    def test_no_per_user_budgets_warns_and_yields_none(self):
+        # Spend routing needs a per-user threshold; a workspace whose only budgets lack one has
+        # nothing usable to attach a policy to.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": False}]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(wizard, "print_warning") as warn,
+        ):
+            assert wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE) is None
+        assert warn.called
+
+    def test_only_per_user_budgets_are_offered(self):
+        # The picker hides budgets without a per-user threshold rather than letting the admin pick
+        # one that would leave every tier inert.
+        budgets = [
+            {"id": "no-per-user", "display_name": "shared-only", "has_per_user_alert": False},
+            {"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True},
+        ]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
+            ) as select,
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+        ):
+            policy = wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        # First selection call is the budget picker; only the per-user budget is offered.
+        offered = [value for value, _ in select.call_args_list[0][0][1]]
+        assert offered == [BUDGET_ID]
+        assert policy is not None and policy["budget_id"] == BUDGET_ID
+
     def test_percentages_are_stored_as_fractions(self):
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -925,7 +1036,7 @@ class TestBudgetPolicy:
                 }
             }
         }
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -954,7 +1065,7 @@ class TestBudgetPolicy:
                 }
             }
         }
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -973,7 +1084,7 @@ class TestBudgetPolicy:
     def test_falls_back_to_the_catalog_when_an_agent_lists_nothing(self):
         # An agent configured through a provider service has no enumerable list; better to offer the
         # catalog than nothing at all.
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -990,7 +1101,7 @@ class TestBudgetPolicy:
         assert offered == ["system.ai.gemini-3-flash"]
 
     def test_authored_policy_validates(self):
-        budgets = [{"id": BUDGET_ID, "display_name": "eng"}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1296,7 +1407,7 @@ class TestSearchablePickers:
         assert seen[0].get("searchable") is True
 
     def test_budget_and_tier_pickers_are_searchable(self):
-        budgets = [{"id": "budget-1", "display_name": "eng"}]
+        budgets = [{"id": "budget-1", "display_name": "eng", "has_per_user_alert": True}]
         searchable_prompts: list[str] = []
 
         def fake_sel(prompt, options, **kwargs):
@@ -1535,18 +1646,6 @@ class TestApplyCommand:
         with pytest.raises(RuntimeError, match="resource name"):
             self._run(get_managed_config=lambda *a, **k: ({"enabled_agents": {}}, None))
 
-    def test_dry_run_validates_without_publishing(self, monkeypatch):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
-        monkeypatch.setattr(config_io_mod, "_dry_run", True)
-        created = {"called": False}
-
-        def fake_create(*a, **k):
-            created["called"] = True
-            return {}, None
-
-        assert self._run(create_coding_agent_config=fake_create) == 0
-        assert created["called"] is False
-
 
 class TestPublishFailureMessages:
     """The server's error codes, turned into something an admin can act on."""
@@ -1603,12 +1702,14 @@ class TestCliWiring:
         assert result.exit_code == 0
         assert "apply" in result.output
 
-    def test_apply_declares_yes_and_dry_run(self):
-        # Asserted on the declared options rather than rendered help, which Rich ellipsizes at
-        # narrow terminal widths (see test_setup_help_lists_from_file).
+    def test_apply_declares_yes_and_no_dry_run(self):
+        # `--dry-run` was removed: apply always validates before publishing, so a separate
+        # validate-only mode is redundant. Asserted on declared options rather than rendered help,
+        # which Rich ellipsizes at narrow widths (see test_setup_help_lists_from_file).
         command = typer.main.get_command(app).commands["apply"]  # type: ignore[attr-defined]
         declared = {opt for param in command.params for opt in param.opts}
-        assert {"--yes", "--dry-run"} <= declared
+        assert "--yes" in declared
+        assert "--dry-run" not in declared
 
     def test_apply_error_exits_nonzero_with_a_message(self):
         with patch.object(cli_mod, "apply_command", side_effect=RuntimeError("no config authored")):

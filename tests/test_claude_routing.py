@@ -155,21 +155,20 @@ def test_spawn_rewrite_injects_routed_model(monkeypatch):
 
     hook = output["hookSpecificOutput"]
     # The rationale is surfaced in the systemMessage (shown to the user), not
-    # only in permissionDecisionReason.
+    # only in permissionDecisionReason. The model field is the short family
+    # name ("opus") that Claude Code's Agent tool schema accepts.
     assert output["systemMessage"] == (
-        "Using Smart Routing. Routing to system.ai.claude-opus-4-8. "
-        "Deep exploration needs the strongest model."
+        "Using Smart Routing. Routing to opus. Deep exploration needs the strongest model."
     )
     assert hook["permissionDecision"] == "allow"
     assert hook["updatedInput"] == {
         "subagent_type": "Explore",
         "prompt": "map the codebase",
         "description": "explore",
-        "model": "system.ai.claude-opus-4-8",
+        "model": "opus",
     }
     assert hook["permissionDecisionReason"] == (
-        "Using Smart Routing. Routing to system.ai.claude-opus-4-8. "
-        "Deep exploration needs the strongest model."
+        "Using Smart Routing. Routing to opus. Deep exploration needs the strongest model."
     )
 
 
@@ -192,7 +191,41 @@ def test_task_tool_alias_is_routed(monkeypatch):
         available_models=["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
     )
 
-    assert output["hookSpecificOutput"]["updatedInput"]["model"] == "system.ai.claude-sonnet-5"
+    assert output["hookSpecificOutput"]["updatedInput"]["model"] == "sonnet"
+
+
+def test_spawn_routes_on_prompt_not_generic_label(monkeypatch):
+    # Claude Code's Agent tool puts the subagent task in `prompt`/`description`,
+    # not `message`. The router should receive the real prompt, not the generic
+    # "Claude Code subagent task" fallback.
+    captured = {}
+
+    def fake_decision(workspace, token, task, models, **kwargs):
+        captured["task"] = task
+        return (
+            claude_routing.RoutingDecision(
+                model="system.ai.claude-sonnet-5", raw_model="claude-sonnet-5"
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(claude_routing, "request_routing_decision", fake_decision)
+
+    claude_routing.route_pre_tool_use(
+        {
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "Explore",
+                "prompt": "find all Python entry points",
+                "description": "explore the repo",
+            },
+        },
+        workspace=WS,
+        token="token",
+        available_models=["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
+    )
+
+    assert captured["task"] == "find all Python entry points"
 
 
 def test_non_spawn_tool_has_no_opinion():
@@ -255,12 +288,50 @@ def test_decision_is_reconciled_with_actual_subagent_model(tmp_path, monkeypatch
         audit_decision=True,
     )
     record = claude_routing.record_subagent_start(
-        {"session_id": "s1", "agent_id": "a1", "model": "system.ai.claude-opus-4-8"}
+        {"session_id": "s1", "agent_id": "a1", "model": "opus"}
     )
 
     assert record["router_model"] == "claude-opus-4-8"
-    assert record["requested_model"] == "system.ai.claude-opus-4-8"
+    assert record["requested_model"] == "opus"
     assert record["matches_router_decision"] is True
+
+
+def test_subagent_start_without_model_reports_unknown_not_mismatch(tmp_path, monkeypatch):
+    # Claude Code's SubagentStart event does not include the subagent's model,
+    # so reconciliation can't verify the match — record None (unknown) rather
+    # than a false mismatch. The PreToolUse hook already injected the model.
+    decisions = tmp_path / "decisions.jsonl"
+    audit = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(claude_routing, "DECISIONS_PATH", decisions)
+    monkeypatch.setattr(claude_routing, "AUDIT_PATH", audit)
+    monkeypatch.setattr(
+        claude_routing,
+        "request_routing_decision",
+        lambda *args, **kwargs: (
+            claude_routing.RoutingDecision(
+                model="system.ai.claude-sonnet-5", raw_model="claude-sonnet-5"
+            ),
+            None,
+        ),
+    )
+
+    claude_routing.route_pre_tool_use(
+        {
+            "session_id": "s2",
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "Explore", "prompt": "x"},
+        },
+        workspace=WS,
+        token="token",
+        available_models=["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
+        audit_decision=True,
+    )
+    record = claude_routing.record_subagent_start(
+        {"session_id": "s2", "agent_id": "a2", "model": None}
+    )
+
+    assert record["requested_model"] == "sonnet"
+    assert record["matches_router_decision"] is None
 
 
 def test_launch_task_uses_positional_prompt():
