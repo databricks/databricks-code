@@ -1542,6 +1542,18 @@ def _launch_tool(
             # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
             if model and tool != "claude":
                 resolved_model = model
+            # Claude Code's enterprise managed-settings scope (e.g. an Isaac/dbexec install)
+            # outranks the --settings file ucode writes AND can't be excluded with --setting-sources,
+            # so a model pinned there silently wins over `--model`. Warn so a launch that ignores the
+            # requested model looks like the misconfiguration it is, not a ucode bug.
+            if model and tool == "claude":
+                enterprise = claude_agent.managed_settings_model_overrides()
+                if enterprise is not None:
+                    print_warning(
+                        f"Your enterprise managed settings at {enterprise} pin the Claude model, "
+                        f"which overrides `--model {model}` — Claude Code will launch on the pinned "
+                        "model instead. Edit or remove that file to use --model."
+                    )
         state = configure_tool(
             tool,
             state,

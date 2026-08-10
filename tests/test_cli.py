@@ -282,8 +282,8 @@ class TestSubcommandRouting:
 
 
 class TestClaudeModelFlag:
-    """`ucode claude --model <id>` pins ANTHROPIC_MODEL so the gateway resolves any Databricks
-    model id, instead of Claude Code's own --model flag rejecting non-catalog ids."""
+    """`ucode claude --model <id>` pins the id into the family aliases so the gateway resolves any
+    Databricks model id, instead of Claude Code's own --model flag rejecting non-catalog ids."""
 
     def test_model_threads_through_to_launch(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
@@ -315,6 +315,46 @@ class TestClaudeModelFlag:
         )
         assert result.exit_code == 1
         assert "Use either --model or --provider" in result.output
+
+    def test_warns_when_enterprise_settings_pin_the_model(self):
+        # Claude Code's enterprise managed-settings scope outranks the --settings file ucode writes,
+        # so --model is silently ignored; warn instead of launching on the "wrong" model unexplained.
+        from pathlib import Path
+
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.resolve_launch_model", return_value=(MINIMAL_STATE, "system.ai.opus")),
+            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
+            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch(
+                "ucode.cli.claude_agent.managed_settings_model_overrides",
+                return_value=Path("/etc/claude-code/managed-settings.json"),
+            ),
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, ["claude", "--model", "main.aarushi.claude-opus-5"])
+        assert result.exit_code == 0, result.output
+        assert "enterprise managed settings" in _strip_ansi(result.output)
+        assert "overrides `--model main.aarushi.claude-opus-5`" in _strip_ansi(result.output)
+
+    def test_no_enterprise_warning_when_no_managed_settings(self):
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.resolve_launch_model", return_value=(MINIMAL_STATE, "system.ai.opus")),
+            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
+            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli.claude_agent.managed_settings_model_overrides", return_value=None),
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, ["claude", "--model", "main.aarushi.claude-opus-5"])
+        assert result.exit_code == 0, result.output
+        assert "enterprise managed settings" not in _strip_ansi(result.output)
 
 
 class TestMcpSubcommands:
