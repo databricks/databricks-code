@@ -8,24 +8,31 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import cast
 
 from ucode.databricks import (
+    SqlWarehouse,
     apply_pat_environment,
-    discover_sql_warehouse_http_path,
+    discover_sql_warehouses,
     ensure_databricks_auth,
     get_databricks_token,
+    resolve_current_budget_spend,
     run_usage_query,
 )
 from ucode.state import load_state
 from ucode.ui import (
     console,
     format_duration,
+    format_meter,
     format_token_count,
+    format_usd,
     heading,
     label,
+    muted,
     print_heading,
     print_note,
+    print_warning,
     render_box_table,
     spinner,
     value,
@@ -33,6 +40,11 @@ from ucode.ui import (
 
 USAGE_BREAKDOWN_DAYS = 7
 USAGE_SUMMARY_DAYS = 30
+
+QUERY_MESSAGE = "Querying system.ai_gateway.usage..."
+STARTUP_MESSAGE = "Starting up warehouse..."
+# `REQUESTED` is an explicit --warehouse-id, whose state we never looked up.
+WARM_WAREHOUSE_STATES = ("RUNNING", "REQUESTED")
 
 
 def build_usage_report_query() -> str:
@@ -370,10 +382,27 @@ def find_requester_name(
     return "current user"
 
 
+def render_budget_lines(budget_spend: tuple[Decimal, Decimal] | None) -> list[str]:
+    """Spend-against-threshold lines, or nothing when unavailable."""
+    if budget_spend is None:
+        return []
+    spend, threshold = budget_spend
+    # No whole to be a fraction of; dividing would raise.
+    if threshold <= 0:
+        return [f"{label('Budget spend:')} {value(format_usd(spend))}"]
+    fraction = float(spend / threshold)
+    summary = f"{format_usd(spend)} of {format_usd(threshold)} ({fraction:.0%})"
+    return [
+        f"{label('Budget spend:')} {value(summary)}",
+        muted(format_meter(fraction)),
+    ]
+
+
 def render_usage_summary(
     records: list[dict[str, object]],
     requester_name: str,
     tool_displays: dict[str, str],
+    budget_spend: tuple[Decimal, Decimal] | None = None,
 ) -> str:
     today = date.today()
     week_start = today - timedelta(days=USAGE_BREAKDOWN_DAYS - 1)
@@ -434,10 +463,57 @@ def render_usage_summary(
             for model_name, token_total in top_models
         )
         lines.append(f"{label('Top models this week:')} {value(models_text)}")
+    lines.extend(render_budget_lines(budget_spend))
     return "\n".join(lines)
 
 
-def usage() -> int:
+def run_query_on_first_working_warehouse(
+    workspace: str,
+    token: str,
+    candidates: list[SqlWarehouse],
+    query: str,
+) -> tuple[str, list[str], list[tuple]]:
+    """Run `query` on the first candidate that accepts the connection.
+
+    Returns the warehouse's http path alongside the result so later queries
+    reuse it. Raises the last error when every candidate fails.
+    """
+    last_error: RuntimeError | None = None
+    for warehouse in candidates:
+        print_note(f"Using SQL warehouse `{warehouse.label}` ({warehouse.state}).")
+        try:
+            # Inside the loop so the spinner stops before any warning prints.
+            columns, rows = _query_with_progress(workspace, token, warehouse, query)
+        except RuntimeError as exc:
+            last_error = exc
+            print_warning(f"SQL warehouse `{warehouse.label}` is unusable: {exc}")
+            continue
+        return warehouse.http_path, columns, rows
+    raise last_error or RuntimeError("No SQL warehouse could run the usage query.")
+
+
+def _query_with_progress(
+    workspace: str,
+    token: str,
+    warehouse: SqlWarehouse,
+    query: str,
+) -> tuple[list[str], list[tuple]]:
+    """Run the query, reporting a cold start until the connection opens.
+
+    A warehouse that isn't already up costs minutes to start, so the spinner
+    says that until `run_usage_query` reports it connected.
+    """
+    connected = warehouse.state in WARM_WAREHOUSE_STATES
+
+    def mark_connected() -> None:
+        nonlocal connected
+        connected = True
+
+    with spinner(lambda: QUERY_MESSAGE if connected else STARTUP_MESSAGE):
+        return run_usage_query(workspace, warehouse.http_path, token, query, mark_connected)
+
+
+def usage(warehouse_id: str | None = None) -> int:
     # Late import to avoid circular import (agents → state, but usage uses TOOL_SPECS for displays).
     from ucode.agents import TOOL_SPECS
 
@@ -453,24 +529,31 @@ def usage() -> int:
         token = get_databricks_token(workspace, profile)
 
     with spinner("Discovering SQL warehouse..."):
-        resolved_http_path = discover_sql_warehouse_http_path(workspace, token, quiet=False)
+        candidates = discover_sql_warehouses(workspace, token, warehouse_id=warehouse_id)
 
-    with spinner("Querying system.ai_gateway.usage..."):
-        columns, rows = run_usage_query(
-            workspace,
-            resolved_http_path,
-            token,
-            build_usage_report_query(),
-        )
+    resolved_http_path, columns, rows = run_query_on_first_working_warehouse(
+        workspace, token, candidates, build_usage_report_query()
+    )
     records = parse_usage_rows(columns, rows)
     requester_name = find_requester_name(workspace, resolved_http_path, token, records)
+
+    # Opt-in per workspace: omit the lines rather than fail the report.
+    with spinner("Checking budget spend..."):
+        budget_spend, _ = resolve_current_budget_spend(workspace, token)
 
     tool_displays = {tool: spec["display"] for tool, spec in TOOL_SPECS.items()}
     configured_tools = configured_usage_tools(state, tool_displays)
     configured_tool_displays = {tool: tool_displays[tool] for tool in configured_tools}
     records = filter_records_for_tools(records, configured_tools)
 
-    console.print(render_usage_summary(records, requester_name, configured_tool_displays))
+    console.print(
+        render_usage_summary(
+            records,
+            requester_name,
+            configured_tool_displays,
+            budget_spend=budget_spend,
+        )
+    )
 
     table_headers = ["Date", "Day", "Tokens", "Sessions", "Duration", "Models"]
     table_widths = [8, 5, 10, 8, 8, 24]

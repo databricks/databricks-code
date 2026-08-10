@@ -13,6 +13,10 @@ from ucode.databricks import (
 
 STATE_PATH = APP_DIR / "state.json"
 STATE_VERSION = 3
+# Transient key holding the developer's own values for whatever a managed config layered over them.
+# Present only in memory: the layered values render the agent settings files, while `save_state`
+# restores what's under it so `state.json` keeps recording the developer's own configuration.
+MANAGED_OVERLAY_KEY = "_managed_overlay"
 AUTH_COMMAND_TIMEOUT_MS = 5000
 AUTH_REFRESH_INTERVAL_MS = 900_000
 
@@ -42,19 +46,45 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    """Save workspace state back into the per-workspace structure."""
+    """Save workspace state back into the per-workspace structure.
+
+    Values a managed config layered over the developer's own are stripped first (see
+    ``MANAGED_OVERLAY_KEY``), so an admin-published config takes effect through the generated agent
+    settings files without overwriting what the developer configured for themselves. Read
+    non-destructively: a launch can save more than once from the same dict (e.g. the relayed proxy
+    rewriting its port), and every one of those writes must restore the developer's values.
+    """
     if is_dry_run():
         return
     full = load_full_state()
     workspace = state.get("workspace") or full.get("current_workspace")
     if workspace:
         full["current_workspace"] = workspace
-        full["workspaces"][workspace] = hydrate_state(state)
+        full["workspaces"][workspace] = hydrate_state(_without_managed_overlay(state))
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         STATE_PATH.write_text(json.dumps(full, indent=2), encoding="utf-8")
     except OSError as exc:
         raise RuntimeError(f"Failed to write state file: {STATE_PATH}") from exc
+
+
+def _without_managed_overlay(state: dict) -> dict:
+    """Return ``state`` with managed-config values swapped back for the developer's own.
+
+    Returns a new dict and leaves ``state`` untouched, so the caller keeps the layered values it
+    needs for rendering and repeated saves stay idempotent.
+    """
+    overlay = state.get(MANAGED_OVERLAY_KEY)
+    if not isinstance(overlay, dict):
+        return state
+    persisted = {key: value for key, value in state.items() if key != MANAGED_OVERLAY_KEY}
+    for key, value in overlay.items():
+        # A key the developer never set is dropped rather than persisted as None.
+        if value is None:
+            persisted.pop(key, None)
+        else:
+            persisted[key] = value
+    return persisted
 
 
 def set_current_workspace(workspace: str | None) -> None:
@@ -125,6 +155,8 @@ def build_agent_state(state: dict) -> dict[str, dict]:
     if not isinstance(workspace, str) or not workspace:
         return {}
 
+    from ucode.agents import default_model_for_tool
+
     profile = state.get("profile") if isinstance(state.get("profile"), str) else None
     base_urls_value = state.get("base_urls")
     base_urls = base_urls_value if isinstance(base_urls_value, dict) else {}
@@ -138,11 +170,18 @@ def build_agent_state(state: dict) -> dict[str, dict]:
     gemini_models_value = state.get("gemini_models")
     gemini_models = gemini_models_value if isinstance(gemini_models_value, list) else []
 
+    selection_state = {
+        **state,
+        "claude_models": claude_models,
+        "codex_models": codex_models,
+        "gemini_models": gemini_models,
+    }
+
     claude_model = (
         claude_models.get("opus") or claude_models.get("sonnet") or claude_models.get("haiku")
     )
-    codex_model = codex_models[0] if codex_models else None
-    pi_model = claude_model or codex_model or (gemini_models[0] if gemini_models else None)
+    codex_model = default_model_for_tool("codex", selection_state)
+    pi_model = default_model_for_tool("pi", selection_state)
 
     agents: dict[str, dict] = {
         "claude": {
@@ -153,7 +192,10 @@ def build_agent_state(state: dict) -> dict[str, dict]:
             "env": {
                 "ANTHROPIC_BASE_URL": base_urls.get("claude"),
                 "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(AUTH_REFRESH_INTERVAL_MS),
-                "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+                # Kept in sync with agents/claude.py render_overlay.
+                "ENABLE_PROMPT_CACHING_1H": "1",
+                "ENABLE_TOOL_SEARCH": "1",
+                "CLAUDE_CODE_USE_GATEWAY": "1",
             },
         },
         "codex": {

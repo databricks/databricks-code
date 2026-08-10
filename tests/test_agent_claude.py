@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 
+import pytest
+
 from ucode.agents import claude
+from ucode.smart_routing import claude_routing
 
 WS = "https://example.databricks.com"
 
@@ -69,6 +73,34 @@ class TestRenderOverlay:
         )
         assert overlay["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "system.ai.claude-haiku-4-6"
 
+    def test_custom_model_pins_all_family_aliases(self):
+        # `ucode claude --model` pins the id into every family alias so it takes effect whichever
+        # slot Claude Code resolves — and NOT into ANTHROPIC_MODEL, which Claude Code validates and
+        # rejects for a raw Databricks id. It overrides the discovered-model aliases.
+        overlay, _ = claude.render_overlay(
+            WS,
+            "s4",
+            claude_models={"opus": "system.ai.claude-opus-4-8", "sonnet": "system.ai.sonnet"},
+            custom_model="main.aarushi.claude-opus-5",
+        )
+        env = overlay["env"]
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "main.aarushi.claude-opus-5"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "main.aarushi.claude-opus-5"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "main.aarushi.claude-opus-5"
+        assert "ANTHROPIC_MODEL" not in env
+        # No [1m] suffix is appended to the custom id — it's passed through verbatim.
+        assert "[1m]" not in env["ANTHROPIC_DEFAULT_OPUS_MODEL"]
+
+    def test_custom_model_pins_fable_alias_only_when_fable_enabled(self):
+        without = claude.render_overlay(WS, "s4", claude_models={}, custom_model="main.x.m")[0][
+            "env"
+        ]
+        assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in without
+        with_fable = claude.render_overlay(
+            WS, "s4", claude_models={}, custom_model="main.x.m", fable_enabled=True
+        )[0]["env"]
+        assert with_fable["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "main.x.m"
+
     def test_sets_anthropic_base_url(self):
         overlay, _ = claude.render_overlay(WS, "s4")
         assert overlay["env"]["ANTHROPIC_BASE_URL"] == f"{WS}/ai-gateway/anthropic"
@@ -77,14 +109,63 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert "x-databricks-use-coding-agent-mode" in overlay["env"]["ANTHROPIC_CUSTOM_HEADERS"]
 
-    def test_disables_experimental_betas(self):
+    def test_does_not_disable_experimental_betas(self):
+        # Would suppress the beta header 1h prompt caching needs.
         overlay, _ = claude.render_overlay(WS, "s4")
-        assert overlay["env"]["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
+        assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in overlay["env"]
+
+    def test_enables_prompt_caching_1h(self):
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["ENABLE_PROMPT_CACHING_1H"] == "1"
+
+    def test_enables_tool_search(self):
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["ENABLE_TOOL_SEARCH"] == "1"
+
+    def test_enables_use_gateway(self):
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
     def test_sets_api_key_helper(self):
         overlay, _ = claude.render_overlay(WS, "s4")
         assert "apiKeyHelper" in overlay
         assert WS in overlay["apiKeyHelper"]
+
+    def test_relayed_omits_api_key_helper(self):
+        # Claude Code's own subscription OAuth must own Authorization; an
+        # apiKeyHelper would outrank it.
+        overlay, _ = claude.render_overlay(
+            WS,
+            None,
+            provider="c.s.mps",
+            relayed=True,
+            relayed_base_url="http://127.0.0.1:9",
+        )
+        assert "apiKeyHelper" not in overlay
+
+    def test_relayed_points_base_url_at_proxy(self):
+        overlay, _ = claude.render_overlay(
+            WS,
+            None,
+            provider="c.s.mps",
+            relayed=True,
+            relayed_base_url="http://127.0.0.1:9",
+        )
+        assert overlay["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9"
+
+    def test_relayed_sends_mps_header_but_not_swap_token(self):
+        # The MPS header selects the service; the swap token is injected by the
+        # proxy, never written into settings.
+        overlay, _ = claude.render_overlay(
+            WS,
+            None,
+            provider="c.s.mps",
+            relayed=True,
+            relayed_base_url="http://127.0.0.1:9",
+        )
+        headers = overlay["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+        assert "Databricks-Model-Provider-Service: c.s.mps" in headers
+        assert "X-Databricks-AI-Gateway-Token" not in headers
 
     def test_model_overrides_when_all_provided(self):
         models = {
@@ -109,6 +190,37 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         env = overlay["env"]
         assert "ANTHROPIC_DEFAULT_SONNET_MODEL" not in env
+
+    def test_fable_not_pinned_by_default(self):
+        # Fable is opt-in: even when the workspace advertises it, the env var is
+        # absent unless fable_enabled is passed.
+        models = {"fable": "databricks-claude-fable-5", "opus": "databricks-claude-opus-4-8"}
+        overlay, _ = claude.render_overlay(WS, "s4", claude_models=models)
+        env = overlay["env"]
+        assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in env
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-8[1m]"
+
+    def test_fable_pinned_when_enabled_and_discovered(self):
+        models = {"fable": "system.ai.claude-fable-5"}
+        overlay, _ = claude.render_overlay(WS, "s4", claude_models=models, fable_enabled=True)
+        env = overlay["env"]
+        # Fable 5 is 1M-context by default, so no `[1m]` suffix is appended.
+        assert env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "system.ai.claude-fable-5"
+
+    def test_fable_not_pinned_when_enabled_but_not_discovered(self):
+        # --enable-fable is a no-op when the workspace advertises no fable model,
+        # mirroring the opus/sonnet/haiku "only if discovered" behavior.
+        models = {"opus": "databricks-claude-opus-4-8"}
+        overlay, _ = claude.render_overlay(WS, "s4", claude_models=models, fable_enabled=True)
+        assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in overlay["env"]
+
+    def test_fable_not_pinned_under_provider(self):
+        # A Model Provider Service routes by header and pins no Databricks model.
+        models = {"fable": "databricks-claude-fable-5"}
+        overlay, _ = claude.render_overlay(
+            WS, "s4", claude_models=models, fable_enabled=True, provider="main.x.claude-svc"
+        )
+        assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in overlay["env"]
 
     def test_provider_adds_routing_header(self):
         overlay, _ = claude.render_overlay(WS, "s4", provider="main.aarushi.aarushi-claude")
@@ -211,20 +323,22 @@ class TestRenderOverlayWebSearchDisable:
         assert "mcpServers" not in overlay
 
     def test_disables_builtin_websearch_when_requested(self):
+        # A bare `permissions.deny` entry removes the built-in WebSearch tool
+        # from Claude's context (Claude Code has no `disabledTools` setting).
         overlay, _ = claude.render_overlay(WS, "s4", disable_web_search=True)
-        assert overlay["disabledTools"] == ["WebSearch"]
+        assert overlay["permissions"] == {"deny": ["WebSearch"]}
 
     def test_no_disable_when_not_requested(self):
         overlay, _ = claude.render_overlay(WS, "s4", disable_web_search=False)
-        assert "disabledTools" not in overlay
+        assert "permissions" not in overlay
 
     def test_managed_keys_include_disabled_tools_when_set(self):
         _, keys = claude.render_overlay(WS, "s4", disable_web_search=True)
-        assert ["disabledTools"] in keys
+        assert ["permissions", "deny"] in keys
 
     def test_managed_keys_omit_disabled_tools_when_not_set(self):
         _, keys = claude.render_overlay(WS, "s4", disable_web_search=False)
-        assert ["disabledTools"] not in keys
+        assert ["permissions", "deny"] not in keys
 
 
 class TestWebSearchMcpEntry:
@@ -328,6 +442,30 @@ class TestWriteToolConfigMcpRegistration:
         }
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
         assert calls == [("register", WS, "explicit-model")]
+
+
+class TestWriteToolConfigStripsRemovedEnvKeys:
+    """Stale keys ucode no longer writes are dropped from the merged settings."""
+
+    def _patch(self, monkeypatch, existing, written):
+        monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        monkeypatch.setattr(claude, "read_json_safe", lambda path: existing)
+        monkeypatch.setattr(
+            claude, "write_json_file", lambda path, payload: written.append(payload)
+        )
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
+
+    def test_strips_stale_disable_experimental_betas(self, monkeypatch):
+        existing = {"env": {"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"}}
+        written: list = []
+        self._patch(monkeypatch, existing, written)
+        state = {"workspace": WS, "codex_models": []}
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in written[0]["env"]
+        assert written[0]["env"]["ENABLE_PROMPT_CACHING_1H"] == "1"
+        assert written[0]["env"]["ENABLE_TOOL_SEARCH"] == "1"
+        assert written[0]["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
 
 class TestRegisterWebSearchMcp:
@@ -523,3 +661,275 @@ class TestWriteToolConfigPrunesStaleModelEnv:
         assert "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME" not in env
         assert "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME" not in env
         assert "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME" not in env
+
+
+class TestBuildClaudeArgv:
+    def test_no_caller_settings_uses_ucode_file(self, monkeypatch):
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
+        argv = claude._build_claude_argv("claude", ["-p", "hi"])
+        assert argv == ["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "-p", "hi"]
+
+    def test_non_relayed_does_not_set_setting_sources(self, monkeypatch):
+        # Normal launches must keep loading user settings (hooks/permissions) —
+        # no --setting-sources so nothing changes for the stored-key path.
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
+        argv = claude._build_claude_argv("claude", ["-p", "hi"], relayed=False)
+        assert "--setting-sources" not in argv
+
+    def test_relayed_excludes_user_scope_via_setting_sources(self, monkeypatch):
+        # Relayed must drop the user scope so a stale ~/.claude/settings.json
+        # apiKeyHelper can't merge through and shadow the subscription OAuth.
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"env": {}})
+        argv = claude._build_claude_argv("claude", ["-p", "hi"], relayed=True)
+        assert "--setting-sources" in argv
+        src = argv[argv.index("--setting-sources") + 1]
+        assert src == claude._RELAYED_SETTING_SOURCES
+        assert "user" not in src
+        # ucode's own settings file is still passed.
+        assert "--settings" in argv
+        assert str(claude.CLAUDE_SETTINGS_PATH) in argv
+
+    def test_relayed_with_caller_settings_keeps_setting_sources(self, monkeypatch):
+        # Even when composing a caller --settings, relayed still excludes user scope.
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"env": {}})
+        caller = json.dumps({"statusLine": {"type": "command", "command": "sl"}})
+        argv = claude._build_claude_argv("claude", ["--settings", caller], relayed=True)
+        assert argv[:3] == ["claude", "--setting-sources", claude._RELAYED_SETTING_SOURCES]
+        assert argv.count("--settings") == 1
+
+    def test_inline_caller_settings_merged_into_single_flag(self, monkeypatch):
+        ucode_settings = {
+            "apiKeyHelper": "ucode-helper",
+            "env": {"ANTHROPIC_BASE_URL": "https://gw"},
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "ucode-stop"}]}]},
+        }
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: ucode_settings)
+        caller = json.dumps(
+            {
+                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "caller-stop"}]}]},
+                "statusLine": {"type": "command", "command": "sl"},
+            }
+        )
+        argv = claude._build_claude_argv("claude", ["--settings", caller, "-p", "hi"])
+        # Exactly one --settings reaches Claude, and the caller's raw flag is gone.
+        assert argv.count("--settings") == 1
+        assert argv[:2] == ["claude", "--settings"]
+        assert argv[3:] == ["-p", "hi"]
+        merged = json.loads(argv[2])
+        # ucode's gateway config survives.
+        assert merged["apiKeyHelper"] == "ucode-helper"
+        assert merged["env"]["ANTHROPIC_BASE_URL"] == "https://gw"
+        # The caller's own (non-hook) settings pass through.
+        assert merged["statusLine"] == {"type": "command", "command": "sl"}
+        # Hooks from BOTH sides fire (unioned, not clobbered).
+        stop_cmds = [h["command"] for e in merged["hooks"]["Stop"] for h in e["hooks"]]
+        assert "ucode-stop" in stop_cmds
+        assert "caller-stop" in stop_cmds
+
+    def test_equals_form_is_handled(self, monkeypatch):
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
+        caller = json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "c"}]}]}})
+        argv = claude._build_claude_argv("claude", [f"--settings={caller}"])
+        assert argv.count("--settings") == 1
+        merged = json.loads(argv[2])
+        assert merged["apiKeyHelper"] == "u"
+        assert merged["hooks"]["Stop"][0]["hooks"][0]["command"] == "c"
+
+    def test_ucode_wins_on_conflicting_env(self, monkeypatch):
+        monkeypatch.setattr(
+            claude, "read_json_safe", lambda p: {"env": {"ANTHROPIC_BASE_URL": "https://ucode"}}
+        )
+        caller = json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://caller", "FOO": "bar"}})
+        argv = claude._build_claude_argv("claude", ["--settings", caller])
+        merged = json.loads(argv[2])
+        assert merged["env"]["ANTHROPIC_BASE_URL"] == "https://ucode"  # ucode wins
+        assert merged["env"]["FOO"] == "bar"  # caller's non-conflicting key kept
+
+    def test_file_path_caller_settings(self, tmp_path, monkeypatch):
+        caller_file = tmp_path / "caller.json"
+        caller_file.write_text(
+            json.dumps(
+                {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "cs"}]}]}}
+            )
+        )
+        # The caller file is read directly; read_json_safe is only used for
+        # ucode's own settings file.
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
+        argv = claude._build_claude_argv("claude", ["--settings", str(caller_file)])
+        assert argv.count("--settings") == 1
+        merged = json.loads(argv[2])
+        assert merged["apiKeyHelper"] == "u"
+        assert merged["hooks"]["SessionStart"][0]["hooks"][0]["command"] == "cs"
+
+    def test_malformed_inline_json_raises(self, monkeypatch):
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
+        # Clearly-intended-as-JSON but broken: fail loudly rather than pass it
+        # through as a second, colliding --settings flag.
+        with pytest.raises(RuntimeError, match="not valid JSON"):
+            claude._build_claude_argv("claude", ["--settings", '{"hooks": '])
+
+    def test_nonexistent_file_raises(self, monkeypatch):
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
+        with pytest.raises(RuntimeError, match="file not found"):
+            claude._build_claude_argv("claude", ["--settings", "/no/such/settings.json"])
+
+    def test_non_object_file_json_raises(self, tmp_path, monkeypatch):
+        # A --settings file whose JSON is not an object (e.g. an array) can't be
+        # merged; fail loudly. (An inline value only enters the JSON branch when
+        # it starts with "{", so the non-object case is reachable via a file.)
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text("[1, 2, 3]")
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
+        with pytest.raises(RuntimeError, match="must be a JSON object"):
+            claude._build_claude_argv("claude", ["--settings", str(bad_file)])
+
+    def test_malformed_file_json_raises(self, tmp_path, monkeypatch):
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text('{"hooks": ')
+        monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
+        with pytest.raises(RuntimeError, match="not valid JSON"):
+            claude._build_claude_argv("claude", ["--settings", str(bad_file)])
+
+
+class TestClaudeSmartRouting:
+    def _capture_write(self, monkeypatch, existing, written):
+        monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        monkeypatch.setattr(claude, "read_json_safe", lambda path: existing)
+        monkeypatch.setattr(
+            claude, "write_json_file", lambda path, payload: written.append(payload)
+        )
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
+
+    def test_enable_sets_state_key(self):
+        state = claude.enable_smart_routing({})
+        assert state[claude.SMART_ROUTING_STATE_KEY] is True
+
+    def test_enabled_reads_state_key(self):
+        assert claude.smart_routing_enabled({claude.SMART_ROUTING_STATE_KEY: True})
+        assert not claude.smart_routing_enabled({})
+
+    def test_write_config_installs_routing_hooks(self, monkeypatch):
+        written: list = []
+        self._capture_write(monkeypatch, {}, written)
+        state = {
+            "workspace": WS,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+            claude.SMART_ROUTING_STATE_KEY: True,
+        }
+        claude.write_tool_config(state, "system.ai.claude-opus-4-8", route_root_model=None)
+        hooks = written[0]["hooks"]
+        assert set(hooks) == {"PreToolUse", "SessionStart", "SubagentStart"}
+        commands = [hook["command"] for group in hooks["PreToolUse"] for hook in group["hooks"]]
+        assert any("claude-router-hook" in command for command in commands)
+
+    def test_root_model_pins_anthropic_model(self, monkeypatch):
+        written: list = []
+        self._capture_write(monkeypatch, {}, written)
+        state = {
+            "workspace": WS,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+            claude.SMART_ROUTING_STATE_KEY: True,
+        }
+        claude.write_tool_config(
+            state, "system.ai.claude-opus-4-8", route_root_model="system.ai.claude-sonnet-5"
+        )
+        assert written[0]["env"]["ANTHROPIC_MODEL"] == "system.ai.claude-sonnet-5"
+
+    def test_provider_suppresses_routing_hooks(self, monkeypatch):
+        written: list = []
+        self._capture_write(monkeypatch, {}, written)
+        state = {"workspace": WS, claude.SMART_ROUTING_STATE_KEY: True}
+        # Under a Model Provider Service no Databricks model is pinned, so routing
+        # is inapplicable — hooks must not be installed even when the flag is set.
+        claude.write_tool_config(state, None, provider="cat.sch.svc")
+        assert "hooks" not in written[0] or "PreToolUse" not in written[0]["hooks"]
+
+    def test_disable_removes_only_ucode_hooks(self, tmp_path, monkeypatch):
+        settings_path = tmp_path / "ucode-settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [
+                            {
+                                "matcher": "Bash",
+                                "hooks": [{"type": "command", "command": "user-policy"}],
+                            },
+                            {
+                                "matcher": "Agent|Task",
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "ucode claude-router-hook route-subagent",
+                                    }
+                                ],
+                            },
+                        ],
+                        "SessionStart": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "ucode claude-router-hook session-start",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", settings_path)
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(claude_routing, "clear_routing_artifacts", lambda: None)
+        state = {"workspace": WS, claude.SMART_ROUTING_STATE_KEY: True}
+
+        assert claude.disable_smart_routing(state) is True
+
+        doc = json.loads(settings_path.read_text())
+        assert state.get(claude.SMART_ROUTING_STATE_KEY) is None
+        assert list(doc["hooks"]) == ["PreToolUse"]
+        assert doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "user-policy"
+
+
+class TestManagedSettingsModelOverrides:
+    """Enterprise managed settings outrank ucode's --settings, so a model pinned there beats the
+    one an admin published — worth pointing a developer at the file."""
+
+    @staticmethod
+    def _write(monkeypatch, tmp_path, payload):
+        path = tmp_path / "managed-settings.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: path)
+        return path
+
+    @pytest.mark.parametrize(
+        "key",
+        ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+    )
+    def test_reports_the_path_when_a_model_is_pinned(self, monkeypatch, tmp_path, key):
+        path = self._write(monkeypatch, tmp_path, {"env": {key: "system.ai.claude-opus-5"}})
+        assert claude.managed_settings_model_overrides() == path
+
+    def test_none_for_name_companions_that_select_nothing(self, monkeypatch, tmp_path):
+        # The `_NAME` keys are picker labels, so an enterprise value there overrides no model.
+        self._write(monkeypatch, tmp_path, {"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "Opus 5"}})
+        assert claude.managed_settings_model_overrides() is None
+
+    def test_none_when_no_model_keys_are_set(self, monkeypatch, tmp_path):
+        self._write(monkeypatch, tmp_path, {"env": {"SOMETHING_ELSE": "1"}})
+        assert claude.managed_settings_model_overrides() is None
+
+    def test_none_when_env_block_is_absent(self, monkeypatch, tmp_path):
+        self._write(monkeypatch, tmp_path, {"permissions": {}})
+        assert claude.managed_settings_model_overrides() is None
+
+    def test_none_on_platforms_without_managed_settings(self, monkeypatch):
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: None)
+        assert claude.managed_settings_model_overrides() is None
+
+    def test_none_when_the_file_does_not_exist(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: tmp_path / "missing.json")
+        assert claude.managed_settings_model_overrides() is None

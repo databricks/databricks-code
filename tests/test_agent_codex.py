@@ -8,6 +8,7 @@ import pytest
 
 from ucode.agents import codex
 from ucode.config_io import read_toml_safe
+from ucode.smart_routing import codex_routing
 
 WS = "https://example.databricks.com"
 
@@ -110,7 +111,10 @@ class TestCodexWriteConfig:
         assert doc["model"] == "gpt-5"
         assert "profiles" not in doc
 
-    def test_writes_openai_model_id_for_databricks_gpt_endpoint(self, tmp_path, monkeypatch):
+    def test_pins_discovered_databricks_model_id_verbatim(self, tmp_path, monkeypatch):
+        # The gateway routes by the discovered endpoint name, so the id is
+        # written as-is (not rewritten to an OpenAI id like `gpt-5.5`, which the
+        # gateway would resolve to a non-existent `system.ai.*` alias and 404).
         config_path = tmp_path / ".codex" / "ucode.config.toml"
         backup_path = tmp_path / "codex-ucode-config.backup.toml"
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
@@ -123,11 +127,9 @@ class TestCodexWriteConfig:
         )
 
         doc = read_toml_safe(config_path)
-        assert doc["model"] == "gpt-5.5"
+        assert doc["model"] == "databricks-gpt-5-5"
 
-    def test_preserves_databricks_model_id_when_openai_id_is_incompatible(
-        self, tmp_path, monkeypatch
-    ):
+    def test_pins_uc_model_services_id_verbatim(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
         backup_path = tmp_path / "codex-ucode-config.backup.toml"
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
@@ -136,12 +138,11 @@ class TestCodexWriteConfig:
         monkeypatch.setattr(codex, "save_state", lambda state: None)
 
         codex.write_tool_config(
-            {"workspace": WS, "codex_models": ["databricks-gpt-5-2-codex"]},
-            "databricks-gpt-5-2-codex",
+            {"workspace": WS, "codex_models": ["system.ai.gpt-5", "system.ai.gpt-5-5"]}
         )
 
         doc = read_toml_safe(config_path)
-        assert doc["model"] == "databricks-gpt-5-2-codex"
+        assert doc["model"] == "system.ai.gpt-5-5"
 
     def test_provider_writes_header_and_drops_stale_model(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
@@ -219,6 +220,65 @@ class TestCodexWriteConfig:
         assert provider["base_url"] == f"{WS}/ai-gateway/codex/v1"
         assert provider["wire_api"] == "responses"
 
+    def test_smart_routing_writes_profile_scoped_hooks(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            "[[hooks.PreToolUse]]\n"
+            'matcher = "Bash"\n'
+            "[[hooks.PreToolUse.hooks]]\n"
+            'type = "command"\n'
+            'command = "user-policy"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.145.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+
+        codex.write_tool_config(
+            {
+                "workspace": WS,
+                "profile": "prod",
+                "codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"],
+                codex.SMART_ROUTING_STATE_KEY: True,
+            }
+        )
+
+        doc = read_toml_safe(config_path)
+        assert set(doc["hooks"]) == {"PreToolUse", "SessionStart", "SubagentStart"}
+        pre_tool_commands = [
+            hook["command"] for group in doc["hooks"]["PreToolUse"] for hook in group["hooks"]
+        ]
+        assert "user-policy" in pre_tool_commands
+        route_command = next(
+            command for command in pre_tool_commands if "codex-router-hook" in command
+        )
+        assert "route-subagent" in route_command
+        assert "--host https://example.databricks.com" in route_command
+        assert "--profile prod" in route_command
+        assert "--model databricks-gpt-5-5" in route_command
+
+    def test_provider_launch_removes_routing_hooks(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        backup_path = tmp_path / "backup.toml"
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", backup_path)
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.145.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+        state = {
+            "workspace": WS,
+            "codex_models": ["databricks-gpt-5"],
+            codex.SMART_ROUTING_STATE_KEY: True,
+        }
+
+        codex.write_tool_config(state)
+        assert "hooks" in read_toml_safe(config_path)
+
+        codex.write_tool_config(state, provider="main.schema.provider")
+
+        assert "hooks" not in read_toml_safe(config_path)
+
     def test_legacy_write_preserves_other_profiles_in_shared_config(self, tmp_path, monkeypatch):
         config_dir = tmp_path / ".codex"
         config_dir.mkdir()
@@ -259,6 +319,94 @@ class TestCodexLegacyLayoutDetection:
         monkeypatch.setattr(codex, "agent_version", lambda binary: "unknown")
 
         assert codex._use_legacy_layout() is False
+
+
+class TestCodexSmartRouting:
+    def test_enable_requires_supported_codex(self, monkeypatch):
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.144.0")
+
+        try:
+            codex.enable_smart_routing({})
+            assert False
+        except RuntimeError as exc:
+            assert "0.145.0 or newer" in str(exc)
+
+    def test_disable_removes_only_ucode_hooks(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        legacy_path = tmp_path / ".codex" / "config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            "[[hooks.PreToolUse]]\n"
+            'matcher = "Bash"\n'
+            "[[hooks.PreToolUse.hooks]]\n"
+            'type = "command"\n'
+            'command = "user-policy"\n\n'
+            "[[hooks.PreToolUse]]\n"
+            'matcher = "Agent"\n'
+            "[[hooks.PreToolUse.hooks]]\n"
+            'type = "command"\n'
+            'command = "ucode codex-router-hook route-subagent"\n\n'
+            "[[hooks.SessionStart]]\n"
+            "[[hooks.SessionStart.hooks]]\n"
+            'type = "command"\n'
+            'command = "ucode codex-router-hook session-start"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+        monkeypatch.setattr(codex_routing, "clear_routing_artifacts", lambda: None)
+        state = {"workspace": WS, codex.SMART_ROUTING_STATE_KEY: True}
+
+        assert codex.disable_smart_routing(state) is True
+
+        doc = read_toml_safe(config_path)
+        assert state.get(codex.SMART_ROUTING_STATE_KEY) is None
+        assert list(doc["hooks"]) == ["PreToolUse"]
+        assert doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "user-policy"
+
+    def test_launch_task_uses_exec_prompt(self):
+        assert codex_routing._launch_routing_task(["exec", "fix the parser"]) == "fix the parser"
+
+    def test_launch_task_uses_positional_interactive_prompt(self):
+        # `codex "fix the parser"` — the seed prompt is routed directly, not
+        # wrapped in a placeholder.
+        assert codex_routing._launch_routing_task(["fix the parser"]) == "fix the parser"
+
+    def test_launch_task_skips_value_option_before_prompt(self):
+        # `-m <model>` consumes its value; the model id must not be taken as the
+        # prompt.
+        assert (
+            codex_routing._launch_routing_task(["-m", "gpt-5", "refactor the parser"])
+            == "refactor the parser"
+        )
+
+    def test_launch_task_honors_double_dash(self):
+        assert (
+            codex_routing._launch_routing_task(["--", "--not-a-flag prompt"])
+            == "--not-a-flag prompt"
+        )
+
+    def test_launch_task_bare_launch_returns_none(self):
+        # No prompt on the command line → None, so the caller skips routing and
+        # keeps the user's default model (root model can't be re-routed once the
+        # TUI is up).
+        assert codex_routing._launch_routing_task([]) is None
+
+    def test_launch_task_flags_only_returns_none(self):
+        assert codex_routing._launch_routing_task(["--search", "-m", "gpt-5"]) is None
+
+    def test_route_launch_model_skips_routing_without_prompt(self, monkeypatch):
+        # Bare launch: no router call at all, no decision, no error.
+        def fail(*args, **kwargs):
+            raise AssertionError("router must not be called on a bare launch")
+
+        monkeypatch.setattr(codex_routing, "request_routing_decision", fail)
+        decision, error = codex_routing.route_launch_model(
+            {"workspace": WS, "codex_models": ["system.ai.gpt-5-6-sol"]}, []
+        )
+        assert decision is None
+        assert error is None
 
 
 class TestCodexRemoveLegacyProfile:
@@ -369,28 +517,17 @@ class TestCodexDefaultModel:
 
         assert codex.default_model({"codex_models": models}) == "served-models/databricks-gpt-5-5"
 
-    def test_openai_model_id_maps_databricks_naming(self):
-        assert codex._openai_model_id("databricks-gpt-5-5") == "gpt-5.5"
-        assert codex._openai_model_id("databricks-gpt-5-5-mini") == "gpt-5.5-mini"
-        assert codex._openai_model_id("databricks-gpt-4o") == "gpt-4o"
-        assert codex._openai_model_id("served-models/databricks-gpt-5-5") == "gpt-5.5"
-        assert codex._openai_model_id("gpt-5.5") == "gpt-5.5"
-
-    def test_codex_model_id_preserves_openai_incompatible_models(self):
-        assert codex._codex_model_id("databricks-gpt-5-2-codex") == "databricks-gpt-5-2-codex"
-        assert codex._codex_model_id("databricks-gpt-5-4-nano") == "databricks-gpt-5-4-nano"
-
-    def test_codex_model_id_passes_model_services_id_verbatim(self):
-        # UC model-services ids route by name, so they must not be rewritten
-        # to the OpenAI id form.
-        assert codex._codex_model_id("system.ai.gpt-5") == "system.ai.gpt-5"
-        assert codex._codex_model_id("system.ai.gpt-5-2-codex") == "system.ai.gpt-5-2-codex"
+    def test_codex_default_model_wins_over_allowlist(self):
+        state = {
+            "codex_default_model": "admin-chosen-default",
+            "codex_models": ["databricks-gpt-5-5"],
+        }
+        assert codex.default_model(state) == "admin-chosen-default"
 
     def test_default_model_selects_model_services_gpt(self):
         models = ["system.ai.gpt-5", "system.ai.gpt-5-5", "system.ai.claude-opus-4-8"]
 
         assert codex.default_model({"codex_models": models}) == "system.ai.gpt-5-5"
-        assert codex._codex_model_id("databricks-gpt-5-5") == "gpt-5.5"
 
 
 class TestCodexValidateCmd:

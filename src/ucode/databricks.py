@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from concurrent.futures import (
     ThreadPoolExecutor,
     as_completed,
@@ -22,11 +23,12 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal, cast, overload
+from typing import Literal, NamedTuple, cast, overload
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from databricks.sql.exc import ServerOperationError
 
@@ -49,7 +51,8 @@ WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
 AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
-MIN_DATABRICKS_CLI_VERSION = (0, 298, 0)
+# v1.0.0 is the release that ships `databricks aitools`.
+MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 
 
@@ -242,30 +245,45 @@ def _http_get_json(
     except urllib_error.URLError as exc:
         _debug(f"GET {url}", f"URLError: {exc.reason}")
         return None, f"network error: {exc.reason}"
+    except OSError as exc:
+        # A socket read timeout raises a bare TimeoutError (an OSError), not a
+        # URLError, so it must be caught explicitly or it escapes the whole
+        # discovery flow. Surface it as a reason like every other failure.
+        _debug(f"GET {url}", f"OSError: {exc}")
+        return None, f"network error: {exc}"
 
 
-def _http_post_json(
-    url: str, token: str, payload: dict, *, timeout: int = 10
+def _http_send_json(
+    method: str,
+    url: str,
+    token: str,
+    payload: dict | None,
+    *,
+    timeout: int = 10,
+    allow_empty_body: bool = False,
 ) -> tuple[dict | list | None, str | None]:
-    """POST a JSON body to an endpoint. Returns (payload, None) on success,
-    (None, reason) on failure. Mirrors `_http_get_json`."""
-    body_bytes = json.dumps(payload).encode("utf-8")
-    request = urllib_request.Request(
-        url,
-        data=body_bytes,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        },
-    )
+    """Send a request that may carry a JSON body, and decode a JSON response.
+
+    Shared by `_http_post_json`, `_http_patch_json`, and `_http_delete` — the three differ only in
+    verb, whether they send a body, and whether an empty response is success. Returns
+    ``(payload, None)`` on success and ``(None, reason)`` on failure, like `_http_get_json`.
+
+    ``allow_empty_body`` is for DELETE, whose success response is ``google.protobuf.Empty`` — an
+    empty body there is the expected result, not a decode failure.
+    """
+    body_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if body_bytes is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib_request.Request(url, data=body_bytes, method=method, headers=headers)
     try:
         with urllib_request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
-        _debug(f"POST {url}", f"HTTP {response.status}, {len(body)} bytes")
+        _debug(f"{method} {url}", f"HTTP {response.status}, {len(body)} bytes")
         if _debug_enabled():
             _debug("body", body[:4000])
+        if allow_empty_body and not body.strip():
+            return None, None
         try:
             return json.loads(body), None
         except json.JSONDecodeError as exc:
@@ -276,7 +294,7 @@ def _http_post_json(
             body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
         except Exception:
             body = ""
-        _debug(f"POST {url}", f"HTTP {exc.code} {exc.reason}")
+        _debug(f"{method} {url}", f"HTTP {exc.code} {exc.reason}")
         if _debug_enabled() and body:
             _debug("body", body[:4000])
         reason = f"HTTP {exc.code} {exc.reason}"
@@ -285,8 +303,164 @@ def _http_post_json(
             reason = f"{reason}: {body_excerpt}"
         return None, reason
     except urllib_error.URLError as exc:
-        _debug(f"POST {url}", f"URLError: {exc.reason}")
+        _debug(f"{method} {url}", f"URLError: {exc.reason}")
         return None, f"network error: {exc.reason}"
+    except OSError as exc:
+        # See `_http_get_json`: a bare socket timeout is an OSError, not a
+        # URLError, and would otherwise escape the caller's error handling.
+        _debug(f"{method} {url}", f"OSError: {exc}")
+        return None, f"network error: {exc}"
+
+
+def _http_post_json(
+    url: str, token: str, payload: dict, *, timeout: int = 10
+) -> tuple[dict | list | None, str | None]:
+    """POST a JSON body to an endpoint. Returns (payload, None) on success,
+    (None, reason) on failure. Mirrors `_http_get_json`."""
+    return _http_send_json("POST", url, token, payload, timeout=timeout)
+
+
+def _http_patch_json(
+    url: str, token: str, payload: dict, *, timeout: int = 10
+) -> tuple[dict | list | None, str | None]:
+    """PATCH a JSON body to an endpoint. Returns (payload, None) on success,
+    (None, reason) on failure."""
+    return _http_send_json("PATCH", url, token, payload, timeout=timeout)
+
+
+def _http_delete(
+    url: str, token: str, *, timeout: int = 10
+) -> tuple[dict | list | None, str | None]:
+    """DELETE a resource. Returns (payload, None) on success, (None, reason) on failure.
+
+    A successful delete returns ``google.protobuf.Empty``, which serializes as ``{}`` or an empty
+    body depending on the gateway, so both count as success and yield ``(None, None)``. Callers
+    should test ``reason`` rather than the payload.
+    """
+    return _http_send_json("DELETE", url, token, None, timeout=timeout, allow_empty_body=True)
+
+
+def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes | None, str | None]:
+    """GET raw bytes. Returns (body, None) on success, (None, reason) on failure.
+
+    Like `_http_get_json` but leaves the body undecoded, since skill bundles can
+    contain binary files.
+    """
+    request = urllib_request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib_request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+        _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
+        return body, None
+    except urllib_error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        except Exception:
+            detail = ""
+        _debug(f"GET {url}", f"HTTP {exc.code} {exc.reason}")
+        reason = f"HTTP {exc.code} {exc.reason}"
+        excerpt = detail.strip()[:200]
+        if excerpt:
+            reason = f"{reason}: {excerpt}"
+        return None, reason
+    except urllib_error.URLError as exc:
+        _debug(f"GET {url}", f"URLError: {exc.reason}")
+        return None, f"network error: {exc.reason}"
+
+
+# Workspace group whose members are workspace admins. `ucode setup` / `ucode apply` are restricted
+# to this group because the coding-agent-config CRUD API enforces the same check server-side.
+WORKSPACE_ADMIN_GROUP = "admins"
+
+
+def _scim_me(workspace: str, token: str) -> dict | None:
+    """Return the SCIM `Me` payload for the caller, or None on failure."""
+    hostname = workspace_hostname(workspace)
+    payload, _ = _http_get_json(f"https://{hostname}/api/2.0/preview/scim/v2/Me", token)
+    return payload if isinstance(payload, dict) else None
+
+
+def is_workspace_admin(workspace: str, token: str) -> bool | None:
+    """Whether the caller is a workspace admin, via their SCIM `Me` group membership.
+
+    Returns True/False, or None when the check itself could not be made (SCIM unreachable or a
+    malformed response). Callers should treat None as "unknown" and proceed optimistically rather
+    than blocking: the API enforces the same check server-side, so a false negative here would
+    needlessly stop a legitimate admin, while a false positive just surfaces the server's
+    PERMISSION_DENIED later.
+    """
+    payload = _scim_me(workspace, token)
+    if payload is None:
+        return None
+    groups = payload.get("groups")
+    if not isinstance(groups, list):
+        # A well-formed `Me` for a user in no groups omits `groups` entirely, so this is a
+        # definitive "not an admin" rather than a failed check.
+        return False
+    return any(
+        isinstance(group, dict) and group.get("display") == WORKSPACE_ADMIN_GROUP
+        for group in groups
+    )
+
+
+# Workspace-scoped budget listing. Account-level budget APIs need account auth, which ucode does not
+# have; this endpoint resolves the workspace server-side from the caller's token.
+_WORKSPACE_BUDGETS_API_PATH = "/api/ai-gateway/v2/workspace-metrics/budgets"
+
+
+# Alert-config scope that carries a per-user threshold. A budget's coding-agent spend routing only
+# works when it has one: the gateway's `recommendModel` measures the caller's spend against a
+# per-user threshold, so a budget with only a shared (workspace-wide) alert reports no spend and
+# leaves every tier inert. The listing exposes `scope_type` but not the alert's action, so ucode can
+# only check for the scope's presence; the server enforces the (block) action on config create.
+_PER_USER_ALERT_SCOPE = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
+
+
+def _has_per_user_alert(entry: dict) -> bool:
+    """Whether a raw budget entry carries a per-user alert threshold."""
+    for alert in entry.get("alert_configurations") or []:
+        if isinstance(alert, dict) and alert.get("scope_type") == _PER_USER_ALERT_SCOPE:
+            return True
+    return False
+
+
+def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str | None]:
+    """List the AI Gateway budgets that apply to this workspace.
+
+    Returns ``(budgets, reason)`` where each budget is ``{"id", "display_name", "has_per_user_alert"}``.
+    ``reason`` is None on success, otherwise it explains why the list is empty. ucode never creates
+    budgets — an admin picks an existing one to attach a spend-routing policy to. ``has_per_user_alert``
+    lets the picker hide budgets that can't drive spend routing (see ``_PER_USER_ALERT_SCOPE``).
+    """
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}{_WORKSPACE_BUDGETS_API_PATH}"
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if reason is not None:
+        return [], reason
+    if not isinstance(payload, dict):
+        return [], "workspace budget listing returned an unexpected response shape"
+    raw = payload.get("workspace_ai_gateway_budgets")
+    if not isinstance(raw, list):
+        return [], "workspace budget listing returned no budgets"
+    budgets: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        budget_id = entry.get("budget_configuration_id")
+        if not isinstance(budget_id, str) or not budget_id:
+            continue
+        display_name = entry.get("display_name")
+        budgets.append(
+            {
+                "id": budget_id,
+                "display_name": display_name if isinstance(display_name, str) else "",
+                "has_per_user_alert": _has_per_user_alert(entry),
+            }
+        )
+    if not budgets:
+        return [], "workspace budget listing returned no budgets"
+    return budgets, None
 
 
 def get_current_user_name(workspace: str, token: str) -> str | None:
@@ -294,9 +468,8 @@ def get_current_user_name(workspace: str, token: str) -> str | None:
 
     Databricks puts the workspace login in `userName`; fall back to the first
     `emails` entry for workspaces that diverge."""
-    hostname = workspace_hostname(workspace)
-    payload, _ = _http_get_json(f"https://{hostname}/api/2.0/preview/scim/v2/Me", token)
-    if not isinstance(payload, dict):
+    payload = _scim_me(workspace, token)
+    if payload is None:
         return None
     user_name = payload.get("userName")
     if isinstance(user_name, str) and user_name.strip():
@@ -548,6 +721,41 @@ def install_databricks_cli() -> None:
     ensure_databricks_cli_version()
 
 
+def install_ai_tools(agent_tokens: list[str], profile: str | None = None) -> None:
+    """Install Databricks AI Tools for the given agents (e.g. ``claude-code``).
+
+    Databricks AI Tools is the set of skills and plugins that teach coding
+    agents how to work with Databricks (installed via ``databricks aitools``).
+    Idempotent and best-effort: any failure only warns (surfacing the CLI's
+    own error), since AI Tools aren't required to launch an agent."""
+    if not agent_tokens:
+        return
+
+    agents_arg = ",".join(agent_tokens)
+    try:
+        with spinner(f"Installing Databricks AI Tools for {agents_arg}..."):
+            run(
+                ["databricks", "aitools", "install", "--agents", agents_arg, "--scope", "global"]
+                + _profile_args(profile),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # The CLI version is already guaranteed by ensure_databricks_cli_version,
+        # so any failure here is something else (e.g. an agent binary missing
+        # from PATH). Surface the CLI's own error rather than guessing a cause.
+        detail = getattr(exc, "stderr", None) or ""
+        if isinstance(detail, bytes):  # TimeoutExpired.stderr is bytes even with text=True
+            detail = detail.decode(errors="replace")
+        detail = detail.strip()
+        reason = detail.splitlines()[-1] if detail else str(exc)
+        print_warning(f"Could not install Databricks AI Tools: {reason}")
+    else:
+        print_success("Databricks AI Tools installed")
+
+
 def _profile_args(profile: str | None) -> list[str]:
     """Return ``["--profile", profile]`` when set, otherwise an empty list.
 
@@ -766,12 +974,20 @@ def run_databricks_login(workspace: str, profile: str | None = None) -> None:
     print_success("Databricks authentication complete")
 
 
-def ensure_databricks_auth(workspace: str, profile: str | None = None) -> None:
-    """Check auth and login only if needed (used by launch path)."""
+def ensure_databricks_auth(
+    workspace: str, profile: str | None = None, *, quiet: bool = False
+) -> None:
+    """Check auth and login only if needed (used by launch path).
+
+    ``quiet`` suppresses the "already available" line for a caller that only needs a token before
+    some later step re-authenticates and reports it — otherwise the same success prints twice. A
+    login that actually runs is never silent.
+    """
     with spinner("Checking Databricks auth..."):
         auth_is_valid = has_valid_databricks_auth(workspace, profile)
     if auth_is_valid:
-        print_success(f"Databricks auth already available for {workspace}")
+        if not quiet:
+            print_success(f"Databricks auth already available for {workspace}")
         return
     run_databricks_login(workspace, profile)
 
@@ -1073,6 +1289,27 @@ def build_auth_token_argv(
     return argv
 
 
+def build_mcp_proxy_argv(
+    url: str, workspace: str, profile: str | None = None, *, use_pat: bool = False
+) -> list[str]:
+    """Argv for the stdio MCP bridge: `ucode mcp-proxy --url ... --host ...`.
+
+    Every coding agent registers this single command as a local stdio MCP
+    server instead of a per-client HTTP endpoint with a bearer header. The proxy
+    forwards to ``url`` and mints a fresh OAuth token on each upstream request,
+    so tokens never expire mid-session — the client only ever spawns a process,
+    which keeps registration uniform across CLIs that disagree on HTTP-auth
+    syntax. Like `build_auth_token_argv`, this resolves the absolute `ucode`
+    path and passes plain arguments (no shell), so it runs identically on every
+    platform."""
+    argv = [_ucode_binary(), "mcp-proxy", "--url", url, "--host", workspace.rstrip("/")]
+    if profile:
+        argv += ["--profile", profile]
+    if use_pat:
+        argv.append("--use-pat")
+    return argv
+
+
 def build_auth_shell_command(
     workspace: str, profile: str | None = None, *, use_pat: bool = False
 ) -> str:
@@ -1095,6 +1332,61 @@ _MODEL_SERVICE_NAME_PREFIX = "model-services/"
 # `main.user.foo`, `temp.*`, internal DLT schemas). We only want the
 # Databricks-managed foundation models under `system.ai`.
 _MODEL_SERVICE_REQUIRED_PREFIX = "system.ai."
+
+# Supported OSS chat families, matched by name substring. Add an entry to
+# support a new family.
+_OSS_MODEL_FAMILIES = ("kimi-", "glm-")
+
+# Claude model families ucode buckets, newest tier first. Each maps to a
+# Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
+# support a new family in both discovery paths (`claude-<family>-*` via the
+# model-services listing and `databricks-claude-<family>-*` via the AI Gateway).
+ANTHROPIC_FAMILIES = ("fable", "opus", "sonnet", "haiku")
+
+
+def classify_model_family(model_id: str) -> str | None:
+    """Bucket a model FQN into the family ucode keys its state by, or None if unrecognized.
+
+    Mirrors how discovery buckets a model-services listing (see `discover_model_services`), so a
+    model named in a managed config lands in the same bucket it would have from discovery. Returns
+    one of ``ANTHROPIC_FAMILIES``, ``"codex"``, ``"gemini"``, or ``"oss"``. Matching is by name
+    substring because neither the listing nor the config records a model's API dialect.
+    """
+    for family in ANTHROPIC_FAMILIES:
+        if f"claude-{family}-" in model_id:
+            return family
+    if "gpt-" in model_id:
+        return "codex"
+    if "gemini-" in model_id:
+        return "gemini"
+    if any(oss in model_id for oss in _OSS_MODEL_FAMILIES):
+        return "oss"
+    return None
+
+
+# Per-family token limits (context window + max output tokens). These are a
+# property of the model + its `/ai-gateway/mlflow/v1` route (the gateway rejects
+# requests whose output exceeds the cap), not of any one agent — so every agent
+# that serves OSS models reads this single table and translates it into its own
+# config dialect. Both fields are provided because agents like OpenCode require
+# context and output together. Keyed by family substring; add an entry to bound
+# a new model.
+_MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
+    # GLM-4.6: 200k context, but the gateway caps output well below the model's
+    # native 128k — pin 25k so requests aren't rejected.
+    "glm": {"context": 200_000, "output": 25_000},
+}
+
+
+def model_token_limits(model_id: str) -> dict[str, int] | None:
+    """Return ``{"context": ..., "output": ...}`` limits for ``model_id``, or None.
+
+    Matches by family substring (e.g. any ``*glm*`` id). None means the model
+    has no known limits and the agent should not pin any."""
+    for family, limits in _MODEL_TOKEN_LIMITS.items():
+        if family in model_id:
+            return dict(limits)
+    return None
 
 
 def _model_service_id(service: dict) -> str | None:
@@ -1140,12 +1432,44 @@ def _get_model_services_page(
     return payload, reason
 
 
+# Successful model-service listings for this process, keyed by workspace. The listing is a paginated
+# walk of the whole metastore catalog, and several callers want different views of the same result
+# (`discover_model_services` buckets it per family, `discover_claude_models_unbucketed` keeps the raw
+# Claude ids), so a single `ucode setup` run would otherwise page it twice. Cached per process, not
+# persisted: a long-lived process is not a thing here, and a new model appearing mid-command is not
+# worth a second walk. Failures are never cached, so a transient error still retries.
+_MODEL_SERVICES_CACHE: dict[str, list[str]] = {}
+
+# Same idea for the Model Provider Service listing (a different endpoint). It is workspace-wide and
+# filtered per agent afterwards, so `ucode setup` would otherwise re-list it once per MPS-capable
+# agent. Keyed by ``(workspace, parent)`` — a schema-scoped listing is a different result set than
+# the metastore-wide one, so they must not share an entry.
+_MODEL_PROVIDER_SERVICES_CACHE: dict[tuple[str, str], list[dict]] = {}
+
+
+def clear_model_services_cache() -> None:
+    """Forget cached model-service listings (used by tests, and after a workspace switch)."""
+    _MODEL_SERVICES_CACHE.clear()
+    _MODEL_PROVIDER_SERVICES_CACHE.clear()
+
+
+def has_cached_model_provider_services(workspace: str, parent: str | None = None) -> bool:
+    """True when :func:`list_model_provider_services` will answer from cache.
+
+    Lets a caller skip a progress spinner it doesn't need: the cold listing takes over a second, so
+    it deserves one, but repeating it per agent on an instant cache hit is just noise. Takes
+    ``parent`` for the same reason the cache is keyed on it — a scoped listing is a separate entry.
+    """
+    return (workspace, parent or "") in _MODEL_PROVIDER_SERVICES_CACHE
+
+
 def list_model_services(
     workspace: str,
     token: str,
     *,
     page_size: int = _MODEL_SERVICES_PAGE_SIZE,
     max_pages: int = 100,
+    use_cache: bool = True,
 ) -> tuple[list[str], str | None]:
     """List all `system.ai.*` model ids via the UC model-services API.
 
@@ -1154,7 +1478,15 @@ def list_model_services(
     de-duplicated, sorted list of ``system.ai.<model-name>`` ids. Returns
     (ids, reason); reason is None on success, otherwise it describes why the
     list is empty (HTTP/network error or no services).
+
+    A successful result is memoized per workspace for the life of the process; pass
+    ``use_cache=False`` to force a fresh walk.
     """
+    if use_cache:
+        cached = _MODEL_SERVICES_CACHE.get(workspace)
+        if cached is not None:
+            return list(cached), None
+
     hostname = workspace_hostname(workspace)
     ids: list[str] = []
     page_token: str | None = None
@@ -1187,8 +1519,38 @@ def list_model_services(
 
     deduped = sorted(set(ids))
     if deduped:
+        if use_cache:
+            _MODEL_SERVICES_CACHE[workspace] = list(deduped)
         return deduped, None
     return [], last_reason or "model-services listing returned no models"
+
+
+def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """Every `system.ai.claude-*` id on the workspace, unbucketed.
+
+    `discover_model_services` keeps only the newest id per family because the launch path pins one
+    model per Claude family alias. An admin authoring a managed config needs the alternatives too
+    (see `managed_setup.claude_family_candidates`), so this returns the full set without disturbing
+    that shape.
+    """
+    ids, reason = list_model_services(workspace, token)
+    if not ids:
+        return [], reason
+    return [m for m in ids if "claude-" in m.lower()], None
+
+
+def _prefer_opus_4_8(models: dict[str, str], all_ids: list[str]) -> None:
+    """Swap the opus slot to claude-opus-4-8 when it's available.
+
+    Discovery picks the newest opus (opus-5) but smart routing's
+    CLAUDE_ROUTE_ARMS require claude-opus-4-8. Pin to 4-8 when both
+    exist so the routing availability check passes.
+    """
+    opus = models.get("opus")
+    if opus and "claude-opus-5" in opus:
+        opus_48 = next((m for m in all_ids if "claude-opus-4-8" in m), None)
+        if opus_48:
+            models["opus"] = opus_48
 
 
 def discover_model_services(
@@ -1198,8 +1560,9 @@ def discover_model_services(
 
     Returns (claude_models, codex_models, gemini_models, oss_models, reason):
 
-    - ``claude_models`` maps ``opus``/``sonnet``/``haiku`` to the newest
-      matching ``system.ai.claude-*`` id (mirrors ``discover_claude_models``).
+    - ``claude_models`` maps ``fable``/``opus``/``sonnet``/``haiku`` to the
+      newest matching ``system.ai.claude-*`` id (mirrors
+      ``discover_claude_models``).
     - ``codex_models`` is the list of ``system.ai.*gpt-*`` ids.
     - ``gemini_models`` is the list of ``system.ai.*gemini-*`` ids, newest first.
     - ``oss_models`` is the list of OSS-model ``system.ai.*`` ids.
@@ -1213,17 +1576,24 @@ def discover_model_services(
         return {}, [], [], [], reason
 
     claude_models: dict[str, str] = {}
-    for family in ("opus", "sonnet", "haiku"):
+    for family in ANTHROPIC_FAMILIES:
         candidates = sorted(
             [m for m in ids if f"claude-{family}-" in m],
             reverse=True,
         )
         if candidates:
             claude_models[family] = candidates[0]
+    # Smart routing's CLAUDE_ROUTE_ARMS require claude-opus-4-8, but the
+    # newest-wins sort above picks opus-5 when both exist — making the
+    # routing availability check fail. Pin opus-4-8 when it's available so
+    # routing works with the currently-deployed task_v1 router. Revert to
+    # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
+    _prefer_opus_4_8(claude_models, ids)
 
     codex_models = [m for m in ids if "gpt-" in m]
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
-    oss_models = [m for m in ids if "kimi-" in m]
+
+    oss_models = [m for m in ids if any(family in m for family in _OSS_MODEL_FAMILIES)]
 
     if not (claude_models or codex_models or gemini_models or oss_models):
         sample = ", ".join(ids[:5])
@@ -1238,6 +1608,144 @@ def discover_model_services(
             ),
         )
     return claude_models, codex_models, gemini_models, oss_models, None
+
+
+# --- Managed coding-agent config (admin-authored, developer-read) -----------
+
+# The workspace-admin authors a CodingAgentConfig via the AI Gateway; developers read it
+# (non-admin) through the List endpoint and apply it locally.
+_CODING_AGENT_CONFIGS_API_PATH = "/api/ai-gateway/v2/coding-agent-configs"
+
+
+def fetch_managed_coding_agent_configs(workspace: str, token: str) -> tuple[list[dict], str | None]:
+    """List the workspace's managed CodingAgentConfig(s) via the AI Gateway."""
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}{_CODING_AGENT_CONFIGS_API_PATH}"
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if reason is not None:
+        return [], reason
+    if isinstance(payload, dict):
+        configs = payload.get("coding_agent_configs") or []
+    elif isinstance(payload, list):
+        configs = payload
+    else:
+        return [], "coding-agent-configs listing returned an unexpected response shape"
+    if not isinstance(configs, list):
+        return [], "coding-agent-configs listing returned an unexpected response shape"
+    return [c for c in configs if isinstance(c, dict)], None
+
+
+def fetch_model_recommendation(workspace: str, token: str) -> tuple[dict, str | None]:
+    """Ask the AI Gateway which agent and model the caller's budget tier allows.
+
+    The request takes no parameters: the server matches the caller's live spend against the managed
+    config's budget tiers and resolves the agent first, then that agent's model.
+    """
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}{_CODING_AGENT_CONFIGS_API_PATH}:recommendModel"
+    payload, reason = _http_post_json(url, token, {}, timeout=30)
+    if reason is not None:
+        return {}, reason
+    if not isinstance(payload, dict):
+        return {}, "recommendModel returned an unexpected response shape"
+    return payload, None
+
+
+# Every field ucode's manifest can set, as `update_mask` paths for a PATCH. The server rejects a
+# missing or empty mask, and rejects paths outside its own mutable set — this is that set minus the
+# fields ucode doesn't author: `budget_id` (deprecated in favour of `budget_policy.budget_id`, and
+# rejected on write) and `default_options`/`tiers` (the legacy model-only shape superseded by
+# `enabled_agents`/`budget_policy`). Sending every path ucode owns, rather than only the ones
+# currently populated, is what lets a re-run *clear* a field the admin removed: the server merges
+# per path, so an omitted path leaves the old value in place.
+MANAGED_CONFIG_UPDATE_MASK_PATHS: tuple[str, ...] = (
+    "display_name",
+    "default_agent",
+    "enabled_agents",
+    "mcp_servers",
+    "skills",
+    "tracing",
+    "budget_policy",
+)
+
+
+def _coding_agent_config_url(workspace: str, name: str | None = None) -> str:
+    """The collection URL, or one config's resource URL when ``name`` is given.
+
+    ``name`` is the server-assigned resource name (``coding-agent-configs/{id}``), which the Get and
+    Update paths template directly, so it is appended as-is rather than rebuilt from an id.
+    """
+    hostname = workspace_hostname(workspace)
+    base = f"https://{hostname}{_CODING_AGENT_CONFIGS_API_PATH}"
+    if name is None:
+        return base
+    # The resource name already carries the collection segment, so join on the API root.
+    root = base.rsplit("/coding-agent-configs", 1)[0]
+    return f"{root}/{name.strip().strip('/')}"
+
+
+def create_coding_agent_config(
+    workspace: str, token: str, config: dict
+) -> tuple[dict | None, str | None]:
+    """Create the workspace's managed CodingAgentConfig.
+
+    v0 allows at most one config per workspace, so this fails with ALREADY_EXISTS when one is
+    already defined; callers should update that one instead of creating a second.
+    """
+    url = _coding_agent_config_url(workspace)
+    payload, reason = _http_post_json(url, token, config, timeout=30)
+    if reason is not None:
+        return None, reason
+    if not isinstance(payload, dict):
+        return None, "coding-agent-config create returned an unexpected response shape"
+    return payload, None
+
+
+def update_coding_agent_config(
+    workspace: str,
+    token: str,
+    name: str,
+    config: dict,
+    *,
+    update_mask: tuple[str, ...] = MANAGED_CONFIG_UPDATE_MASK_PATHS,
+) -> tuple[dict | None, str | None]:
+    """Update an existing managed CodingAgentConfig in place.
+
+    Preferred over delete-then-create: the server applies the mask inside a single entity-store
+    update, so the workspace is never left without a config if the write fails partway. ``name``
+    identifies the config and is echoed in the body, which is what the API's path template expects.
+
+    ``update_mask`` goes in the query string, not the body. The RPC's HTTP binding is
+    ``patch: "…/{coding_agent_config.name=coding-agent-configs/*}"`` with ``body:
+    "coding_agent_config"`` — the config *is* the whole body, so a mask nested inside it is parsed
+    as an unknown config field and the server reports the mask as missing:
+
+        Field 'update_mask' is required and must contain at least one subfield with a non-default
+        value!
+
+    It is also a ``google.protobuf.FieldMask``, whose JSON/query form is one comma-separated string
+    rather than a ``{"paths": [...]}`` object.
+    """
+    query = urlencode({"update_mask": ",".join(update_mask)})
+    url = f"{_coding_agent_config_url(workspace, name)}?{query}"
+    body = {**config, "name": name}
+    payload, reason = _http_patch_json(url, token, body, timeout=30)
+    if reason is not None:
+        return None, reason
+    if not isinstance(payload, dict):
+        return None, "coding-agent-config update returned an unexpected response shape"
+    return payload, None
+
+
+def delete_coding_agent_config(workspace: str, token: str, name: str) -> str | None:
+    """Delete a managed CodingAgentConfig by resource name. Returns None on success, else a reason.
+
+    Returns only the failure reason: a successful delete responds with ``Empty``, so there is no
+    payload worth handing back.
+    """
+    url = _coding_agent_config_url(workspace, name)
+    _, reason = _http_delete(url, token, timeout=30)
+    return reason
 
 
 # --- MCP services (parallel to model services) -----------------------------
@@ -1293,6 +1801,19 @@ def build_mcp_service_url(workspace: str, full_name: str) -> str:
     return f"{workspace}/ai-gateway/mcp-services/{full_name}"
 
 
+def build_skills_mcp_url(workspace: str, locations: list[str]) -> str:
+    """Skills route with one ``?schema=`` scope per location. The trailing slash
+    is required by the Envoy prefix even with no query params.
+
+        []                        -> ``.../ai-gateway/skills/``
+        ["main.default", "ml.a"]  -> ``.../ai-gateway/skills/?schema=main.default&schema=ml.a``
+    """
+    base = f"{workspace}/ai-gateway/skills/"
+    if not locations:
+        return base
+    return base + "?" + urlencode([("schema", loc) for loc in locations])
+
+
 # Maps the gateway routing dialect a coding tool speaks to the Model Provider
 # Service `provider_type`s it can be backed by. claude speaks Anthropic's API,
 # which both the `anthropic` and `amazon_bedrock` provider types serve (Bedrock
@@ -1323,46 +1844,180 @@ def _provider_type_tag(provider_type: str | None) -> str:
     return tag.lower()
 
 
-def list_model_provider_services(workspace: str, token: str) -> tuple[list[dict], str | None]:
+# The listing is paginated; a metastore with more services than one page silently truncated before
+# this was honored, making services on later pages look nonexistent.
+_PROVIDER_SERVICES_PAGE_SIZE = 100
+_PROVIDER_SERVICES_MAX_PAGES = 50
+
+
+def list_model_provider_services(
+    workspace: str, token: str, *, parent: str | None = None, use_cache: bool = True
+) -> tuple[list[dict], str | None]:
     """List Unity Catalog Model Provider Services on the workspace.
 
     Returns ``(services, reason)`` where each service is
     ``{"name": "<catalog>.<schema>.<service>", "provider_type": "anthropic"|...,
-    "targets": [model_id, ...], "allow_all_targets": bool}``. ``targets`` is the
-    provider-side model ids the service exposes (used to pin Bedrock model
-    names). A non-None ``reason`` means the listing call itself failed.
+    "targets": [model_id, ...], "allow_all_targets": bool, "relayed": bool}``.
+    ``targets`` is the provider-side model ids the service exposes (used to pin
+    Bedrock model names). ``relayed`` is True for a credential-less Anthropic
+    service (Claude Max/Team/Enterprise subscription relay). A non-None
+    ``reason`` means the listing call itself failed.
+
+    Pages through the endpoint: a metastore with more services than fit on one page used to have the
+    remainder silently dropped, so a service that plainly existed looked absent. ``parent`` scopes
+    the listing to one ``catalog.schema`` — the metastore-wide default is documented as an internal,
+    likely-to-be-deprecated scope, so prefer passing it when the schema is known.
+
+    A successful result is memoized per workspace for the life of the process, like the
+    model-services listing: the listing is workspace-wide (filtered per agent afterwards by
+    :func:`service_usable_for_tool`), so without the memo `ucode setup` re-lists it once per
+    MPS-capable agent. Pass ``use_cache=False`` to force a fresh call.
+    """
+    # Keyed by workspace *and* parent: a `parent`-scoped listing holds only that schema's services,
+    # so caching it under the workspace alone would serve a partial list to an unscoped caller (and
+    # vice versa) — a service that plainly exists would look absent, the same failure pagination was
+    # added to fix.
+    cache_key = (workspace, parent or "")
+    if use_cache:
+        cached = _MODEL_PROVIDER_SERVICES_CACHE.get(cache_key)
+        if cached is not None:
+            # A fresh list of fresh dicts each time: callers treat the result as theirs (the wizard
+            # filters it per agent), so handing out the cached objects would let one caller's edit
+            # reach the next.
+            return [dict(service) for service in cached], None
+
+    hostname = workspace_hostname(workspace)
+    services: list[dict] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    last_reason: str | None = None
+    for _ in range(_PROVIDER_SERVICES_MAX_PAGES):
+        params: dict[str, str] = {"page_size": str(_PROVIDER_SERVICES_PAGE_SIZE)}
+        if parent:
+            params["parent"] = f"schemas/{parent}"
+        if page_token:
+            params["page_token"] = page_token
+        url = (
+            f"https://{hostname}/api/2.1/unity-catalog/model-provider-services?{urlencode(params)}"
+        )
+        payload, reason = _http_get_json(url, token, timeout=30)
+        if payload is None:
+            # Surface the failure only if we have nothing yet; a mid-pagination blip still
+            # returns whatever was collected.
+            last_reason = reason
+            break
+        data = cast(dict, payload) if isinstance(payload, dict) else {}
+        for service in data.get("model_provider_services") or []:
+            entry = _provider_service_entry(service)
+            if entry is not None:
+                services.append(entry)
+        page_token = data.get("next_page_token") or None
+        if not page_token:
+            last_reason = None
+            break
+        if page_token in seen_tokens:
+            break
+        seen_tokens.add(page_token)
+
+    if not services and last_reason is not None:
+        return [], last_reason
+    services.sort(key=lambda s: s["name"])
+    if use_cache:
+        _MODEL_PROVIDER_SERVICES_CACHE[cache_key] = [dict(service) for service in services]
+    return services, None
+
+
+def _provider_service_entry(raw_service: object) -> dict | None:
+    """Normalize one listing entry, or None when it isn't usable."""
+    if not isinstance(raw_service, dict):
+        return None
+    # A bare isinstance narrows to dict[Never, Never], which rejects string keys.
+    service = cast("dict[str, object]", raw_service)
+    raw_name = service.get("name")
+    if not isinstance(raw_name, str) or not raw_name:
+        return None
+    # The API returns `model-provider-services/<catalog>.<schema>.<name>`.
+    full_name = raw_name.split("/", 1)[1] if "/" in raw_name else raw_name
+    raw_config = service.get("config")
+    config = cast("dict[str, object]", raw_config) if isinstance(raw_config, dict) else {}
+    targets: list[str] = []
+    raw_targets = config.get("targets")
+    for target in raw_targets if isinstance(raw_targets, list) else []:
+        if not isinstance(target, dict):
+            continue
+        model_id = cast("dict[str, object]", target).get("model")
+        if isinstance(model_id, str) and model_id:
+            targets.append(model_id)
+    # Relayed = credential-less Anthropic (subscription relay). Only whether
+    # it's relayed matters here; the tier (Max vs Team/Enterprise) is governed
+    # server-side, so both launch identically.
+    anthropic_cfg = config.get("anthropic")
+    relayed = isinstance(anthropic_cfg, dict) and "relayed" in anthropic_cfg
+    raw_type = config.get("provider_type")
+    return {
+        "name": full_name,
+        "provider_type": _provider_type_tag(raw_type if isinstance(raw_type, str) else None),
+        "targets": targets,
+        "allow_all_targets": bool(config.get("allow_all_targets")),
+        "relayed": relayed,
+    }
+
+
+def get_model_provider_service(
+    service_name: str, workspace: str, token: str
+) -> tuple[dict | None, str | None]:
+    """Fetch one provider service by its full `catalog.schema.name`, bypassing the listing.
+
+    The listing is paginated and metastore-wide, so any gap in it (a page we failed to fetch, a
+    server-side filter) makes a service that plainly exists look absent. Addressing it directly
+    removes that whole class of false negative.
     """
     hostname = workspace_hostname(workspace)
-    url = f"https://{hostname}/api/2.1/unity-catalog/model-provider-services"
+    url = f"https://{hostname}/api/2.1/unity-catalog/model-provider-services/{service_name}"
     payload, reason = _http_get_json(url, token, timeout=30)
     if payload is None:
-        return [], reason
-    data = cast(dict, payload) if isinstance(payload, dict) else {}
-    services: list[dict] = []
-    for service in data.get("model_provider_services") or []:
-        if not isinstance(service, dict):
+        return None, reason
+    entry = _provider_service_entry(payload)
+    if entry is None:
+        return None, "model-provider-service response had an unexpected shape"
+    return entry, None
+
+
+# The group every workspace user belongs to. USE_SCHEMA granted to it (directly or inherited from
+# the catalog) is what lets an arbitrary developer pull a config that routes through an MPS in that
+# schema; without it they hit "User does not have USE_SCHEMA on Schema <catalog>.<schema>".
+_ALL_WORKSPACE_USERS_GROUP = "account users"
+
+
+def all_users_can_use_schema(workspace: str, token: str, schema_full_name: str) -> bool | None:
+    """Whether the `account users` group has USE_SCHEMA on ``<catalog>.<schema>``.
+
+    Uses UC's effective-permissions API, so a USE_SCHEMA inherited from a catalog-level grant counts.
+    Returns True/False, or None when the check itself could not be made (API unreachable or an
+    unexpected shape) — callers treat None as "unknown" and skip the warning rather than cry wolf.
+
+    A False here is only a heuristic: a workspace may instead grant access through team groups or
+    individual users, so callers must warn rather than block on it.
+    """
+    hostname = workspace_hostname(workspace)
+    principal = quote(_ALL_WORKSPACE_USERS_GROUP)
+    url = (
+        f"https://{hostname}/api/2.1/unity-catalog/effective-permissions/"
+        f"schema/{schema_full_name}?principal={principal}"
+    )
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if reason is not None or not isinstance(payload, dict):
+        return None
+    for assignment in payload.get("privilege_assignments") or []:
+        if not isinstance(assignment, dict):
             continue
-        raw_name = service.get("name")
-        if not isinstance(raw_name, str) or not raw_name:
-            continue
-        # The API returns `model-provider-services/<catalog>.<schema>.<name>`.
-        full_name = raw_name.split("/", 1)[1] if "/" in raw_name else raw_name
-        config = service.get("config") if isinstance(service.get("config"), dict) else {}
-        targets = []
-        for target in config.get("targets") or []:
-            model_id = target.get("model") if isinstance(target, dict) else None
-            if isinstance(model_id, str) and model_id:
-                targets.append(model_id)
-        services.append(
-            {
-                "name": full_name,
-                "provider_type": _provider_type_tag(config.get("provider_type")),
-                "targets": targets,
-                "allow_all_targets": bool(config.get("allow_all_targets")),
-            }
-        )
-    services.sort(key=lambda s: s["name"])
-    return services, None
+        for entry in assignment.get("privileges") or []:
+            if isinstance(entry, dict) and entry.get("privilege") in (
+                "USE_SCHEMA",
+                "ALL_PRIVILEGES",
+            ):
+                return True
+    return False
 
 
 def is_model_provider_feature_unavailable(reason: str | None) -> bool:
@@ -1423,11 +2078,16 @@ def resolve_provider_service(
         return None, f"Could not list model provider services: {reason}"
     match = next((s for s in services if s["name"] == service_name), None)
     if match is None:
-        usable = [
-            s["name"] for s in services if tool_supports_provider_type(tool, s["provider_type"])
-        ]
-        suffix = f" Available for {tool}: {', '.join(usable)}." if usable else ""
-        return None, f"Model provider service '{service_name}' was not found.{suffix}"
+        # Don't conclude "not found" from a listing that may be incomplete — a named service can be
+        # fetched directly. Only when that 404s is it really absent.
+        match, get_reason = get_model_provider_service(service_name, workspace, token)
+        if match is None:
+            usable = [
+                s["name"] for s in services if tool_supports_provider_type(tool, s["provider_type"])
+            ]
+            suffix = f" Available for {tool}: {', '.join(usable)}." if usable else ""
+            detail = f" ({get_reason})" if get_reason and "404" not in get_reason else ""
+            return None, f"Model provider service '{service_name}' was not found.{detail}{suffix}"
     provider_type = match["provider_type"]
     if not tool_supports_provider_type(tool, provider_type):
         supported = ", ".join(_TOOL_PROVIDER_TYPES.get(tool, ())) or "none"
@@ -1506,6 +2166,10 @@ _UC_LIST_HTTP_TIMEOUT = 10
 _UC_FUNCTION_PROBE_TIMEOUT = 5
 _VECTOR_SEARCH_DEADLINE_SECONDS = 15.0
 _UC_FUNCTIONS_DEADLINE_SECONDS = 20.0
+# Most MCP services live outside `system.ai`, so this workspace-wide walk needs
+# enough time to enumerate them; a slow workspace still degrades to partial
+# results once the budget is exceeded instead of hanging indefinitely.
+_MCP_SERVICES_WALK_DEADLINE_SECONDS = 30.0
 # Skip UC catalogs whose schemas almost never carry user-callable functions
 # you'd want to expose as agent tools.
 _UC_FUNCTIONS_SKIP_CATALOGS = frozenset(
@@ -1594,11 +2258,16 @@ def list_vector_search_catalog_schemas(
     token: str,
     *,
     deadline_seconds: float = _VECTOR_SEARCH_DEADLINE_SECONDS,
+    on_progress: Callable[[int, int, int], None] | None = None,
 ) -> tuple[list[tuple[str, str]], str | None]:
     """Return sorted unique `(catalog, schema)` pairs that contain at least
     one Databricks Vector Search index. Walks the per-endpoint index listings
     in parallel under a wall-clock budget; returns partial results once
-    `deadline_seconds` is exceeded."""
+    `deadline_seconds` is exceeded.
+
+    `on_progress`, if given, is called as each endpoint's listing completes with
+    `(endpoints_done, endpoints_total, pairs_found)` for live count reporting.
+    It is invoked serially from the draining thread (not the workers)."""
     hostname = workspace_hostname(workspace)
     deadline = time.monotonic() + deadline_seconds
     endpoints, reason = _paginated_json_items(
@@ -1615,7 +2284,9 @@ def list_vector_search_catalog_schemas(
         return [], "no vector search endpoints with names"
 
     pairs: set[tuple[str, str]] = set()
-    workers = max(1, min(_UC_FUNCTION_PROBE_WORKERS, len(endpoint_names)))
+    endpoints_total = len(endpoint_names)
+    endpoints_done = 0
+    workers = max(1, min(_UC_FUNCTION_PROBE_WORKERS, endpoints_total))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
@@ -1630,11 +2301,15 @@ def list_vector_search_catalog_schemas(
         }
 
         def collect(result, _endpoint):
+            nonlocal endpoints_done
             indexes, _ = result
             for index in indexes:
                 pair = _vector_index_catalog_schema(index)
                 if pair:
                     pairs.add(pair)
+            endpoints_done += 1
+            if on_progress is not None:
+                on_progress(endpoints_done, endpoints_total, len(pairs))
 
         _drain_with_deadline(futures, deadline, collect)
         pool.shutdown(wait=False, cancel_futures=True)
@@ -1662,9 +2337,14 @@ def list_uc_functions_catalog_schemas(
     token: str,
     *,
     deadline_seconds: float = _UC_FUNCTIONS_DEADLINE_SECONDS,
+    on_progress: Callable[[int, int, int], None] | None = None,
 ) -> tuple[list[tuple[str, str]], str | None]:
     """Return sorted unique `(catalog, schema)` pairs containing at least one
-    user-defined UC function."""
+    user-defined UC function.
+
+    `on_progress`, if given, is called during the function-probe phase with
+    `(schemas_done, schemas_total, pairs_found)` for live count reporting. It is
+    invoked serially from the draining thread (not the workers)."""
     hostname = workspace_hostname(workspace)
     deadline = time.monotonic() + deadline_seconds
 
@@ -1728,6 +2408,8 @@ def list_uc_functions_catalog_schemas(
 
     # Parallel function-existence probes.
     pairs: set[tuple[str, str]] = set()
+    schemas_total = len(candidate_pairs)
+    schemas_done = 0
     with ThreadPoolExecutor(max_workers=_UC_FUNCTION_PROBE_WORKERS) as pool:
         probe_futures = {
             pool.submit(_schema_has_user_function, hostname, token, cat, schema): (cat, schema)
@@ -1735,8 +2417,12 @@ def list_uc_functions_catalog_schemas(
         }
 
         def collect_pair(has_fn, pair):
+            nonlocal schemas_done
             if has_fn:
                 pairs.add(pair)
+            schemas_done += 1
+            if on_progress is not None:
+                on_progress(schemas_done, schemas_total, len(pairs))
 
         _drain_with_deadline(probe_futures, deadline, collect_pair)
         pool.shutdown(wait=False, cancel_futures=True)
@@ -1746,6 +2432,111 @@ def list_uc_functions_catalog_schemas(
             return [], "deadline exceeded probing UC schemas for functions"
         return [], "no UC schemas with user functions found"
     return sorted(pairs), None
+
+
+def list_all_mcp_services(
+    workspace: str,
+    token: str,
+    *,
+    deadline_seconds: float = _MCP_SERVICES_WALK_DEADLINE_SECONDS,
+    on_progress: Callable[[int, int, int], None] | None = None,
+) -> tuple[list[str], str | None]:
+    """Return sorted unique MCP-service full names across every `<catalog>.<schema>`
+    in the workspace. The mcp-services API is one-schema-per-call, so this walks
+    catalogs -> schemas -> mcp-services in parallel under a wall-clock budget,
+    returning partial results once `deadline_seconds` is exceeded.
+
+    `on_progress`, if given, is called as each schema's listing completes with
+    `(schemas_done, schemas_total, services_found)` so callers can render a live
+    count. It is invoked serially from the draining thread (not the workers).
+
+    This walk is the slow, workspace-wide counterpart to `list_mcp_services`
+    (single schema)."""
+    hostname = workspace_hostname(workspace)
+    deadline = time.monotonic() + deadline_seconds
+
+    catalogs, catalogs_reason = _paginated_json_items(
+        f"https://{hostname}/api/2.1/unity-catalog/catalogs",
+        token,
+        items_key="catalogs",
+        timeout=_UC_LIST_HTTP_TIMEOUT,
+    )
+    if not catalogs:
+        return [], catalogs_reason or "no UC catalogs found"
+
+    catalog_names = [
+        c["name"]
+        for c in catalogs
+        if isinstance(c.get("name"), str)
+        and c["name"]
+        and c["name"] not in _UC_FUNCTIONS_SKIP_CATALOGS
+    ]
+    if not catalog_names:
+        return [], "no user UC catalogs found"
+    if time.monotonic() > deadline:
+        return [], "deadline exceeded while listing UC catalogs"
+
+    # Parallel per-catalog schema listing.
+    schema_refs: list[str] = []
+    schema_workers = max(1, min(_UC_FUNCTION_PROBE_WORKERS, len(catalog_names)))
+    with ThreadPoolExecutor(max_workers=schema_workers) as pool:
+        schema_futures = {
+            pool.submit(
+                _paginated_json_items,
+                f"https://{hostname}/api/2.1/unity-catalog/schemas",
+                token,
+                items_key="schemas",
+                extra_params={"catalog_name": cat},
+                timeout=_UC_LIST_HTTP_TIMEOUT,
+            ): cat
+            for cat in catalog_names
+        }
+
+        def collect_schemas(result, catalog):
+            schemas, _ = result
+            for schema in schemas:
+                schema_name = schema.get("name")
+                if (
+                    isinstance(schema_name, str)
+                    and schema_name
+                    and schema_name != "information_schema"
+                ):
+                    schema_refs.append(f"{catalog}.{schema_name}")
+
+        _drain_with_deadline(schema_futures, deadline, collect_schemas)
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    if not schema_refs:
+        if time.monotonic() > deadline:
+            return [], "deadline exceeded while listing UC schemas"
+        return [], "no UC schemas found"
+
+    # Parallel per-schema mcp-services listing.
+    names: set[str] = set()
+    schemas_total = len(schema_refs)
+    schemas_done = 0
+    probe_workers = max(1, min(_UC_FUNCTION_PROBE_WORKERS, schemas_total))
+    with ThreadPoolExecutor(max_workers=probe_workers) as pool:
+        service_futures = {
+            pool.submit(list_mcp_services, workspace, token, ref): ref for ref in schema_refs
+        }
+
+        def collect_services(result, _ref):
+            nonlocal schemas_done
+            found, _ = result
+            names.update(found)
+            schemas_done += 1
+            if on_progress is not None:
+                on_progress(schemas_done, schemas_total, len(names))
+
+        _drain_with_deadline(service_futures, deadline, collect_services)
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    if not names:
+        if time.monotonic() > deadline:
+            return [], "deadline exceeded while listing MCP services"
+        return [], "no MCP services found"
+    return sorted(names), None
 
 
 def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], str | None]:
@@ -1768,21 +2559,24 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     ]
 
     result: dict[str, str] = {}
-    for family, key in [("opus", "opus"), ("sonnet", "sonnet"), ("haiku", "haiku")]:
+    for family in ANTHROPIC_FAMILIES:
         candidates = sorted(
             [m for m in raw_ids if f"databricks-claude-{family}-" in m],
             reverse=True,
         )
         if candidates:
-            result[key] = candidates[0]
+            result[family] = candidates[0]
+    # Same opus-4-8 pin as discover_model_services — see comment there.
+    _prefer_opus_4_8(result, raw_ids)
     if result:
         return result, None
     if not raw_ids:
         return {}, "AI Gateway returned no Claude model ids"
     sample = ", ".join(raw_ids[:5])
+    families = ",".join(ANTHROPIC_FAMILIES)
     return {}, (
         "AI Gateway returned model ids but none matched "
-        f"`databricks-claude-{{opus,sonnet,haiku}}-*` (got: {sample})"
+        f"`databricks-claude-{{{families}}}-*` (got: {sample})"
     )
 
 
@@ -1947,12 +2741,83 @@ def _looks_like_auth_failure(reason: str) -> bool:
     return False
 
 
-def discover_sql_warehouse_http_path(
+CODING_AGENT_RECOMMEND_MODEL_PATH = "/api/ai-gateway/v2/coding-agent-configs:recommendModel"
+
+
+def resolve_current_budget_spend(
     workspace: str,
     token: str,
     *,
-    quiet: bool = False,
-) -> str:
+    timeout: int = 10,
+) -> tuple[tuple[Decimal, Decimal] | None, str | None]:
+    """Fetch the caller's coding-agent budget spend and alert threshold.
+
+    Reads them off `recommendModel`, which returns the spend its model
+    recommendation was based on. `available_models` is empty since we want the
+    spend, not the recommendation.
+
+    Returns `((spend, threshold), None)` or `(None, reason)`. Absence is
+    routine — the endpoint needs a per-org SAFE flag (default off) and a
+    coding-agent config — so it never raises.
+    """
+    url = f"https://{workspace_hostname(workspace)}{CODING_AGENT_RECOMMEND_MODEL_PATH}"
+    payload, reason = _http_post_json(url, token, {"available_models": []}, timeout=timeout)
+    if payload is None:
+        return None, reason or "unknown error"
+    if not isinstance(payload, dict):
+        return None, "response was not a JSON object"
+
+    # The threshold is what anchors the spend: a caller with a per-user threshold but no spend yet
+    # this period gets `effective_threshold` set and `current_spend` omitted (see the server's
+    # per-user spend resolution). Treat an *absent* spend as $0 rather than "no budget", so a
+    # developer who hasn't spent anything still sees their budget instead of a blank. With no
+    # threshold there is nothing to measure against, so that genuinely counts as no spend.
+    threshold = _parse_decimal(payload.get("effective_threshold"))
+    if threshold is None:
+        return None, "workspace reported no coding-agent budget spend"
+    raw_spend = payload.get("current_spend")
+    if raw_spend is None:
+        spend: Decimal | None = Decimal(0)
+    else:
+        # Present but unparseable is corrupt data, not zero spend — don't silently mask it.
+        spend = _parse_decimal(raw_spend)
+        if spend is None:
+            return None, "workspace reported no coding-agent budget spend"
+    return (spend, threshold), None
+
+
+def _parse_decimal(value: object) -> Decimal | None:
+    if isinstance(value, str) and value.strip():
+        try:
+            return Decimal(value.strip())
+        except InvalidOperation:
+            return None
+    if isinstance(value, int):
+        return Decimal(value)
+    return None
+
+
+class SqlWarehouse(NamedTuple):
+    http_path: str
+    label: str
+    state: str
+
+
+def discover_sql_warehouses(
+    workspace: str,
+    token: str,
+    *,
+    warehouse_id: str | None = None,
+) -> list[SqlWarehouse]:
+    """Candidate warehouses to run the usage query against, RUNNING ones first.
+
+    Several are returned because a warehouse can report RUNNING and still refuse
+    connections, so callers fall through to the next one. An explicit
+    `warehouse_id` skips discovery entirely.
+    """
+    if warehouse_id:
+        return [SqlWarehouse(_warehouse_http_path(warehouse_id), warehouse_id, "REQUESTED")]
+
     hostname = workspace_hostname(workspace)
     request = urllib_request.Request(
         f"https://{hostname}/api/2.0/sql/warehouses",
@@ -1977,33 +2842,30 @@ def discover_sql_warehouse_http_path(
     warehouses = payload.get("warehouses")
     if not isinstance(warehouses, list) or not warehouses:
         raise RuntimeError(
-            "No SQL warehouses found in this workspace. Create one or pass `--http-path`."
+            "No SQL warehouses found in this workspace. Create one or pass `--warehouse-id`."
         )
 
-    running = [w for w in warehouses if isinstance(w, dict) and w.get("state") == "RUNNING"]
-    chosen = (
-        running[0]
-        if running
-        else next(
-            (w for w in warehouses if isinstance(w, dict) and w.get("id")),
-            None,
-        )
-    )
-    if not chosen:
+    candidates: list[SqlWarehouse] = []
+    for entry in warehouses:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str) or not entry_id.strip():
+            continue
+        name = entry.get("name")
+        state = entry.get("state", "UNKNOWN")
+        label = name if isinstance(name, str) and name else entry_id
+        candidates.append(SqlWarehouse(_warehouse_http_path(entry_id), label, str(state)))
+
+    if not candidates:
         raise RuntimeError("No usable SQL warehouse was returned by Databricks.")
+    # Stopped warehouses work too, but cold-starting one costs minutes.
+    candidates.sort(key=lambda w: w.state != "RUNNING")
+    return candidates
 
-    warehouse_id = chosen.get("id")
-    if not isinstance(warehouse_id, str) or not warehouse_id.strip():
-        raise RuntimeError("Databricks returned a warehouse without an ID.")
 
-    warehouse_name = chosen.get("name")
-    warehouse_state = chosen.get("state", "UNKNOWN")
-    label_value = (
-        warehouse_name if isinstance(warehouse_name, str) and warehouse_name else warehouse_id
-    )
-    if not quiet:
-        print_note(f"Using SQL warehouse `{label_value}` ({warehouse_state}).")
-    return f"/sql/1.0/warehouses/{warehouse_id}"
+def _warehouse_http_path(warehouse_id: str) -> str:
+    return f"/sql/1.0/warehouses/{warehouse_id.strip()}"
 
 
 def run_usage_query(
@@ -2011,7 +2873,14 @@ def run_usage_query(
     http_path: str,
     token: str,
     query: str,
+    on_connected: Callable[[], None] | None = None,
 ) -> tuple[list[str], list[tuple]]:
+    """Run `query` on one warehouse.
+
+    `on_connected` fires once the connection opens — the point a stopped
+    warehouse has finished starting — so callers can update their progress
+    message.
+    """
     try:
         logging.getLogger("databricks.sql").setLevel(logging.ERROR)
         from databricks import sql
@@ -2027,6 +2896,8 @@ def run_usage_query(
             http_path=http_path,
             access_token=token,
         ) as connection:
+            if on_connected is not None:
+                on_connected()
             with connection.cursor() as cursor:
                 cursor.execute(query)
                 columns = [desc[0] for desc in (cursor.description or [])]

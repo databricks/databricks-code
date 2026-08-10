@@ -14,6 +14,7 @@ from ucode.agents import (
     configure_selected_tools,
     default_model_for_tool,
     ensure_tool_binary_available,
+    install_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
     provider_permission_error,
@@ -58,6 +59,70 @@ class TestToolSpecs:
     def test_each_agent_exposes_update_check(self):
         for tool, module in agents_mod._MODULES.items():
             assert callable(module.is_update_available), f"{tool} missing is_update_available"
+
+
+class TestInstallAiToolsForAgents:
+    def _capture(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            agents_mod,
+            "install_ai_tools",
+            lambda agents, profile: captured.update(agents=agents, profile=profile),
+        )
+        return captured
+
+    def test_maps_supported_tools_and_drops_others(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        # gemini and pi aren't supported by `databricks aitools`, so they drop.
+        install_ai_tools_for_agents(["claude", "codex", "gemini", "pi"], {"profile": "prof"})
+        assert captured == {"agents": ["claude-code", "codex"], "profile": "prof"}
+
+    def test_installed_by_default(self, monkeypatch):
+        # Opt-out: absent flag means install.
+        captured = self._capture(monkeypatch)
+        install_ai_tools_for_agents(["claude"], {"profile": "p"})
+        assert captured == {"agents": ["claude-code"], "profile": "p"}
+
+    def test_skipped_when_disabled(self, monkeypatch):
+        # `configure --disable-databricks-ai-tools` persists this False.
+        captured = self._capture(monkeypatch)
+        install_ai_tools_for_agents(
+            ["claude"], {"profile": "p", "databricks_ai_tools_enabled": False}
+        )
+        assert captured == {}  # install_ai_tools never called
+
+
+class TestConfigureWiresAiToolsInstall:
+    """Both configure chokepoints must trigger AI Tools install."""
+
+    def _stub_configure(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(agents_mod, "configure_tool", lambda tool, state, model=None: state)
+        monkeypatch.setattr(agents_mod, "save_state", lambda state: None)
+        monkeypatch.setattr(
+            agents_mod,
+            "install_ai_tools",
+            lambda agents, profile: captured.update(agents=agents, profile=profile),
+        )
+        return captured
+
+    def test_configure_single_tool_triggers_install(self, monkeypatch):
+        captured = self._stub_configure(monkeypatch)
+        agents_mod.configure_single_tool("codex", {"codex_models": ["m"], "profile": "myprof"})
+        assert captured == {"agents": ["codex"], "profile": "myprof"}
+
+    def test_configure_selected_tools_triggers_install(self, monkeypatch):
+        captured = self._stub_configure(monkeypatch)
+        agents_mod.configure_selected_tools({"profile": "myprof"}, ["codex"])
+        assert captured == {"agents": ["codex"], "profile": "myprof"}
+
+    def test_configure_single_tool_respects_disable(self, monkeypatch):
+        captured = self._stub_configure(monkeypatch)
+        agents_mod.configure_single_tool(
+            "codex",
+            {"codex_models": ["m"], "profile": "myprof", "databricks_ai_tools_enabled": False},
+        )
+        assert captured == {}
 
 
 class TestNormalizeTool:
@@ -212,14 +277,28 @@ class TestResolveProviderModels:
         )
 
     def test_none_provider_returns_none(self):
-        models, error = agents_mod.resolve_provider_models("claude", self._STATE, None)
-        assert (models, error) == (None, None)
+        models, error, relayed = agents_mod.resolve_provider_models("claude", self._STATE, None)
+        assert (models, error, relayed) == (None, None, False)
 
     def test_anthropic_returns_no_models(self, monkeypatch):
         self._patch(monkeypatch, {"provider_type": "anthropic", "targets": []}, None)
-        models, error = agents_mod.resolve_provider_models("claude", self._STATE, "main.a.svc")
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.a.svc"
+        )
         assert error is None
         assert models is None
+        assert relayed is False
+
+    def test_relayed_anthropic_flagged(self, monkeypatch):
+        self._patch(
+            monkeypatch, {"provider_type": "anthropic", "targets": [], "relayed": True}, None
+        )
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.a.relayed"
+        )
+        assert error is None
+        assert models is None
+        assert relayed is True
 
     def test_bedrock_returns_pinned_models(self, monkeypatch):
         service = {
@@ -227,8 +306,11 @@ class TestResolveProviderModels:
             "targets": ["us.anthropic.claude-sonnet-4-6", "global.anthropic.claude-opus-4-8"],
         }
         self._patch(monkeypatch, service, None)
-        models, error = agents_mod.resolve_provider_models("claude", self._STATE, "main.b.svc")
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.b.svc"
+        )
         assert error is None
+        assert relayed is False
         assert models == {
             "sonnet": "us.anthropic.claude-sonnet-4-6",
             "opus": "global.anthropic.claude-opus-4-8",
@@ -236,9 +318,12 @@ class TestResolveProviderModels:
 
     def test_invalid_provider_returns_error(self, monkeypatch):
         self._patch(monkeypatch, None, "boom")
-        models, error = agents_mod.resolve_provider_models("claude", self._STATE, "main.x.svc")
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.x.svc"
+        )
         assert models is None
         assert error == "boom"
+        assert relayed is False
 
 
 class TestInstallToolBinary:
@@ -567,3 +652,51 @@ class TestValidateAllToolsVerbosity:
         assert "Ready" not in out
         # Per-tool success line is still printed.
         assert "Codex is working" in out
+
+
+class TestValidateTool:
+    def test_runs_validate_command_with_stdin_devnull(self, monkeypatch):
+        # Regression guard: the validation smoke test must never inherit the
+        # caller's stdin, or it hangs to the timeout when ucode is launched
+        # from a non-interactive parent whose stdin is an open pipe.
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr("ucode.agents.subprocess.run", fake_run)
+        monkeypatch.setattr(agents_mod, "load_state", lambda: {})
+
+        ok, err = agents_mod.validate_tool("codex")
+
+        assert ok is True
+        assert err == ""
+        assert captured["kwargs"].get("stdin") is subprocess.DEVNULL
+
+    def test_reports_timed_out_on_timeout(self, monkeypatch):
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 60)
+
+        monkeypatch.setattr("ucode.agents.subprocess.run", fake_run)
+        monkeypatch.setattr(agents_mod, "load_state", lambda: {})
+
+        ok, err = agents_mod.validate_tool("codex")
+
+        assert ok is False
+        assert err == "timed out"
+
+    def test_relayed_claude_skips_live_probe(self, monkeypatch):
+        # Relayed configs have no proxy/login at validation time; probing them
+        # with a live message would hang, so validation must trust the config.
+        def fail_run(cmd, **kwargs):
+            raise AssertionError("relayed validation must not run a subprocess")
+
+        monkeypatch.setattr("ucode.agents.subprocess.run", fail_run)
+        monkeypatch.setattr(agents_mod, "load_state", lambda: {"claude_relayed": True})
+
+        ok, err = agents_mod.validate_tool("claude")
+
+        assert ok is True
+        assert err == ""

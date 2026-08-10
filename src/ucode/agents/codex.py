@@ -24,6 +24,10 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
+from ucode.smart_routing.codex_hooks import (
+    remove_smart_routing_hooks,
+    sync_smart_routing_hooks,
+)
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.ui import print_warning_err
@@ -37,6 +41,11 @@ LEGACY_CODEX_BACKUP_PATH = APP_DIR / "codex-config.backup.toml"
 CODEX_MODEL_PROVIDER_NAME = "ucode-databricks"
 MINIMUM_CODEX_VERSION = (0, 134, 0)
 MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
+MINIMUM_ROUTING_CODEX_VERSION = (0, 145, 0)
+MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
+# Shared across agents: one opt-in enables smart routing for every routing-capable
+# tool (codex, claude), so a workspace turns it on once.
+SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 
 
 SPEC: ToolSpec = {
@@ -62,13 +71,6 @@ LEGACY_MANAGED_KEYS: list[list[str]] = [
 ]
 
 _GPT_RE = re.compile(r"(?:databricks-)?gpt-(\d+)(?:[.-](\d+))?(?:[.-](\d+))?(-.+|[a-z].*)?")
-
-# These models should use the Databricks ID, not the OpenAI ID, as the OpenAI
-# ID is incompatible with Codex.
-CODEX_OPENAI_ID_INCOMPATIBLE_MODELS = {
-    "databricks-gpt-5-2-codex",
-    "databricks-gpt-5-4-nano",
-}
 
 
 def is_update_available() -> tuple[str, str] | None:
@@ -269,30 +271,6 @@ def revert_legacy_shared_config() -> bool:
     return _strip_legacy_ucode_entries(_legacy_config_path())
 
 
-def _openai_model_id(model: str | None) -> str | None:
-    """Map Databricks GPT endpoint ids to OpenAI model ids for Codex metadata."""
-    parsed = _parse_gpt(model)
-    if parsed is None:
-        return model
-    major, minor, patch, suffix = parsed
-    version = str(major)
-    if minor is not None:
-        version += f".{minor}"
-    if patch is not None:
-        version += f".{patch}"
-    return f"gpt-{version}{suffix}"
-
-
-def _codex_model_id(model: str | None) -> str | None:
-    # UC model-services ids (`system.ai.gpt-5`) route by name through the
-    # gateway, so they must be sent verbatim — not rewritten to an OpenAI id.
-    if model and model.startswith("system.ai."):
-        return model
-    if model in CODEX_OPENAI_ID_INCOMPATIBLE_MODELS:
-        return model
-    return _openai_model_id(model)
-
-
 def _parse_gpt(model: str | None) -> tuple[int, int | None, int | None, str] | None:
     if not model:
         return None
@@ -317,11 +295,19 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     workspace = state["workspace"]
     # With a Model Provider Service the gateway routes by header and Codex sends
     # its own canonical model name (e.g. `gpt-5`) — leave `model` unset so no
-    # Databricks endpoint id is pinned.
-    chosen_model = None if provider else _codex_model_id(model or default_model(state))
+    # Databricks endpoint id is pinned. Otherwise pin the discovered endpoint id
+    # verbatim: the gateway routes by that exact name (whether `databricks-gpt-5`
+    # from the AI Gateway listing or `system.ai.gpt-5` from UC model-services), so
+    # rewriting it to an OpenAI id (`gpt-5`) makes the gateway resolve a
+    # non-existent `system.ai.*` alias and 404.
+    chosen_model = None if provider else (model or default_model(state))
     databricks_profile = state.get("profile")
 
     if _use_legacy_layout():
+        if smart_routing_enabled(state) and provider is None:
+            raise RuntimeError(
+                f"Codex smart routing requires Codex {MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer."
+            )
         # Codex < 0.134.0 only reads ~/.codex/config.toml. Write the shared
         # config with [profiles.ucode] + shared [model_providers.ucode-databricks]
         # and skip the per-profile-file cleanup that would normally strip
@@ -362,6 +348,11 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         # deep_merge can't drop keys, so clear a `model` pinned by an earlier
         # non-provider run that the provider overlay omits.
         doc.pop("model", None)
+    sync_smart_routing_hooks(
+        doc,
+        state,
+        enabled=smart_routing_enabled(state) and provider is None,
+    )
     write_toml_file(CODEX_CONFIG_PATH, doc)
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
@@ -371,15 +362,17 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
 def default_model(state: dict) -> str | None:
     """Pick the newest GPT model when multiple are available.
 
-    The discovery list is alphabetically sorted, which can put
-    "databricks-gpt-5" ahead of "databricks-gpt-5-5". Prefer the
-    highest semantic version instead.
+    A managed config's ``codex_default_model`` takes priority. The discovery list
+    is alphabetically sorted, which can put "databricks-gpt-5" ahead of
+    "databricks-gpt-5-5". Prefer the highest semantic version instead.
 
     Only GPT-parseable ids are considered. Codex routes the chosen ``model``
     through the gateway as-is, so a non-GPT entry (e.g. ``moonshotai/kimi-k2.5``)
     would be rejected with a Unity Catalog endpoint-name error. When no
     candidate parses as GPT we return None rather than pinning an unroutable id.
     """
+    if isinstance(state.get("codex_default_model"), str):
+        return state.get("codex_default_model")
     codex_models = state.get("codex_models") or []
     parsed: list[tuple[str, tuple[int, int | None, int | None, str]]] = [
         (mid, gpt) for mid in codex_models if (gpt := _parse_gpt(mid)) is not None
@@ -446,6 +439,43 @@ def launch(state: dict, tool_args: list[str]) -> None:
         exec_or_spawn([binary, *tool_args])
         return  # unreachable in production (exec replaces the process)
     sys.exit(returncode)
+
+
+def smart_routing_enabled(state: dict) -> bool:
+    """Return whether the current workspace opted into Codex routing."""
+    return state.get(SMART_ROUTING_STATE_KEY) is True
+
+
+def enable_smart_routing(state: dict) -> dict:
+    """Persist the current workspace's Codex smart-routing opt-in."""
+    parsed = _parse_version(agent_version(SPEC["binary"]))
+    if parsed is not None and parsed < MINIMUM_ROUTING_CODEX_VERSION:
+        raise RuntimeError(
+            "Codex smart routing requires Codex "
+            f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found "
+            f"{agent_version(SPEC['binary'])}."
+        )
+    state[SMART_ROUTING_STATE_KEY] = True
+    return state
+
+
+def disable_smart_routing(state: dict) -> bool:
+    """Disable routing and remove only ucode's Codex routing hooks."""
+    state.pop(SMART_ROUTING_STATE_KEY, None)
+    if state.get("workspace"):
+        save_state(state)
+    changed = False
+    for path in (CODEX_CONFIG_PATH, LEGACY_CODEX_CONFIG_PATH):
+        if not path.exists():
+            continue
+        doc = read_toml_safe(path)
+        if remove_smart_routing_hooks(doc):
+            write_toml_file(path, doc)
+            changed = True
+    from ucode.smart_routing.codex_routing import clear_routing_artifacts
+
+    clear_routing_artifacts()
+    return changed
 
 
 def validate_cmd(binary: str) -> list[str]:

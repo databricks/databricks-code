@@ -93,6 +93,21 @@ class TestRenderOverlay:
         options = overlay["provider"]["databricks-oss"]["options"]
         assert options["baseURL"] == f"{WS}/ai-gateway/mlflow/v1"
 
+    def test_glm_gets_token_limits(self):
+        models = {"oss": ["system.ai.glm-5-2"]}
+        overlay, _ = opencode.render_overlay("system.ai.glm-5-2", "tok", _base_urls(), models)
+        glm = overlay["provider"]["databricks-oss"]["models"]["system.ai.glm-5-2"]
+        # OpenCode's schema requires both context and output on `limit`.
+        assert glm["limit"] == {"context": 200000, "output": 25000}
+
+    def test_non_glm_oss_model_has_no_output_cap(self):
+        models = {"oss": ["system.ai.kimi-k2-7-code"]}
+        overlay, _ = opencode.render_overlay(
+            "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
+        )
+        kimi = overlay["provider"]["databricks-oss"]["models"]["system.ai.kimi-k2-7-code"]
+        assert "limit" not in kimi
+
     def test_token_in_api_key(self):
         models = {"anthropic": ["claude-sonnet"]}
         overlay, _ = opencode.render_overlay("claude-sonnet", "mytoken", _base_urls(), models)
@@ -188,14 +203,17 @@ class TestRenderOverlay:
 
 
 class TestMcpServerConfig:
-    def test_builds_remote_server_entry_with_oauth_token_env_header(self):
-        entry = opencode.build_mcp_server_entry(f"{WS}/api/2.0/mcp/external/github")
+    # ucode registers the `ucode mcp-proxy ...` bridge as a `local` (stdio) MCP
+    # server; the proxy handles token refresh, so no URL/bearer header here.
+    PROXY_ARGV = ["ucode", "mcp-proxy", "--url", f"{WS}/api/2.0/mcp/functions/system/ai"]
+
+    def test_builds_local_server_entry_from_proxy_argv(self):
+        entry = opencode.build_mcp_server_entry(self.PROXY_ARGV)
 
         assert entry == {
-            "type": "remote",
-            "url": f"{WS}/api/2.0/mcp/external/github",
+            "type": "local",
+            "command": self.PROXY_ARGV,
             "enabled": True,
-            "headers": {"Authorization": "Bearer {env:OAUTH_TOKEN}"},
         }
 
     def test_writes_mcp_server_without_clobbering_existing_config(self, tmp_path, monkeypatch):
@@ -218,20 +236,16 @@ class TestMcpServerConfig:
             encoding="utf-8",
         )
 
-        removed = oc_mod.write_mcp_server_config(
-            "github",
-            f"{WS}/api/2.0/mcp/external/github",
-        )
+        removed = oc_mod.write_mcp_server_config("github", self.PROXY_ARGV)
 
         written = json.loads(config_file.read_text())
         assert removed is False
         assert written["model"] == "existing-model"
         assert written["mcp"]["old-server"] == {"type": "local", "command": ["old"]}
         assert written["mcp"]["github"] == {
-            "type": "remote",
-            "url": f"{WS}/api/2.0/mcp/external/github",
+            "type": "local",
+            "command": self.PROXY_ARGV,
             "enabled": True,
-            "headers": {"Authorization": "Bearer {env:OAUTH_TOKEN}"},
         }
 
     def test_reports_replaced_mcp_server(self, tmp_path, monkeypatch):
@@ -246,14 +260,11 @@ class TestMcpServerConfig:
 
         config_file.write_text(json.dumps({"mcp": {"github": {"old": True}}}), encoding="utf-8")
 
-        removed = oc_mod.write_mcp_server_config(
-            "github",
-            f"{WS}/api/2.0/mcp/external/github",
-        )
+        removed = oc_mod.write_mcp_server_config("github", self.PROXY_ARGV)
 
         assert removed is True
         written = json.loads(config_file.read_text())
-        assert written["mcp"]["github"]["url"] == f"{WS}/api/2.0/mcp/external/github"
+        assert written["mcp"]["github"]["command"] == self.PROXY_ARGV
 
     def test_removes_mcp_server_without_clobbering_others(self, tmp_path, monkeypatch):
         import ucode.agents.opencode as oc_mod
@@ -316,6 +327,13 @@ class TestOpencodeDefaultModel:
     def test_returns_none_when_empty(self):
         assert opencode.default_model({}) is None
         assert opencode.default_model({"opencode_models": {}}) is None
+
+    def test_opencode_default_model_wins_over_bucketed_models(self):
+        state = {
+            "opencode_default_model": "admin-chosen-default",
+            "opencode_models": {"anthropic": ["claude-sonnet"]},
+        }
+        assert opencode.default_model(state) == "admin-chosen-default"
 
 
 class TestOpencodeValidateCmd:
