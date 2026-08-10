@@ -2210,7 +2210,7 @@ class TestManagedConfigDecidesDiscoveryFromFreshRead:
 
 
 class TestConfigureDeprecation:
-    """`ucode configure` is refused once a managed config exists, since the admin's wins anyway."""
+    """`ucode configure` short-circuits once a managed config exists, since the admin's wins anyway."""
 
     @staticmethod
     def _reject():
@@ -2218,13 +2218,21 @@ class TestConfigureDeprecation:
 
         cli_mod._reject_configure_under_managed_config()
 
-    def test_blocks_when_a_managed_config_exists(self, monkeypatch):
+    def test_shows_summary_and_exits_when_a_managed_config_exists(self, monkeypatch, capsys):
+        import typer
+
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: {"enabled_agents": {}})
-        with pytest.raises(RuntimeError, match="being deprecated") as exc:
+        monkeypatch.setattr(
+            "ucode.cli.load_managed_state",
+            lambda ws: {"enabled_agents": {"claude": {}}},
+        )
+        with pytest.raises(typer.Exit) as exc:
             self._reject()
-        assert "Please run `ucode`" in str(exc.value)
+        assert exc.value.exit_code == 0
+        out = capsys.readouterr().out
+        assert "managed config has been detected" in out
+        assert "run `ucode`" in out
 
     def test_silent_and_proceeds_without_a_managed_config(self, monkeypatch, capsys):
         # Setting up a new workspace still goes through `ucode configure`, so say nothing.

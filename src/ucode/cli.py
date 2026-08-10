@@ -156,21 +156,28 @@ def _policy_summary_lines(managed: dict) -> list[str]:
     return lines
 
 
-def _print_managed_summary(managed: dict, state: dict, tool: str) -> None:
-    """Show the developer which of their admin's settings are in force for this launch."""
+def _print_managed_summary(managed: dict, state: dict, tool: str | None) -> None:
+    """Show which of the admin's settings are in force.
+
+    With ``tool`` set (launch path) the per-agent Agent/Provider/Model lines are included;
+    with ``tool=None`` (e.g. ``ucode configure`` under a managed config) they are skipped
+    since no single agent has been chosen yet.
+    """
     lines = [f"[bold]Workspace:[/bold] [cyan]{state.get('workspace', '?')}[/cyan]"]
-    lines.append(f"[bold]Agent:[/bold] [green]{TOOL_SPECS[tool]['display']}[/green]")
+    if tool is not None:
+        lines.append(f"[bold]Agent:[/bold] [green]{TOOL_SPECS[tool]['display']}[/green]")
     enabled = [t for t in (managed.get("enabled_agents") or {}) if t in TOOL_SPECS]
     if enabled:
         lines.append(
             f"[bold]Enabled agents:[/bold] {', '.join(TOOL_SPECS[t]['display'] for t in enabled)}"
         )
-    provider = managed_provider_service(managed, tool)
-    if provider:
-        lines.append(f"[bold]Provider:[/bold] [magenta]{provider}[/magenta]")
-    model = managed_default_model(managed, tool)
-    if model:
-        lines.append(f"[bold]Model:[/bold] [magenta]{model}[/magenta]")
+    if tool is not None:
+        provider = managed_provider_service(managed, tool)
+        if provider:
+            lines.append(f"[bold]Provider:[/bold] [magenta]{provider}[/magenta]")
+        model = managed_default_model(managed, tool)
+        if model:
+            lines.append(f"[bold]Model:[/bold] [magenta]{model}[/magenta]")
     # Always listed, including when empty: "none configured" tells a developer their admin set none,
     # which a missing row leaves ambiguous. Shown as the admin configured them — registering them
     # locally is a separate change, hence "pending".
@@ -195,18 +202,22 @@ def _print_managed_summary(managed: dict, state: dict, tool: str) -> None:
 
 
 def _reject_configure_under_managed_config() -> None:
-    """Refuse ``ucode configure`` when the workspace publishes a managed config.
+    """Short-circuit ``ucode configure`` when the workspace publishes a managed config.
 
-    Configuring locally would be overridden at launch anyway, so it is an error rather than a
-    silently-ignored run. Without a managed config the command still runs unchanged.
+    Configuring locally would be overridden at launch anyway. Rather than erroring, show the
+    developer the config their admin already set and point them at `ucode`. Without a managed
+    config the command still runs unchanged.
     """
     if not managed_agent_config_enabled():
         return
-    if load_managed_state(load_state().get("workspace")):
-        raise RuntimeError(
-            "The ucode configure command is being deprecated. Please run `ucode` to launch "
-            "with your admin's managed config applied"
-        )
+    state = load_state()
+    managed = load_managed_state(state.get("workspace"))
+    if not managed:
+        return
+    print_success("A managed config has been detected for your workspace — you're all set.")
+    _print_managed_summary(managed, state, tool=None)
+    print_note("Configuration is complete. Just run `ucode` to launch with it applied.")
+    raise typer.Exit(0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
