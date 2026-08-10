@@ -206,9 +206,6 @@ Once the manifest looks right, publish it:
 # Validate, show what would change, and ask before publishing.
 ucode apply
 
-# Preview without publishing.
-ucode apply --dry-run
-
 # Publish without the confirmation prompt (for CI).
 ucode apply --yes
 ```
