@@ -1536,15 +1536,12 @@ def _launch_tool(
                 else:
                     resolved_model = managed_model
             # An explicit `--model` is the user's own choice and outranks everything above (managed
-            # default, smart-routing pick). For Claude it must be pinned as ANTHROPIC_MODEL — Claude
-            # Code's own `--model` flag validates the name client-side against the models it lists and
-            # rejects a raw Databricks id ("may not exist ... run /model"), whereas ANTHROPIC_MODEL
-            # routes it straight to the gateway (the same path smart routing and managed configs use).
-            if model:
-                if tool == "claude":
-                    route_root_model = model
-                else:
-                    resolved_model = model
+            # default, smart-routing pick). Non-claude agents take it as the resolved model, which
+            # their CLIs pass to the gateway verbatim. Claude is special (see custom_model below):
+            # Claude Code validates ANTHROPIC_MODEL client-side and rejects a raw Databricks id, so
+            # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
+            if model and tool != "claude":
+                resolved_model = model
         state = configure_tool(
             tool,
             state,
@@ -1553,12 +1550,16 @@ def _launch_tool(
             provider_models=provider_models,
             relayed=relayed,
             route_root_model=route_root_model,
+            custom_model=model if tool == "claude" else None,
         )
         print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
         if managed is not None:
             print_kv("Config", "workspace-managed")
         if provider:
             print_kv("Provider", provider)
+        elif model and tool == "claude":
+            # Claude's --model is pinned via the family aliases, not resolved_model/route_root_model.
+            print_kv("Model", model)
         elif route_root_model:
             print_kv("Model", route_root_model)
         elif resolved_model:

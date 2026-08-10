@@ -291,7 +291,7 @@ class TestClaudeModelFlag:
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.kwargs["model"] == "cat.schema.claude-opus-5"
 
-    def test_model_pins_anthropic_model_for_claude(self):
+    def test_model_threads_to_claude_as_custom_model(self):
         with (
             patch("ucode.cli.ensure_bootstrap_dependencies"),
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
@@ -304,8 +304,10 @@ class TestClaudeModelFlag:
         ):
             result = runner.invoke(app, ["claude", "--model", "cat.schema.claude-opus-5"])
         assert result.exit_code == 0, result.output
-        # Claude pins the model via ANTHROPIC_MODEL (route_root_model), overriding the resolved one.
-        assert mock_configure.call_args.kwargs["route_root_model"] == "cat.schema.claude-opus-5"
+        # Claude routes --model as custom_model (pinned into the family aliases by render_overlay),
+        # NOT as ANTHROPIC_MODEL — Claude Code validates that value and rejects a raw id.
+        assert mock_configure.call_args.kwargs["custom_model"] == "cat.schema.claude-opus-5"
+        assert mock_configure.call_args.kwargs["route_root_model"] is None
 
     def test_model_and_provider_are_mutually_exclusive(self):
         result = runner.invoke(
