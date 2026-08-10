@@ -202,16 +202,16 @@ def route_spawn_tool(
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
-    # Derive the routing task from the first available plaintext field. `message`
-    # carries the actual subagent task content — prefer it when present and a
-    # plaintext string (Codex encrypts it at send-time, but the PreToolUse hook
-    # fires before that, so it may be readable here). When `message` is an
-    # encrypted dict (or absent), fall back to `task_name` / `agent_name`
-    # (weaker labels), then the generic default.
+    # Derive the routing task from the first available plaintext field. The
+    # harness-specific names are tried in order: `prompt`/`description` (Claude
+    # Code's Agent tool), `message` (Codex's spawn_agent — encrypted at
+    # send-time but readable here because the PreToolUse hook fires before
+    # that), then `task_name` / `agent_name` (weaker labels), then the generic
+    # default.
     task = next(
         (
             value
-            for field in ("message", "task_name", "agent_name")
+            for field in ("prompt", "description", "message", "task_name", "agent_name")
             if isinstance(value := tool_input.get(field), str) and value
         ),
         default_task_label,
@@ -269,12 +269,17 @@ def record_subagent_start(
         "at": time.time(),
     }
     if decision is not None:
+        # When the harness doesn't report the subagent's model (actual_model is
+        # None), we can't verify the match — record None rather than a false
+        # mismatch. The PreToolUse hook already injected the routed model, so
+        # routing still worked; the reconciliation is observability, not enforcement.
+        matches = None if actual_model is None else decision.get("requested_model") == actual_model
         record.update(
             {
                 "decision_id": decision.get("decision_id"),
                 "router_model": decision.get("router_model"),
                 "requested_model": decision.get("requested_model"),
-                "matches_router_decision": decision.get("requested_model") == actual_model,
+                "matches_router_decision": matches,
             }
         )
     _append_jsonl(audit_path, record)

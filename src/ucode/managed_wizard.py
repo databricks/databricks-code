@@ -1096,10 +1096,6 @@ def apply_command(*, yes: bool = False) -> int:
         print_note("Nothing was published.")
         return 1
 
-    if is_dry_run():
-        print_success("Dry run: the config was validated but not published.")
-        return 0
-
     if existing is None:
         with spinner("Publishing the managed config..."):
             published, publish_reason = create_coding_agent_config(workspace, token, payload)
