@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple, cast, overload
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from databricks.sql.exc import ServerOperationError
 
@@ -409,12 +409,29 @@ def is_workspace_admin(workspace: str, token: str) -> bool | None:
 _WORKSPACE_BUDGETS_API_PATH = "/api/ai-gateway/v2/workspace-metrics/budgets"
 
 
+# Alert-config scope that carries a per-user threshold. A budget's coding-agent spend routing only
+# works when it has one: the gateway's `recommendModel` measures the caller's spend against a
+# per-user threshold, so a budget with only a shared (workspace-wide) alert reports no spend and
+# leaves every tier inert. The listing exposes `scope_type` but not the alert's action, so ucode can
+# only check for the scope's presence; the server enforces the (block) action on config create.
+_PER_USER_ALERT_SCOPE = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
+
+
+def _has_per_user_alert(entry: dict) -> bool:
+    """Whether a raw budget entry carries a per-user alert threshold."""
+    for alert in entry.get("alert_configurations") or []:
+        if isinstance(alert, dict) and alert.get("scope_type") == _PER_USER_ALERT_SCOPE:
+            return True
+    return False
+
+
 def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str | None]:
     """List the AI Gateway budgets that apply to this workspace.
 
-    Returns ``(budgets, reason)`` where each budget is ``{"id": ..., "display_name": ...}``.
+    Returns ``(budgets, reason)`` where each budget is ``{"id", "display_name", "has_per_user_alert"}``.
     ``reason`` is None on success, otherwise it explains why the list is empty. ucode never creates
-    budgets — an admin picks an existing one to attach a spend-routing policy to.
+    budgets — an admin picks an existing one to attach a spend-routing policy to. ``has_per_user_alert``
+    lets the picker hide budgets that can't drive spend routing (see ``_PER_USER_ALERT_SCOPE``).
     """
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}{_WORKSPACE_BUDGETS_API_PATH}"
@@ -438,6 +455,7 @@ def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str 
             {
                 "id": budget_id,
                 "display_name": display_name if isinstance(display_name, str) else "",
+                "has_per_user_alert": _has_per_user_alert(entry),
             }
         )
     if not budgets:
@@ -1965,6 +1983,43 @@ def get_model_provider_service(
     return entry, None
 
 
+# The group every workspace user belongs to. USE_SCHEMA granted to it (directly or inherited from
+# the catalog) is what lets an arbitrary developer pull a config that routes through an MPS in that
+# schema; without it they hit "User does not have USE_SCHEMA on Schema <catalog>.<schema>".
+_ALL_WORKSPACE_USERS_GROUP = "account users"
+
+
+def all_users_can_use_schema(workspace: str, token: str, schema_full_name: str) -> bool | None:
+    """Whether the `account users` group has USE_SCHEMA on ``<catalog>.<schema>``.
+
+    Uses UC's effective-permissions API, so a USE_SCHEMA inherited from a catalog-level grant counts.
+    Returns True/False, or None when the check itself could not be made (API unreachable or an
+    unexpected shape) — callers treat None as "unknown" and skip the warning rather than cry wolf.
+
+    A False here is only a heuristic: a workspace may instead grant access through team groups or
+    individual users, so callers must warn rather than block on it.
+    """
+    hostname = workspace_hostname(workspace)
+    principal = quote(_ALL_WORKSPACE_USERS_GROUP)
+    url = (
+        f"https://{hostname}/api/2.1/unity-catalog/effective-permissions/"
+        f"schema/{schema_full_name}?principal={principal}"
+    )
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if reason is not None or not isinstance(payload, dict):
+        return None
+    for assignment in payload.get("privilege_assignments") or []:
+        if not isinstance(assignment, dict):
+            continue
+        for entry in assignment.get("privileges") or []:
+            if isinstance(entry, dict) and entry.get("privilege") in (
+                "USE_SCHEMA",
+                "ALL_PRIVILEGES",
+            ):
+                return True
+    return False
+
+
 def is_model_provider_feature_unavailable(reason: str | None) -> bool:
     """True when a model-provider-services API failure means the workspace
     simply hasn't enabled the feature (HTTP 400 "feature is not available"),
@@ -2712,12 +2767,22 @@ def resolve_current_budget_spend(
     if not isinstance(payload, dict):
         return None, "response was not a JSON object"
 
-    # Per the server's BudgetSpend.fromProto, a spend with no threshold to
-    # measure against counts as no spend.
-    spend = _parse_decimal(payload.get("current_spend"))
+    # The threshold is what anchors the spend: a caller with a per-user threshold but no spend yet
+    # this period gets `effective_threshold` set and `current_spend` omitted (see the server's
+    # per-user spend resolution). Treat an *absent* spend as $0 rather than "no budget", so a
+    # developer who hasn't spent anything still sees their budget instead of a blank. With no
+    # threshold there is nothing to measure against, so that genuinely counts as no spend.
     threshold = _parse_decimal(payload.get("effective_threshold"))
-    if spend is None or threshold is None:
+    if threshold is None:
         return None, "workspace reported no coding-agent budget spend"
+    raw_spend = payload.get("current_spend")
+    if raw_spend is None:
+        spend: Decimal | None = Decimal(0)
+    else:
+        # Present but unparseable is corrupt data, not zero spend — don't silently mask it.
+        spend = _parse_decimal(raw_spend)
+        if spend is None:
+            return None, "workspace reported no coding-agent budget spend"
     return (spend, threshold), None
 
 
