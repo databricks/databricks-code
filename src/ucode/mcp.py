@@ -1546,6 +1546,88 @@ def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[
     return workspace, profile, clients
 
 
+def pick_mcp_servers(
+    workspace: str,
+    profile: str | None,
+    *,
+    preselected: list[dict] | None = None,
+    clients: list[str] | None = None,
+) -> list[dict] | None:
+    """Run the two-step MCP picker and return the chosen servers as resolved entries.
+
+    The interaction only: source picker -> discovery -> server checkbox -> resolve each pick to a
+    ``{name, url}`` entry. Persistence is the caller's job — ``configure_mcp_command`` diffs the
+    result against local state and applies it to the machine, while ``ucode setup`` maps it to the
+    managed manifest's ``{name, type}`` and writes nothing to the machine.
+
+    Returns the working list (each entry ``{name, url, auth, clients}``), or None if the user
+    cancelled at either step. ``preselected`` seeds which rows start checked; the manifest-authoring
+    caller passes ``[]`` (or nothing) so the picker starts empty and every pick resolves through the
+    add-path — a kept row would carry a state-only URL the manifest can't supply.
+    """
+    preselected_servers = list(preselected or [])
+    original_by_name = _servers_by_name(preselected_servers)
+
+    # Two-step wizard: (1) choose which sources to search, (2) pick servers from the results.
+    # Pressing Left (←) in the picker returns to step 1, so the user can revise their source
+    # selection without restarting.
+    while True:
+        sources = prompt_for_mcp_search_sources()
+        if sources is None:
+            return None
+        discovered = _discover_selected_mcp_sources(workspace, profile, sources)
+
+        selections = prompt_for_mcp_server_choices(
+            discovered["external"],
+            discovered["genie"],
+            discovered["apps"],
+            preselected_servers,
+            discovered["services"],
+            discovered["vector_search"],
+            discovered["uc_functions"],
+            allow_back=True,
+        )
+        if selections is None:
+            return None
+        if isinstance(selections, _Back):
+            continue
+        break
+
+    working_mcp_servers: list[dict] = []
+    working_names: set[str] = set()
+    add_selections: list[str] = []
+    for selection in selections:
+        if selection.startswith(MCP_ADD_PREFIX):
+            add_selections.append(selection.removeprefix(MCP_ADD_PREFIX))
+            continue
+        original = original_by_name.get(selection)
+        if original and selection not in working_names:
+            working_mcp_servers.append(original.copy())
+            working_names.add(selection)
+
+    for selection in add_selections:
+        try:
+            entry_name, url = _resolve_mcp_selection(
+                selection,
+                workspace,
+                discovered["apps"],
+                discovered["genie"],
+                discovered["vector_search"],
+                discovered["uc_functions"],
+            )
+        except RuntimeError as exc:
+            print_warning(f"Skipped MCP selection `{selection}`: {exc}.")
+            continue
+        if entry_name in working_names:
+            continue
+        working_mcp_servers.append(
+            {"name": entry_name, "url": url, "auth": "proxy", "clients": clients or []}
+        )
+        working_names.add(entry_name)
+
+    return working_mcp_servers
+
+
 def configure_mcp_command(location: str | None = None, services: set[str] | None = None) -> int:
     if services is not None and location is None:
         # `--services` works standalone with full names (`system.ai.github`): the
@@ -1593,72 +1675,13 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
     picker_servers = [s for s in original_mcp_servers if s.get("kind") != SKILLS_MCP_KIND]
     original_by_name = _servers_by_name(picker_servers)
 
-    # Two-step wizard: (1) choose which sources to search, (2) pick servers from
-    # the results. Pressing Left (←) in the picker returns to step 1, so the user
-    # can revise their source selection without restarting the command.
-    while True:
-        sources = prompt_for_mcp_search_sources()
-        if sources is None:
-            return 0
-        discovered = _discover_selected_mcp_sources(workspace, profile, sources)
+    picked = pick_mcp_servers(workspace, profile, preselected=picker_servers, clients=clients)
+    if picked is None:
+        return 0
 
-        selections = prompt_for_mcp_server_choices(
-            discovered["external"],
-            discovered["genie"],
-            discovered["apps"],
-            picker_servers,
-            discovered["services"],
-            discovered["vector_search"],
-            discovered["uc_functions"],
-            allow_back=True,
-        )
-        if selections is None:
-            return 0
-        if isinstance(selections, _Back):
-            continue
-        break
-
-    available_app_mcp_servers = discovered["apps"]
-    available_genie_mcp_servers = discovered["genie"]
-    available_vector_search_servers = discovered["vector_search"]
-    available_uc_functions_servers = discovered["uc_functions"]
-
-    working_mcp_servers: list[dict] = list(skills_servers)
-    working_names: set[str] = set()
-    add_selections: list[str] = []
-    for selection in selections:
-        if selection.startswith(MCP_ADD_PREFIX):
-            add_selections.append(selection.removeprefix(MCP_ADD_PREFIX))
-            continue
-        original = original_by_name.get(selection)
-        if original and selection not in working_names:
-            working_mcp_servers.append(original.copy())
-            working_names.add(selection)
-
-    for selection in add_selections:
-        try:
-            entry_name, url = _resolve_mcp_selection(
-                selection,
-                workspace,
-                available_app_mcp_servers,
-                available_genie_mcp_servers,
-                available_vector_search_servers,
-                available_uc_functions_servers,
-            )
-        except RuntimeError as exc:
-            print_warning(f"Skipped MCP selection `{selection}`: {exc}.")
-            continue
-        if entry_name in working_names:
-            continue
-        working_mcp_servers.append(
-            {
-                "name": entry_name,
-                "url": url,
-                "auth": "proxy",
-                "clients": clients,
-            }
-        )
-        working_names.add(entry_name)
+    # Carry the skills connections through untouched; the picker never sees them.
+    working_mcp_servers: list[dict] = list(skills_servers) + picked
+    working_names = {s["name"] for s in picked}
 
     changed = apply_mcp_server_changes(
         original_mcp_servers,
@@ -1674,7 +1697,7 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
         added = sorted(working_names - set(original_by_name))
         removed = sorted(set(original_by_name) - working_names)
         print_success(_mcp_change_summary(added, removed, clients))
-    elif not selections and not original_mcp_servers:
+    elif not picked and not original_mcp_servers:
         # User submitted the picker without toggling anything --> make it clear nothing was selected
         print_note("No MCP servers selected. Press space to toggle an item, then enter to save.")
     return 0

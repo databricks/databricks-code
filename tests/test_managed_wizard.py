@@ -100,18 +100,19 @@ class TestMcpUrlClassification:
         assert wizard._mcp_type_for_url("https://ws.example.com/api/2.0/mcp/sql") == "sql"
 
 
-class TestMcpServersFromState:
-    def test_maps_registered_servers_to_name_and_type(self):
-        state = {
-            "mcp_servers": [
-                {
-                    "name": "databricks-github",
-                    "url": f"{WORKSPACE}/ai-gateway/mcp-services/system.ai.github",
-                },
-                {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
-            ]
-        }
-        assert wizard._mcp_servers_from_state(state) == [
+class TestMcpEntriesToManifest:
+    """The picker returns state-shape `{name, url}` entries; the manifest stores `{name, type}`.
+    The URL is derived to a type and dropped — it is a local-machine concept the manifest omits."""
+
+    def test_maps_entries_to_name_and_type(self):
+        entries = [
+            {
+                "name": "databricks-github",
+                "url": f"{WORKSPACE}/ai-gateway/mcp-services/system.ai.github",
+            },
+            {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
+        ]
+        assert wizard._mcp_entries_to_manifest(entries) == [
             {"name": "databricks-github", "type": "mcp-service"},
             {"name": "databricks-sql", "type": "sql"},
         ]
@@ -121,43 +122,75 @@ class TestMcpServersFromState:
         # would configure them twice.
         from ucode.mcp import SKILLS_MCP_KIND
 
-        state = {
-            "mcp_servers": [
-                {
-                    "name": "databricks-skill-registry",
-                    "kind": SKILLS_MCP_KIND,
-                    "url": f"{WORKSPACE}/api/2.0/mcp/sql",
-                },
-                {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
-            ]
-        }
-        assert wizard._mcp_servers_from_state(state) == [{"name": "databricks-sql", "type": "sql"}]
+        entries = [
+            {
+                "name": "databricks-skill-registry",
+                "kind": SKILLS_MCP_KIND,
+                "url": f"{WORKSPACE}/api/2.0/mcp/sql",
+            },
+            {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
+        ]
+        assert wizard._mcp_entries_to_manifest(entries) == [
+            {"name": "databricks-sql", "type": "sql"}
+        ]
 
-    def test_skips_unclassifiable_servers(self):
-        state = {"mcp_servers": [{"name": "mystery", "url": "https://example.com/nope"}]}
-        assert wizard._mcp_servers_from_state(state) == []
+    def test_skips_unclassifiable_entries(self):
+        assert wizard._mcp_entries_to_manifest([{"name": "mystery", "url": "https://x/nope"}]) == []
 
     def test_skips_entries_missing_name_or_url(self):
-        state = {
-            "mcp_servers": [
-                {"url": f"{WORKSPACE}/api/2.0/mcp/sql"},
-                {"name": "no-url"},
-                "not-a-dict",
-            ]
-        }
-        assert wizard._mcp_servers_from_state(state) == []
+        entries = [
+            {"url": f"{WORKSPACE}/api/2.0/mcp/sql"},
+            {"name": "no-url"},
+            "not-a-dict",
+        ]
+        assert wizard._mcp_entries_to_manifest(entries) == []
 
-    def test_empty_state_yields_nothing(self):
-        assert wizard._mcp_servers_from_state({}) == []
+    def test_empty_yields_nothing(self):
+        assert wizard._mcp_entries_to_manifest([]) == []
 
     def test_output_validates_as_a_manifest(self):
-        state = {
-            "mcp_servers": [
-                {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
-            ]
-        }
-        servers = wizard._mcp_servers_from_state(state)
+        entries = [{"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"}]
+        servers = wizard._mcp_entries_to_manifest(entries)
         assert validate_manifest({"mcp_servers": servers}) == []
+
+
+class TestAuthorMcpServers:
+    """`ucode setup` authors MCP into the manifest via the shared picker, touching no local state."""
+
+    def test_starts_the_picker_empty_and_returns_manifest_shape(self):
+        # The bug: the picker pre-checked the admin's own registered servers. Authoring a workspace
+        # declaration must start empty, so `preselected` is not passed (defaults to none).
+        seen = {}
+
+        def fake_pick(workspace, profile, **kwargs):
+            seen["kwargs"] = kwargs
+            return [{"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"}]
+
+        with patch("ucode.mcp.pick_mcp_servers", side_effect=fake_pick):
+            servers = wizard._author_mcp_servers(WORKSPACE, "profile")
+        assert servers == [{"name": "databricks-sql", "type": "sql"}]
+        # `preselected` must not be passed at all — not merely passed empty. Seeding it from local
+        # state (the bug) would pass it, so asserting the key is absent catches that regression even
+        # when the caller's own state happens to hold no servers.
+        assert "preselected" not in seen["kwargs"]
+
+    def test_does_not_touch_local_state_or_the_machine(self):
+        # Authoring a managed config must not register servers on the admin's machine or save state.
+        with (
+            patch(
+                "ucode.mcp.pick_mcp_servers",
+                return_value=[{"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"}],
+            ),
+            patch("ucode.mcp.apply_mcp_server_changes") as apply,
+            patch("ucode.mcp.save_state") as save,
+        ):
+            wizard._author_mcp_servers(WORKSPACE, "profile")
+        assert not apply.called
+        assert not save.called
+
+    def test_cancelled_picker_yields_no_servers(self):
+        with patch("ucode.mcp.pick_mcp_servers", return_value=None):
+            assert wizard._author_mcp_servers(WORKSPACE, "profile") == []
 
 
 class TestAdminGate:

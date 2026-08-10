@@ -121,16 +121,19 @@ def _mcp_type_for_url(url: str) -> str | None:
     return None
 
 
-def _mcp_servers_from_state(state: dict) -> list[dict]:
-    """The registered MCP servers, as managed-config ``{name, type}`` entries.
+def _mcp_entries_to_manifest(entries: list[dict]) -> list[dict]:
+    """Map picker/state ``{name, url, ...}`` entries to managed-config ``{name, type}``.
 
-    Skips the skills registry connection: skills are published under the manifest's own ``skills``
-    field, so including its MCP entry would configure it twice.
+    The manifest stores only ``name`` + ``type``; the URL is a local-machine concept (it is what
+    ``ucode configure --mcp`` writes into agent configs, and what a developer's ucode rebuilds from
+    ``{name, type}`` at pull time). Here the URL is derived-and-dropped: it exists only to recover
+    the type. Skips the skills registry connection, which is published under the manifest's own
+    ``skills`` field, and any entry whose URL shape isn't recognized.
     """
     from ucode.mcp import SKILLS_MCP_KIND
 
     servers: list[dict] = []
-    for entry in state.get("mcp_servers") or []:
+    for entry in entries:
         if not isinstance(entry, dict) or entry.get("kind") == SKILLS_MCP_KIND:
             continue
         name = entry.get("name")
@@ -145,11 +148,21 @@ def _mcp_servers_from_state(state: dict) -> list[dict]:
     return servers
 
 
-def _skill_names_from_state(state: dict) -> list[str]:
-    """Skill schemas registered on the skills MCP connection (``catalog.schema`` entries)."""
-    from ucode.mcp import _skill_mcp_locations
+def _author_mcp_servers(workspace: str, profile: str | None) -> list[dict]:
+    """Pick MCP servers for the managed manifest, as ``{name, type}`` — no machine changes.
 
-    return [name for name in _skill_mcp_locations(state) if isinstance(name, str) and name]
+    Runs the shared picker starting from an empty selection (so it does not pre-check the admin's
+    own registered servers — those are irrelevant to a workspace-wide declaration) and maps the
+    result to the manifest shape. Unlike ``configure_mcp_command``, nothing is written to agent
+    config files or ``state.json``: authoring a managed config must not reconfigure the admin's own
+    machine.
+    """
+    from ucode.mcp import pick_mcp_servers
+
+    picked = pick_mcp_servers(workspace, profile)
+    if not picked:
+        return []
+    return _mcp_entries_to_manifest(picked)
 
 
 def provider_service_model_options(service: dict) -> list[str]:
@@ -933,13 +946,12 @@ def setup_command(from_file: str | None = None) -> int:
 
     print_section("MCP servers")
     if prompt_yes_no_default("Set up managed MCP servers for this workspace?", default=False):
-        from ucode.mcp import configure_mcp_command
-
-        configure_mcp_command()
-        mcp_servers = _mcp_servers_from_state(load_state())
+        mcp_servers = _author_mcp_servers(workspace, profile)
         if mcp_servers:
             manifest["mcp_servers"] = mcp_servers
             print_success(f"{len(mcp_servers)} MCP server(s) added to the managed config")
+        else:
+            print_note("No MCP servers selected.")
 
     print_section("Skills")
     if prompt_yes_no_default("Set up managed skills for this workspace?", default=False):
@@ -947,14 +959,10 @@ def setup_command(from_file: str | None = None) -> int:
             "Skill schemas to publish, comma-separated `catalog.schema` (blank to skip)",
             default="",
         )
-        parsed: list[str] = [item.strip() for item in (locations or "").split(",") if item.strip()]
+        parsed = [item.strip() for item in (locations or "").split(",") if item.strip()]
         if parsed:
-            from ucode.mcp import configure_skills_mcp_command
-
-            configure_skills_mcp_command(parsed)
-            skill_names = _skill_names_from_state(load_state()) or parsed
-            manifest["skills"] = {"names": skill_names}
-            print_success(f"{len(skill_names)} skill schema(s) added to the managed config")
+            manifest["skills"] = {"names": parsed}
+            print_success(f"{len(parsed)} skill schema(s) added to the managed config")
 
     budget_policy = _prompt_budget_policy(workspace, token, enabled_agents, state)
     if budget_policy:
