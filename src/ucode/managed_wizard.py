@@ -960,7 +960,10 @@ def setup_command(from_file: str | None = None) -> int:
     if prompt_yes_no_default("Set up managed MCP servers for this workspace?", default=False):
         from ucode.mcp import configure_mcp_command
 
-        configure_mcp_command()
+        # Managed configs can't carry a Databricks app (its host isn't reconstructable from the
+        # workspace), so hide apps from the picker rather than let an admin pick one that is then
+        # dropped from the published config.
+        configure_mcp_command(exclude_sources={"apps"})
         mcp_servers = _mcp_servers_from_state(load_state())
         if mcp_servers:
             manifest["mcp_servers"] = mcp_servers

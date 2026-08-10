@@ -572,7 +572,9 @@ def _patch_mcp_choices(monkeypatch, *values: str, categories: set[str] | None = 
     # `categories`, which are unioned in.
     default_sources = {"external", "apps", "mcp-services", "genie"}
     selected_sources = default_sources | (categories or set())
-    monkeypatch.setattr(mcp, "prompt_for_mcp_search_sources", lambda: selected_sources)
+    monkeypatch.setattr(
+        mcp, "prompt_for_mcp_search_sources", lambda exclude_sources=None: selected_sources
+    )
     # Stub the always-on discoveries so configure_mcp_command tests don't hit
     # real APIs. Individual tests override these after calling the helper.
     monkeypatch.setattr(mcp, "discover_mcp_service_names", lambda workspace, profile=None: [])
@@ -675,7 +677,7 @@ class TestConfigureMcpWizardNavigation:
 
         source_calls: list[int] = []
 
-        def fake_sources():
+        def fake_sources(exclude_sources=None):
             source_calls.append(1)
             return {"external", "apps", "mcp-services", "genie"}
 
@@ -700,7 +702,7 @@ class TestConfigureMcpWizardNavigation:
         monkeypatch.setattr(mcp, "ensure_databricks_auth", lambda workspace, profile=None: None)
         monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["claude"])
         # Cancelling the first screen (None) returns without discovering anything.
-        monkeypatch.setattr(mcp, "prompt_for_mcp_search_sources", lambda: None)
+        monkeypatch.setattr(mcp, "prompt_for_mcp_search_sources", lambda exclude_sources=None: None)
         monkeypatch.setattr(
             mcp,
             "prompt_for_mcp_server_choices",
@@ -1139,7 +1141,7 @@ class TestConfigureMcpCommand:
         monkeypatch.setattr(
             mcp,
             "prompt_for_mcp_search_sources",
-            lambda: {"external", "apps", "mcp-services", "genie"},
+            lambda exclude_sources=None: {"external", "apps", "mcp-services", "genie"},
         )
         monkeypatch.setattr(
             mcp,
@@ -2493,3 +2495,47 @@ class TestApplyManagedMcpServers:
             self._managed({"name": "databricks-sql", "type": "sql"}), "not-a-client", WS
         )
         assert registered == []
+
+
+class TestPromptForMcpSearchSourcesExclusion:
+    def _values(self, monkeypatch, exclude):
+        captured: dict = {}
+
+        class FakePrompt:
+            def ask(self):
+                return []
+
+        def fake_checkbox(*args, **kwargs):
+            captured["choices"] = kwargs["choices"]
+            return FakePrompt()
+
+        monkeypatch.setattr(mcp, "_scrolling_checkbox", fake_checkbox)
+        mcp.prompt_for_mcp_search_sources(exclude_sources=exclude)
+        return [c.value for c in captured["choices"]]
+
+    def test_apps_excluded(self, monkeypatch):
+        values = self._values(monkeypatch, {"apps"})
+        assert "apps" not in values
+        assert "external" in values and "genie" in values
+
+    def test_nothing_excluded_by_default(self, monkeypatch):
+        assert "apps" in self._values(monkeypatch, None)
+
+
+class TestIsAppMcpServer:
+    def test_app_host_is_an_app(self):
+        assert mcp._is_app_mcp_server({"url": "https://myapp-1.databricksapps.com/mcp"}) is True
+
+    def test_workspace_relative_shapes_are_not_apps(self):
+        for url in (
+            f"{WS}/api/2.0/mcp/sql",
+            f"{WS}/api/2.0/mcp/external/jira",
+            f"{WS}/api/2.0/mcp/genie/01ef",
+            f"{WS}/api/2.0/mcp/vector-search/main/default",
+            f"{WS}/api/2.0/mcp/functions/main/default",
+            f"{WS}/ai-gateway/mcp-services/system.ai.dbsql",
+        ):
+            assert mcp._is_app_mcp_server({"url": url}) is False
+
+    def test_non_string_url_is_not_an_app(self):
+        assert mcp._is_app_mcp_server({}) is False

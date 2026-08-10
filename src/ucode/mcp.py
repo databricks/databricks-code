@@ -1030,6 +1030,30 @@ def _mcp_server_clients(server: dict) -> list[str]:
     return [client for client in (server.get("clients") or []) if client in MCP_CLIENTS]
 
 
+def _is_app_mcp_server(server: dict) -> bool:
+    """Whether a registered server points at a Databricks app (an off-workspace ``*/mcp`` host).
+
+    Apps are the residual ``/mcp`` URL shape — everything else ucode registers is a known
+    workspace-relative path. Used to hide already-registered apps from the picker where they can't be
+    published (``ucode setup``)."""
+    url = server.get("url")
+    if not isinstance(url, str):
+        return False
+    stripped = url.rstrip("/")
+    known = (
+        "/ai-gateway/mcp-services/",
+        "/api/2.0/mcp/external/",
+        "/api/2.0/mcp/genie/",
+        "/api/2.0/mcp/vector-search/",
+        "/api/2.0/mcp/functions/",
+    )
+    if any(fragment in url for fragment in known):
+        return False
+    if stripped.endswith("/api/2.0/mcp/sql"):
+        return False
+    return stripped.endswith("/mcp")
+
+
 def managed_mcp_server_entry(name: str, mcp_type: str, workspace: str) -> tuple[str, str] | None:
     """Rebuild an ``(entry_name, url)`` pair from a managed config's ``{name, type}`` entry.
 
@@ -1590,12 +1614,18 @@ MCP_SEARCH_SOURCES = (
 )
 
 
-def prompt_for_mcp_search_sources() -> set[str] | None:
+def prompt_for_mcp_search_sources(exclude_sources: set[str] | None = None) -> set[str] | None:
     """First wizard step: choose which sources to search. Returns the set of
-    selected source keys, or `None` if the user cancelled (Ctrl-C)."""
+    selected source keys, or `None` if the user cancelled (Ctrl-C).
+
+    ``exclude_sources`` drops source keys the caller can't use — e.g. `ucode setup` excludes
+    ``apps`` because a managed config can't carry an app's off-workspace host, so offering it would
+    let an admin pick a server that is then silently dropped."""
+    excluded = exclude_sources or set()
     choices = [
         questionary.Choice(title=label, value=key, checked=checked)
         for key, label, checked in MCP_SEARCH_SOURCES
+        if key not in excluded
     ]
     selection = _scrolling_checkbox(
         "Search for:",
@@ -1652,7 +1682,15 @@ def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[
     return workspace, profile, clients
 
 
-def configure_mcp_command(location: str | None = None, services: set[str] | None = None) -> int:
+def configure_mcp_command(
+    location: str | None = None,
+    services: set[str] | None = None,
+    *,
+    exclude_sources: set[str] | None = None,
+) -> int:
+    """Interactive MCP picker. ``exclude_sources`` hides search sources the caller can't use —
+    `ucode setup` passes ``{"apps"}`` because a managed config can't carry an app's off-workspace
+    host, so an app picked here would be silently dropped from the published config."""
     if services is not None and location is None:
         # `--services` works standalone with full names (`system.ai.github`): the
         # `<catalog>.<schema>` to configure is derived from them. Bare short names
@@ -1692,18 +1730,23 @@ def configure_mcp_command(location: str | None = None, services: set[str] | None
             print_success("Saved")
         return 0
 
+    excluded_sources = exclude_sources or set()
     original_mcp_servers: list[dict] = list(state.get("mcp_servers") or [])
     # Skills connections are managed by `configure skills`, so keep them out of
     # the picker and carry them through untouched.
     skills_servers = _skills_entries(original_mcp_servers)
     picker_servers = [s for s in original_mcp_servers if s.get("kind") != SKILLS_MCP_KIND]
+    # Drop already-registered servers from an excluded source too (e.g. a previously-added app under
+    # `ucode setup`), so the picker never shows a server the caller couldn't re-add.
+    if "apps" in excluded_sources:
+        picker_servers = [s for s in picker_servers if not _is_app_mcp_server(s)]
     original_by_name = _servers_by_name(picker_servers)
 
     # Two-step wizard: (1) choose which sources to search, (2) pick servers from
     # the results. Pressing Left (←) in the picker returns to step 1, so the user
     # can revise their source selection without restarting the command.
     while True:
-        sources = prompt_for_mcp_search_sources()
+        sources = prompt_for_mcp_search_sources(exclude_sources=excluded_sources)
         if sources is None:
             return 0
         discovered = _discover_selected_mcp_sources(workspace, profile, sources)
