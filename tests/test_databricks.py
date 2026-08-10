@@ -19,6 +19,7 @@ from ucode.databricks import (
     _run_databricks_cli_installer,
     _scrub_databrickscfg,
     _scrub_json,
+    all_users_can_use_schema,
     build_auth_shell_command,
     build_auth_token_argv,
     build_databricks_cli_env,
@@ -2695,3 +2696,67 @@ class TestDiscoverSqlWarehouses:
         )
         with pytest.raises(RuntimeError, match="No usable SQL warehouse"):
             discover_sql_warehouses(WS, "token")
+
+
+class TestAllUsersCanUseSchema:
+    def _stub(self, monkeypatch, payload, reason=None):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, reason)
+        )
+
+    def test_true_when_account_users_have_use_schema(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "USE_SCHEMA"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is True
+
+    def test_true_when_account_users_have_all_privileges(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "ALL_PRIVILEGES"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is True
+
+    def test_false_when_no_use_schema(self, monkeypatch):
+        # An empty assignment list is what the API returns when the group has no grant on the schema.
+        self._stub(monkeypatch, {})
+        assert all_users_can_use_schema("https://ws", "tok", "main.tien_le") is False
+
+    def test_false_when_only_unrelated_privileges(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "MANAGE"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is False
+
+    def test_none_when_the_call_fails(self, monkeypatch):
+        self._stub(monkeypatch, None, reason="HTTP 403 Forbidden")
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is None
+
+    def test_none_on_unexpected_shape(self, monkeypatch):
+        self._stub(monkeypatch, [])
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is None
+
+    def test_requests_the_account_users_principal(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (seen.setdefault("url", url), ({}, None))[1],
+        )
+        all_users_can_use_schema("https://ws", "tok", "main.tien_le")
+        assert "effective-permissions/schema/main.tien_le" in seen["url"]
+        assert "principal=account%20users" in seen["url"]

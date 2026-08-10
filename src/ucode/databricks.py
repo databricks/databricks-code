@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple, cast, overload
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from databricks.sql.exc import ServerOperationError
 
@@ -1943,6 +1943,43 @@ def get_model_provider_service(
     if entry is None:
         return None, "model-provider-service response had an unexpected shape"
     return entry, None
+
+
+# The group every workspace user belongs to. USE_SCHEMA granted to it (directly or inherited from
+# the catalog) is what lets an arbitrary developer pull a config that routes through an MPS in that
+# schema; without it they hit "User does not have USE_SCHEMA on Schema <catalog>.<schema>".
+_ALL_WORKSPACE_USERS_GROUP = "account users"
+
+
+def all_users_can_use_schema(workspace: str, token: str, schema_full_name: str) -> bool | None:
+    """Whether the `account users` group has USE_SCHEMA on ``<catalog>.<schema>``.
+
+    Uses UC's effective-permissions API, so a USE_SCHEMA inherited from a catalog-level grant counts.
+    Returns True/False, or None when the check itself could not be made (API unreachable or an
+    unexpected shape) — callers treat None as "unknown" and skip the warning rather than cry wolf.
+
+    A False here is only a heuristic: a workspace may instead grant access through team groups or
+    individual users, so callers must warn rather than block on it.
+    """
+    hostname = workspace_hostname(workspace)
+    principal = quote(_ALL_WORKSPACE_USERS_GROUP)
+    url = (
+        f"https://{hostname}/api/2.1/unity-catalog/effective-permissions/"
+        f"schema/{schema_full_name}?principal={principal}"
+    )
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if reason is not None or not isinstance(payload, dict):
+        return None
+    for assignment in payload.get("privilege_assignments") or []:
+        if not isinstance(assignment, dict):
+            continue
+        for entry in assignment.get("privileges") or []:
+            if isinstance(entry, dict) and entry.get("privilege") in (
+                "USE_SCHEMA",
+                "ALL_PRIVILEGES",
+            ):
+                return True
+    return False
 
 
 def is_model_provider_feature_unavailable(reason: str | None) -> bool:

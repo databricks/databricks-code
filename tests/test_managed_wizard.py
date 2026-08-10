@@ -895,6 +895,7 @@ class TestProviderServiceSelection:
                 "prompt_for_selection",
                 side_effect=["mps", "main.default.lilly-anthropic"],
             ),
+            patch.object(wizard, "all_users_can_use_schema", return_value=True),
         ):
             service = wizard._select_provider_service("claude", WORKSPACE, "token")
         assert service == ANTHROPIC_SERVICE
@@ -911,10 +912,45 @@ class TestProviderServiceSelection:
                 "prompt_for_selection",
                 side_effect=["mps", "main.default.lilly-anthropic"],
             ) as select,
+            patch.object(wizard, "all_users_can_use_schema", return_value=True),
         ):
             wizard._select_provider_service("claude", WORKSPACE, "token")
         offered = [value for value, _ in select.call_args_list[1][0][1]]
         assert offered == ["main.default.lilly-anthropic"]
+
+    def test_warns_when_all_users_lack_schema_access(self):
+        # The picked MPS's schema isn't granted to all workspace users, so developers who pull the
+        # config may hit "does not have USE_SCHEMA"; warn but still return the service (never block).
+        with (
+            patch.object(
+                wizard, "list_model_provider_services", return_value=([ANTHROPIC_SERVICE], None)
+            ),
+            patch.object(
+                wizard, "prompt_for_selection", side_effect=["mps", "main.default.lilly-anthropic"]
+            ),
+            patch.object(wizard, "all_users_can_use_schema", return_value=False),
+            patch.object(wizard, "print_warning") as warn,
+        ):
+            service = wizard._select_provider_service("claude", WORKSPACE, "token")
+        assert service == ANTHROPIC_SERVICE
+        assert warn.called
+        assert "main.default" in warn.call_args[0][0]
+
+    def test_no_warning_when_access_check_is_inconclusive(self):
+        # A None result (API unreachable / unexpected shape) must not cry wolf.
+        with (
+            patch.object(
+                wizard, "list_model_provider_services", return_value=([ANTHROPIC_SERVICE], None)
+            ),
+            patch.object(
+                wizard, "prompt_for_selection", side_effect=["mps", "main.default.lilly-anthropic"]
+            ),
+            patch.object(wizard, "all_users_can_use_schema", return_value=None),
+            patch.object(wizard, "print_warning") as warn,
+        ):
+            service = wizard._select_provider_service("claude", WORKSPACE, "token")
+        assert service == ANTHROPIC_SERVICE
+        assert not warn.called
 
     def test_cancelling_the_service_picker_returns_none(self):
         with (
