@@ -81,6 +81,7 @@ from ucode.managed_wizard import apply_command, setup_command, show_command
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
+    apply_managed_mcp_servers,
     configure_mcp_command,
     configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
@@ -1363,6 +1364,37 @@ def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = 
         console.print(panel)
 
 
+def _register_managed_mcp_servers(managed: dict, tool: str, state: dict) -> None:
+    """Apply the managed config's MCP servers to ``tool`` and persist what was registered.
+
+    Persisting under ``managed_mcp_servers`` lets the next launch diff against it, so a server the
+    admin later removes from the config is unregistered rather than left behind. A failure here never
+    blocks the launch — the agent still starts, just without the workspace's MCP servers.
+    """
+    try:
+        registered = apply_managed_mcp_servers(
+            managed,
+            tool,
+            state["workspace"],
+            state.get("profile"),
+            use_pat=bool(state.get("use_pat")),
+        )
+    except RuntimeError as exc:
+        print_warning(f"Could not register your workspace's MCP servers: {exc}")
+        return
+    # Persist even when empty so a config that dropped its last server clears the prior registration.
+    others = [
+        server
+        for server in (state.get("managed_mcp_servers") or [])
+        if isinstance(server, dict) and tool not in (server.get("clients") or [])
+    ]
+    state["managed_mcp_servers"] = others + registered
+    save_state(state)
+    if registered:
+        names = ", ".join(str(server["name"]) for server in registered)
+        print_note(f"Registered workspace MCP server(s) for {TOOL_SPECS[tool]['display']}: {names}")
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -1566,6 +1598,12 @@ def _launch_tool(
             )
         if recommendation is not None:
             _print_budget_panel(recommendation, tool, managed)
+        # Register the managed config's MCP servers so they reach the agent's `/mcp` list. Nothing
+        # else on this path does it — the config only lists them — so without this a
+        # workspace-published server never shows up. Skipped under --skip-preflight (deliberately
+        # unmanaged) and --dry-run (writes nothing).
+        if managed is not None and not skip_preflight and not is_dry_run():
+            _register_managed_mcp_servers(managed, tool, state)
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
     except RuntimeError as exc:

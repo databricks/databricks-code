@@ -351,7 +351,12 @@ def remove_client_mcp_server(client: str, name: str) -> list[str]:
 
 def revert_mcp_configs(state: dict) -> dict[str, bool]:
     results: dict[str, bool] = {}
-    for server in state.get("mcp_servers") or []:
+    # Both the developer's own servers and any registered from the workspace's managed config, so a
+    # revert leaves no ucode-added MCP server behind in an agent's config.
+    all_servers = list(state.get("mcp_servers") or []) + list(
+        state.get("managed_mcp_servers") or []
+    )
+    for server in all_servers:
         name = server.get("name")
         if not isinstance(name, str) or not name:
             continue
@@ -1023,6 +1028,89 @@ def prompt_for_mcp_server_choices(
 
 def _mcp_server_clients(server: dict) -> list[str]:
     return [client for client in (server.get("clients") or []) if client in MCP_CLIENTS]
+
+
+# Managed-config MCP `type` tags whose URL can be rebuilt from the stored `{name, type}` alone.
+# Other tags (genie-space, app, vector-search, uc-functions) need an id/host the manifest doesn't
+# carry, so they are skipped on launch until the manifest stores enough to reconstruct them.
+_MANAGED_MCP_SUPPORTED_TYPES = ("sql", "external", "mcp-service")
+
+
+def managed_mcp_server_url(name: str, mcp_type: str, workspace: str) -> str | None:
+    """Rebuild a launchable MCP URL from a managed config's ``{name, type}`` entry.
+
+    Returns None for a type this can't reconstruct from name+type alone, so the caller skips it
+    rather than registering a broken server. Mirrors the URL shapes :func:`_resolve_mcp_selection`
+    builds for the interactive picker.
+    """
+    if mcp_type == "sql":
+        return f"{workspace}/api/2.0/mcp/sql"
+    if mcp_type == "external":
+        return f"{workspace}/api/2.0/mcp/external/{name}"
+    if mcp_type == "mcp-service":
+        # The manifest stores the service in dash form (`system-ai-dbsql`), matching the entry name
+        # the interactive path registers; the URL wants the UC dotted form. Only the catalog and
+        # schema separators (the first two dashes) become dots — the service name keeps its own.
+        parts = name.split("-", 2)
+        if len(parts) != 3:
+            return None
+        return build_mcp_service_url(workspace, ".".join(parts))
+    return None
+
+
+def apply_managed_mcp_servers(
+    managed: dict, tool: str, workspace: str, profile: str | None = None, *, use_pat: bool = False
+) -> list[dict]:
+    """Register the managed config's MCP servers with ``tool`` so they reach its `/mcp` list.
+
+    The managed config only lists ``{name, type}`` entries; nothing else on the launch path turns
+    them into agent MCP registrations, so without this a workspace-published server never shows up.
+    Reconstructs the URL for each supported type (see :data:`_MANAGED_MCP_SUPPORTED_TYPES`), diffs
+    against what ucode previously registered, and applies the change for the launching tool only.
+
+    Returns the server dicts registered (for state persistence); an empty list when the config names
+    none, or names only types that can't yet be reconstructed.
+    """
+    if tool not in MCP_CLIENTS:
+        return []
+    entries = managed.get("mcp_servers")
+    if not isinstance(entries, list):
+        return []
+    working: list[dict] = []
+    seen: set[str] = set()
+    skipped: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        mcp_type = entry.get("type")
+        if not isinstance(name, str) or not name or not isinstance(mcp_type, str):
+            continue
+        url = managed_mcp_server_url(name, mcp_type, workspace)
+        if url is None:
+            skipped.append(f"{name} ({mcp_type})")
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        working.append({"name": name, "url": url, "auth": "proxy", "clients": [tool]})
+    if skipped:
+        print_warning(
+            "Skipping managed MCP server(s) ucode can't yet auto-register from the workspace "
+            f"config: {', '.join(skipped)}. Add them with `ucode configure mcp`."
+        )
+    if not working:
+        return []
+    # Diff against the managed servers ucode registered on a prior launch so a removed entry is
+    # unregistered and an unchanged one is a no-op. Only this tool's managed servers are considered.
+    state = load_state()
+    previous = [
+        server
+        for server in (state.get("managed_mcp_servers") or [])
+        if isinstance(server, dict) and tool in (server.get("clients") or [])
+    ]
+    apply_mcp_server_changes(previous, working, [tool], workspace, profile, use_pat=use_pat)
+    return working
 
 
 def _resolve_mcp_selection(
