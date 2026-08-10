@@ -2210,54 +2210,76 @@ class TestManagedConfigDecidesDiscoveryFromFreshRead:
 
 
 class TestConfigureDeprecation:
-    """`ucode configure` short-circuits once a managed config exists, since the admin's wins anyway."""
+    """`ucode configure` resolves the target workspace first, then short-circuits once a managed
+    config exists for it, since the admin's wins anyway."""
 
     @staticmethod
-    def _reject():
+    def _resolve(entries=None):
         import ucode.cli as cli_mod
 
-        cli_mod._reject_configure_under_managed_config()
+        return cli_mod._resolve_workspace_then_maybe_reject(entries)
 
     def test_shows_summary_and_exits_when_a_managed_config_exists(self, monkeypatch, capsys):
         import typer
 
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         monkeypatch.setattr(
             "ucode.cli.load_managed_state",
             lambda ws: {"enabled_agents": {"claude": {}}},
         )
         with pytest.raises(typer.Exit) as exc:
-            self._reject()
+            self._resolve([("https://w", None)])
         assert exc.value.exit_code == 0
         out = capsys.readouterr().out
         assert "managed config has been detected" in out
         assert "run `ucode`" in out
 
-    def test_silent_and_proceeds_without_a_managed_config(self, monkeypatch, capsys):
-        # Setting up a new workspace still goes through `ucode configure`, so say nothing.
+    def test_prompts_for_the_workspace_before_checking_the_config(self, monkeypatch):
+        # The whole point: even under a managed config the developer can still switch workspaces,
+        # so the prompt runs (and the picked workspace is made current) before the config check.
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
+        picked = []
+        monkeypatch.setattr(
+            "ucode.cli._prompt_for_configuration", lambda tool=None: ("https://picked", None)
+        )
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: picked.append(ws))
         monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
-        self._reject()
+        entries = self._resolve(None)
+        assert picked == ["https://picked"]
+        assert entries == [("https://picked", None)]
+
+    def test_returns_flag_entries_and_proceeds_without_a_managed_config(self, monkeypatch, capsys):
+        # Setting up a new workspace still goes through `ucode configure`, so say nothing and
+        # hand the resolved workspace back to the caller instead of re-prompting.
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        entries = self._resolve([("https://w", None)])
+        assert entries == [("https://w", None)]
         assert capsys.readouterr().out == ""
 
     def test_configure_command_exits_zero_without_erroring(self, monkeypatch):
         # `typer.Exit(0)` subclasses RuntimeError, so the command's own RuntimeError handler must
         # not catch the clean exit and print `str(exc)` -> a bare, meaningless "ERROR 0".
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         monkeypatch.setattr(
             "ucode.cli.load_managed_state",
             lambda ws: {"enabled_agents": {"claude": {}}},
         )
-        with patch("ucode.cli.install_databricks_cli"):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli._prompt_for_configuration", return_value=("https://w", None)),
+        ):
             result = runner.invoke(app, ["configure"])
         assert result.exit_code == 0, result.output
         assert "ERROR" not in result.output
 
     @pytest.mark.parametrize("env_value", [None, "", "0"])
-    def test_silent_when_the_env_var_is_off(self, monkeypatch, capsys, env_value):
+    def test_passes_entries_through_when_the_env_var_is_off(self, monkeypatch, capsys, env_value):
         if env_value is None:
             monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
         else:
@@ -2266,7 +2288,11 @@ class TestConfigureDeprecation:
             "ucode.cli.load_managed_state",
             lambda ws: pytest.fail("must not read the config when disabled"),
         )
-        self._reject()
+        monkeypatch.setattr(
+            "ucode.cli._prompt_for_configuration",
+            lambda tool=None: pytest.fail("must not prompt when disabled"),
+        )
+        assert self._resolve(None) is None
         assert capsys.readouterr().out == ""
 
 

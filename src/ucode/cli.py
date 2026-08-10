@@ -201,21 +201,32 @@ def _print_managed_summary(managed: dict, state: dict, tool: str | None) -> None
     )
 
 
-def _reject_configure_under_managed_config() -> None:
-    """Short-circuit ``ucode configure`` when the workspace publishes a managed config.
+def _resolve_workspace_then_maybe_reject(
+    workspace_entries: list[tuple[str, str | None]] | None,
+) -> list[tuple[str, str | None]] | None:
+    """Resolve the workspace ``ucode configure`` targets, then short-circuit if it is managed.
 
-    Configuring locally would be overridden at launch anyway. Rather than erroring, show the
-    developer the config their admin already set and point them at `ucode`. Without a managed
-    config the command still runs unchanged.
+    When managed coding-agent configs are enabled, ``ucode configure`` must still let a developer
+    switch workspaces — so resolve the target workspace up front (prompting when the interactive
+    path gave no ``--workspaces``/``--profiles``) and make it current *before* deciding whether to
+    short-circuit. Only then, if that workspace already publishes a managed config, configuring
+    locally would be overridden at launch anyway: show the admin's config and point the developer
+    at `ucode`.
+
+    Returns the resolved entries to configure when there is no managed config so the caller reuses
+    them instead of prompting again. Without the feature enabled it returns ``workspace_entries``
+    unchanged and prompts nothing.
     """
     if not managed_agent_config_enabled():
-        return
-    state = load_state()
-    managed = load_managed_state(state.get("workspace"))
+        return workspace_entries
+    entries = workspace_entries or [_prompt_for_configuration(None)]
+    workspace = entries[0][0]
+    set_current_workspace(workspace)
+    managed = load_managed_state(workspace)
     if not managed:
-        return
+        return entries
     print_success("A managed config has been detected for your workspace — you're all set.")
-    _print_managed_summary(managed, state, tool=None)
+    _print_managed_summary(managed, load_state(), tool=None)
     print_note("Configuration is complete. Just run `ucode` to launch with it applied.")
     raise typer.Exit(0)
 
@@ -2014,7 +2025,6 @@ def configure(
     prompt_optional_updates = not skip_upgrade
     try:
         install_databricks_cli()
-        _reject_configure_under_managed_config()
         if agent is not None and agents is not None:
             raise RuntimeError("Use either --agent or --agents, not both.")
         if workspaces is not None and profiles is not None:
@@ -2027,6 +2037,14 @@ def configure(
         workspace_entries = _parse_workspaces_option(workspaces) if workspaces is not None else None
         if profiles is not None:
             workspace_entries = _parse_profiles_option(profiles)
+        # Whether the user named the workspace(s) via flags, captured before the resolver below
+        # may fill `workspace_entries` from a prompt — this, not the resolved value, decides the
+        # fully-interactive MCP prompt at the end.
+        flag_driven_workspace = workspace_entries is not None
+        # Under a managed config, resolve (prompting when interactive) and set the target workspace
+        # first, so the developer can switch workspaces; only then short-circuit if that workspace
+        # is already managed. Returns the resolved entries so the flow below doesn't prompt again.
+        workspace_entries = _resolve_workspace_then_maybe_reject(workspace_entries)
         # Only forward the opt-in flags when set so existing call expectations
         # (and defaults) stay unchanged for the common interactive path.
         skip_kwargs: dict = {}
@@ -2131,8 +2149,10 @@ def configure(
                 )
             # Only the no-agent, no-workspace path is truly interactive (the user
             # picked agents/workspace via prompts); that's where we offer the MCP
-            # step below. Flag-driven runs stay scriptable.
-            fully_interactive = workspace_entries is None
+            # step below. Flag-driven runs stay scriptable. Keyed off whether the
+            # workspace came from a flag, not the now-resolved `workspace_entries`
+            # (which the managed-config resolver may have filled from a prompt).
+            fully_interactive = not flag_driven_workspace
         if tracing:
             # The workspaces were just configured, so enable tracing for them
             # directly instead of re-prompting. Fall back to the workspace that
