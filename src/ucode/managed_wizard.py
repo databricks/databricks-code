@@ -2,8 +2,10 @@
 
 Workspace admins run this to build the ``CodingAgentConfig`` their developers will pull. It walks
 the admin through agents, per-agent models, tracing, MCP servers, skills, and a spend-routing budget
-policy, then writes the manifest to ``~/.ucode/managed-settings.json``. Publishing it to the
-workspace is ``ucode apply`` (a separate command, so an admin can review the file first).
+policy, then writes the manifest to ``~/.ucode/managed-state.json`` (the one local managed-config
+file, owned by :mod:`ucode.managed_config`). An admin can try it with ``ucode --dry-run`` and then
+publish it to the workspace with ``ucode apply`` (a separate command, so the file can be reviewed
+first).
 
 Serialization, validation, and the per-agent model catalogs live in :mod:`ucode.managed_setup`; this
 module is the interaction layer on top of them. Sub-flows an admin already knows — tracing, MCP,
@@ -36,14 +38,17 @@ from ucode.databricks import (
     service_usable_for_tool,
     update_coding_agent_config,
 )
-from ucode.managed_config import get_managed_config
+from ucode.managed_config import (
+    get_managed_config,
+    load_managed_state,
+    managed_state_workspace,
+    save_managed_state,
+)
 from ucode.managed_setup import (
     CLAUDE_SLOT_FOR_FAMILY,
     claude_family_candidates,
     claude_family_for_model,
-    load_managed_settings,
     model_options_for_agent,
-    save_managed_settings,
     serialize_managed_config,
     supports_provider_service,
     validate_manifest,
@@ -357,7 +362,7 @@ def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | No
     # Nothing pre-checked: the first option is whatever discovery sorted first, not a
     # recommendation — for pi it is a Claude model, for codex the oldest GPT. Pre-checking it made
     # "hit Enter" produce an arbitrary config. (A worthwhile follow-up is to pre-check the models
-    # this workspace was configured with last time, which `load_managed_settings` already loads for
+    # this workspace was configured with last time, which `load_managed_state` already loads for
     # the agent picker, so a re-run becomes an edit rather than a re-entry.)
     picked = _require_multi_selection(
         f"Select models for {display}:",
@@ -981,9 +986,9 @@ def setup_from_file(path: str) -> int:
             print_note(error)
         return 1
 
-    save_managed_settings(workspace, manifest)
+    save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
-    print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-settings.json")
+    print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-state.json")
     _print_next_steps()
     return 0
 
@@ -991,9 +996,10 @@ def setup_from_file(path: str) -> int:
 def _print_next_steps() -> None:
     console.print()
     print_heading("Next steps")
-    # Deliberately only `apply`. There is no way yet to try the authored config locally: the
-    # manifest describes what developers should get, while `ucode configure --dry-run` previews
-    # this machine's own agent configs, so pointing at it implied a local test it doesn't perform.
+    # The authored manifest is saved to the same local file a launch reads, so `ucode --dry-run`
+    # previews this machine's agents *as configured by the manifest* without fetching or overwriting
+    # it — a real local test of the config before it is published.
+    print_note("Try it locally:               ucode --dry-run")
     print_note("Publish it to the workspace:  ucode apply")
 
 
@@ -1038,7 +1044,7 @@ def setup_command(from_file: str | None = None) -> int:
             "serves models for at least one agent."
         )
 
-    previous = load_managed_settings(workspace) or {}
+    previous = load_managed_state(workspace) or {}
     previously_enabled = [
         tool for tool in (previous.get("enabled_agents") or {}) if tool in TOOL_SPECS
     ]
@@ -1124,18 +1130,20 @@ def setup_command(from_file: str | None = None) -> int:
             print_note(error)
         return 1
 
-    save_managed_settings(workspace, manifest)
+    save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
     console.print()
-    print_success("Saved to ~/.ucode/managed-settings.json")
+    print_success("Saved to ~/.ucode/managed-state.json")
     _print_next_steps()
     return 0
 
 
 def show_command() -> int:
     """Print the authored manifest and the proto-JSON `ucode apply` would publish."""
-    workspace = load_state().get("workspace")
-    manifest = load_managed_settings(workspace)
+    # Fall back to the workspace the on-disk file was authored for, so `ucode setup --show` still
+    # works before `ucode configure` has put a workspace in local state.
+    workspace = load_state().get("workspace") or managed_state_workspace()
+    manifest = load_managed_state(workspace)
     if manifest is None:
         print_note("No managed config has been authored yet. Run `ucode setup` to create one.")
         return 0
@@ -1225,7 +1233,7 @@ def apply_command(*, yes: bool = False) -> int:
     if not workspace:
         workspace, profile = _prompt_for_configuration()
 
-    manifest = load_managed_settings(workspace)
+    manifest = load_managed_state(workspace)
     if manifest is None:
         raise RuntimeError(
             "No managed config has been authored for this workspace. Run `ucode setup` first "
@@ -1241,7 +1249,7 @@ def apply_command(*, yes: bool = False) -> int:
         print_err("The authored config is not valid, so it was not published:")
         for error in errors:
             print_note(error)
-        print_note("Re-run `ucode setup` to fix it, or edit ~/.ucode/managed-settings.json.")
+        print_note("Re-run `ucode setup` to fix it, or edit ~/.ucode/managed-state.json.")
         return 1
 
     token = get_databricks_token(workspace, profile)

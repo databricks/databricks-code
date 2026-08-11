@@ -1,12 +1,20 @@
 """Admin-authored managed coding-agent config: fetch, normalize, and local persistence.
 
 An org admin authors a ``CodingAgentConfig`` through the Databricks AI Gateway; developers read it
-(non-admin) and ``ucode`` applies it locally. This module owns the developer-read half:
+(non-admin) and ``ucode`` applies it locally. This module owns the fetch/normalize side and the one
+local file, ``~/.ucode/managed-state.json`` (0600), that both roles share:
 
 - fetching the raw manifest (via :func:`ucode.databricks.fetch_managed_coding_agent_configs`),
 - normalizing the proto-JSON into a stable internal dict keyed by ucode's own tool names,
-- persisting it to ``~/.ucode/managed-state.json`` (0600), and
+- persisting it via :func:`save_managed_state` / :func:`load_managed_state` — the admin-write side
+  (``managed_setup`` / ``managed_wizard``) authors the manifest here, and the launch path pulls the
+  published copy back into the same file, and
 - re-reading it on each launch, falling back to the persisted copy when the read fails.
+
+There is deliberately one file, not a separate authored ``managed-settings.json``: the workspace is
+the source of truth, so an authored draft and the pulled copy are the same shape and coexist in
+``managed-state.json``. ``ucode --dry-run`` reads the local draft without fetching or overwriting it,
+which is how an admin tries a config out between ``ucode setup`` and ``ucode apply``.
 
 :func:`refresh_managed_config` is the launch path's entry point. It is called before model discovery,
 because the manifest decides whether that discovery is needed at all; the launch path then hands the
@@ -370,6 +378,11 @@ def load_managed_state(workspace: str | None) -> dict | None:
 
     Returns the normalized config dict (the ``config`` field), only when the stored file is for the
     same workspace — so a stale file from another workspace is ignored rather than misapplied.
+
+    This is the single local managed config: ``ucode setup`` authors it here, ``ucode --dry-run``
+    reads it to try the authored config locally, ``ucode apply`` publishes it, and a normal launch
+    refreshes it from the workspace. The admin-authored draft and the pulled copy share one file
+    because the workspace is the source of truth — to keep a draft, publish it with ``ucode apply``.
     """
     if not workspace:
         return None
@@ -378,6 +391,16 @@ def load_managed_state(workspace: str | None) -> dict | None:
         return None
     config = data.get("config")
     return config if isinstance(config, dict) else None
+
+
+def managed_state_workspace() -> str | None:
+    """The workspace the on-disk managed config was authored/pulled for, or None when there is none.
+
+    Lets a caller that has no workspace in local ucode state (e.g. ``ucode setup --show`` before
+    ``ucode configure``) still find the manifest on disk and report which workspace it belongs to.
+    """
+    workspace = config_io.read_json_safe(MANAGED_STATE_PATH).get("workspace")
+    return workspace if isinstance(workspace, str) and workspace else None
 
 
 def refresh_managed_config(state: dict) -> dict | None:

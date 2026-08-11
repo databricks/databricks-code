@@ -16,7 +16,7 @@ from typer.testing import CliRunner
 
 import ucode.cli as cli_mod
 import ucode.config_io as config_io_mod
-import ucode.managed_setup as managed_setup_mod
+import ucode.managed_config as managed_config_mod
 import ucode.managed_wizard as wizard
 from ucode.cli import app
 from ucode.managed_setup import validate_manifest
@@ -43,11 +43,9 @@ STATE = {
 
 @pytest.fixture(autouse=True)
 def _isolate_settings(tmp_path, monkeypatch):
-    """Point the manifest path at a tmp dir so no test touches the real ~/.ucode."""
+    """Point the managed-config file at a tmp dir so no test touches the real ~/.ucode."""
     monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-    monkeypatch.setattr(
-        managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
-    )
+    monkeypatch.setattr(managed_config_mod, "MANAGED_STATE_PATH", tmp_path / "managed-state.json")
     monkeypatch.setattr(config_io_mod, "_dry_run", False)
 
 
@@ -1550,13 +1548,13 @@ class TestSetupFromFile:
         path = self._write(tmp_path, self._valid())
         with patch.object(wizard, "load_state", return_value=STATE):
             assert wizard.setup_from_file(str(path)) == 0
-        assert managed_setup_mod.load_managed_settings(WORKSPACE) == self._valid()
+        assert managed_config_mod.load_managed_state(WORKSPACE) == self._valid()
 
     def test_invalid_manifest_returns_1_and_saves_nothing(self, tmp_path):
         path = self._write(tmp_path, {"enabled_agents": {"claude": {}}})
         with patch.object(wizard, "load_state", return_value=STATE):
             assert wizard.setup_from_file(str(path)) == 1
-        assert managed_setup_mod.load_managed_settings(WORKSPACE) is None
+        assert managed_config_mod.load_managed_state(WORKSPACE) is None
 
     def test_missing_file_is_actionable(self, tmp_path):
         with patch.object(wizard, "load_state", return_value=STATE):
@@ -1595,7 +1593,7 @@ class TestShowCommand:
                 "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}}
             },
         }
-        managed_setup_mod.save_managed_settings(WORKSPACE, manifest)
+        managed_config_mod.save_managed_state(WORKSPACE, manifest)
         with patch.object(wizard, "load_state", return_value={"workspace": WORKSPACE}):
             assert wizard.show_command() == 0
         out = capsys.readouterr().out
@@ -1812,7 +1810,7 @@ class TestApplyCommand:
                 wizard.apply_command()
 
     def test_creates_when_no_config_exists(self):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         created = {}
 
         def fake_create(workspace, token, payload):
@@ -1827,7 +1825,7 @@ class TestApplyCommand:
     def test_updates_in_place_when_a_config_exists(self):
         # Delete-then-create would leave the workspace with no config if the create failed, so an
         # existing config must be PATCHed rather than replaced.
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         existing = {"name": "coding-agent-configs/abc", "enabled_agents": {"codex": {}}}
         updated = {}
         created = {"called": False}
@@ -1853,7 +1851,7 @@ class TestApplyCommand:
 
     def test_invalid_manifest_is_not_published(self):
         # `default_agent` names an agent that isn't enabled.
-        managed_setup_mod.save_managed_settings(
+        managed_config_mod.save_managed_state(
             WORKSPACE, {"default_agent": "codex", "enabled_agents": {"claude": {}}}
         )
         created = {"called": False}
@@ -1871,7 +1869,7 @@ class TestApplyCommand:
         # `apply` process used to reject a model it had just offered:
         #   claude: model 'system.ai.claude-opus-4-1' is not available on this workspace.
         # `apply` re-fetches the full listing rather than trusting what `setup` left in state.
-        managed_setup_mod.save_managed_settings(
+        managed_config_mod.save_managed_state(
             WORKSPACE,
             {
                 "default_agent": "claude",
@@ -1909,7 +1907,7 @@ class TestApplyCommand:
     def test_a_failed_inventory_fetch_does_not_block_publishing(self):
         # The re-fetch is best-effort: a transient listing failure must not turn into a refusal to
         # publish a manifest that validates against what state already knows.
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         published: dict = {}
 
         def fake_create(workspace, token, payload):
@@ -1926,7 +1924,7 @@ class TestApplyCommand:
         assert published
 
     def test_declining_the_prompt_publishes_nothing(self):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         created = {"called": False}
 
         def fake_create(*a, **k):
@@ -1940,7 +1938,7 @@ class TestApplyCommand:
         assert created["called"] is False
 
     def test_yes_skips_the_prompt(self):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
 
         def refuse(*a, **k):
             raise AssertionError("--yes must not prompt")
@@ -1948,7 +1946,7 @@ class TestApplyCommand:
         assert self._run(yes=True, prompt_yes_no_default=refuse) == 0
 
     def test_non_admin_is_rejected_before_publishing(self):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         created = {"called": False}
 
         def fake_create(*a, **k):
@@ -1963,7 +1961,7 @@ class TestApplyCommand:
 
     def test_unreadable_existing_config_refuses_to_publish(self):
         # Publishing without knowing whether a config exists risks silently overwriting one.
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         created = {"called": False}
 
         def fake_create(*a, **k):
@@ -1978,7 +1976,7 @@ class TestApplyCommand:
         assert created["called"] is False
 
     def test_existing_config_without_a_resource_name_is_an_error(self):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         with pytest.raises(RuntimeError, match="resource name"):
             self._run(get_managed_config=lambda *a, **k: ({"enabled_agents": {}}, None))
 

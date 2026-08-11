@@ -7,11 +7,13 @@ import stat
 
 import pytest
 
+import ucode.config_io as config_io_mod
 import ucode.databricks as db_mod
 import ucode.managed_config as mc_mod
 from ucode.managed_config import (
     get_managed_config,
     load_managed_state,
+    managed_state_workspace,
     normalize_managed_config,
     refresh_managed_config,
     save_managed_state,
@@ -210,6 +212,22 @@ class TestPersistence:
         save_managed_state("https://ws.example.com", {"default_agent": "claude"})
         save_managed_state("https://ws.example.com", {})
         assert load_managed_state("https://ws.example.com") == {}
+
+    def test_workspace_is_stored_alongside_the_config(self, _managed_path):
+        # `ucode setup --show` reads this when local state carries no workspace yet, so the authored
+        # file can still be found and attributed on disk.
+        save_managed_state("https://ws.example.com", {"default_agent": "claude"})
+        assert managed_state_workspace() == "https://ws.example.com"
+
+    def test_workspace_is_none_when_absent(self, _managed_path):
+        assert managed_state_workspace() is None
+
+    def test_dry_run_writes_nothing(self, _managed_path, monkeypatch):
+        # Under --dry-run the config writers print instead of touching disk, so a launch that
+        # dry-runs an admin's authored draft never overwrites it.
+        monkeypatch.setattr(config_io_mod, "is_dry_run", lambda: True)
+        save_managed_state("https://ws.example.com", {"default_agent": "claude"})
+        assert not _managed_path.exists()
 
 
 class TestFetchClient:
