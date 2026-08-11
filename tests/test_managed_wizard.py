@@ -72,32 +72,46 @@ class TestTracingReadback:
         assert wizard._tracing_table_from_state({"tracing": "on"}) is None
 
 
-class TestMcpUrlClassification:
+class TestMcpServerFromUrl:
     @pytest.mark.parametrize(
         ("url", "expected"),
         [
-            ("https://ws.example.com/ai-gateway/mcp-services/system.ai.github", "mcp-service"),
-            ("https://ws.example.com/api/2.0/mcp/external/jira-prod", "external"),
-            ("https://ws.example.com/api/2.0/mcp/genie/01ef", "genie-space"),
-            ("https://ws.example.com/api/2.0/mcp/vector-search/main/default", "vector-search"),
-            ("https://ws.example.com/api/2.0/mcp/functions/main/default", "uc-functions"),
-            ("https://ws.example.com/api/2.0/mcp/sql", "sql"),
-            ("https://mcp-myapp-123.aws.databricksapps.com/mcp", "app"),
+            # mcp-service stores the dash form the launch path rebuilds the dotted URL from.
+            (
+                "https://ws.example.com/ai-gateway/mcp-services/system.ai.github",
+                ("system-ai-github", "mcp-service"),
+            ),
+            ("https://ws.example.com/api/2.0/mcp/external/jira-prod", ("jira-prod", "external")),
+            ("https://ws.example.com/api/2.0/mcp/genie/01ef", ("01ef", "genie-space")),
+            # vector-search / uc-functions store `<catalog>.<schema>`, not the local display slug.
+            (
+                "https://ws.example.com/api/2.0/mcp/vector-search/my_cat/my_schema",
+                ("my_cat.my_schema", "vector-search"),
+            ),
+            (
+                "https://ws.example.com/api/2.0/mcp/functions/dev_cat/dev_fixture",
+                ("dev_cat.dev_fixture", "uc-functions"),
+            ),
+            ("https://ws.example.com/api/2.0/mcp/sql", ("databricks-sql", "sql")),
         ],
     )
     def test_known_urls(self, url, expected):
-        assert wizard._mcp_type_for_url(url) == expected
+        assert wizard._mcp_server_from_url(url) == expected
 
-    def test_trailing_slash_is_tolerated(self):
-        assert wizard._mcp_type_for_url("https://ws.example.com/api/2.0/mcp/sql/") == "sql"
+    def test_apps_are_not_publishable(self):
+        # An app's host isn't reconstructable from the workspace + an id, so it can't be published.
+        assert (
+            wizard._mcp_server_from_url("https://mcp-myapp-123.aws.databricksapps.com/mcp") is None
+        )
 
     def test_unknown_url_yields_none(self):
-        # Better to skip a server than publish it with a guessed type.
-        assert wizard._mcp_type_for_url("https://example.com/something/else") is None
+        assert wizard._mcp_server_from_url("https://example.com/something/else") is None
 
-    def test_sql_is_not_confused_for_app(self):
-        # Both end in a fixed segment; sql must win since it is checked first.
-        assert wizard._mcp_type_for_url("https://ws.example.com/api/2.0/mcp/sql") == "sql"
+    def test_vector_search_needs_both_catalog_and_schema(self):
+        assert (
+            wizard._mcp_server_from_url("https://ws.example.com/api/2.0/mcp/functions/onlycat")
+            is None
+        )
 
 
 class TestMcpServersFromState:
@@ -111,9 +125,25 @@ class TestMcpServersFromState:
                 {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
             ]
         }
+        # The published name comes from the URL (the identifier the server field holds), not the
+        # local display name.
         assert wizard._mcp_servers_from_state(state) == [
-            {"name": "databricks-github", "type": "mcp-service"},
+            {"name": "system-ai-github", "type": "mcp-service"},
             {"name": "databricks-sql", "type": "sql"},
+        ]
+
+    def test_publishes_catalog_schema_for_uc_functions(self):
+        # The lossy local slug is replaced with the dotted catalog.schema the launch path can split.
+        state = {
+            "mcp_servers": [
+                {
+                    "name": "databricks-functions-dev-cat-dev-fixture",
+                    "url": f"{WORKSPACE}/api/2.0/mcp/functions/dev_cat/dev_fixture",
+                },
+            ]
+        }
+        assert wizard._mcp_servers_from_state(state) == [
+            {"name": "dev_cat.dev_fixture", "type": "uc-functions"},
         ]
 
     def test_skips_the_skills_registry_entry(self):
@@ -133,8 +163,13 @@ class TestMcpServersFromState:
         }
         assert wizard._mcp_servers_from_state(state) == [{"name": "databricks-sql", "type": "sql"}]
 
-    def test_skips_unclassifiable_servers(self):
-        state = {"mcp_servers": [{"name": "mystery", "url": "https://example.com/nope"}]}
+    def test_skips_apps_and_unclassifiable_servers(self):
+        state = {
+            "mcp_servers": [
+                {"name": "mystery", "url": "https://example.com/nope"},
+                {"name": "databricks-app-x", "url": "https://x-1.databricksapps.com/mcp"},
+            ]
+        }
         assert wizard._mcp_servers_from_state(state) == []
 
     def test_skips_entries_missing_name_or_url(self):
