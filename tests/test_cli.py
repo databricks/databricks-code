@@ -2557,25 +2557,6 @@ class TestBareUcode:
         assert launched == []
         assert "Ask a workspace admin" in result.output
 
-    def test_dry_run_uses_the_cache_and_does_not_fetch(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
-        monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
-        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: pytest.fail("--dry-run must not fetch"),
-        )
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: self.MANAGED)
-        launched: list[tuple] = []
-        monkeypatch.setattr(
-            "ucode.cli._launch_tool", lambda tool, ctx, **kw: launched.append((tool, kw))
-        )
-        result = runner.invoke(app, ["--dry-run"])
-        assert result.exit_code == 0, result.output
-        # The config bare `ucode` already read is handed down, so the launch path does not refetch.
-        assert launched[0][1]["managed"] == self.MANAGED
-
     def test_skip_preflight_has_no_config_to_pick_an_agent_from(self, monkeypatch):
         # --skip-preflight is deliberately unmanaged, so bare `ucode` cannot resolve an agent. It
         # must say that rather than report "no config found", which would be wrong.

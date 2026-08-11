@@ -13,8 +13,8 @@ local file, ``~/.ucode/managed-state.json`` (0600), that both roles share:
 
 There is deliberately one file, not a separate authored ``managed-settings.json``: the workspace is
 the source of truth, so an authored draft and the pulled copy are the same shape and coexist in
-``managed-state.json``. ``ucode --dry-run`` reads the local draft without fetching or overwriting it,
-which is how an admin tries a config out between ``ucode setup`` and ``ucode apply``.
+``managed-state.json``. ``ucode setup`` authors the draft; ``ucode apply`` publishes it; a launch
+then pulls the published copy back into the same file.
 
 :func:`refresh_managed_config` is the launch path's entry point. It is called before model discovery,
 because the manifest decides whether that discovery is needed at all; the launch path then hands the
@@ -379,10 +379,10 @@ def load_managed_state(workspace: str | None) -> dict | None:
     Returns the normalized config dict (the ``config`` field), only when the stored file is for the
     same workspace — so a stale file from another workspace is ignored rather than misapplied.
 
-    This is the single local managed config: ``ucode setup`` authors it here, ``ucode --dry-run``
-    reads it to try the authored config locally, ``ucode apply`` publishes it, and a normal launch
-    refreshes it from the workspace. The admin-authored draft and the pulled copy share one file
-    because the workspace is the source of truth — to keep a draft, publish it with ``ucode apply``.
+    This is the single local managed config: ``ucode setup`` authors it here, ``ucode apply``
+    publishes it, and a launch refreshes it from the workspace. The admin-authored draft and the
+    pulled copy share one file because the workspace is the source of truth — to keep a draft,
+    publish it with ``ucode apply``.
     """
     if not workspace:
         return None

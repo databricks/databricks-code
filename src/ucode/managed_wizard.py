@@ -3,9 +3,8 @@
 Workspace admins run this to build the ``CodingAgentConfig`` their developers will pull. It walks
 the admin through agents, per-agent models, tracing, MCP servers, skills, and a spend-routing budget
 policy, then writes the manifest to ``~/.ucode/managed-state.json`` (the one local managed-config
-file, owned by :mod:`ucode.managed_config`). An admin can try it with ``ucode --dry-run`` and then
-publish it to the workspace with ``ucode apply`` (a separate command, so the file can be reviewed
-first).
+file, owned by :mod:`ucode.managed_config`). Publishing it to the workspace is ``ucode apply`` (a
+separate command, so an admin can review the file first).
 
 Serialization, validation, and the per-agent model catalogs live in :mod:`ucode.managed_setup`; this
 module is the interaction layer on top of them. Sub-flows an admin already knows — tracing, MCP,
@@ -1001,10 +1000,6 @@ def setup_from_file(path: str) -> int:
 def _print_next_steps() -> None:
     console.print()
     print_heading("Next steps")
-    # The authored manifest is saved to the same local file a launch reads, so `ucode --dry-run`
-    # previews this machine's agents *as configured by the manifest* without fetching or overwriting
-    # it — a real local test of the config before it is published.
-    print_note("Try it locally:               ucode --dry-run")
     print_note("Publish it to the workspace:  ucode apply")
 
 
@@ -1036,8 +1031,7 @@ def setup_command(from_file: str | None = None) -> int:
     if not _handle_existing_config(workspace, token):
         return 0
 
-    # Discover the workspace's models and gateway URLs. This also logs in and persists local state,
-    # which is what lets the admin dry-run the config on their own machine afterwards.
+    # Discover the workspace's models and gateway URLs. This also logs in and persists local state.
     state = configure_shared_state(workspace, profile=profile, force_login=False)
     workspace = state.get("workspace") or workspace
     profile = state.get("profile") or profile

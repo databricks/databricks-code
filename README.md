@@ -186,10 +186,9 @@ skipped. It then offers tracing, managed MCP servers, skills, and a spend-based 
 switches the default agent and model as the workspace burns through a budget.
 
 The result is written to `~/.ucode/managed-state.json` — the one local managed-config file — which
-`ucode apply` publishes to the workspace. Because a launch reads that same file, `ucode --dry-run`
-tries the authored config on this machine before it is published, without fetching or overwriting
-it. Your own agent configs are left alone, with one exception: answering yes to tracing, MCP
-servers, or skills runs the matching `ucode configure` step, which does configure this machine.
+`ucode apply` publishes to the workspace. Your own agent configs are left alone, with one exception:
+answering yes to tracing, MCP servers, or skills runs the matching `ucode configure` step, which
+does configure this machine.
 
 ```bash
 # Review the manifest and the exact payload `ucode apply` would publish.
@@ -197,9 +196,6 @@ ucode setup show
 
 # Walk the flow without writing anything.
 ucode setup --dry-run
-
-# Try the authored config locally before publishing (no fetch, no overwrite).
-ucode --dry-run
 
 # Skip the prompts and load a hand-written config instead (validated before saving).
 ucode setup --from-file ./managed-config.json

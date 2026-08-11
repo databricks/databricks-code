@@ -33,7 +33,7 @@ from ucode.agents import (
 )
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
-from ucode.config_io import is_dry_run, restore_file, set_dry_run
+from ucode.config_io import restore_file, set_dry_run
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
@@ -1378,9 +1378,7 @@ def _fetch_budget_recommendation(
     Enforcement is server-side, so a failed read only costs the recommendation: the config's own
     ``default_model`` still applies and the launch proceeds.
     """
-    # --dry-run resolves the agent from the last saved config alone, so it must not reach the
-    # control plane — mirroring the managed-config read, which is likewise skipped under --dry-run.
-    if managed is None or skip_preflight or is_dry_run():
+    if managed is None or skip_preflight:
         return None
     reason: str | None = None
     recommendation = None
@@ -1699,8 +1697,8 @@ def _launch_tool(
         # Register the managed config's MCP servers so they reach the agent's `/mcp` list. Nothing
         # else on this path does it — the config only lists them — so without this a
         # workspace-published server never shows up. Skipped under --skip-preflight (deliberately
-        # unmanaged) and --dry-run (writes nothing).
-        if managed is not None and not skip_preflight and not is_dry_run():
+        # unmanaged).
+        if managed is not None and not skip_preflight:
             _register_managed_mcp_servers(managed, tool, state)
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
@@ -1751,14 +1749,6 @@ def default(
             is_eager=True,
         ),
     ] = False,
-    dry_run: Annotated[
-        bool,
-        typer.Option(
-            "--dry-run",
-            help="Print config files without writing them. Uses the last saved managed "
-            "config instead of fetching a fresh one.",
-        ),
-    ] = False,
     skip_preflight: SkipPreflightOption = False,
     workspace: WorkspaceOption = None,
 ) -> None:
@@ -1768,11 +1758,8 @@ def default(
     """
     if ctx.invoked_subcommand is not None:
         return
-    set_dry_run(dry_run)
     try:
-        _launch_managed_default(
-            ctx, dry_run=dry_run, skip_preflight=skip_preflight, workspace=workspace
-        )
+        _launch_managed_default(ctx, skip_preflight=skip_preflight, workspace=workspace)
     except typer.Exit:
         # `typer.Exit` subclasses RuntimeError, so it has to be re-raised ahead of the handler
         # below. Otherwise a launch that already reported its own error is followed by
@@ -1786,7 +1773,6 @@ def default(
 def _launch_managed_default(
     ctx: typer.Context,
     *,
-    dry_run: bool,
     skip_preflight: bool,
     workspace: str | None,
 ) -> None:
@@ -1808,22 +1794,9 @@ def _launch_managed_default(
             "--skip-preflight launches with your own settings, so `ucode` has no managed config "
             "to pick an agent from. Run `ucode <agent> --skip-preflight` instead."
         )
-    # --dry-run avoids the fetch but still applies the last saved config.
-    if dry_run:
-        managed = load_managed_state(current)
-    else:
-        with spinner("Checking for a managed coding agent config..."):
-            managed = refresh_managed_config(state)
+    with spinner("Checking for a managed coding agent config..."):
+        managed = refresh_managed_config(state)
     if not managed:
-        # Only a read that actually reached the workspace can say it publishes no config. Under
-        # --dry-run nothing was fetched, so an empty cache means "not pulled yet" — reporting that
-        # as "no config" would tell an admin their own published config doesn't exist.
-        if dry_run:
-            print_warning(
-                "No managed coding agent config is saved locally yet, so there is nothing to "
-                "dry-run. Run `ucode` without --dry-run to pull your workspace's config first."
-            )
-            return
         _print_no_managed_config_guidance(current, state.get("profile"))
         return
     # The budget tier can move the org to a cheaper agent, so it outranks the config's
