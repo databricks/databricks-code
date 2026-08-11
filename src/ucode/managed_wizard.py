@@ -988,8 +988,13 @@ def setup_from_file(path: str) -> int:
 
     save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
-    print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-state.json")
-    _print_next_steps()
+    if is_dry_run():
+        print_success(
+            f"Dry run: {manifest_path.name} was not written to ~/.ucode/managed-state.json."
+        )
+    else:
+        print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-state.json")
+        _print_next_steps()
     return 0
 
 
@@ -1133,8 +1138,11 @@ def setup_command(from_file: str | None = None) -> int:
     save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
     console.print()
-    print_success("Saved to ~/.ucode/managed-state.json")
-    _print_next_steps()
+    if is_dry_run():
+        print_success("Dry run: nothing was written to ~/.ucode/managed-state.json.")
+    else:
+        print_success("Saved to ~/.ucode/managed-state.json")
+        _print_next_steps()
     return 0
 
 

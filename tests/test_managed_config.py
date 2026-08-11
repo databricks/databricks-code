@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 
@@ -18,6 +19,7 @@ from ucode.managed_config import (
     refresh_managed_config,
     save_managed_state,
 )
+from ucode.managed_setup import serialize_managed_config
 
 # A representative raw CodingAgentConfig proto-JSON manifest (mirrors what the API returns).
 RAW_MANIFEST = {
@@ -228,6 +230,23 @@ class TestPersistence:
         monkeypatch.setattr(config_io_mod, "is_dry_run", lambda: True)
         save_managed_state("https://ws.example.com", {"default_agent": "claude"})
         assert not _managed_path.exists()
+
+    def test_corrupt_file_reads_as_absent(self, _managed_path):
+        # A truncated/hand-mangled file must not crash a launch: it reads as "no config" so the
+        # launch falls through rather than raising on JSON it can't parse.
+        _managed_path.parent.mkdir(parents=True, exist_ok=True)
+        _managed_path.write_text("{not json", encoding="utf-8")
+        assert load_managed_state("https://ws.example.com") is None
+        assert managed_state_workspace() is None
+
+    def test_loaded_config_serializes_to_a_json_encodable_payload(self, _managed_path):
+        # `ucode apply` POSTs the serialized config, so a manifest that survives a disk round-trip
+        # must still serialize to something json.dumps accepts with no custom encoder.
+        cfg = normalize_managed_config(RAW_MANIFEST)
+        save_managed_state("https://ws.example.com", cfg)
+        loaded = load_managed_state("https://ws.example.com")
+        assert loaded is not None
+        assert json.loads(json.dumps(serialize_managed_config(loaded)))
 
 
 class TestFetchClient:
