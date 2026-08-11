@@ -225,11 +225,11 @@ def _safe_relative_path(relative_path: str) -> Path | None:
     return path
 
 
-def _write_bundle(skill_dir: Path, leaf: str, files: dict[str, bytes]) -> None:
+def _write_bundle(skill_dir: Path, bundle_name: str, files: dict[str, bytes]) -> None:
     for relative_path, content in files.items():
         safe_path = _safe_relative_path(relative_path)
         if safe_path is None:
-            print_warning(f"Skipping unsafe path in `{leaf}`: {relative_path}")
+            print_warning(f"Skipping unsafe path in `{bundle_name}`: {relative_path}")
             continue
         destination = skill_dir / safe_path
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -342,9 +342,8 @@ def download_skills(
        absent from the schema warn and are skipped, and ``None`` keeps the whole
        schema. Siblings claiming one directory are then reduced to the first (see
        ``_reject_bundle_name_collisions``).
-    2. **Decide** which to download via ``should_download_skill`` (skips invalid
-       names and prompts before overwriting a skill already on disk), so a
-       declined skill is never fetched.
+    2. **Decide** which to download via ``should_download_skill`` (prompts before
+       overwriting a skill already on disk), so a declined skill is never fetched.
     3. **Fetch** the survivors' bundles concurrently (with a progress bar) and
        **write** them.
 
