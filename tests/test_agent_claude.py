@@ -73,6 +73,34 @@ class TestRenderOverlay:
         )
         assert overlay["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "system.ai.claude-haiku-4-6"
 
+    def test_custom_model_pins_all_family_aliases(self):
+        # `ucode claude --model` pins the id into every family alias so it takes effect whichever
+        # slot Claude Code resolves — and NOT into ANTHROPIC_MODEL, which Claude Code validates and
+        # rejects for a raw Databricks id. It overrides the discovered-model aliases.
+        overlay, _ = claude.render_overlay(
+            WS,
+            "s4",
+            claude_models={"opus": "system.ai.claude-opus-4-8", "sonnet": "system.ai.sonnet"},
+            custom_model="main.aarushi.claude-opus-5",
+        )
+        env = overlay["env"]
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "main.aarushi.claude-opus-5"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "main.aarushi.claude-opus-5"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "main.aarushi.claude-opus-5"
+        assert "ANTHROPIC_MODEL" not in env
+        # No [1m] suffix is appended to the custom id — it's passed through verbatim.
+        assert "[1m]" not in env["ANTHROPIC_DEFAULT_OPUS_MODEL"]
+
+    def test_custom_model_pins_fable_alias_only_when_fable_enabled(self):
+        without = claude.render_overlay(WS, "s4", claude_models={}, custom_model="main.x.m")[0][
+            "env"
+        ]
+        assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in without
+        with_fable = claude.render_overlay(
+            WS, "s4", claude_models={}, custom_model="main.x.m", fable_enabled=True
+        )[0]["env"]
+        assert with_fable["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "main.x.m"
+
     def test_sets_anthropic_base_url(self):
         overlay, _ = claude.render_overlay(WS, "s4")
         assert overlay["env"]["ANTHROPIC_BASE_URL"] == f"{WS}/ai-gateway/anthropic"
