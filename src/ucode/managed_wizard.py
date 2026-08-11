@@ -611,6 +611,7 @@ def _prompt_budget_policy(
 
     tiers: list[dict] = []
     seen_percentages: set[float] = set()
+    seen_combos: set[tuple[str, str]] = set()
     print_note(
         "Add one tier per step-down. Each tier activates once spend reaches its percentage, and "
         "the highest activated tier wins."
@@ -640,7 +641,17 @@ def _prompt_budget_policy(
             model = prompt_for_text(f"Tier {index}: which model?")
         if not model:
             break
+        if (agent, model) in seen_combos:
+            # The highest crossed tier wins, so a second tier on the same agent+model never changes
+            # what the lower one already selected — it is a step-down that doesn't step down. Reject
+            # it here rather than let the admin build a policy with a silently inert tier.
+            print_err(
+                f"{TOOL_SPECS[agent]['display']} / {model} is already used by another tier; a "
+                "repeated agent/model makes this tier a no-op. Pick a different one."
+            )
+            continue
         seen_percentages.add(fraction)
+        seen_combos.add((agent, model))
         tiers.append(
             {
                 "spending_percentage": fraction,
@@ -941,20 +952,10 @@ def setup_command(from_file: str | None = None) -> int:
 
     manifest: dict = {"default_agent": default_agent, "enabled_agents": enabled_agents}
 
-    print_section("Tracing")
-    if prompt_yes_no_default(
-        "Send coding-session traces to an MLflow experiment in this workspace?",
-        default=bool(_tracing_table_from_state(state)),
-    ):
-        from ucode.tracing import configure_tracing_command
-
-        configure_tracing_command(workspaces=[(workspace, profile)])
-        tracing_table = _tracing_table_from_state(load_state())
-        if tracing_table:
-            manifest["tracing_table"] = tracing_table
-            print_success(f"Tracing configured ({tracing_table})")
-        else:
-            print_warning("Tracing was not enabled, so it is left out of the managed config.")
+    # Tracing is intentionally not prompted here: the managed-tracing path isn't working yet, so
+    # asking would author a `tracing_table` the workspace can't honor. The manifest field and its
+    # serialize/validate support stay in place, so a hand-written `--from-file` config can still set
+    # it once the backend is ready. Re-add the section below when it is.
 
     print_section("MCP servers")
     if prompt_yes_no_default("Set up managed MCP servers for this workspace?", default=False):

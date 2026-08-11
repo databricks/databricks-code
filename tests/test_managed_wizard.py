@@ -1192,6 +1192,54 @@ class TestBudgetPolicy:
         }
         assert validate_manifest(manifest, STATE) == []
 
+    def test_a_repeated_agent_model_pair_is_rejected_and_re_prompted(self):
+        # The highest crossed tier wins, so a second tier on the same agent+model is inert. The loop
+        # must reject the repeat and re-prompt, the way it already does for a repeated percentage.
+        two_models = {
+            "claude": {
+                "model_config": {
+                    "default_model": "system.ai.claude-opus-4-8",
+                    "models": {
+                        "default_opus_model": "system.ai.claude-opus-4-8",
+                        "default_sonnet_model": "system.ai.claude-sonnet-4-6",
+                    },
+                }
+            }
+        }
+        # `has_per_user_alert` is required since the budget-threshold gate landed on main: spend
+        # routing needs a per-user threshold, so a budget without one is filtered out and the policy
+        # flow returns before the tier loop this test exercises.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[
+                    BUDGET_ID,
+                    # Tier 1: claude / opus.
+                    "claude",
+                    "system.ai.claude-opus-4-8",
+                    # Tier 2 first attempt: claude / opus again — rejected, so the loop re-asks.
+                    "claude",
+                    "system.ai.claude-opus-4-8",
+                    # Tier 2 retry: a genuine step-down.
+                    "claude",
+                    "system.ai.claude-sonnet-4-6",
+                ],
+            ),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", side_effect=[0.5, 0.9, 0.9]),
+            patch.object(wizard, "print_err") as err,
+        ):
+            policy = wizard._prompt_budget_policy(WORKSPACE, "token", two_models, STATE)
+        assert [(t["default_agent"], t["default_model"]) for t in policy["tiers"]] == [
+            ("claude", "system.ai.claude-opus-4-8"),
+            ("claude", "system.ai.claude-sonnet-4-6"),
+        ]
+        assert any("no-op" in call.args[0] for call in err.call_args_list)
+
 
 class TestConfiguredModelsForAgent:
     def test_flat_list_plus_default(self):

@@ -1404,9 +1404,14 @@ def _launch_tool(
     enable_smart_routing_flag: bool = False,
     managed: dict | None = None,
     recommendation: dict | None = None,
+    model: str | None = None,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        # A provider service routes by header and pins no model id, so pairing it with an explicit
+        # model is contradictory — reject rather than silently ignore one.
+        if model and provider:
+            raise RuntimeError("Use either --model or --provider, not both.")
         # An explicit --workspace targets that workspace for this launch (and
         # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
         # works without a prior `ucode configure`.
@@ -1562,6 +1567,25 @@ def _launch_tool(
                     route_root_model = managed_model
                 else:
                     resolved_model = managed_model
+            # An explicit `--model` is the user's own choice and outranks everything above (managed
+            # default, smart-routing pick). Non-claude agents take it as the resolved model, which
+            # their CLIs pass to the gateway verbatim. Claude is special (see custom_model below):
+            # Claude Code validates ANTHROPIC_MODEL client-side and rejects a raw Databricks id, so
+            # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
+            if model and tool != "claude":
+                resolved_model = model
+            # Claude Code's enterprise managed-settings scope (e.g. an Isaac/dbexec install)
+            # outranks the --settings file ucode writes AND can't be excluded with --setting-sources,
+            # so a model pinned there silently wins over `--model`. Warn so a launch that ignores the
+            # requested model looks like the misconfiguration it is, not a ucode bug.
+            if model and tool == "claude":
+                enterprise = claude_agent.managed_settings_model_overrides()
+                if enterprise is not None:
+                    print_warning(
+                        f"Your enterprise managed settings at {enterprise} pin the Claude model, "
+                        f"which overrides `--model {model}` — Claude Code will launch on the pinned "
+                        "model instead. Edit or remove that file to use --model."
+                    )
         state = configure_tool(
             tool,
             state,
@@ -1570,12 +1594,16 @@ def _launch_tool(
             provider_models=provider_models,
             relayed=relayed,
             route_root_model=route_root_model,
+            custom_model=model if tool == "claude" else None,
         )
         print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
         if managed is not None:
             print_kv("Config", "workspace-managed")
         if provider:
             print_kv("Provider", provider)
+        elif model and tool == "claude":
+            # Claude's --model is pinned via the family aliases, not resolved_model/route_root_model.
+            print_kv("Model", model)
         elif route_root_model:
             print_kv("Model", route_root_model)
         elif resolved_model:
@@ -1827,6 +1855,16 @@ def claude_cmd(
             "before any `--` separator.",
         ),
     ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Launch on a specific Databricks model id (e.g. a UC "
+            "`<catalog>.<schema>.<name>`). Pinned via ANTHROPIC_MODEL so the gateway "
+            "resolves it — unlike Claude Code's own --model, which rejects non-catalog ids. "
+            "Pass before any `--` separator; not usable with --provider.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
     workspace: WorkspaceOption = None,
     enable_smart_routing_flag: Annotated[
@@ -1856,6 +1894,7 @@ def claude_cmd(
         "claude",
         ctx,
         provider=provider,
+        model=model,
         skip_preflight=skip_preflight,
         workspace=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,

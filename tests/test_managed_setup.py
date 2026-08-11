@@ -676,6 +676,65 @@ class TestValidate:
         errors = validate_manifest(manifest, STATE)
         assert any("must be unique" in e for e in errors)
 
+    def test_tier_agent_model_pairs_must_differ(self):
+        # Distinct percentages, same agent+model: the higher tier is a no-op, because the server
+        # picks the highest crossed tier and it selects the same pair the lower one already did.
+        manifest = {
+            **_minimal_manifest(),
+            "budget_policy": {
+                "budget_id": BUDGET_ID,
+                "tiers": [
+                    {
+                        "spending_percentage": 0.5,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    },
+                    {
+                        "spending_percentage": 0.9,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    },
+                ],
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("no-op" in e for e in errors), errors
+
+    def test_same_agent_different_model_across_tiers_is_allowed(self):
+        # A real step-down: same agent, cheaper model. Must not be flagged as a duplicate. Both
+        # models are configured on the agent, so the tier-model check passes and only the
+        # duplicate-combo rule is under test.
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "default_model": "system.ai.claude-opus-4-8",
+                        "models": {
+                            "default_opus_model": "system.ai.claude-opus-4-8",
+                            "default_sonnet_model": "system.ai.claude-sonnet-4-6",
+                        },
+                    }
+                }
+            },
+            "budget_policy": {
+                "budget_id": BUDGET_ID,
+                "tiers": [
+                    {
+                        "spending_percentage": 0.5,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    },
+                    {
+                        "spending_percentage": 0.9,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-sonnet-4-6",
+                    },
+                ],
+            },
+        }
+        assert validate_manifest(manifest, STATE) == []
+
     def test_tier_agent_must_be_enabled(self):
         manifest = {
             **_minimal_manifest(),
