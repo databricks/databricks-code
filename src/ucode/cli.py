@@ -81,6 +81,7 @@ from ucode.managed_wizard import apply_command, setup_command, show_command
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
+    apply_managed_mcp_servers,
     configure_mcp_command,
     configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
@@ -1419,6 +1420,37 @@ def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = 
         console.print(panel)
 
 
+def _register_managed_mcp_servers(managed: dict, tool: str, state: dict) -> None:
+    """Apply the managed config's MCP servers to ``tool`` and persist what was registered.
+
+    Persisting under ``managed_mcp_servers`` lets the next launch diff against it, so a server the
+    admin later removes from the config is unregistered rather than left behind. A failure here never
+    blocks the launch — the agent still starts, just without the workspace's MCP servers.
+    """
+    try:
+        registered = apply_managed_mcp_servers(
+            managed,
+            tool,
+            state["workspace"],
+            state.get("profile"),
+            use_pat=bool(state.get("use_pat")),
+        )
+    except RuntimeError as exc:
+        print_warning(f"Could not register your workspace's MCP servers: {exc}")
+        return
+    # Persist even when empty so a config that dropped its last server clears the prior registration.
+    others = [
+        server
+        for server in (state.get("managed_mcp_servers") or [])
+        if isinstance(server, dict) and tool not in (server.get("clients") or [])
+    ]
+    state["managed_mcp_servers"] = others + registered
+    save_state(state)
+    if registered:
+        names = ", ".join(str(server["name"]) for server in registered)
+        print_note(f"Registered workspace MCP server(s) for {TOOL_SPECS[tool]['display']}: {names}")
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -1428,9 +1460,14 @@ def _launch_tool(
     enable_smart_routing_flag: bool = False,
     managed: dict | None = None,
     recommendation: dict | None = None,
+    model: str | None = None,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        # A provider service routes by header and pins no model id, so pairing it with an explicit
+        # model is contradictory — reject rather than silently ignore one.
+        if model and provider:
+            raise RuntimeError("Use either --model or --provider, not both.")
         # An explicit --workspace targets that workspace for this launch (and
         # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
         # works without a prior `ucode configure`.
@@ -1586,6 +1623,25 @@ def _launch_tool(
                     route_root_model = managed_model
                 else:
                     resolved_model = managed_model
+            # An explicit `--model` is the user's own choice and outranks everything above (managed
+            # default, smart-routing pick). Non-claude agents take it as the resolved model, which
+            # their CLIs pass to the gateway verbatim. Claude is special (see custom_model below):
+            # Claude Code validates ANTHROPIC_MODEL client-side and rejects a raw Databricks id, so
+            # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
+            if model and tool != "claude":
+                resolved_model = model
+            # Claude Code's enterprise managed-settings scope (e.g. an Isaac/dbexec install)
+            # outranks the --settings file ucode writes AND can't be excluded with --setting-sources,
+            # so a model pinned there silently wins over `--model`. Warn so a launch that ignores the
+            # requested model looks like the misconfiguration it is, not a ucode bug.
+            if model and tool == "claude":
+                enterprise = claude_agent.managed_settings_model_overrides()
+                if enterprise is not None:
+                    print_warning(
+                        f"Your enterprise managed settings at {enterprise} pin the Claude model, "
+                        f"which overrides `--model {model}` — Claude Code will launch on the pinned "
+                        "model instead. Edit or remove that file to use --model."
+                    )
         state = configure_tool(
             tool,
             state,
@@ -1594,12 +1650,16 @@ def _launch_tool(
             provider_models=provider_models,
             relayed=relayed,
             route_root_model=route_root_model,
+            custom_model=model if tool == "claude" else None,
         )
         print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
         if managed is not None:
             print_kv("Config", "workspace-managed")
         if provider:
             print_kv("Provider", provider)
+        elif model and tool == "claude":
+            # Claude's --model is pinned via the family aliases, not resolved_model/route_root_model.
+            print_kv("Model", model)
         elif route_root_model:
             print_kv("Model", route_root_model)
         elif resolved_model:
@@ -1622,6 +1682,12 @@ def _launch_tool(
             )
         if recommendation is not None:
             _print_budget_panel(recommendation, tool, managed)
+        # Register the managed config's MCP servers so they reach the agent's `/mcp` list. Nothing
+        # else on this path does it — the config only lists them — so without this a
+        # workspace-published server never shows up. Skipped under --skip-preflight (deliberately
+        # unmanaged) and --dry-run (writes nothing).
+        if managed is not None and not skip_preflight and not is_dry_run():
+            _register_managed_mcp_servers(managed, tool, state)
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
     except RuntimeError as exc:
@@ -1845,6 +1911,16 @@ def claude_cmd(
             "before any `--` separator.",
         ),
     ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Launch on a specific Databricks model id (e.g. a UC "
+            "`<catalog>.<schema>.<name>`). Pinned via ANTHROPIC_MODEL so the gateway "
+            "resolves it — unlike Claude Code's own --model, which rejects non-catalog ids. "
+            "Pass before any `--` separator; not usable with --provider.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
     workspace: WorkspaceOption = None,
     enable_smart_routing_flag: Annotated[
@@ -1874,6 +1950,7 @@ def claude_cmd(
         "claude",
         ctx,
         provider=provider,
+        model=model,
         skip_preflight=skip_preflight,
         workspace=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,

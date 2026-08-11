@@ -72,32 +72,46 @@ class TestTracingReadback:
         assert wizard._tracing_table_from_state({"tracing": "on"}) is None
 
 
-class TestMcpUrlClassification:
+class TestMcpServerFromUrl:
     @pytest.mark.parametrize(
         ("url", "expected"),
         [
-            ("https://ws.example.com/ai-gateway/mcp-services/system.ai.github", "mcp-service"),
-            ("https://ws.example.com/api/2.0/mcp/external/jira-prod", "external"),
-            ("https://ws.example.com/api/2.0/mcp/genie/01ef", "genie-space"),
-            ("https://ws.example.com/api/2.0/mcp/vector-search/main/default", "vector-search"),
-            ("https://ws.example.com/api/2.0/mcp/functions/main/default", "uc-functions"),
-            ("https://ws.example.com/api/2.0/mcp/sql", "sql"),
-            ("https://mcp-myapp-123.aws.databricksapps.com/mcp", "app"),
+            # mcp-service stores the dash form the launch path rebuilds the dotted URL from.
+            (
+                "https://ws.example.com/ai-gateway/mcp-services/system.ai.github",
+                ("system-ai-github", "mcp-service"),
+            ),
+            ("https://ws.example.com/api/2.0/mcp/external/jira-prod", ("jira-prod", "external")),
+            ("https://ws.example.com/api/2.0/mcp/genie/01ef", ("01ef", "genie-space")),
+            # vector-search / uc-functions store `<catalog>.<schema>`, not the local display slug.
+            (
+                "https://ws.example.com/api/2.0/mcp/vector-search/my_cat/my_schema",
+                ("my_cat.my_schema", "vector-search"),
+            ),
+            (
+                "https://ws.example.com/api/2.0/mcp/functions/dev_cat/dev_fixture",
+                ("dev_cat.dev_fixture", "uc-functions"),
+            ),
+            ("https://ws.example.com/api/2.0/mcp/sql", ("databricks-sql", "sql")),
         ],
     )
     def test_known_urls(self, url, expected):
-        assert wizard._mcp_type_for_url(url) == expected
+        assert wizard._mcp_server_from_url(url) == expected
 
-    def test_trailing_slash_is_tolerated(self):
-        assert wizard._mcp_type_for_url("https://ws.example.com/api/2.0/mcp/sql/") == "sql"
+    def test_apps_are_not_publishable(self):
+        # An app's host isn't reconstructable from the workspace + an id, so it can't be published.
+        assert (
+            wizard._mcp_server_from_url("https://mcp-myapp-123.aws.databricksapps.com/mcp") is None
+        )
 
     def test_unknown_url_yields_none(self):
-        # Better to skip a server than publish it with a guessed type.
-        assert wizard._mcp_type_for_url("https://example.com/something/else") is None
+        assert wizard._mcp_server_from_url("https://example.com/something/else") is None
 
-    def test_sql_is_not_confused_for_app(self):
-        # Both end in a fixed segment; sql must win since it is checked first.
-        assert wizard._mcp_type_for_url("https://ws.example.com/api/2.0/mcp/sql") == "sql"
+    def test_vector_search_needs_both_catalog_and_schema(self):
+        assert (
+            wizard._mcp_server_from_url("https://ws.example.com/api/2.0/mcp/functions/onlycat")
+            is None
+        )
 
 
 class TestMcpServersFromState:
@@ -111,9 +125,25 @@ class TestMcpServersFromState:
                 {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
             ]
         }
+        # The published name comes from the URL (the identifier the server field holds), not the
+        # local display name.
         assert wizard._mcp_servers_from_state(state) == [
-            {"name": "databricks-github", "type": "mcp-service"},
+            {"name": "system-ai-github", "type": "mcp-service"},
             {"name": "databricks-sql", "type": "sql"},
+        ]
+
+    def test_publishes_catalog_schema_for_uc_functions(self):
+        # The lossy local slug is replaced with the dotted catalog.schema the launch path can split.
+        state = {
+            "mcp_servers": [
+                {
+                    "name": "databricks-functions-dev-cat-dev-fixture",
+                    "url": f"{WORKSPACE}/api/2.0/mcp/functions/dev_cat/dev_fixture",
+                },
+            ]
+        }
+        assert wizard._mcp_servers_from_state(state) == [
+            {"name": "dev_cat.dev_fixture", "type": "uc-functions"},
         ]
 
     def test_skips_the_skills_registry_entry(self):
@@ -133,8 +163,13 @@ class TestMcpServersFromState:
         }
         assert wizard._mcp_servers_from_state(state) == [{"name": "databricks-sql", "type": "sql"}]
 
-    def test_skips_unclassifiable_servers(self):
-        state = {"mcp_servers": [{"name": "mystery", "url": "https://example.com/nope"}]}
+    def test_skips_apps_and_unclassifiable_servers(self):
+        state = {
+            "mcp_servers": [
+                {"name": "mystery", "url": "https://example.com/nope"},
+                {"name": "databricks-app-x", "url": "https://x-1.databricksapps.com/mcp"},
+            ]
+        }
         assert wizard._mcp_servers_from_state(state) == []
 
     def test_skips_entries_missing_name_or_url(self):
@@ -895,6 +930,7 @@ class TestProviderServiceSelection:
                 "prompt_for_selection",
                 side_effect=["mps", "main.default.lilly-anthropic"],
             ),
+            patch.object(wizard, "all_users_can_use_schema", return_value=True),
         ):
             service = wizard._select_provider_service("claude", WORKSPACE, "token")
         assert service == ANTHROPIC_SERVICE
@@ -911,10 +947,45 @@ class TestProviderServiceSelection:
                 "prompt_for_selection",
                 side_effect=["mps", "main.default.lilly-anthropic"],
             ) as select,
+            patch.object(wizard, "all_users_can_use_schema", return_value=True),
         ):
             wizard._select_provider_service("claude", WORKSPACE, "token")
         offered = [value for value, _ in select.call_args_list[1][0][1]]
         assert offered == ["main.default.lilly-anthropic"]
+
+    def test_warns_when_all_users_lack_schema_access(self):
+        # The picked MPS's schema isn't granted to all workspace users, so developers who pull the
+        # config may hit "does not have USE_SCHEMA"; warn but still return the service (never block).
+        with (
+            patch.object(
+                wizard, "list_model_provider_services", return_value=([ANTHROPIC_SERVICE], None)
+            ),
+            patch.object(
+                wizard, "prompt_for_selection", side_effect=["mps", "main.default.lilly-anthropic"]
+            ),
+            patch.object(wizard, "all_users_can_use_schema", return_value=False),
+            patch.object(wizard, "print_warning") as warn,
+        ):
+            service = wizard._select_provider_service("claude", WORKSPACE, "token")
+        assert service == ANTHROPIC_SERVICE
+        assert warn.called
+        assert "main.default" in warn.call_args[0][0]
+
+    def test_no_warning_when_access_check_is_inconclusive(self):
+        # A None result (API unreachable / unexpected shape) must not cry wolf.
+        with (
+            patch.object(
+                wizard, "list_model_provider_services", return_value=([ANTHROPIC_SERVICE], None)
+            ),
+            patch.object(
+                wizard, "prompt_for_selection", side_effect=["mps", "main.default.lilly-anthropic"]
+            ),
+            patch.object(wizard, "all_users_can_use_schema", return_value=None),
+            patch.object(wizard, "print_warning") as warn,
+        ):
+            service = wizard._select_provider_service("claude", WORKSPACE, "token")
+        assert service == ANTHROPIC_SERVICE
+        assert not warn.called
 
     def test_cancelling_the_service_picker_returns_none(self):
         with (
@@ -1120,6 +1191,54 @@ class TestBudgetPolicy:
             "budget_policy": policy,
         }
         assert validate_manifest(manifest, STATE) == []
+
+    def test_a_repeated_agent_model_pair_is_rejected_and_re_prompted(self):
+        # The highest crossed tier wins, so a second tier on the same agent+model is inert. The loop
+        # must reject the repeat and re-prompt, the way it already does for a repeated percentage.
+        two_models = {
+            "claude": {
+                "model_config": {
+                    "default_model": "system.ai.claude-opus-4-8",
+                    "models": {
+                        "default_opus_model": "system.ai.claude-opus-4-8",
+                        "default_sonnet_model": "system.ai.claude-sonnet-4-6",
+                    },
+                }
+            }
+        }
+        # `has_per_user_alert` is required since the budget-threshold gate landed on main: spend
+        # routing needs a per-user threshold, so a budget without one is filtered out and the policy
+        # flow returns before the tier loop this test exercises.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[
+                    BUDGET_ID,
+                    # Tier 1: claude / opus.
+                    "claude",
+                    "system.ai.claude-opus-4-8",
+                    # Tier 2 first attempt: claude / opus again — rejected, so the loop re-asks.
+                    "claude",
+                    "system.ai.claude-opus-4-8",
+                    # Tier 2 retry: a genuine step-down.
+                    "claude",
+                    "system.ai.claude-sonnet-4-6",
+                ],
+            ),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", side_effect=[0.5, 0.9, 0.9]),
+            patch.object(wizard, "print_err") as err,
+        ):
+            policy = wizard._prompt_budget_policy(WORKSPACE, "token", two_models, STATE)
+        assert [(t["default_agent"], t["default_model"]) for t in policy["tiers"]] == [
+            ("claude", "system.ai.claude-opus-4-8"),
+            ("claude", "system.ai.claude-sonnet-4-6"),
+        ]
+        assert any("no-op" in call.args[0] for call in err.call_args_list)
 
 
 class TestConfiguredModelsForAgent:

@@ -21,6 +21,7 @@ from ucode.agents import TOOL_SPECS, check_gateway_endpoint
 from ucode.config_io import is_dry_run
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
+    all_users_can_use_schema,
     create_coding_agent_config,
     delete_coding_agent_config,
     discover_claude_models_unbucketed,
@@ -94,29 +95,47 @@ def _tracing_table_from_state(state: dict) -> str | None:
     return destination if isinstance(destination, str) and destination else None
 
 
-def _mcp_type_for_url(url: str) -> str | None:
-    """Classify a registered MCP server's URL into a managed-config type tag.
+def _mcp_server_from_url(url: str) -> tuple[str, str] | None:
+    """Derive a managed-config ``(name, type)`` entry from a registered server's resolved URL.
 
     ``state.json`` stores each MCP server's resolved URL but not its type, while the managed config
-    stores ``{name, type}`` and lets the developer's ucode rebuild the URL. The URL shape is the only
-    signal available, so map it back. Returns None for a URL that matches nothing known, so unknown
-    servers are skipped rather than published with a guessed type.
+    stores ``{name, type}`` and lets the developer's ucode rebuild the URL. So map the URL back to the
+    type *and* the identifier the ai-gateway ``McpServer.name`` field is meant to hold for that type
+    (a UC name for a UC service, a Genie space id for a genie space, a `<catalog>.<schema>` for
+    vector-search / uc-functions, a connection name for external). Deriving ``name`` from the URL —
+    rather than reusing the local display slug — is what lets the developer's ucode reconstruct the
+    URL on launch. Returns None for a URL that matches nothing reconstructable (e.g. an app's
+    off-workspace host), so those are skipped rather than published unusably.
     """
-    if "/ai-gateway/mcp-services/" in url:
-        return "mcp-service"
+    stripped = url.rstrip("/")
+    marker = "/ai-gateway/mcp-services/"
+    if marker in url:
+        # `.../mcp-services/<catalog>.<schema>.<svc>` — store the dash form the launch path expects.
+        service = url.split(marker, 1)[1].split("/", 1)[0]
+        return service.replace(".", "-"), "mcp-service"
     for fragment, tag in (
         ("/api/2.0/mcp/external/", "external"),
         ("/api/2.0/mcp/genie/", "genie-space"),
+    ):
+        if fragment in url:
+            # external -> connection name; genie -> space id. Both are the single trailing segment.
+            return url.split(fragment, 1)[1].split("/", 1)[0], tag
+    for fragment, tag in (
         ("/api/2.0/mcp/vector-search/", "vector-search"),
         ("/api/2.0/mcp/functions/", "uc-functions"),
     ):
         if fragment in url:
-            return tag
-    if url.rstrip("/").endswith("/api/2.0/mcp/sql"):
-        return "sql"
-    # Databricks apps are the residual case: an arbitrary app host with a /mcp suffix.
-    if url.rstrip("/").endswith("/mcp"):
-        return "app"
+            # `.../<catalog>/<schema>` — store the `<catalog>.<schema>` the launch path splits back.
+            rest = url.split(fragment, 1)[1].split("/")
+            if len(rest) >= 2 and rest[0] and rest[1]:
+                return f"{rest[0]}.{rest[1]}", tag
+            return None
+    if stripped.endswith("/api/2.0/mcp/sql"):
+        return "databricks-sql", "sql"
+    # Databricks apps are the residual case: an arbitrary app host with a /mcp suffix. Its host isn't
+    # reconstructable from the workspace + an id, so it can't be published to the managed config yet.
+    if stripped.endswith("/mcp"):
+        return None
     return None
 
 
@@ -129,6 +148,7 @@ def _mcp_servers_from_state(state: dict) -> list[dict]:
     from ucode.mcp import SKILLS_MCP_KIND
 
     servers: list[dict] = []
+    seen: set[str] = set()
     for entry in state.get("mcp_servers") or []:
         if not isinstance(entry, dict) or entry.get("kind") == SKILLS_MCP_KIND:
             continue
@@ -136,11 +156,18 @@ def _mcp_servers_from_state(state: dict) -> list[dict]:
         url = entry.get("url")
         if not isinstance(name, str) or not name or not isinstance(url, str):
             continue
-        tag = _mcp_type_for_url(url)
-        if tag is None:
-            print_warning(f"Skipping MCP server '{name}': unrecognized URL shape ({url}).")
+        resolved = _mcp_server_from_url(url)
+        if resolved is None:
+            print_warning(
+                f"Skipping MCP server '{name}': ucode can't publish it to a managed config "
+                f"(unrecognized or app-hosted URL: {url})."
+            )
             continue
-        servers.append({"name": name, "type": tag})
+        config_name, tag = resolved
+        if config_name in seen:
+            continue
+        seen.add(config_name)
+        servers.append({"name": config_name, "type": tag})
     return servers
 
 
@@ -234,7 +261,30 @@ def _select_provider_service(tool: str, workspace: str, token: str) -> dict | No
     )
     if not selected:
         return None
-    return next(service for service in usable if service["name"] == selected)
+    service = next(service for service in usable if service["name"] == selected)
+    _warn_if_mps_not_broadly_accessible(workspace, token, service["name"])
+    return service
+
+
+def _warn_if_mps_not_broadly_accessible(workspace: str, token: str, service_name: str) -> None:
+    """Warn if the picked MPS's schema isn't granted to all workspace users.
+
+    A developer who pulls a config routing through this MPS needs USE_SCHEMA on its schema, or they
+    hit "User does not have USE_SCHEMA on Schema <catalog>.<schema>" at launch. This only warns
+    (never blocks): access may instead come from a team group the check can't see, and an
+    inconclusive check stays silent.
+    """
+    schema = ".".join(service_name.split(".")[:2])
+    if schema.count(".") != 1:
+        return
+    with spinner("Checking who can use this service..."):
+        accessible = all_users_can_use_schema(workspace, token, schema)
+    if accessible is False:
+        print_warning(
+            f"All workspace users don't appear to have USE_SCHEMA on `{schema}`, so developers "
+            f"who pull this config may not be able to use `{service_name}`. Grant USE_SCHEMA on "
+            f"`{schema}` to the `account users` group (or the teams that need it) in Unity Catalog."
+        )
 
 
 def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | None) -> dict:
@@ -561,6 +611,7 @@ def _prompt_budget_policy(
 
     tiers: list[dict] = []
     seen_percentages: set[float] = set()
+    seen_combos: set[tuple[str, str]] = set()
     print_note(
         "Add one tier per step-down. Each tier activates once spend reaches its percentage, and "
         "the highest activated tier wins."
@@ -590,7 +641,17 @@ def _prompt_budget_policy(
             model = prompt_for_text(f"Tier {index}: which model?")
         if not model:
             break
+        if (agent, model) in seen_combos:
+            # The highest crossed tier wins, so a second tier on the same agent+model never changes
+            # what the lower one already selected — it is a step-down that doesn't step down. Reject
+            # it here rather than let the admin build a policy with a silently inert tier.
+            print_err(
+                f"{TOOL_SPECS[agent]['display']} / {model} is already used by another tier; a "
+                "repeated agent/model makes this tier a no-op. Pick a different one."
+            )
+            continue
         seen_percentages.add(fraction)
+        seen_combos.add((agent, model))
         tiers.append(
             {
                 "spending_percentage": fraction,
@@ -891,26 +952,19 @@ def setup_command(from_file: str | None = None) -> int:
 
     manifest: dict = {"default_agent": default_agent, "enabled_agents": enabled_agents}
 
-    print_section("Tracing")
-    if prompt_yes_no_default(
-        "Send coding-session traces to an MLflow experiment in this workspace?",
-        default=bool(_tracing_table_from_state(state)),
-    ):
-        from ucode.tracing import configure_tracing_command
-
-        configure_tracing_command(workspaces=[(workspace, profile)])
-        tracing_table = _tracing_table_from_state(load_state())
-        if tracing_table:
-            manifest["tracing_table"] = tracing_table
-            print_success(f"Tracing configured ({tracing_table})")
-        else:
-            print_warning("Tracing was not enabled, so it is left out of the managed config.")
+    # Tracing is intentionally not prompted here: the managed-tracing path isn't working yet, so
+    # asking would author a `tracing_table` the workspace can't honor. The manifest field and its
+    # serialize/validate support stay in place, so a hand-written `--from-file` config can still set
+    # it once the backend is ready. Re-add the section below when it is.
 
     print_section("MCP servers")
     if prompt_yes_no_default("Set up managed MCP servers for this workspace?", default=False):
         from ucode.mcp import configure_mcp_command
 
-        configure_mcp_command()
+        # Managed configs can't carry a Databricks app (its host isn't reconstructable from the
+        # workspace), so hide apps from the picker rather than let an admin pick one that is then
+        # dropped from the published config.
+        configure_mcp_command(exclude_sources={"apps"})
         mcp_servers = _mcp_servers_from_state(load_state())
         if mcp_servers:
             manifest["mcp_servers"] = mcp_servers
