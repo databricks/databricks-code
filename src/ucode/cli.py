@@ -82,6 +82,7 @@ from ucode.managed_wizard import apply_command, setup_command, show_command
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
+    apply_managed_mcp_servers,
     configure_mcp_command,
     configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
@@ -157,21 +158,28 @@ def _policy_summary_lines(managed: dict) -> list[str]:
     return lines
 
 
-def _print_managed_summary(managed: dict, state: dict, tool: str) -> None:
-    """Show the developer which of their admin's settings are in force for this launch."""
+def _print_managed_summary(managed: dict, state: dict, tool: str | None) -> None:
+    """Show which of the admin's settings are in force.
+
+    With ``tool`` set (launch path) the per-agent Agent/Provider/Model lines are included;
+    with ``tool=None`` (e.g. ``ucode configure`` under a managed config) they are skipped
+    since no single agent has been chosen yet.
+    """
     lines = [f"[bold]Workspace:[/bold] [cyan]{state.get('workspace', '?')}[/cyan]"]
-    lines.append(f"[bold]Agent:[/bold] [green]{TOOL_SPECS[tool]['display']}[/green]")
+    if tool is not None:
+        lines.append(f"[bold]Agent:[/bold] [green]{TOOL_SPECS[tool]['display']}[/green]")
     enabled = [t for t in (managed.get("enabled_agents") or {}) if t in TOOL_SPECS]
     if enabled:
         lines.append(
             f"[bold]Enabled agents:[/bold] {', '.join(TOOL_SPECS[t]['display'] for t in enabled)}"
         )
-    provider = managed_provider_service(managed, tool)
-    if provider:
-        lines.append(f"[bold]Provider:[/bold] [magenta]{provider}[/magenta]")
-    model = managed_default_model(managed, tool)
-    if model:
-        lines.append(f"[bold]Model:[/bold] [magenta]{model}[/magenta]")
+    if tool is not None:
+        provider = managed_provider_service(managed, tool)
+        if provider:
+            lines.append(f"[bold]Provider:[/bold] [magenta]{provider}[/magenta]")
+        model = managed_default_model(managed, tool)
+        if model:
+            lines.append(f"[bold]Model:[/bold] [magenta]{model}[/magenta]")
     # Always listed, including when empty: "none configured" tells a developer their admin set none,
     # which a missing row leaves ambiguous. Shown as the admin configured them — registering them
     # locally is a separate change, hence "pending".
@@ -195,19 +203,68 @@ def _print_managed_summary(managed: dict, state: dict, tool: str) -> None:
     )
 
 
-def _reject_configure_under_managed_config() -> None:
-    """Refuse ``ucode configure`` when the workspace publishes a managed config.
+def _resolve_workspace_then_maybe_reject(
+    workspace_entries: list[tuple[str, str | None]] | None,
+) -> list[tuple[str, str | None]] | None:
+    """Resolve the workspace ``ucode configure`` targets, then short-circuit if it is managed.
 
-    Configuring locally would be overridden at launch anyway, so it is an error rather than a
-    silently-ignored run. Without a managed config the command still runs unchanged.
+    When managed coding-agent configs are enabled, ``ucode configure`` must still let a developer
+    switch workspaces — so resolve the target workspace up front (prompting when the interactive
+    path gave no ``--workspaces``/``--profiles``) and make it current *before* deciding whether to
+    short-circuit. Only then, if that workspace already publishes a managed config, configuring
+    locally would be overridden at launch anyway: show the admin's config and point the developer
+    at `ucode`.
+
+    Returns the resolved entries to configure when there is no managed config so the caller reuses
+    them instead of prompting again. Without the feature enabled it returns ``workspace_entries``
+    unchanged and prompts nothing.
     """
     if not managed_agent_config_enabled():
+        return workspace_entries
+    entries = workspace_entries or [_prompt_for_configuration(None)]
+    workspace, profile = entries[0]
+    set_current_workspace(workspace)
+    # Fetch, don't just read the local cache: on a fresh machine (or right after a reinstall) the
+    # cache is empty until the first launch, so a cache read would miss a config the workspace does
+    # publish and wrongly fall through to the local configure flow. `refresh_managed_config` reaches
+    # the workspace and never raises — it falls back to the persisted copy, then None, on failure.
+    with spinner("Checking for a managed coding agent config..."):
+        managed = refresh_managed_config({"workspace": workspace, "profile": profile})
+    if not managed:
+        _maybe_offer_admin_setup(workspace, profile)
+        return entries
+    print_success("A managed config has been detected for your workspace — you're all set.")
+    _print_managed_summary(managed, load_state(), tool=None)
+    print_note("Configuration is complete. Just run `ucode` to launch with it applied.")
+    raise typer.Exit(0)
+
+
+def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
+    """When a workspace admin runs ``configure`` on a workspace with no managed config, offer to
+    bail out so they can publish one with ``ucode setup`` instead.
+
+    Admins are the ones who'd want a managed config; a plain developer just gets the normal
+    configure flow. If they accept, exit cleanly (assuming they'll run `ucode setup`); if they
+    decline, fall through to configure their own local settings. The check is best-effort: any
+    failure to determine admin status (auth or SCIM unreachable) silently skips the prompt.
+    """
+    try:
+        token = get_databricks_token(workspace, profile)
+    except RuntimeError:
         return
-    if load_managed_state(load_state().get("workspace")):
-        raise RuntimeError(
-            "The ucode configure command is being deprecated. Please run `ucode` to launch "
-            "with your admin's managed config applied"
+    with spinner("Checking your workspace permissions..."):
+        is_admin = is_workspace_admin(workspace, token)
+    if not is_admin:
+        return
+    print_note(
+        "✨ New: as a workspace admin you can publish a managed config with `ucode setup` — set "
+        "the agents, models, MCPs, and skills once, and every developer picks them up automatically."
+    )
+    if prompt_yes_no("Set one up now with `ucode setup`?"):
+        print_note(
+            "Run `ucode setup` to author your workspace's managed config, then `ucode apply`."
         )
+        raise typer.Exit(0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
@@ -1364,6 +1421,37 @@ def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = 
         console.print(panel)
 
 
+def _register_managed_mcp_servers(managed: dict, tool: str, state: dict) -> None:
+    """Apply the managed config's MCP servers to ``tool`` and persist what was registered.
+
+    Persisting under ``managed_mcp_servers`` lets the next launch diff against it, so a server the
+    admin later removes from the config is unregistered rather than left behind. A failure here never
+    blocks the launch — the agent still starts, just without the workspace's MCP servers.
+    """
+    try:
+        registered = apply_managed_mcp_servers(
+            managed,
+            tool,
+            state["workspace"],
+            state.get("profile"),
+            use_pat=bool(state.get("use_pat")),
+        )
+    except RuntimeError as exc:
+        print_warning(f"Could not register your workspace's MCP servers: {exc}")
+        return
+    # Persist even when empty so a config that dropped its last server clears the prior registration.
+    others = [
+        server
+        for server in (state.get("managed_mcp_servers") or [])
+        if isinstance(server, dict) and tool not in (server.get("clients") or [])
+    ]
+    state["managed_mcp_servers"] = others + registered
+    save_state(state)
+    if registered:
+        names = ", ".join(str(server["name"]) for server in registered)
+        print_note(f"Registered workspace MCP server(s) for {TOOL_SPECS[tool]['display']}: {names}")
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -1373,9 +1461,14 @@ def _launch_tool(
     enable_smart_routing_flag: bool = False,
     managed: dict | None = None,
     recommendation: dict | None = None,
+    model: str | None = None,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        # A provider service routes by header and pins no model id, so pairing it with an explicit
+        # model is contradictory — reject rather than silently ignore one.
+        if model and provider:
+            raise RuntimeError("Use either --model or --provider, not both.")
         # An explicit --workspace targets that workspace for this launch (and
         # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
         # works without a prior `ucode configure`.
@@ -1544,6 +1637,25 @@ def _launch_tool(
                     route_root_model = managed_model
                 else:
                     resolved_model = managed_model
+            # An explicit `--model` is the user's own choice and outranks everything above (managed
+            # default, smart-routing pick). Non-claude agents take it as the resolved model, which
+            # their CLIs pass to the gateway verbatim. Claude is special (see custom_model below):
+            # Claude Code validates ANTHROPIC_MODEL client-side and rejects a raw Databricks id, so
+            # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
+            if model and tool != "claude":
+                resolved_model = model
+            # Claude Code's enterprise managed-settings scope (e.g. an Isaac/dbexec install)
+            # outranks the --settings file ucode writes AND can't be excluded with --setting-sources,
+            # so a model pinned there silently wins over `--model`. Warn so a launch that ignores the
+            # requested model looks like the misconfiguration it is, not a ucode bug.
+            if model and tool == "claude":
+                enterprise = claude_agent.managed_settings_model_overrides()
+                if enterprise is not None:
+                    print_warning(
+                        f"Your enterprise managed settings at {enterprise} pin the Claude model, "
+                        f"which overrides `--model {model}` — Claude Code will launch on the pinned "
+                        "model instead. Edit or remove that file to use --model."
+                    )
         state = configure_tool(
             tool,
             state,
@@ -1552,12 +1664,16 @@ def _launch_tool(
             provider_models=provider_models,
             relayed=relayed,
             route_root_model=route_root_model,
+            custom_model=model if tool == "claude" else None,
         )
         print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
         if managed is not None:
             print_kv("Config", "workspace-managed")
         if provider:
             print_kv("Provider", provider)
+        elif model and tool == "claude":
+            # Claude's --model is pinned via the family aliases, not resolved_model/route_root_model.
+            print_kv("Model", model)
         elif route_root_model:
             print_kv("Model", route_root_model)
         elif resolved_model:
@@ -1580,6 +1696,12 @@ def _launch_tool(
             )
         if recommendation is not None:
             _print_budget_panel(recommendation, tool, managed)
+        # Register the managed config's MCP servers so they reach the agent's `/mcp` list. Nothing
+        # else on this path does it — the config only lists them — so without this a
+        # workspace-published server never shows up. Skipped under --skip-preflight (deliberately
+        # unmanaged) and --dry-run (writes nothing).
+        if managed is not None and not skip_preflight and not is_dry_run():
+            _register_managed_mcp_servers(managed, tool, state)
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
     except RuntimeError as exc:
@@ -1803,6 +1925,16 @@ def claude_cmd(
             "before any `--` separator.",
         ),
     ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Launch on a specific Databricks model id (e.g. a UC "
+            "`<catalog>.<schema>.<name>`). Pinned via ANTHROPIC_MODEL so the gateway "
+            "resolves it — unlike Claude Code's own --model, which rejects non-catalog ids. "
+            "Pass before any `--` separator; not usable with --provider.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
     workspace: WorkspaceOption = None,
     enable_smart_routing_flag: Annotated[
@@ -1832,6 +1964,7 @@ def claude_cmd(
         "claude",
         ctx,
         provider=provider,
+        model=model,
         skip_preflight=skip_preflight,
         workspace=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
@@ -2021,7 +2154,6 @@ def configure(
     prompt_optional_updates = not skip_upgrade
     try:
         install_databricks_cli()
-        _reject_configure_under_managed_config()
         if agent is not None and agents is not None:
             raise RuntimeError("Use either --agent or --agents, not both.")
         if workspaces is not None and profiles is not None:
@@ -2034,6 +2166,14 @@ def configure(
         workspace_entries = _parse_workspaces_option(workspaces) if workspaces is not None else None
         if profiles is not None:
             workspace_entries = _parse_profiles_option(profiles)
+        # Whether the user named the workspace(s) via flags, captured before the resolver below
+        # may fill `workspace_entries` from a prompt — this, not the resolved value, decides the
+        # fully-interactive MCP prompt at the end.
+        flag_driven_workspace = workspace_entries is not None
+        # Under a managed config, resolve (prompting when interactive) and set the target workspace
+        # first, so the developer can switch workspaces; only then short-circuit if that workspace
+        # is already managed. Returns the resolved entries so the flow below doesn't prompt again.
+        workspace_entries = _resolve_workspace_then_maybe_reject(workspace_entries)
         # Only forward the opt-in flags when set so existing call expectations
         # (and defaults) stay unchanged for the common interactive path.
         skip_kwargs: dict = {}
@@ -2138,8 +2278,10 @@ def configure(
                 )
             # Only the no-agent, no-workspace path is truly interactive (the user
             # picked agents/workspace via prompts); that's where we offer the MCP
-            # step below. Flag-driven runs stay scriptable.
-            fully_interactive = workspace_entries is None
+            # step below. Flag-driven runs stay scriptable. Keyed off whether the
+            # workspace came from a flag, not the now-resolved `workspace_entries`
+            # (which the managed-config resolver may have filled from a prompt).
+            fully_interactive = not flag_driven_workspace
         if tracing:
             # The workspaces were just configured, so enable tracing for them
             # directly instead of re-prompting. Fall back to the workspace that
@@ -2176,6 +2318,12 @@ def configure(
         # scriptable), and when --dry-run is set.
         if fully_interactive and not dry_run and prompt_yes_no("Configure MCP servers now?"):
             configure_mcp_command()
+    except typer.Exit:
+        # `typer.Exit` subclasses RuntimeError, so it has to be re-raised ahead of the handler
+        # below. Otherwise a clean exit (e.g. `_reject_configure_under_managed_config` under a
+        # managed config) is followed by `print_err(str(exc))` printing the exit code — a bare,
+        # meaningless "ERROR 0".
+        raise
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
@@ -2243,9 +2391,9 @@ def configure_skills(
         str | None,
         typer.Option(
             "--skill",
-            help="(download) Download only this comma-separated subset of skills (by leaf "
-            "name, e.g. `my-skill`) from the schema, instead of every skill. Requires a "
-            "single --location; not valid with --mcp.",
+            help="(download) Download only this comma-separated subset of skills (by "
+            "securable name, e.g. `my-skill`) from the schema, instead of every skill. "
+            "Requires a single --location; not valid with --mcp.",
         ),
     ] = None,
 ) -> None:

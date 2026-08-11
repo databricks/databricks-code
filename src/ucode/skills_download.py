@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -27,7 +27,7 @@ from ucode.ui import (
 # `.claude/skills` (Claude) + `.agents/skills` (the alias other agents read).
 SKILL_BASE_DIR_NAMES = (".claude/skills", ".agents/skills")
 
-SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
+SKILL_FILES_API_PREFIX = "Skills"
 
 # Parallel skill fetches per schema; writes stay sequential (they prompt).
 _MAX_FETCH_WORKERS = 8
@@ -36,26 +36,63 @@ _MAX_FETCH_WORKERS = 8
 # --- Download client (UC skills API + Files API) ---------------------------
 
 
-def _skill_bundle_name(skill: dict) -> str | None:
-    """The downloadable leaf name of a skill, or None if it isn't finalized.
+@dataclass(frozen=True)
+class SkillRef:
+    """A downloadable skill's two names, which are not interchangeable.
 
-    Only finalized skills (those with a ``finalize_time``) have bundle content
-    to download. ``bundle_name`` is the leaf; fall back to the last dotted
-    segment of the resource ``name`` (``skills/<cat>.<sch>.<leaf>``).
+    ``securable_name`` is the UC leaf of ``skills/<cat>.<sch>.<leaf>`` and is the
+    only name the Files API resolves, so it addresses the bytes and identifies the
+    skill. ``bundle_name`` is the ``name:`` an agent reads from the bundle's
+    SKILL.md frontmatter, so it names the on-disk directory. Finalize does not
+    require the two to match, so a skill created under a securable that differs
+    from its frontmatter carries both.
+    """
+
+    securable_name: str
+    bundle_name: str
+
+
+def _non_empty_str(value: object) -> str | None:
+    """``value`` when it is a non-empty string, else None."""
+    return value if isinstance(value, str) and value else None
+
+
+def _skill_ref(skill: dict) -> SkillRef | None:
+    """A finalized skill's ``SkillRef``, or None if it cannot be downloaded.
+
+    A skill without a ``finalize_time`` has no bundle content yet and is skipped
+    quietly, since that is a normal in-progress state.
+
+    A finalized skill is expected to carry both names: ``name`` is immutable from
+    creation, and finalize is the sole writer of ``bundle_name``. One missing is
+    therefore an anomaly, so warn and skip rather than substituting the other
+    name -- the two are not interchangeable, and guessing a directory name that
+    doesn't match the bundle's SKILL.md ``name:`` would hide the skill from the
+    agent meant to load it.
     """
     if not skill.get("finalize_time"):
         return None
-    bundle_name = skill.get("bundle_name")
-    if isinstance(bundle_name, str) and bundle_name:
-        return bundle_name
-    name = skill.get("name")
-    return name.rsplit(".", 1)[-1] if isinstance(name, str) else None
+
+    name = _non_empty_str(skill.get("name"))
+    bundle_name = _non_empty_str(skill.get("bundle_name"))
+    if name is None or bundle_name is None:
+        missing = " or ".join(
+            field
+            for field, value in (("name", name), ("bundle_name", bundle_name))
+            if value is None
+        )
+        print_warning(
+            f"Skipping `{name or '<unnamed skill>'}`: the skills API returned no {missing}."
+        )
+        return None
+
+    return SkillRef(securable_name=name.rsplit(".", 1)[-1], bundle_name=bundle_name)
 
 
 def list_schema_skills(
     workspace: str, token: str, catalog: str, schema: str
-) -> tuple[list[str], str | None]:
-    """List the finalized skill leaf names in ``<catalog>.<schema>``.
+) -> tuple[list[SkillRef], str | None]:
+    """List the finalized skills in ``<catalog>.<schema>``.
 
     A non-None reason indicates the listing call itself failed.
     """
@@ -63,7 +100,7 @@ def list_schema_skills(
     base_url = f"https://{hostname}/api/2.1/unity-catalog/skills"
     query = {"parent": f"schemas/{catalog}.{schema}"}
 
-    leaves: list[str] = []
+    refs: list[SkillRef] = []
     page_token: str | None = None
     while True:
         if page_token:
@@ -73,28 +110,29 @@ def list_schema_skills(
             return [], reason
         data = payload if isinstance(payload, dict) else {}
         for skill in data.get("skills") or []:
-            leaf = _skill_bundle_name(skill) if isinstance(skill, dict) else None
-            if leaf:
-                leaves.append(leaf)
+            ref = _skill_ref(skill) if isinstance(skill, dict) else None
+            if ref:
+                refs.append(ref)
         page_token = data.get("next_page_token")
         if not page_token:
-            return leaves, None
+            return refs, None
 
 
 def list_skill_files(
-    workspace: str, token: str, catalog: str, schema: str, leaf: str
+    workspace: str, token: str, catalog: str, schema: str, securable: str
 ) -> tuple[list[str], str | None]:
     """List a skill bundle's files, as paths relative to the skill directory.
 
-    Recursively walks the skill's UC Volume directory (including ``SKILL.md``).
-    A non-None reason indicates the listing call itself failed.
+    Recursively walks the skill's Files API directory (including ``SKILL.md``).
+    Takes the securable leaf, the only name the Files API resolves. A non-None
+    reason indicates the listing call itself failed.
     """
     hostname = workspace_hostname(workspace)
     dirs_base = f"https://{hostname}/api/2.0/fs/directories"
-    volume_prefix = f"/Volumes/{catalog}/{schema}/{leaf}/"
+    skill_prefix = f"/{SKILL_FILES_API_PREFIX}/{catalog}/{schema}/{securable}/"
 
     relative_paths: list[str] = []
-    pending = [f"Volumes/{catalog}/{schema}/{leaf}"]
+    pending = [f"{SKILL_FILES_API_PREFIX}/{catalog}/{schema}/{securable}"]
     while pending:
         directory = pending.pop()
         page_token: str | None = None
@@ -113,7 +151,7 @@ def list_skill_files(
                 if entry.get("is_directory"):
                     pending.append(path.strip("/"))
                 else:
-                    relative_paths.append(path.removeprefix(volume_prefix))
+                    relative_paths.append(path.removeprefix(skill_prefix))
             page_token = data.get("next_page_token")
             if not page_token:
                 break
@@ -121,16 +159,19 @@ def list_skill_files(
 
 
 def fetch_skill_file(
-    workspace: str, token: str, catalog: str, schema: str, leaf: str, relative_path: str
+    workspace: str, token: str, catalog: str, schema: str, securable: str, relative_path: str
 ) -> tuple[bytes | None, str | None]:
-    """Fetch one skill bundle file's raw bytes from its UC Volume."""
+    """Fetch one skill bundle file's raw bytes from the Files API."""
     hostname = workspace_hostname(workspace)
-    url = f"https://{hostname}/api/2.0/fs/files/Volumes/{catalog}/{schema}/{leaf}/{relative_path}"
+    url = (
+        f"https://{hostname}/api/2.0/fs/files/"
+        f"{SKILL_FILES_API_PREFIX}/{catalog}/{schema}/{securable}/{relative_path}"
+    )
     return _http_get_bytes(url, token, timeout=30)
 
 
 def fetch_skill_bundle(
-    workspace: str, token: str, catalog: str, schema: str, leaf: str
+    workspace: str, token: str, catalog: str, schema: str, securable: str
 ) -> tuple[dict[str, bytes] | None, str | None]:
     """Fetch a whole skill bundle as ``{relative_path: bytes}``.
 
@@ -138,12 +179,14 @@ def fetch_skill_bundle(
     reason (and None bundle) means the listing or any file fetch failed, so a
     partially-downloaded skill is never written to disk.
     """
-    relative_paths, reason = list_skill_files(workspace, token, catalog, schema, leaf)
+    relative_paths, reason = list_skill_files(workspace, token, catalog, schema, securable)
     if reason:
         return None, reason
     bundle: dict[str, bytes] = {}
     for relative_path in relative_paths:
-        content, reason = fetch_skill_file(workspace, token, catalog, schema, leaf, relative_path)
+        content, reason = fetch_skill_file(
+            workspace, token, catalog, schema, securable, relative_path
+        )
         if content is None:
             return None, reason
         bundle[relative_path] = content
@@ -170,10 +213,6 @@ def skill_dir_roots(project_dir: str | None) -> list[Path]:
     return [base / name for name in SKILL_BASE_DIR_NAMES]
 
 
-def _is_valid_leaf(leaf: str) -> bool:
-    return bool(SKILL_NAME_PATTERN.match(leaf))
-
-
 def _safe_relative_path(relative_path: str) -> Path | None:
     """A bundle file's path within its skill dir, or None if it escapes the dir.
 
@@ -186,65 +225,105 @@ def _safe_relative_path(relative_path: str) -> Path | None:
     return path
 
 
-def _write_bundle(skill_dir: Path, leaf: str, files: dict[str, bytes]) -> None:
+def _write_bundle(skill_dir: Path, bundle_name: str, files: dict[str, bytes]) -> None:
     for relative_path, content in files.items():
         safe_path = _safe_relative_path(relative_path)
         if safe_path is None:
-            print_warning(f"Skipping unsafe path in `{leaf}`: {relative_path}")
+            print_warning(f"Skipping unsafe path in `{bundle_name}`: {relative_path}")
             continue
         destination = skill_dir / safe_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(content)
 
 
-def write_skill(roots: list[Path], leaf: str, files: dict[str, bytes], *, location: str) -> bool:
-    """Write ``leaf``'s bundle (``{relpath: bytes}``) into every root.
+def existing_skill_on_disk(roots: list[Path], bundle_name: str) -> bool:
+    """Whether ``bundle_name`` already has a skill directory under any root."""
+    return any((root / bundle_name).exists() for root in roots)
 
-    Prompts before overwriting an existing skill dir. ``location`` is the source
-    ``<catalog>.<schema>``, shown in that prompt. Returns True if the skill was
-    written, False if it was skipped or kept.
+
+def should_download_skill(roots: list[Path], ref: SkillRef, *, location: str) -> bool:
+    """Whether ``ref`` should be fetched and written into ``roots``.
+
+    Applies the disk-only check that needs no bundle bytes: prompts before
+    overwriting a skill already on disk (``location`` is the source
+    ``<catalog>.<schema>`` shown in that prompt), so a declined skill is never
+    fetched. Dedup keys on the bundle name, since that is the directory an agent
+    would load. Name validity is the server's job -- FinalizeSkill enforces the
+    Agent Skills naming rules on ``bundle_name`` before we ever see it -- so
+    ucode does not re-check it here.
     """
-    if not _is_valid_leaf(leaf):
-        print_warning(f"Skipping `{leaf}`: not a valid skill name (lowercase a-z, 0-9, -).")
-        return False
-
-    already_on_disk = any((root / leaf).exists() for root in roots)
-    if already_on_disk and not prompt_yes_no(
-        f"A skill named `{leaf}` already exists. Overwrite it with `{location}.{leaf}`?"
+    if existing_skill_on_disk(roots, ref.bundle_name) and not prompt_yes_no(
+        f"A skill named `{ref.bundle_name}` already exists. "
+        f"Overwrite it with `{location}.{ref.securable_name}`?"
     ):
-        print_note(f"Kept existing `{leaf}`.")
+        print_note(f"Kept existing `{ref.bundle_name}`.")
         return False
 
-    for root in roots:
-        _write_bundle(root / leaf, leaf, files)
     return True
+
+
+def write_skill(roots: list[Path], ref: SkillRef, files: dict[str, bytes]) -> None:
+    """Write ``ref``'s bundle (``{relpath: bytes}``) into every root.
+
+    The directory is named for the bundle, so it matches the ``name:`` an agent
+    reads from the written SKILL.md.
+    """
+    for root in roots:
+        _write_bundle(root / ref.bundle_name, ref.bundle_name, files)
 
 
 # --- Orchestration ---------------------------------------------------------
 
 
 def _fetch_bundles(
-    workspace: str, token: str, catalog: str, schema: str, leaves: list[str]
+    workspace: str, token: str, catalog: str, schema: str, refs: list[SkillRef]
 ) -> dict[str, tuple[dict[str, bytes] | None, str | None]]:
-    """Fetch every leaf's bundle concurrently, keyed by leaf name.
+    """Fetch every skill's bundle concurrently, keyed by securable leaf.
 
     Renders a ``k/n`` progress bar that advances as each fetch completes.
     """
-    if not leaves:
+    if not refs:
         return {}
     results: dict[str, tuple[dict[str, bytes] | None, str | None]] = {}
     with (
-        progress_bar(f"Fetching skills from {catalog}.{schema}", len(leaves)) as advance,
-        ThreadPoolExecutor(max_workers=min(_MAX_FETCH_WORKERS, len(leaves))) as pool,
+        progress_bar(f"Fetching skills from {catalog}.{schema}", len(refs)) as advance,
+        ThreadPoolExecutor(max_workers=min(_MAX_FETCH_WORKERS, len(refs))) as pool,
     ):
         futures = {
-            pool.submit(fetch_skill_bundle, workspace, token, catalog, schema, leaf): leaf
-            for leaf in leaves
+            pool.submit(
+                fetch_skill_bundle, workspace, token, catalog, schema, ref.securable_name
+            ): ref.securable_name
+            for ref in refs
         }
         for future in as_completed(futures):
             results[futures[future]] = future.result()
             advance()
     return results
+
+
+def _reject_bundle_name_collisions(refs: list[SkillRef], *, location: str) -> list[SkillRef]:
+    """``refs`` with any later skill that repeats an earlier one's bundle name dropped.
+
+    Only the securable name is unique within a schema; ``bundle_name`` comes from
+    each bundle's SKILL.md frontmatter and is never checked against its siblings,
+    so one schema can hold two skills claiming the same directory. Writing both
+    would land them on top of each other, leaving whichever finished last with no
+    sign the other was lost, so keep the first and warn about the rest.
+    """
+    kept: list[SkillRef] = []
+    claimed: dict[str, str] = {}
+    for ref in refs:
+        winner = claimed.get(ref.bundle_name)
+        if winner is not None:
+            print_warning(
+                f"Skipping `{location}.{ref.securable_name}`: its bundle name "
+                f"`{ref.bundle_name}` is already claimed by `{location}.{winner}`. "
+                "Rename one skill's SKILL.md `name:` to download both."
+            )
+            continue
+        claimed[ref.bundle_name] = ref.securable_name
+        kept.append(ref)
+    return kept
 
 
 def download_skills(
@@ -256,48 +335,64 @@ def download_skills(
 ) -> None:
     """Download every skill in each ``<catalog>.<schema>`` location to disk.
 
-    Bundles are fetched concurrently (with a progress bar) per schema, then
-    written sequentially so overwrite prompts don't interleave. A failure on one
-    skill warns and skips it without aborting the batch.
+    Locations are processed one at a time, and each runs three stages:
 
-    When ``skills`` is given, only those leaf names are downloaded; names absent
-    from a schema warn and are skipped. ``None`` downloads the whole schema.
+    1. **List** the schema's finalized skills. When ``skills`` is given, restrict
+       to those securable names (the name that identifies a skill in UC); names
+       absent from the schema warn and are skipped, and ``None`` keeps the whole
+       schema. Siblings claiming one directory are then reduced to the first (see
+       ``_reject_bundle_name_collisions``).
+    2. **Decide** which to download via ``should_download_skill`` (prompts before
+       overwriting a skill already on disk), so a declined skill is never fetched.
+    3. **Fetch** the survivors' bundles concurrently (with a progress bar) and
+       **write** them.
+
+    Finishing one location before starting the next means a skill written for an
+    earlier location is already on disk when a same-named skill in a later
+    location reaches its decide stage, so the overwrite prompt still fires. A
+    failure on one skill warns and skips it without aborting the batch.
     """
     roots = skill_dir_roots(path)
     roots_display = " and ".join(str(root) for root in roots)
     for location in locations:
         catalog, schema = location.split(".")
-        leaves, reason = list_schema_skills(workspace, token, catalog, schema)
+        refs, reason = list_schema_skills(workspace, token, catalog, schema)
         if reason:
             print_warning(f"Skipping `{location}`: {reason}.")
             continue
         if skills is not None:
-            unknown = skills - set(leaves)
+            unknown = skills - {ref.securable_name for ref in refs}
             if unknown:
                 print_warning(
                     f"Skipping requested skill(s) not found in `{location}`: "
                     f"{', '.join(sorted(unknown))}."
                 )
-            leaves = [leaf for leaf in leaves if leaf in skills]
-            if not leaves:
+            refs = [ref for ref in refs if ref.securable_name in skills]
+            if not refs:
                 print_note(f"No requested skills to download from `{location}`.")
                 continue
-        if not leaves:
+        if not refs:
             print_note(f"No skills found in `{location}`.")
             continue
+        # Before the decide stage, so a dropped sibling is never fetched and the
+        # summary's denominator counts only skills that can reach disk.
+        refs = _reject_bundle_name_collisions(refs, location=location)
 
-        bundles = _fetch_bundles(workspace, token, catalog, schema, leaves)
+        to_download = [ref for ref in refs if should_download_skill(roots, ref, location=location)]
+        bundles = _fetch_bundles(workspace, token, catalog, schema, to_download)
         written = 0
-        for leaf in leaves:
-            files, reason = bundles[leaf]
+        for ref in to_download:
+            files, reason = bundles[ref.securable_name]
             if reason or files is None:
-                print_warning(f"Skipping `{location}.{leaf}`: {reason}.")
+                print_warning(f"Skipping `{location}.{ref.securable_name}`: {reason}.")
                 continue
-            if write_skill(roots, leaf, files, location=location):
-                written += 1
+            write_skill(roots, ref, files)
+            written += 1
         console.print()
+        total = len(refs)
+        skipped = f"; {total - written} skipped" if written < total else ""
         print_success(
-            f"Downloaded {written}/{len(leaves)} skill(s) from `{location}` in {roots_display}."
+            f"Downloaded {written}/{total} skill(s){skipped} from `{location}` in {roots_display}."
         )
 
 

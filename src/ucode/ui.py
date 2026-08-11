@@ -104,6 +104,11 @@ def print_warning(message: str) -> None:
     console.print(f"[bold yellow]![/bold yellow] {message}")
 
 
+def print_warning_err(message: str) -> None:
+    """``print_warning`` on stderr, for when stdout is a machine-read stream."""
+    err_console.print(f"[bold yellow]![/bold yellow] {message}")
+
+
 def print_err(message: str) -> None:
     err_console.print(f"[bold red]ERROR[/bold red] {message}")
 
