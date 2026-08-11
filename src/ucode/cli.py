@@ -83,6 +83,7 @@ from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
     apply_managed_mcp_servers,
+    apply_managed_skills,
     configure_mcp_command,
     configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
@@ -1452,6 +1453,33 @@ def _register_managed_mcp_servers(managed: dict, tool: str, state: dict) -> None
         print_note(f"Registered workspace MCP server(s) for {TOOL_SPECS[tool]['display']}: {names}")
 
 
+def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
+    """Register the managed config's skill schemas on ``tool``'s skills MCP connection.
+
+    Sibling of :func:`_register_managed_mcp_servers` for the skills registry: the managed config
+    lists the skill schemas the admin published, and nothing else on the launch path routes them to
+    the agent. ``apply_managed_skills`` persists the connection (and the applied set, for diffing a
+    later removal) into ``state`` itself. A failure here never blocks the launch.
+    """
+    try:
+        applied = apply_managed_skills(
+            state,
+            managed,
+            tool,
+            state["workspace"],
+            state.get("profile"),
+            use_pat=bool(state.get("use_pat")),
+        )
+    except RuntimeError as exc:
+        print_warning(f"Could not register your workspace's skills: {exc}")
+        return
+    if applied:
+        names = ", ".join(applied)
+        print_note(
+            f"Registered workspace skill schema(s) for {TOOL_SPECS[tool]['display']}: {names}"
+        )
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -1702,6 +1730,7 @@ def _launch_tool(
         # unmanaged) and --dry-run (writes nothing).
         if managed is not None and not skip_preflight and not is_dry_run():
             _register_managed_mcp_servers(managed, tool, state)
+            _apply_managed_skills(managed, tool, state)
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
     except RuntimeError as exc:
