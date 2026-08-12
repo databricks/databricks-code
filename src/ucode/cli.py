@@ -262,10 +262,18 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
         "the agents, models, MCPs, and skills once, and every developer picks them up automatically."
     )
     if prompt_yes_no("Set one up now with `ucode setup`?"):
-        print_note(
-            "Run `ucode setup` to author your workspace's managed config, then `ucode apply`."
-        )
-        raise typer.Exit(0)
+        # Launch the setup flow in place rather than telling them to re-run a command. Reuse the
+        # workspace/profile we already resolved and authenticated against so setup doesn't prompt
+        # for them again.
+        try:
+            code = setup_command(workspace=workspace, profile=profile)
+        except RuntimeError as exc:
+            print_err(str(exc))
+            raise typer.Exit(1) from None
+        except KeyboardInterrupt:
+            print_err("Interrupted.")
+            raise typer.Exit(130) from None
+        raise typer.Exit(code or 0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
