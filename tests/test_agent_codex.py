@@ -527,6 +527,18 @@ class TestCodexDefaultModel:
 
         assert codex.default_model({"codex_models": models}) == "system.ai.gpt-5-5"
 
+    def test_default_model_falls_back_to_first_when_no_versioned_gpt(self):
+        # gpt-oss-* models are in the codex bucket from UC model-services and
+        # expose the responses API, so they're routable even though _parse_gpt
+        # returns None for them (no semantic version to rank).
+        models = ["system.ai.gpt-oss-120b", "system.ai.gpt-oss-20b"]
+        assert codex.default_model({"codex_models": models}) == "system.ai.gpt-oss-120b"
+
+    def test_default_model_prefers_versioned_gpt_over_oss(self):
+        # When both versioned and OSS models are present, the versioned one wins.
+        models = ["system.ai.gpt-oss-120b", "system.ai.gpt-5"]
+        assert codex.default_model({"codex_models": models}) == "system.ai.gpt-5"
+
 
 class TestCodexValidateCmd:
     def test_starts_with_binary(self):
