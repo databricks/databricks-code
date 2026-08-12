@@ -355,6 +355,9 @@ class TestDiscoverModelServices:
         assert ids == ["system.ai.gpt-5"]
         assert reason is None
         assert all("page_size=" in u for u in urls)
+        # Scope to the `system.ai` schema so the endpoint returns just the
+        # foundation models rather than walking the whole metastore.
+        assert all("parent=schemas%2Fsystem.ai" in u for u in urls)
 
     def test_retries_page_before_giving_up(self, monkeypatch):
         payload = {"model_services": [_model_service("system.ai.gpt-5")]}
