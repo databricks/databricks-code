@@ -409,29 +409,39 @@ def is_workspace_admin(workspace: str, token: str) -> bool | None:
 _WORKSPACE_BUDGETS_API_PATH = "/api/ai-gateway/v2/workspace-metrics/budgets"
 
 
-# Alert-config scope that carries a per-user threshold. A budget's coding-agent spend routing only
-# works when it has one: the gateway's `recommendModel` measures the caller's spend against a
-# per-user threshold, so a budget with only a shared (workspace-wide) alert reports no spend and
-# leaves every tier inert. The listing exposes `scope_type` but not the alert's action, so ucode can
-# only check for the scope's presence; the server enforces the (block) action on config create.
+# A budget's coding-agent spend routing only works when it has a per-user alert threshold that also
+# hard-blocks: the gateway's `recommendModel` measures the caller's spend against a per-user
+# threshold (a shared, workspace-wide alert reports no per-user spend and leaves every tier inert),
+# and the routing policy is only enforced when that threshold carries a `BLOCK_USAGE` action rather
+# than an email notification alone. The listing exposes each alert's `scope_type` and its
+# `action_configurations`, so ucode can check both directly instead of leaning on the server to
+# reject unusable budgets at config-create time.
 _PER_USER_ALERT_SCOPE = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
+_BLOCK_ACTION_TYPE = "BLOCK_USAGE"
 
 
-def _has_per_user_alert(entry: dict) -> bool:
-    """Whether a raw budget entry carries a per-user alert threshold."""
+def _has_per_user_block(entry: dict) -> bool:
+    """Whether a raw budget entry has a per-user alert threshold that hard-blocks usage.
+
+    True only when some alert is per-user scoped *and* carries a ``BLOCK_USAGE`` action; a per-user
+    alert with only an email notification does not enforce spend routing.
+    """
     for alert in entry.get("alert_configurations") or []:
-        if isinstance(alert, dict) and alert.get("scope_type") == _PER_USER_ALERT_SCOPE:
-            return True
+        if not isinstance(alert, dict) or alert.get("scope_type") != _PER_USER_ALERT_SCOPE:
+            continue
+        for action in alert.get("action_configurations") or []:
+            if isinstance(action, dict) and action.get("action_type") == _BLOCK_ACTION_TYPE:
+                return True
     return False
 
 
 def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str | None]:
     """List the AI Gateway budgets that apply to this workspace.
 
-    Returns ``(budgets, reason)`` where each budget is ``{"id", "display_name", "has_per_user_alert"}``.
+    Returns ``(budgets, reason)`` where each budget is ``{"id", "display_name", "has_per_user_block"}``.
     ``reason`` is None on success, otherwise it explains why the list is empty. ucode never creates
-    budgets — an admin picks an existing one to attach a spend-routing policy to. ``has_per_user_alert``
-    lets the picker hide budgets that can't drive spend routing (see ``_PER_USER_ALERT_SCOPE``).
+    budgets — an admin picks an existing one to attach a spend-routing policy to. ``has_per_user_block``
+    lets the picker hide budgets that can't enforce spend routing (see ``_has_per_user_block``).
     """
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}{_WORKSPACE_BUDGETS_API_PATH}"
@@ -455,7 +465,7 @@ def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str 
             {
                 "id": budget_id,
                 "display_name": display_name if isinstance(display_name, str) else "",
-                "has_per_user_alert": _has_per_user_alert(entry),
+                "has_per_user_block": _has_per_user_block(entry),
             }
         )
     if not budgets:
