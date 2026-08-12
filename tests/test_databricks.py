@@ -1888,6 +1888,30 @@ class TestEnsureDatabricksCliVersion:
         with pytest.raises(RuntimeError, match="Could not parse"):
             ensure_databricks_cli_version()
 
+    def test_custom_minimum_upgrades_version_below_it(self, tmp_path, monkeypatch):
+        import ucode.databricks as db_mod
+
+        # v1.8.0 clears the default floor but not the skills-MCP floor (1.11.0).
+        env = self._fake_databricks(tmp_path, "Databricks CLI v1.8.0")
+        monkeypatch.setattr("os.environ", env)
+        upgraded = []
+        monkeypatch.setattr(
+            db_mod,
+            "_run_databricks_cli_installer",
+            lambda brew_subcommand="install": upgraded.append(brew_subcommand),
+        )
+        call_count = [0]
+        original = db_mod.ensure_databricks_cli_version
+
+        def once(*a, **kw):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                original(*a, **kw)
+
+        monkeypatch.setattr(db_mod, "ensure_databricks_cli_version", once)
+        once(db_mod.SKILLS_MCP_MIN_DATABRICKS_CLI_VERSION)
+        assert upgraded == ["upgrade"]
+
 
 class TestRunDatabricksCliInstaller:
     @pytest.mark.parametrize("brew_subcommand", ["install", "upgrade"])
