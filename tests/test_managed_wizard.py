@@ -213,6 +213,28 @@ class TestAdminGate:
         assert warn.called
 
 
+class TestFeatureGate:
+    def test_feature_disabled_is_rejected(self):
+        disabled = 'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED"}'
+        with patch.object(
+            wizard, "fetch_managed_coding_agent_configs", return_value=([], disabled)
+        ):
+            with pytest.raises(RuntimeError, match="Enhanced Unity AI Gateway Preview"):
+                wizard._require_feature_enabled(WORKSPACE, "token")
+
+    def test_feature_enabled_passes(self):
+        with patch.object(wizard, "fetch_managed_coding_agent_configs", return_value=([], None)):
+            wizard._require_feature_enabled(WORKSPACE, "token")  # must not raise
+
+    def test_transient_read_failure_is_allowed_through(self):
+        with patch.object(
+            wizard,
+            "fetch_managed_coding_agent_configs",
+            return_value=([], "HTTP 500 Server Error"),
+        ):
+            wizard._require_feature_enabled(WORKSPACE, "token")  # must not raise
+
+
 class TestExistingConfigHandling:
     RICH_CONFIG = {
         "name": "coding-agent-configs/abc",

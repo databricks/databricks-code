@@ -28,6 +28,7 @@ from ucode.databricks import (
     delete_coding_agent_config,
     discover_claude_models_unbucketed,
     ensure_databricks_auth,
+    fetch_managed_coding_agent_configs,
     get_databricks_token,
     has_cached_model_provider_services,
     is_model_provider_feature_unavailable,
@@ -40,6 +41,7 @@ from ucode.databricks import (
 )
 from ucode.managed_config import (
     get_managed_config,
+    is_feature_disabled,
     load_managed_state,
     managed_state_workspace,
     save_managed_state,
@@ -860,6 +862,16 @@ def _render_summary(workspace: str, manifest: dict) -> None:
     print_panel("Configuration summary", lines)
 
 
+def _require_feature_enabled(workspace: str, token: str) -> None:
+    with spinner("Checking whether managed coding-agent config is enabled..."):
+        _, reason = fetch_managed_coding_agent_configs(workspace, token)
+    if reason is not None and is_feature_disabled(reason):
+        raise RuntimeError(
+            f"Managed coding-agent config is not enabled for {workspace}. Reach out to your "
+            "account admin to enable the Enhanced Unity AI Gateway Preview."
+        )
+
+
 def _require_admin(workspace: str, token: str) -> None:
     """Stop unless the caller is a workspace admin.
 
@@ -1032,6 +1044,7 @@ def setup_command(from_file: str | None = None) -> int:
     ensure_databricks_auth(workspace, profile, quiet=True)
     token = get_databricks_token(workspace, profile)
 
+    _require_feature_enabled(workspace, token)
     _require_admin(workspace, token)
     if not _handle_existing_config(workspace, token):
         return 0

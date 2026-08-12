@@ -44,6 +44,7 @@ from ucode.databricks import (
     ensure_ai_gateway_v2,
     ensure_databricks_auth,
     ensure_pat_bearer,
+    fetch_managed_coding_agent_configs,
     find_profile_name_for_host,
     get_databricks_profiles,
     get_databricks_token,
@@ -63,6 +64,7 @@ from ucode.managed_budget import (
 )
 from ucode.managed_config import (
     get_model_recommendation,
+    is_feature_disabled,
     load_managed_state,
     managed_agent_config_enabled,
     refresh_managed_config,
@@ -1851,6 +1853,14 @@ def _launch_managed_default(
             print_warning(
                 "No managed coding agent config is saved locally yet, so there is nothing to "
                 "dry-run. Run `ucode` without --dry-run to pull your workspace's config first."
+            )
+            return
+        token = get_databricks_token(current, state.get("profile"))
+        _, reason = fetch_managed_coding_agent_configs(current, token)
+        if reason is not None and is_feature_disabled(reason):
+            print_warning(
+                "Managed coding agent config is not enabled for your workspace. Please launch "
+                "ucode with a specific agent, ex. `ucode codex` or `ucode claude`."
             )
             return
         _print_no_managed_config_guidance(current, state.get("profile"))

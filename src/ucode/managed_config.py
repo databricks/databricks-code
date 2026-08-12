@@ -276,6 +276,8 @@ def get_model_recommendation(workspace: str, token: str) -> tuple[dict | None, s
     """
     payload, reason = fetch_model_recommendation(workspace, token)
     if reason is not None:
+        if is_feature_disabled(reason):
+            return None, None
         return None, reason
     agent = AGENT_ENUM_TO_TOOL.get(_str(payload.get("recommended_agent")) or "")
     model = _str(payload.get("recommended_model"))
@@ -310,8 +312,7 @@ def get_managed_config(workspace: str, token: str) -> tuple[dict | None, str | N
     """
     configs, reason = fetch_managed_coding_agent_configs(workspace, token)
     if reason is not None:
-        # A NOT_FOUND means the admin hasn't defined a config for this workspace — not a failure.
-        if _is_not_found(reason):
+        if _is_not_found(reason) or is_feature_disabled(reason):
             return None, None
         return None, reason
     if not configs:
@@ -326,6 +327,10 @@ def _is_not_found(reason: str) -> bool:
     as an ``HTTP 404`` there (and the API's error body carries ``NOT_FOUND``)."""
     lowered = reason.lower()
     return "http 404" in lowered or "not_found" in lowered
+
+
+def is_feature_disabled(reason: str) -> bool:
+    return "feature_disabled" in reason.lower()
 
 
 def _is_permission_denied(reason: str) -> bool:
