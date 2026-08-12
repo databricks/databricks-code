@@ -561,6 +561,63 @@ class TestClaudeRevertNativeConfig:
         state = {"managed_configs": {"claude": {"keys": []}}}
         assert claude.revert_native_config(state) is None
 
+    def test_preserves_user_hooks_under_managed_events(self, tmp_path):
+        # Regression: the descriptor's `keys` include whole hook-event paths (["hooks","PreToolUse"],
+        # ["hooks","Stop"], ...). Path-pruning those deleted the user's own hooks registered under the
+        # same events. Revert must surgically strip only ucode's marker-matched hooks, symmetric with
+        # the write path.
+        user_pre = {"matcher": "Bash", "hooks": [{"type": "command", "command": "my-linter"}]}
+        ucode_pre = {
+            "matcher": "Agent|Task",
+            "hooks": [{"type": "command", "command": "auth claude-router-hook route-subagent"}],
+        }
+        user_stop = {"hooks": [{"type": "command", "command": "my-notify"}]}
+        ucode_stop = {"hooks": [{"type": "command", "command": "mlflow autolog claude stop-hook"}]}
+        native_path = tmp_path / "settings.json"
+        native_path.write_text(
+            json.dumps(
+                {
+                    "env": {"ANTHROPIC_BASE_URL": "x", "MY": "keep"},
+                    "hooks": {
+                        "PreToolUse": [user_pre, ucode_pre],
+                        "SessionStart": [
+                            {"hooks": [{"type": "command", "command": "auth claude-router-hook s"}]}
+                        ],
+                        "Stop": [user_stop, ucode_stop],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        state = {
+            "managed_configs": {
+                "claude": {
+                    "keys": [],
+                    "native": [
+                        {
+                            "path": str(native_path),
+                            "format": "json",
+                            "keys": [
+                                ["env", "ANTHROPIC_BASE_URL"],
+                                ["hooks", "PreToolUse"],
+                                ["hooks", "SessionStart"],
+                                ["hooks", "Stop"],
+                            ],
+                        }
+                    ],
+                }
+            }
+        }
+        assert claude.revert_native_config(state) == "ucode entries removed"
+        result = json.loads(native_path.read_text())
+        # ucode's env key gone, the user's kept.
+        assert result["env"] == {"MY": "keep"}
+        # The user's own hooks survive; ucode's marker-matched hooks and the now-empty
+        # SessionStart event are gone.
+        assert result["hooks"]["PreToolUse"] == [user_pre]
+        assert result["hooks"]["Stop"] == [user_stop]
+        assert "SessionStart" not in result["hooks"]
+
 
 class TestRegisterWebSearchMcp:
     def test_clears_existing_then_adds(self, monkeypatch):

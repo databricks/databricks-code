@@ -313,3 +313,24 @@ class TestMarkToolManaged:
         result = mark_tool_managed({}, "claude", [["env", "X"]])
         assert result["managed_configs"]["claude"] == {"keys": [["env", "X"]]}
         assert "native" not in result["managed_configs"]["claude"]
+
+    def test_preserves_prior_native_when_native_is_none(self):
+        # A re-launch that writes no native file (use_as_global_settings unset, a relayed Claude
+        # launch, or a legacy-layout Codex launch) must not drop the descriptor from the launch that
+        # did write ucode's keys — otherwise `ucode revert` can no longer prune them.
+        native = [{"path": "/x/config.toml", "format": "toml", "keys": [["model_provider"]]}]
+        state = mark_tool_managed({}, "codex", [["model"]], native=native)
+        result = mark_tool_managed(state, "codex", [["model"]], native=None)
+        assert result["managed_configs"]["codex"]["native"] == native
+
+    def test_native_none_without_prior_leaves_no_native(self):
+        state = mark_tool_managed({}, "claude", [["env", "X"]])
+        result = mark_tool_managed(state, "claude", [["env", "Y"]], native=None)
+        assert "native" not in result["managed_configs"]["claude"]
+
+    def test_new_native_replaces_prior(self):
+        first = [{"path": "/a", "format": "json", "keys": [["a"]]}]
+        second = [{"path": "/b", "format": "json", "keys": [["b"]]}]
+        state = mark_tool_managed({}, "claude", [["env", "X"]], native=first)
+        result = mark_tool_managed(state, "claude", [["env", "X"]], native=second)
+        assert result["managed_configs"]["claude"]["native"] == second

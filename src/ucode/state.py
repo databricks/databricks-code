@@ -251,11 +251,22 @@ def mark_tool_managed(
     ``native`` optionally describes the agent's own native config file(s) ucode also wrote under
     ``use_as_global_settings`` — each ``{"path": str, "format": "json"|"toml", "keys": [...]}`` —
     so ``ucode revert`` can surgically prune only ucode's keys from the user's shared file.
+
+    ``native=None`` means "this launch wrote no native file", not "clear the tracking": a later
+    launch that skips the native write (the admin unset ``use_as_global_settings``, a relayed Claude
+    launch, or a legacy-layout Codex launch) leaves ucode's keys sitting in the user's shared file, so
+    the descriptor from the launch that *did* write them must be preserved or ``ucode revert`` can no
+    longer find and prune them. ``ucode revert`` wipes state wholesale (``clear_state``), so a stale
+    descriptor never lingers past a revert.
     """
     managed_configs = dict(state.get("managed_configs") or {})
     entry: dict = {"keys": list(managed_keys)}
     if native:
         entry["native"] = native
+    else:
+        prior_native = (managed_configs.get(tool) or {}).get("native")
+        if isinstance(prior_native, list) and prior_native:
+            entry["native"] = prior_native
     managed_configs[tool] = entry
     state["managed_configs"] = managed_configs
     state["last_tool"] = tool

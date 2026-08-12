@@ -639,7 +639,30 @@ def revert_native_config(state: dict) -> str | None:
         if not path or not path.exists():
             continue
         doc = read_json_safe(path)
-        if prune_key_paths(doc, keys):
+        # Hook-event keys ([`hooks`, <event>]) address the user's own shared hook arrays. Pruning the
+        # whole path would delete every hook they registered under that event, not just ucode's — so
+        # route those through the same marker-matched removers the write path uses (symmetric with
+        # `sync_smart_routing_hooks` / `_upsert_tracing_stop_hook` in `write_tool_config`). Only plain,
+        # ucode-owned key paths go to `prune_key_paths`.
+        plain_keys: list[list[str]] = []
+        touches_routing_hooks = False
+        touches_tracing_stop_hook = False
+        for key in keys:
+            if len(key) == 2 and key[0] == "hooks" and key[1] in CLAUDE_ROUTING_HOOK_EVENTS:
+                touches_routing_hooks = True
+            elif len(key) == 2 and key[0] == "hooks" and key[1] == "Stop":
+                touches_tracing_stop_hook = True
+            else:
+                plain_keys.append(key)
+        file_changed = prune_key_paths(doc, plain_keys)
+        if touches_routing_hooks and remove_smart_routing_hooks(doc):
+            file_changed = True
+        if touches_tracing_stop_hook:
+            before = json.dumps(doc.get("hooks"), sort_keys=True)
+            _remove_tracing_stop_hook(doc)
+            if json.dumps(doc.get("hooks"), sort_keys=True) != before:
+                file_changed = True
+        if file_changed:
             write_json_file(path, doc)
             changed = True
     return "ucode entries removed" if changed else "unchanged"
