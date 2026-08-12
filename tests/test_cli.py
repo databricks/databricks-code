@@ -1731,13 +1731,10 @@ class TestConfigureProfilesFlag:
                 app,
                 [
                     "configure",
-                    "--profiles",
-                    "DEFAULT",
+                    "--workspaces",
+                    "https://example.azuredatabricks.net",
                     "--agents",
                     "claude,codex,pi",
-                    "--use-pat",
-                    "--skip-validate",
-                    "--skip-upgrade",
                     "--skip-unavailable",
                 ],
             )

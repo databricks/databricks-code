@@ -355,6 +355,14 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     return state
 
 
+def _is_gpt_family(model: str) -> bool:
+    """Return True if this id is in the GPT family (versioned or OSS variants)."""
+    tail = model.split("/")[-1]
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    return tail.startswith("gpt-")
+
+
 def default_model(state: dict) -> str | None:
     """Pick the best available codex model.
 
@@ -380,10 +388,12 @@ def default_model(state: dict) -> str | None:
 
         return max(parsed, key=_gpt_version_key)[0]
 
-    # No versioned GPT found — fall back to the first available model. Any id in
-    # codex_models comes from UC model-services' codex bucket and exposes the
-    # responses API, so it's routable (e.g. system.ai.gpt-oss-120b).
-    return codex_models[0] if codex_models else None
+    # No versioned GPT found. Fall back to the first GPT-family id (gpt-*
+    # after stripping the system.ai. prefix). gpt-oss-* models are confirmed
+    # routable through the responses API; non-GPT ids (e.g. moonshotai/kimi-k2.5)
+    # would be rejected by the gateway, so they stay excluded.
+    gpt_family = [m for m in codex_models if _is_gpt_family(m)]
+    return gpt_family[0] if gpt_family else None
 
 
 def launch(state: dict, tool_args: list[str]) -> None:
