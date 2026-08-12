@@ -246,6 +246,20 @@ class TestHydrateState:
         assert "codex" not in result["managed_configs"]
         assert "claude" not in result["managed_configs"]
 
+    def test_preserves_native_tracking(self):
+        native = [
+            {"path": "/home/u/.claude/settings.json", "format": "json", "keys": [["env", "X"]]}
+        ]
+        state = {"managed_configs": {"claude": {"keys": [["env", "X"]], "native": native}}}
+        result = hydrate_state(state)
+        # Without preserving `native`, `ucode revert` would strand ucode's keys in the user's file.
+        assert result["managed_configs"]["claude"]["native"] == native
+
+    def test_drops_non_list_native(self):
+        state = {"managed_configs": {"claude": {"keys": [], "native": "bogus"}}}
+        result = hydrate_state(state)
+        assert "native" not in result["managed_configs"]["claude"]
+
 
 class TestBuildAgentState:
     def test_returns_empty_without_workspace(self):
@@ -289,3 +303,13 @@ class TestMarkToolManaged:
         result = mark_tool_managed(state, "codex", [["profile"]])
         assert "gemini" in result["managed_configs"]
         assert "codex" in result["managed_configs"]
+
+    def test_records_native_descriptor(self):
+        native = [{"path": "/x/config.toml", "format": "toml", "keys": [["model_provider"]]}]
+        result = mark_tool_managed({}, "codex", [["model"]], native=native)
+        assert result["managed_configs"]["codex"] == {"keys": [["model"]], "native": native}
+
+    def test_no_native_key_when_none(self):
+        result = mark_tool_managed({}, "claude", [["env", "X"]])
+        assert result["managed_configs"]["claude"] == {"keys": [["env", "X"]]}
+        assert "native" not in result["managed_configs"]["claude"]

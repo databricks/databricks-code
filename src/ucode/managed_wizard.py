@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from typing import cast
 
-from ucode.agents import TOOL_SPECS, check_gateway_endpoint
+from ucode.agents import GLOBAL_SETTINGS_AGENTS, TOOL_SPECS, check_gateway_endpoint
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
     all_users_can_use_schema,
@@ -827,8 +827,12 @@ def _render_summary(workspace: str, manifest: dict) -> None:
         provider = model_config.get("model_provider_service")
         if provider:
             detail = f"{detail} via {provider}"
-        scope = "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
-        lines.append(kv_line(display, f"{detail} ({scope})"))
+        # Only agents that can use global settings carry the scope label; for the rest it's not a choice.
+        if tool in GLOBAL_SETTINGS_AGENTS:
+            scope = "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
+            lines.append(kv_line(display, f"{detail} ({scope})"))
+        else:
+            lines.append(kv_line(display, detail))
         # Spell out the per-family slots and model lists: the one-line default alone doesn't show
         # which families an admin configured, which is most of what they chose for claude.
         models = model_config.get("models")
@@ -1086,11 +1090,15 @@ def setup_command(
         agent_config: dict = {
             "model_config": _prompt_models_for_agent(tool, state, provider_service)
         }
-        agent_config["use_as_global_settings"] = prompt_yes_no_default(
-            f"Write {TOOL_SPECS[tool]['display']}'s config to its global settings file? "
-            f"({GLOBAL_SETTINGS_BLURB})",
-            default=False,
-        )
+        # Only claude and codex have an OS-level managed settings file that a bare `claude`/`codex`
+        # reads (`/etc/claude-code/managed-settings.json`, `/etc/codex/managed_config.toml`); the
+        # other agents don't, so we don't offer them the choice.
+        if tool in GLOBAL_SETTINGS_AGENTS:
+            agent_config["use_as_global_settings"] = prompt_yes_no_default(
+                f"Write {TOOL_SPECS[tool]['display']}'s config to its global settings file? "
+                f"({GLOBAL_SETTINGS_BLURB})",
+                default=False,
+            )
         enabled_agents[tool] = agent_config
 
     manifest: dict = {"default_agent": default_agent, "enabled_agents": enabled_agents}

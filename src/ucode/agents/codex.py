@@ -354,9 +354,87 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         enabled=smart_routing_enabled(state) and provider is None,
     )
     write_toml_file(CODEX_CONFIG_PATH, doc)
-    state = mark_tool_managed(state, "codex", MANAGED_KEYS)
+    # use_as_global_settings: also write the modern overlay to the native ~/.codex/config.toml so a
+    # bare `codex` (no `--profile ucode`) defaults to the gateway. Written last, after
+    # `_remove_legacy_ucode_profile` above stripped the legacy entries, so the modern provider block
+    # survives. codex auth self-refreshes via `ucode auth-token`, so the native file keeps working.
+    native_configs = None
+    if state.get("write_native_config"):
+        native_configs = _write_native_config(
+            workspace, chosen_model, databricks_profile, bool(state.get("use_pat")), provider
+        )
+    state = mark_tool_managed(state, "codex", MANAGED_KEYS, native=native_configs)
     save_state(state)
     return state
+
+
+def _write_native_config(
+    workspace: str,
+    model: str | None,
+    databricks_profile: str | None,
+    use_pat: bool,
+    provider: str | None,
+) -> list[dict]:
+    """Merge the modern overlay into the native ~/.codex/config.toml, preserving the user's keys.
+
+    Returns the native descriptor for revert tracking.
+    """
+    overlay = render_overlay(
+        workspace, model, databricks_profile, use_pat=use_pat, provider=provider
+    )
+    doc = read_toml_safe(LEGACY_CODEX_CONFIG_PATH)
+    deep_merge_dict(doc, overlay)
+    if provider:
+        # deep_merge can't drop keys; clear a `model` a prior non-provider run pinned.
+        doc.pop("model", None)
+    write_toml_file(LEGACY_CODEX_CONFIG_PATH, doc)
+    return [
+        {
+            "path": str(LEGACY_CODEX_CONFIG_PATH),
+            "format": "toml",
+            "keys": [list(k) for k in MANAGED_KEYS],
+        }
+    ]
+
+
+def _strip_modern_ucode_entries(path: Path) -> bool:
+    """Surgically remove ucode's *modern* keys from a shared Codex config.
+
+    Drops the top-level ``model_provider = "ucode-databricks"`` selector (and the ``model`` pinned
+    alongside it) and the ``[model_providers.ucode-databricks]`` block, leaving the user's other keys
+    intact. Mirrors :func:`_strip_legacy_ucode_entries` for the modern native write. Returns True if
+    anything was removed.
+    """
+    if not path.exists():
+        return False
+    doc = read_toml_safe(path)
+    changed = False
+    if doc.get("model_provider") == CODEX_MODEL_PROVIDER_NAME:
+        doc.pop("model_provider", None)
+        # ucode pins `model` only alongside its own provider, so remove it when the provider is ours.
+        doc.pop("model", None)
+        changed = True
+    providers = doc.get("model_providers")
+    if isinstance(providers, dict) and CODEX_MODEL_PROVIDER_NAME in providers:
+        providers.pop(CODEX_MODEL_PROVIDER_NAME, None)
+        if not providers:
+            doc.pop("model_providers", None)
+        changed = True
+    if changed:
+        write_toml_file(path, doc)
+    return changed
+
+
+def revert_native_config(state: dict) -> str | None:
+    """Strip ucode's modern keys from ~/.codex/config.toml if it was written under global settings.
+
+    Returns a short status for the revert summary, or None when ucode never wrote the native file.
+    """
+    native = ((state.get("managed_configs") or {}).get("codex") or {}).get("native")
+    if not isinstance(native, list) or not native:
+        return None
+    changed = _strip_modern_ucode_entries(LEGACY_CODEX_CONFIG_PATH)
+    return "ucode entries removed" if changed else "unchanged"
 
 
 def default_model(state: dict) -> str | None:

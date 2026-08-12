@@ -124,7 +124,14 @@ def hydrate_state(state: dict) -> dict:
     for tool, entry in managed_configs.items():
         if isinstance(entry, dict):
             keys = entry.get("keys") if isinstance(entry.get("keys"), list) else []
-            normalized[tool] = {"keys": keys}
+            norm: dict = {"keys": keys}
+            # Preserve native-file tracking so `ucode revert` can surgically prune the agent's
+            # own config file (e.g. ~/.claude/settings.json) it wrote under use_as_global_settings.
+            # Dropping it here would silently strand ucode's keys in the user's file forever.
+            native = entry.get("native")
+            if isinstance(native, list):
+                norm["native"] = native
+            normalized[tool] = norm
         elif entry:
             normalized[tool] = {"keys": []}
     hydrated["managed_configs"] = normalized
@@ -236,9 +243,20 @@ def clear_state() -> None:
         raise RuntimeError(f"Failed to clear state file: {STATE_PATH}") from exc
 
 
-def mark_tool_managed(state: dict, tool: str, managed_keys: list) -> dict:
+def mark_tool_managed(
+    state: dict, tool: str, managed_keys: list, native: list[dict] | None = None
+) -> dict:
+    """Record which config keys ucode manages for ``tool``.
+
+    ``native`` optionally describes the agent's own native config file(s) ucode also wrote under
+    ``use_as_global_settings`` — each ``{"path": str, "format": "json"|"toml", "keys": [...]}`` —
+    so ``ucode revert`` can surgically prune only ucode's keys from the user's shared file.
+    """
     managed_configs = dict(state.get("managed_configs") or {})
-    managed_configs[tool] = {"keys": list(managed_keys)}
+    entry: dict = {"keys": list(managed_keys)}
+    if native:
+        entry["native"] = native
+    managed_configs[tool] = entry
     state["managed_configs"] = managed_configs
     state["last_tool"] = tool
     return state

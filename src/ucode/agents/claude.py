@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -21,6 +22,7 @@ from ucode.config_io import (
     ToolSpec,
     backup_existing_file,
     deep_merge_dict,
+    prune_key_paths,
     read_json_safe,
     write_json_file,
 )
@@ -42,6 +44,10 @@ from ucode.ui import print_err, print_note, print_success, print_warning
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
+# Claude Code's own user-scope settings file, read by a bare `claude` with no flags. ucode writes
+# here (in addition to the private file above) only when the managed config sets
+# use_as_global_settings, so a developer who launches `claude` directly still hits the gateway.
+CLAUDE_NATIVE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "settings.json"
 
 SPEC: ToolSpec = {
     "binary": "claude",
@@ -516,43 +522,50 @@ def write_tool_config(
                 "to install the Claude Stop hook — traces won't be emitted. Re-run "
                 "`ucode configure tracing`."
             )
-
-    existing = read_json_safe(CLAUDE_SETTINGS_PATH)
-    merged = deep_merge_dict(existing, overlay)
-    # Drop any apiKeyHelper a prior non-relayed launch left in the file; relayed
-    # must not carry one (it would outrank the subscription OAuth).
-    if relayed:
-        merged.pop("apiKeyHelper", None)
-    if tracing_env_vars and stop_hook_command:
-        _upsert_tracing_stop_hook(merged, stop_hook_command)
-    if not tracing_env_vars:
-        env_block = merged.get("env")
-        if isinstance(env_block, dict):
-            for key in CLAUDE_TRACING_ENV_KEYS:
-                env_block.pop(key, None)
-        # Strip only ucode's tracing Stop hook so user hooks stay intact.
-        _remove_tracing_stop_hook(merged)
-    # Prune ucode-managed model env keys we deliberately don't write this run
-    # (e.g. ANTHROPIC_MODEL — see render_overlay).
-    overlay_env = overlay.get("env", {})
-    merged_env = merged.get("env")
-    if isinstance(merged_env, dict):
-        for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
-            if key not in overlay_env:
-                merged_env.pop(key, None)
-    # deep_merge_dict keeps keys already in the file, so drop the ones ucode no
-    # longer writes.
-    if isinstance(merged_env, dict):
-        for key in CLAUDE_REMOVED_ENV_KEYS:
-            merged_env.pop(key, None)
-    # Smart-routing hooks: install ucode's PreToolUse/SessionStart/
-    # SubagentStart hooks when routing is enabled (and not under a provider,
-    # which pins no Databricks model), else surgically strip only ucode's own.
+    # Smart-routing hooks: install ucode's PreToolUse/SessionStart/SubagentStart hooks when routing
+    # is enabled (and not under a provider, which pins no Databricks model), else surgically strip
+    # only ucode's own. Applied per file inside _compose_claude_settings.
     routing_enabled = smart_routing_enabled(state) and provider is None
-    sync_smart_routing_hooks(merged, state, enabled=routing_enabled)
     if routing_enabled:
         managed_keys = managed_keys + [["hooks", event] for event in CLAUDE_ROUTING_HOOK_EVENTS]
-    write_json_file(CLAUDE_SETTINGS_PATH, merged)
+
+    def _compose(base: dict) -> dict:
+        # deepcopy the overlay per file so merging into one base can't alias nested dicts into
+        # the other (deep_merge_dict grafts overlay's own dict objects onto a base missing the key).
+        merged = deep_merge_dict(base, copy.deepcopy(overlay))
+        # Drop any apiKeyHelper a prior non-relayed launch left in the file; relayed
+        # must not carry one (it would outrank the subscription OAuth).
+        if relayed:
+            merged.pop("apiKeyHelper", None)
+        if tracing_env_vars and stop_hook_command:
+            _upsert_tracing_stop_hook(merged, stop_hook_command)
+        if not tracing_env_vars:
+            env_block = merged.get("env")
+            if isinstance(env_block, dict):
+                for key in CLAUDE_TRACING_ENV_KEYS:
+                    env_block.pop(key, None)
+            # Strip only ucode's tracing Stop hook so user hooks stay intact.
+            _remove_tracing_stop_hook(merged)
+        # Prune ucode-managed model env keys we deliberately don't write this run
+        # (e.g. ANTHROPIC_MODEL — see render_overlay).
+        overlay_env = overlay.get("env", {})
+        merged_env = merged.get("env")
+        if isinstance(merged_env, dict):
+            for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
+                if key not in overlay_env:
+                    merged_env.pop(key, None)
+            # deep_merge_dict keeps keys already in the file, so drop the ones ucode no
+            # longer writes.
+            for key in CLAUDE_REMOVED_ENV_KEYS:
+                merged_env.pop(key, None)
+        sync_smart_routing_hooks(merged, state, enabled=routing_enabled)
+        return merged
+
+    write_json_file(CLAUDE_SETTINGS_PATH, _compose(read_json_safe(CLAUDE_SETTINGS_PATH)))
+
+    native_configs = None
+    if state.get("write_native_config"):
+        native_configs = _write_native_settings(_compose, managed_keys, relayed)
 
     if web_search_model:
         _register_web_search_mcp(state["workspace"], web_search_model, state.get("profile"))
@@ -564,9 +577,72 @@ def write_tool_config(
     else:
         state.pop("claude_relayed", None)
         state.pop("relayed_proxy_port", None)
-    state = mark_tool_managed(state, "claude", managed_keys)
+    state = mark_tool_managed(state, "claude", managed_keys, native=native_configs)
     save_state(state)
     return state
+
+
+def _write_native_settings(
+    compose: Callable[[dict], dict], managed_keys: list[list[str]], relayed: bool
+) -> list[dict] | None:
+    """Mirror ucode's managed config into Claude Code's native ~/.claude/settings.json.
+
+    Runs only under use_as_global_settings so a bare `claude` reaches the gateway. The same compose
+    (merge overlay + prune stale keys) that produced the private file is applied to the user's own
+    settings, so their unrelated keys survive. Returns the native descriptor for revert tracking, or
+    None when nothing was written.
+
+    Relayed launches are skipped: they depend on a per-session loopback refresh proxy that only runs
+    during `ucode claude`, so a bare `claude` could not reach the gateway anyway.
+    """
+    if relayed:
+        print_warning(
+            "Claude subscription-relay launches use a per-session proxy a bare `claude` can't "
+            "reach, so ucode did not write ~/.claude/settings.json for machine-wide use. Launch "
+            "with `ucode claude` to use the relay."
+        )
+        return None
+    write_json_file(
+        CLAUDE_NATIVE_SETTINGS_PATH, compose(read_json_safe(CLAUDE_NATIVE_SETTINGS_PATH))
+    )
+    # Enterprise managed settings outrank the user scope per key and can't be excluded, so warn when
+    # they'd shadow what we just wrote — a bare `claude` would silently ignore ucode's config there.
+    conflict = _managed_relayed_conflicts()
+    overrides = managed_settings_model_overrides()
+    if conflict:
+        conflict_path, keys = conflict
+        print_warning(
+            f"Enterprise managed settings at {conflict_path} set {', '.join(keys)}, which override "
+            "~/.claude/settings.json — a bare `claude` may not route through the gateway."
+        )
+    elif overrides:
+        print_warning(
+            f"Enterprise managed settings at {overrides} pin a model, which overrides the workspace "
+            "default a bare `claude` would otherwise use."
+        )
+    return [{"path": str(CLAUDE_NATIVE_SETTINGS_PATH), "format": "json", "keys": managed_keys}]
+
+
+def revert_native_config(state: dict) -> str | None:
+    """Surgically strip ucode's keys from native config files it wrote under use_as_global_settings.
+
+    Returns a short status ("ucode entries removed" / "unchanged") for the revert summary, or None
+    when ucode never wrote a native file for claude.
+    """
+    native = ((state.get("managed_configs") or {}).get("claude") or {}).get("native")
+    if not isinstance(native, list) or not native:
+        return None
+    changed = False
+    for descriptor in native:
+        path = Path(descriptor.get("path", ""))
+        keys = descriptor.get("keys") or []
+        if not path or not path.exists():
+            continue
+        doc = read_json_safe(path)
+        if prune_key_paths(doc, keys):
+            write_json_file(path, doc)
+            changed = True
+    return "ucode entries removed" if changed else "unchanged"
 
 
 def _is_tracing_stop_hook(hook: object) -> bool:

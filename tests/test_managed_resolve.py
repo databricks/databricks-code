@@ -18,10 +18,11 @@ from ucode.managed_resolve import (
     managed_state_overrides,
     managed_supplies_models,
     managed_unservable_models,
+    managed_use_as_global_settings,
     recommended_agent,
     resolve_state,
 )
-from ucode.state import MANAGED_OVERLAY_KEY
+from ucode.state import MANAGED_OVERLAY_KEY, _without_managed_overlay
 
 WORKSPACE = "https://ws.example.com"
 
@@ -181,6 +182,41 @@ class TestResolveState:
             "claude": "main.default.keep",
             "codex": "main.default.managed",
         }
+
+
+class TestGlobalSettings:
+    def test_only_claude_and_codex_support_global_settings(self):
+        # This set gates both the write path AND the `ucode setup` machine-wide prompt. Adding an
+        # agent whose token can't self-refresh here would re-introduce a config that breaks in ~1h.
+        from ucode.agents import GLOBAL_SETTINGS_AGENTS
+
+        assert GLOBAL_SETTINGS_AGENTS == frozenset({"claude", "codex"})
+
+    def test_flag_true_for_opted_in_supported_agent(self):
+        assert managed_use_as_global_settings(MANAGED, "claude") is True
+
+    def test_flag_false_when_not_opted_in(self):
+        # codex is enabled but never marked machine-wide.
+        assert managed_use_as_global_settings(MANAGED, "codex") is False
+
+    def test_flag_ignored_for_unsupported_agent(self):
+        # A hand-written --from-file config can't turn it on for an agent whose token can't refresh.
+        managed = {"enabled_agents": {"gemini": {"use_as_global_settings": True}}}
+        assert managed_use_as_global_settings(managed, "gemini") is False
+
+    def test_resolve_sets_transient_write_native_config(self):
+        resolved = resolve_state(MANAGED, _state(), "claude")
+        assert resolved["write_native_config"] is True
+
+    def test_resolve_omits_flag_when_not_opted_in(self):
+        resolved = resolve_state(MANAGED, _state(), "codex")
+        assert "write_native_config" not in resolved
+
+    def test_write_native_config_is_not_persisted(self):
+        # It lives only for the config-write; save_state (via _without_managed_overlay) drops it so
+        # a later non-managed launch never writes native files.
+        resolved = resolve_state(MANAGED, _state(), "claude")
+        assert "write_native_config" not in _without_managed_overlay(resolved)
 
 
 class TestStateFileIsNotRewritten:

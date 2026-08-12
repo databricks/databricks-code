@@ -468,6 +468,100 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
         assert written[0]["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
 
+class TestWriteToolConfigNativeSettings:
+    """use_as_global_settings: also write Claude Code's own ~/.claude/settings.json."""
+
+    def _patch(self, monkeypatch, writes, existing_by_path=None):
+        existing_by_path = existing_by_path or {}
+        monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        monkeypatch.setattr(
+            claude, "read_json_safe", lambda path: dict(existing_by_path.get(str(path), {}))
+        )
+        monkeypatch.setattr(
+            claude, "write_json_file", lambda path, payload: writes.append((str(path), payload))
+        )
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
+        # Keep the enterprise managed-settings checks deterministic regardless of the host machine.
+        monkeypatch.setattr(claude, "_managed_relayed_conflicts", lambda: None)
+        monkeypatch.setattr(claude, "managed_settings_model_overrides", lambda: None)
+
+    def test_writes_native_file_when_flagged(self, monkeypatch):
+        writes: list = []
+        self._patch(monkeypatch, writes)
+        state = {"workspace": WS, "codex_models": [], "write_native_config": True}
+        result = claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        paths = [p for p, _ in writes]
+        assert str(claude.CLAUDE_SETTINGS_PATH) in paths
+        assert str(claude.CLAUDE_NATIVE_SETTINGS_PATH) in paths
+        native = result["managed_configs"]["claude"]["native"]
+        assert native[0]["path"] == str(claude.CLAUDE_NATIVE_SETTINGS_PATH)
+        assert native[0]["format"] == "json"
+
+    def test_native_file_preserves_user_keys(self, monkeypatch):
+        writes: list = []
+        existing = {str(claude.CLAUDE_NATIVE_SETTINGS_PATH): {"env": {"MY_OWN": "keep"}}}
+        self._patch(monkeypatch, writes, existing)
+        state = {"workspace": WS, "codex_models": [], "write_native_config": True}
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        native = next(p for path, p in writes if path == str(claude.CLAUDE_NATIVE_SETTINGS_PATH))
+        # The user's own key survives; ucode's gateway keys are merged in alongside it.
+        assert native["env"]["MY_OWN"] == "keep"
+        assert native["env"]["ANTHROPIC_BASE_URL"]
+        assert native["apiKeyHelper"]
+
+    def test_no_native_write_by_default(self, monkeypatch):
+        writes: list = []
+        self._patch(monkeypatch, writes)
+        state = {"workspace": WS, "codex_models": []}
+        result = claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        paths = [p for p, _ in writes]
+        assert str(claude.CLAUDE_NATIVE_SETTINGS_PATH) not in paths
+        assert "native" not in result["managed_configs"]["claude"]
+
+    def test_relayed_skips_native_write(self, monkeypatch):
+        writes: list = []
+        warns: list = []
+        self._patch(monkeypatch, writes)
+        monkeypatch.setattr(claude, "print_warning", lambda msg: warns.append(msg))
+        monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
+        state = {"workspace": WS, "codex_models": [], "write_native_config": True}
+        result = claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
+        paths = [p for p, _ in writes]
+        assert str(claude.CLAUDE_NATIVE_SETTINGS_PATH) not in paths
+        assert result["managed_configs"]["claude"].get("native") is None
+        assert any("bare `claude`" in w for w in warns)
+
+
+class TestClaudeRevertNativeConfig:
+    def test_prunes_only_tracked_keys(self, tmp_path):
+        native_path = tmp_path / "settings.json"
+        native_path.write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "x", "MY": "keep"}, "apiKeyHelper": "h"}),
+            encoding="utf-8",
+        )
+        state = {
+            "managed_configs": {
+                "claude": {
+                    "keys": [],
+                    "native": [
+                        {
+                            "path": str(native_path),
+                            "format": "json",
+                            "keys": [["env", "ANTHROPIC_BASE_URL"], ["apiKeyHelper"]],
+                        }
+                    ],
+                }
+            }
+        }
+        assert claude.revert_native_config(state) == "ucode entries removed"
+        assert json.loads(native_path.read_text()) == {"env": {"MY": "keep"}}
+
+    def test_returns_none_without_native_tracking(self):
+        state = {"managed_configs": {"claude": {"keys": []}}}
+        assert claude.revert_native_config(state) is None
+
+
 class TestRegisterWebSearchMcp:
     def test_clears_existing_then_adds(self, monkeypatch):
         import ucode.mcp as mcp_mod

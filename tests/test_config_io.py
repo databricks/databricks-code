@@ -14,6 +14,7 @@ from ucode.config_io import (
     ensure_parent_dir,
     is_dry_run,
     parse_dotenv,
+    prune_key_paths,
     read_json_safe,
     read_toml_safe,
     restore_file,
@@ -313,3 +314,41 @@ class TestDeepMergeDict:
         base = {"a": 1}
         result = deep_merge_dict(base, {"b": 2})
         assert result is base
+
+
+# ---------------------------------------------------------------------------
+# prune_key_paths
+# ---------------------------------------------------------------------------
+
+
+class TestPruneKeyPaths:
+    def test_removes_leaf_and_leaves_siblings(self):
+        doc = {"env": {"MANAGED": "1", "USER": "2"}, "apiKeyHelper": "x"}
+        changed = prune_key_paths(doc, [["env", "MANAGED"], ["apiKeyHelper"]])
+        assert changed is True
+        assert doc == {"env": {"USER": "2"}}
+
+    def test_drops_emptied_parent(self):
+        doc = {"env": {"ONLY": "1"}}
+        assert prune_key_paths(doc, [["env", "ONLY"]]) is True
+        assert doc == {}
+
+    def test_keeps_parent_with_remaining_siblings(self):
+        doc = {"env": {"A": "1", "B": "2"}}
+        assert prune_key_paths(doc, [["env", "A"]]) is True
+        assert doc == {"env": {"B": "2"}}
+
+    def test_missing_path_is_noop(self):
+        doc = {"env": {"A": "1"}}
+        assert prune_key_paths(doc, [["env", "NOPE"], ["absent"]]) is False
+        assert doc == {"env": {"A": "1"}}
+
+    def test_removes_top_level_key(self):
+        doc = {"model_provider": "ucode", "model": "gpt-5", "other": True}
+        assert prune_key_paths(doc, [["model_provider"], ["model"]]) is True
+        assert doc == {"other": True}
+
+    def test_partial_path_through_non_dict_is_noop(self):
+        doc = {"model": "scalar"}
+        assert prune_key_paths(doc, [["model", "nested"]]) is False
+        assert doc == {"model": "scalar"}
