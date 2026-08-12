@@ -1303,6 +1303,8 @@ class TestBudgetPolicy:
             policy = wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
         assert policy is not None
         assert policy["budget_id"] == BUDGET_ID
+        # The picked budget's name is remembered for the summary.
+        assert policy["budget_display_name"] == "eng"
         assert policy["tiers"] == [
             {
                 "spending_percentage": 0.8,
@@ -1640,6 +1642,47 @@ class TestSummaryPanel:
             },
         )
         assert "[prod] tiered routing" in capsys.readouterr().out
+
+    def test_shows_both_budget_and_policy_names(self, capsys):
+        # An admin checks the policy against two distinct things: which budget it tracks and what the
+        # policy itself is called. The summary must surface both, not collapse to one.
+        wizard._render_summary(
+            WORKSPACE,
+            {
+                "default_agent": "claude",
+                "enabled_agents": {
+                    "claude": {"model_config": {"default_model": "system.ai.claude-opus-5"}}
+                },
+                "budget_policy": {
+                    "budget_id": "19165ea4-ff8d-4fbb-b6ce-fc5abe7e1c57",
+                    "budget_display_name": "eng-budget",
+                    "display_name": "tiered routing",
+                    "tiers": [],
+                },
+            },
+        )
+        out = capsys.readouterr().out
+        assert "eng-budget" in out
+        assert "tiered routing" in out
+
+    def test_falls_back_to_budget_id_without_a_budget_name(self, capsys):
+        # `--from-file` and server-read manifests carry no `budget_display_name`, so the budget id is
+        # all there is to show.
+        wizard._render_summary(
+            WORKSPACE,
+            {
+                "default_agent": "claude",
+                "enabled_agents": {
+                    "claude": {"model_config": {"default_model": "system.ai.claude-opus-5"}}
+                },
+                "budget_policy": {
+                    "budget_id": "19165ea4-ff8d-4fbb-b6ce-fc5abe7e1c57",
+                    "display_name": "tiered routing",
+                    "tiers": [],
+                },
+            },
+        )
+        assert "19165ea4-ff8d-4fbb-b6ce-fc5abe7e1c57" in capsys.readouterr().out
 
 
 class TestCancelledPromptsAbort:

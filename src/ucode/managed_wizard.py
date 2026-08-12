@@ -737,6 +737,13 @@ def _prompt_budget_policy(
         return None
 
     policy: dict = {"budget_id": budget_id}
+    # Remember the budget's own name so the summary can show it beside the policy name. It's a local
+    # display aid only — `_budget_policy_payload` doesn't serialize it, so it never reaches the API.
+    budget_display_name = next(
+        (budget["display_name"] for budget in usable if budget["id"] == budget_id), ""
+    )
+    if budget_display_name:
+        policy["budget_display_name"] = budget_display_name
     display_name = prompt_for_text("Policy name", default="coding-agents-tiered-routing")
     if display_name:
         policy["display_name"] = display_name
@@ -848,8 +855,9 @@ def _render_summary(workspace: str, manifest: dict) -> None:
     if isinstance(policy, dict):
         tiers = policy.get("tiers") or []
         lines.append(
-            kv_line("Budget policy", policy.get("display_name") or policy.get("budget_id") or "set")
+            kv_line("Budget", policy.get("budget_display_name") or policy.get("budget_id") or "set")
         )
+        lines.append(kv_line("Policy name", policy.get("display_name") or "unnamed"))
         for tier in tiers:
             agent = tier.get("default_agent")
             display = TOOL_SPECS.get(agent, {}).get("display", agent)
