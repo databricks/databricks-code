@@ -733,7 +733,7 @@ def _prompt_custom_model(state: dict) -> str:
             return model
         print_err(
             f"'{model}' isn't a model service on this workspace. Check the name and try again "
-            "(expected catalog.schema.model, e.g. main.aarushi.claude-opus-4-5)."
+            "(expected catalog.schema.model, e.g. main.default.claude-opus-4-5)."
         )
 
 
@@ -759,17 +759,21 @@ def _select_hosted_models_multi(
 ) -> list[str]:
     """Multi-select over the top few ``options`` plus a custom-entry row; requires one pick.
 
-    Selecting the custom row prompts for one model id and folds it into the picks. Records any custom
-    id in ``custom_sink`` (see :func:`_select_hosted_model`).
+    Selecting the custom row prompts for custom model ids — as many as the admin wants, since a
+    multi-select agent (opencode, pi) can carry a whole list — and folds them into the picks. Records
+    each custom id in ``custom_sink`` (see :func:`_select_hosted_model`).
     """
     rows = _custom_option_rows([(m, m) for m in options])
     picked = _require_multi_selection(prompt, rows)
     models = [p for p in picked if p != _CUSTOM_MODEL]
     if _CUSTOM_MODEL in picked:
-        custom = _prompt_custom_model(state)
-        custom_sink.append(custom)
-        if custom not in models:
-            models.append(custom)
+        while True:
+            custom = _prompt_custom_model(state)
+            if custom not in models:
+                models.append(custom)
+                custom_sink.append(custom)
+            if not prompt_yes_no_default("Add another custom model?", default=False):
+                break
     return models
 
 

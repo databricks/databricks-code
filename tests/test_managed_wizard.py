@@ -1056,6 +1056,23 @@ class TestCustomModelEntry:
         assert config["default_model"] == "main.real.model"
         assert err.called
 
+    def test_multi_select_agent_can_add_several_custom_models(self):
+        # opencode/pi carry a model list, so the custom row keeps prompting until the admin declines.
+        with (
+            patch.object(wizard, "prompt_for_multi_selection", return_value=[wizard._CUSTOM_MODEL]),
+            patch.object(
+                wizard, "prompt_for_text", side_effect=["main.default.a", "main.default.b"]
+            ),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_for_selection", return_value="main.default.a"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(True, None)),
+        ):
+            config = wizard._prompt_models_for_agent("pi", STATE, None)
+        assert config["models"] == ["main.default.a", "main.default.b"]
+        assert config["custom_models"] == ["main.default.a", "main.default.b"]
+        assert config["default_model"] == "main.default.a"
+
     def test_short_reason_drops_the_json_body(self):
         # The warning for an inconclusive check should show the status, not the raw error blob.
         assert (
