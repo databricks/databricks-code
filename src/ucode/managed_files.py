@@ -115,7 +115,13 @@ def _clear_immutable(path: Path) -> bool:
     set, and report that it must be restored. Linux: best-effort ``chattr -i`` (not every filesystem
     supports it), never restored — matching isaac.
     """
-    if not path.exists():
+    try:
+        # `path.exists()` stats the file; under a root-locked parent dir (e.g. a 750 /etc/codex we
+        # haven't opened yet) that raises PermissionError. There's nothing to unlock we can see, and
+        # the subsequent `sudo cp` (as root) overwrites regardless, so treat it as "nothing to clear".
+        if not path.exists():
+            return False
+    except OSError:
         return False
     if sys.platform == "darwin":
         result = subprocess.run(

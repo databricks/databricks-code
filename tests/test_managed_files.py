@@ -91,6 +91,21 @@ class TestWriteManagedFile:
         assert managed_files.write_managed_file(path, "new", display="X") == "skipped"
 
 
+class TestClearImmutableStatDenied:
+    def test_stat_denied_path_returns_false_without_raising(self, monkeypatch):
+        # Regression: `_clear_immutable` ran an unguarded path.exists() inside the sudo write; under a
+        # root-locked /etc/codex that raised PermissionError and aborted the write ("without root").
+        class _StatDenied:
+            def exists(self):
+                raise PermissionError(13, "Permission denied")
+
+        # Ensure no sudo subprocess is attempted if the guard ever regresses.
+        monkeypatch.setattr(
+            managed_files.subprocess, "run", lambda *a, **k: pytest.fail("should not shell out")
+        )
+        assert managed_files._clear_immutable(_StatDenied()) is False
+
+
 class TestPruneManagedFile:
     def test_prune_is_noop_when_already_absent(self, tmp_path, monkeypatch):
         # Revert on a file that never held ucode's keys: pruned text == existing -> no sudo.

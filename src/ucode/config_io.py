@@ -142,9 +142,12 @@ def _prune_one(node: object, path: list[str]) -> bool:
 
 
 def read_json_safe(path: Path) -> dict:
-    if not path.exists():
-        return {}
+    # `path.exists()` is inside the try: stat-ing a file under a root-locked dir (e.g. a
+    # root-owned /etc/codex) raises PermissionError, which must read as "absent/unreadable → {}"
+    # rather than crash a launch that only wanted to merge into it.
     try:
+        if not path.exists():
+            return {}
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
@@ -152,9 +155,11 @@ def read_json_safe(path: Path) -> dict:
 
 
 def read_toml_safe(path: Path) -> tomlkit.TOMLDocument:
-    if not path.exists():
-        return tomlkit.document()
+    # See read_json_safe: keep `path.exists()` inside the try so a PermissionError on a locked
+    # parent directory is treated as an empty document rather than propagating.
     try:
+        if not path.exists():
+            return tomlkit.document()
         return tomlkit.parse(path.read_text(encoding="utf-8"))
     except (OSError, tomlkit.exceptions.TOMLKitError):
         return tomlkit.document()

@@ -75,6 +75,7 @@ from ucode.managed_resolve import (
     managed_provider_service,
     managed_supplies_models,
     managed_unservable_models,
+    managed_use_as_global_settings,
     recommended_agent,
     resolve_state,
 )
@@ -1579,8 +1580,10 @@ def _launch_tool(
                 )
             # The enterprise scope outranks the --settings file ucode writes, so a model pinned
             # there quietly beats the admin's — point at the file rather than let the mismatch
-            # look like a ucode bug.
-            if tool == "claude":
+            # look like a ucode bug. Suppressed under use_as_global_settings: there ucode itself
+            # authored that managed-settings file, so its model keys are the admin's config, not an
+            # external override.
+            if tool == "claude" and not managed_use_as_global_settings(managed, "claude"):
                 overrides = claude_agent.managed_settings_model_overrides()
                 if overrides is not None:
                     print_warning(
@@ -1692,7 +1695,12 @@ def _launch_tool(
             # outranks the --settings file ucode writes AND can't be excluded with --setting-sources,
             # so a model pinned there silently wins over `--model`. Warn so a launch that ignores the
             # requested model looks like the misconfiguration it is, not a ucode bug.
-            if model and tool == "claude":
+            # Suppressed when ucode authored the managed-settings file itself (use_as_global_settings)
+            # — the pinned model is then ucode's own, deliberately applied, not a surprise override.
+            managed_owns_claude = managed is not None and managed_use_as_global_settings(
+                managed, "claude"
+            )
+            if model and tool == "claude" and not managed_owns_claude:
                 enterprise = claude_agent.managed_settings_model_overrides()
                 if enterprise is not None:
                     print_warning(

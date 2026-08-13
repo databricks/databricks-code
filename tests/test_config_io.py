@@ -321,6 +321,27 @@ class TestDeepMergeDict:
 # ---------------------------------------------------------------------------
 
 
+class _StatDeniedPath:
+    """Path stand-in whose existence check raises PermissionError, as stat-ing a file under a
+    root-locked directory (e.g. a root-owned /etc/codex) does for a non-root process."""
+
+    def exists(self):
+        raise PermissionError(13, "Permission denied")
+
+    def read_text(self, encoding="utf-8"):
+        raise AssertionError("read_text must not be reached once exists() denies")
+
+
+class TestReadSafePermissionDenied:
+    def test_read_json_safe_returns_empty_on_permission_error(self):
+        # Regression: a locked parent dir made path.exists() raise and crashed the whole launch.
+        assert read_json_safe(_StatDeniedPath()) == {}
+
+    def test_read_toml_safe_returns_empty_on_permission_error(self):
+        result = read_toml_safe(_StatDeniedPath())
+        assert dict(result) == {}
+
+
 class TestPruneKeyPaths:
     def test_removes_leaf_and_leaves_siblings(self):
         doc = {"env": {"MANAGED": "1", "USER": "2"}, "apiKeyHelper": "x"}
