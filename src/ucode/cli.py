@@ -2442,15 +2442,10 @@ def setup(
             "ucode's manifest shape) instead. Validated before it is saved.",
         ),
     ] = None,
-    dry_run: Annotated[
-        bool,
-        typer.Option("--dry-run", help="Walk the flow without writing any files."),
-    ] = False,
 ) -> None:
     """Author the managed coding config for your workspace (workspace admins only)."""
     if ctx.invoked_subcommand is not None:
         return
-    set_dry_run(dry_run)
     # `typer.Exit` subclasses RuntimeError, so it must be raised outside the try — inside, the
     # `except RuntimeError` below would swallow it and report the exit code as an error message.
     try:

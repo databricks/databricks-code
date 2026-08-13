@@ -279,7 +279,6 @@ class TestExistingConfigHandling:
             ),
             patch.object(wizard, "prompt_for_selection", return_value="delete"),
             patch.object(wizard, "prompt_yes_no_default", return_value=True),
-            patch.object(wizard, "is_dry_run", return_value=False),
             patch.object(wizard, "delete_coding_agent_config", return_value=None) as delete,
         ):
             assert wizard._handle_existing_config(WORKSPACE, "token") is False
@@ -300,21 +299,6 @@ class TestExistingConfigHandling:
             assert wizard._handle_existing_config(WORKSPACE, "token") is False
         assert not delete.called
 
-    def test_delete_honors_dry_run(self):
-        with (
-            patch.object(
-                wizard,
-                "get_managed_config",
-                return_value=({"name": "cfg/1", "enabled_agents": {}}, None),
-            ),
-            patch.object(wizard, "prompt_for_selection", return_value="delete"),
-            patch.object(wizard, "prompt_yes_no_default", return_value=True),
-            patch.object(wizard, "is_dry_run", return_value=True),
-            patch.object(wizard, "delete_coding_agent_config") as delete,
-        ):
-            assert wizard._handle_existing_config(WORKSPACE, "token") is False
-        assert not delete.called
-
     def test_delete_failure_raises(self):
         with (
             patch.object(
@@ -324,7 +308,6 @@ class TestExistingConfigHandling:
             ),
             patch.object(wizard, "prompt_for_selection", return_value="delete"),
             patch.object(wizard, "prompt_yes_no_default", return_value=True),
-            patch.object(wizard, "is_dry_run", return_value=False),
             patch.object(wizard, "delete_coding_agent_config", return_value="HTTP 500"),
             pytest.raises(RuntimeError, match="Could not delete"),
         ):
@@ -2102,15 +2085,6 @@ class TestCliWiring:
         ):
             runner.invoke(app, ["setup", "--from-file", "/tmp/x.json"])
         assert setup.call_args.kwargs["from_file"] == "/tmp/x.json"
-
-    def test_dry_run_sets_the_flag(self):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.setup_command", return_value=0),
-            patch("ucode.cli.set_dry_run") as set_flag,
-        ):
-            runner.invoke(app, ["setup", "--dry-run"])
-        set_flag.assert_called_once_with(True)
 
     def test_show_exits_zero(self):
         with patch("ucode.cli.show_command", return_value=0):

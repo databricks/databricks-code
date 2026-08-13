@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import cast
 
 from ucode.agents import TOOL_SPECS, check_gateway_endpoint
-from ucode.config_io import is_dry_run
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
     all_users_can_use_schema,
@@ -925,7 +924,7 @@ def _delete_existing_config(workspace: str, token: str, existing: dict) -> None:
     """Delete the workspace's published config after confirming. Raises RuntimeError on failure.
 
     Deleting leaves the workspace with no managed config, so every developer falls back to their own
-    settings on their next ucode run — confirm before doing it, and honor ``--dry-run``.
+    settings on their next ucode run — confirm before doing it.
     """
     name = existing.get("name")
     if not isinstance(name, str):
@@ -939,9 +938,6 @@ def _delete_existing_config(workspace: str, token: str, existing: dict) -> None:
     )
     if not prompt_yes_no_default("Delete the existing managed config?", default=False):
         print_note("Nothing was deleted.")
-        return
-    if is_dry_run():
-        print_success("Dry run: the config was not deleted.")
         return
     with spinner("Deleting the managed config..."):
         delete_reason = delete_coding_agent_config(workspace, token, name)
@@ -987,13 +983,8 @@ def setup_from_file(path: str) -> int:
 
     save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
-    if is_dry_run():
-        print_success(
-            f"Dry run: {manifest_path.name} was not written to ~/.ucode/managed-state.json."
-        )
-    else:
-        print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-state.json")
-        _print_next_steps()
+    print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-state.json")
+    _print_next_steps()
     return 0
 
 
@@ -1132,11 +1123,8 @@ def setup_command(from_file: str | None = None) -> int:
     save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
     console.print()
-    if is_dry_run():
-        print_success("Dry run: nothing was written to ~/.ucode/managed-state.json.")
-    else:
-        print_success("Saved to ~/.ucode/managed-state.json")
-        _print_next_steps()
+    print_success("Saved to ~/.ucode/managed-state.json")
+    _print_next_steps()
     return 0
 
 

@@ -194,9 +194,6 @@ does configure this machine.
 # Review the manifest and the exact payload `ucode apply` would publish.
 ucode setup show
 
-# Walk the flow without writing anything.
-ucode setup --dry-run
-
 # Skip the prompts and load a hand-written config instead (validated before saving).
 ucode setup --from-file ./managed-config.json
 ```
