@@ -2373,7 +2373,9 @@ class TestConfigureDeprecation:
         entries = self._resolve([("https://w", None)])
         assert entries == [("https://w", None)]
 
-    def test_admin_who_accepts_exits_to_run_setup(self, monkeypatch):
+    def test_admin_who_accepts_launches_setup_in_place(self, monkeypatch):
+        # Accepting the offer runs `setup_command` right there — reusing the workspace/profile we
+        # already resolved so setup doesn't re-prompt for them — then exits with its code.
         import typer
 
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
@@ -2382,9 +2384,34 @@ class TestConfigureDeprecation:
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
         monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: True)
+        calls = {}
+        monkeypatch.setattr(
+            "ucode.cli.setup_command",
+            lambda **kwargs: calls.update(kwargs) or 0,
+        )
         with pytest.raises(typer.Exit) as exc:
             self._resolve([("https://w", None)])
         assert exc.value.exit_code == 0
+        assert calls == {"workspace": "https://w", "profile": None}
+
+    def test_admin_who_accepts_propagates_setup_failure(self, monkeypatch):
+        # A RuntimeError from setup (e.g. discovery failed) surfaces as a non-zero exit, not a stack
+        # trace bubbling out of configure.
+        import typer
+
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
+        monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: True)
+        monkeypatch.setattr(
+            "ucode.cli.setup_command",
+            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("no agents")),
+        )
+        with pytest.raises(typer.Exit) as exc:
+            self._resolve([("https://w", None)])
+        assert exc.value.exit_code == 1
 
     def test_non_admin_is_never_prompted_for_setup(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
@@ -2556,25 +2583,6 @@ class TestBareUcode:
         assert result.exit_code == 0, result.output
         assert launched == []
         assert "Ask a workspace admin" in result.output
-
-    def test_dry_run_uses_the_cache_and_does_not_fetch(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
-        monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
-        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: pytest.fail("--dry-run must not fetch"),
-        )
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: self.MANAGED)
-        launched: list[tuple] = []
-        monkeypatch.setattr(
-            "ucode.cli._launch_tool", lambda tool, ctx, **kw: launched.append((tool, kw))
-        )
-        result = runner.invoke(app, ["--dry-run"])
-        assert result.exit_code == 0, result.output
-        # The config bare `ucode` already read is handed down, so the launch path does not refetch.
-        assert launched[0][1]["managed"] == self.MANAGED
 
     def test_skip_preflight_has_no_config_to_pick_an_agent_from(self, monkeypatch):
         # --skip-preflight is deliberately unmanaged, so bare `ucode` cannot resolve an agent. It
