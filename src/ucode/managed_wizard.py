@@ -15,6 +15,7 @@ back out of ``state.json``, so there is exactly one picker per concern in the co
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
@@ -54,6 +55,7 @@ from ucode.managed_setup import (
 from ucode.state import load_state
 from ucode.ui import (
     console,
+    format_usd,
     kv_line,
     print_err,
     print_heading,
@@ -747,6 +749,16 @@ def _prompt_budget_policy(
     if display_name:
         policy["display_name"] = display_name
 
+    # The per-user monthly cap the budget was created with. Tiers are picked as percentages of it, so
+    # showing the dollar amount (and what each percentage works out to) tells the admin what the total
+    # possible per-user spend even is. None when the listing couldn't read it — then we just skip the
+    # dollar hints and prompt in percent as before.
+    threshold = next(
+        (budget.get("per_user_threshold") for budget in usable if budget["id"] == budget_id), None
+    )
+    if threshold is not None:
+        print_note(f"This budget's per-user limit is {format_usd(threshold)} per month.")
+
     tiers: list[dict] = []
     seen_percentages: set[float] = set()
     seen_combos: set[tuple[str, str]] = set()
@@ -760,6 +772,13 @@ def _prompt_budget_policy(
         if fraction in seen_percentages:
             print_err("That percentage is already used by another tier; pick a different one.")
             continue
+        if threshold is not None:
+            # Echo the dollars this percentage stands for, so the admin can sanity-check the tier
+            # against the real per-user cap instead of reasoning about percentages in a vacuum.
+            print_note(
+                f"  {fraction * 100:g}% of {format_usd(threshold)} is "
+                f"{format_usd(threshold * Decimal(str(fraction)))}."
+            )
         agent = prompt_for_selection(
             f"Tier {index}: which agent becomes the default?",
             [(tool, TOOL_SPECS[tool]["display"]) for tool in enabled_agents],

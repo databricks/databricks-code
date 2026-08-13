@@ -8,6 +8,7 @@ managed-config types, the admin gate, and the per-agent model-config shapes.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
@@ -1295,6 +1296,54 @@ class TestBudgetPolicy:
                 "default_model": "system.ai.claude-opus-4-8",
             }
         ]
+
+    def test_shows_per_user_threshold_and_tier_dollars(self):
+        # The admin picks tiers as percentages, so surface the budget's per-user monthly cap and what
+        # each percentage works out to in dollars — otherwise a percentage is a number in a vacuum.
+        budgets = [
+            {
+                "id": BUDGET_ID,
+                "display_name": "eng",
+                "has_per_user_block": True,
+                "per_user_threshold": Decimal("500.00"),
+            }
+        ]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
+            ),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+            patch.object(wizard, "print_note") as note,
+        ):
+            wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        notes = " ".join(str(call.args[0]) for call in note.call_args_list)
+        assert "$500" in notes  # the per-user monthly cap
+        assert "$400" in notes  # 80% of $500
+
+    def test_missing_threshold_skips_the_dollar_hints(self):
+        # A budget whose threshold couldn't be read still works; the prompt just omits the dollars.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
+            ),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+            patch.object(wizard, "print_note") as note,
+        ):
+            policy = wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        notes = " ".join(str(call.args[0]) for call in note.call_args_list)
+        assert "$" not in notes
+        assert policy is not None and policy["tiers"][0]["spending_percentage"] == 0.8
 
     def test_offers_only_the_models_the_agent_was_configured_with(self):
         # Pi's catalog spans every family, so offering the workspace catalog would present four

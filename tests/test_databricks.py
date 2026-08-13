@@ -2733,6 +2733,68 @@ class TestListWorkspaceBudgets:
         budgets, _ = list_workspace_budgets("https://ws", "token")
         assert budgets[0]["has_per_user_block"] is False
 
+    def test_extracts_per_user_block_threshold(self, monkeypatch):
+        # The per-user hard block's `quantity_threshold` is the monthly dollar cap; it's read off the
+        # same alert `has_per_user_block` gates on so the tier prompt can show it. A per-user alert
+        # without a block action (email only) contributes no threshold.
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "capped",
+                        "display_name": "capped",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "quantity_threshold": "500.00",
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "email_only",
+                        "display_name": "email only",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "quantity_threshold": "500.00",
+                                "action_configurations": [{"action_type": self.EMAIL}],
+                            }
+                        ],
+                    },
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        by_id = {b["id"]: b for b in budgets}
+        assert by_id["capped"]["per_user_threshold"] == Decimal("500.00")
+        assert by_id["email_only"]["per_user_threshold"] is None
+
+    def test_missing_threshold_is_none_but_block_still_flagged(self, monkeypatch):
+        # A hard block with no (or unparseable) `quantity_threshold` still enforces routing, so the
+        # budget stays offerable — the tier prompt just omits the dollar hint.
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "b",
+                        "display_name": "x",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        assert budgets[0]["has_per_user_block"] is True
+        assert budgets[0]["per_user_threshold"] is None
+
 
 class TestDiscoverSqlWarehouses:
     def _payload(self, *entries: dict) -> dict:
