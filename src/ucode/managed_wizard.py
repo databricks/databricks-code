@@ -71,13 +71,19 @@ from ucode.ui import (
     spinner,
 )
 
-# What `use_as_global_settings` actually does, in plain terms. Admins are choosing whether to write
-# the agent's own global settings file (so it points at the gateway even when launched directly) or
-# a ucode-specific one (so the agent only routes through the gateway when launched via ucode).
+# The OS-level managed settings file `use_as_global_settings` writes for each agent — named in the
+# prompt so an admin sees exactly what answering "yes" touches.
+GLOBAL_SETTINGS_FILES = {
+    "claude": "Claude Code's managed-settings.json",
+    "codex": "Codex's managed_config.toml",
+}
+
+# What `use_as_global_settings` actually does, in plain terms. `{binary}` is filled in per agent.
 GLOBAL_SETTINGS_BLURB = (
-    "Answer Yes to write this agent's own global settings file, so it points at the Databricks "
-    "gateway even when launched directly, without ucode. Answer no to write a ucode-specific "
-    "settings file instead, so the agent only routes through the gateway when launched via ucode."
+    "Yes writes the gateway config into that file (needs sudo once), so a bare `{binary}` reaches "
+    "the Databricks gateway on its own — you don't have to launch it through ucode. No writes a "
+    "ucode-only settings file instead, so `{binary}` uses the gateway only when started with "
+    "`ucode {binary}`."
 )
 
 BUDGET_POLICY_BLURB = (
@@ -1096,9 +1102,10 @@ def setup_command(
         # reads (`/etc/claude-code/managed-settings.json`, `/etc/codex/managed_config.toml`); the
         # other agents don't, so we don't offer them the choice.
         if tool in GLOBAL_SETTINGS_AGENTS:
+            binary = TOOL_SPECS[tool]["binary"]
             agent_config["use_as_global_settings"] = prompt_yes_no_default(
-                f"Write {TOOL_SPECS[tool]['display']}'s config to its global settings file? "
-                f"({GLOBAL_SETTINGS_BLURB})",
+                f"Write {TOOL_SPECS[tool]['display']}'s config to {GLOBAL_SETTINGS_FILES[tool]}? "
+                f"({GLOBAL_SETTINGS_BLURB.format(binary=binary)})",
                 default=False,
             )
         enabled_agents[tool] = agent_config
