@@ -355,6 +355,9 @@ class TestDiscoverModelServices:
         assert ids == ["system.ai.gpt-5"]
         assert reason is None
         assert all("page_size=" in u for u in urls)
+        # Scope to the `system.ai` schema so the endpoint returns just the
+        # foundation models rather than walking the whole metastore.
+        assert all("parent=schemas%2Fsystem.ai" in u for u in urls)
 
     def test_retries_page_before_giving_up(self, monkeypatch):
         payload = {"model_services": [_model_service("system.ai.gpt-5")]}
@@ -2666,23 +2669,46 @@ class TestListWorkspaceBudgets:
             db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
         )
 
-    def test_flags_per_user_alert_presence(self, monkeypatch):
+    BLOCK = "BLOCK_USAGE"
+    EMAIL = "EMAIL_NOTIFICATION"
+
+    def test_flags_per_user_block_presence(self, monkeypatch):
         self._stub(
             monkeypatch,
             {
                 "workspace_ai_gateway_budgets": [
                     {
-                        "budget_configuration_id": "with",
-                        "display_name": "has per-user",
+                        "budget_configuration_id": "blocks",
+                        "display_name": "per-user block",
                         "alert_configurations": [
                             {"scope_type": self.SHARED},
-                            {"scope_type": self.PER_USER},
+                            {
+                                "scope_type": self.PER_USER,
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            },
                         ],
                     },
                     {
-                        "budget_configuration_id": "without",
-                        "display_name": "shared only",
-                        "alert_configurations": [{"scope_type": self.SHARED}],
+                        "budget_configuration_id": "email_only",
+                        "display_name": "per-user email only",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "action_configurations": [
+                                    {"action_type": self.EMAIL, "target": "a@b.com"}
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "shared_block",
+                        "display_name": "shared block only",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.SHARED,
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
                     },
                 ]
             },
@@ -2690,10 +2716,12 @@ class TestListWorkspaceBudgets:
         budgets, reason = list_workspace_budgets("https://ws", "token")
         assert reason is None
         by_id = {b["id"]: b for b in budgets}
-        assert by_id["with"]["has_per_user_alert"] is True
-        assert by_id["without"]["has_per_user_alert"] is False
+        # Only a per-user threshold that also carries a BLOCK_USAGE action enforces spend routing.
+        assert by_id["blocks"]["has_per_user_block"] is True
+        assert by_id["email_only"]["has_per_user_block"] is False
+        assert by_id["shared_block"]["has_per_user_block"] is False
 
-    def test_missing_alert_configs_is_not_per_user(self, monkeypatch):
+    def test_missing_alert_configs_is_not_per_user_block(self, monkeypatch):
         self._stub(
             monkeypatch,
             {
@@ -2703,7 +2731,7 @@ class TestListWorkspaceBudgets:
             },
         )
         budgets, _ = list_workspace_budgets("https://ws", "token")
-        assert budgets[0]["has_per_user_alert"] is False
+        assert budgets[0]["has_per_user_block"] is False
 
 
 class TestDiscoverSqlWarehouses:

@@ -263,10 +263,18 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
         "the agents, models, MCPs, and skills once, and every developer picks them up automatically."
     )
     if prompt_yes_no("Set one up now with `ucode setup`?"):
-        print_note(
-            "Run `ucode setup` to author your workspace's managed config, then `ucode apply`."
-        )
-        raise typer.Exit(0)
+        # Launch the setup flow in place rather than telling them to re-run a command. Reuse the
+        # workspace/profile we already resolved and authenticated against so setup doesn't prompt
+        # for them again.
+        try:
+            code = setup_command(workspace=workspace, profile=profile)
+        except RuntimeError as exc:
+            print_err(str(exc))
+            raise typer.Exit(1) from None
+        except KeyboardInterrupt:
+            print_err("Interrupted.")
+            raise typer.Exit(130) from None
+        raise typer.Exit(code or 0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
@@ -1861,15 +1869,6 @@ def _launch_managed_default(
         with spinner("Checking for a managed coding agent config..."):
             managed = refresh_managed_config(state)
     if not managed:
-        # Only a read that actually reached the workspace can say it publishes no config. Under
-        # --dry-run nothing was fetched, so an empty cache means "not pulled yet" — reporting that
-        # as "no config" would tell an admin their own published config doesn't exist.
-        if dry_run:
-            print_warning(
-                "No managed coding agent config is saved locally yet, so there is nothing to "
-                "dry-run. Run `ucode` without --dry-run to pull your workspace's config first."
-            )
-            return
         _print_no_managed_config_guidance(current, state.get("profile"))
         return
     # The budget tier can move the org to a cheaper agent, so it outranks the config's
@@ -2541,15 +2540,10 @@ def setup(
             "ucode's manifest shape) instead. Validated before it is saved.",
         ),
     ] = None,
-    dry_run: Annotated[
-        bool,
-        typer.Option("--dry-run", help="Walk the flow without writing any files."),
-    ] = False,
 ) -> None:
     """Author the managed coding config for your workspace (workspace admins only)."""
     if ctx.invoked_subcommand is not None:
         return
-    set_dry_run(dry_run)
     # `typer.Exit` subclasses RuntimeError, so it must be raised outside the try — inside, the
     # `except RuntimeError` below would swallow it and report the exit code as an error message.
     try:

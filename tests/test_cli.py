@@ -2369,7 +2369,9 @@ class TestConfigureDeprecation:
         entries = self._resolve([("https://w", None)])
         assert entries == [("https://w", None)]
 
-    def test_admin_who_accepts_exits_to_run_setup(self, monkeypatch):
+    def test_admin_who_accepts_launches_setup_in_place(self, monkeypatch):
+        # Accepting the offer runs `setup_command` right there — reusing the workspace/profile we
+        # already resolved so setup doesn't re-prompt for them — then exits with its code.
         import typer
 
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
@@ -2378,9 +2380,34 @@ class TestConfigureDeprecation:
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
         monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: True)
+        calls = {}
+        monkeypatch.setattr(
+            "ucode.cli.setup_command",
+            lambda **kwargs: calls.update(kwargs) or 0,
+        )
         with pytest.raises(typer.Exit) as exc:
             self._resolve([("https://w", None)])
         assert exc.value.exit_code == 0
+        assert calls == {"workspace": "https://w", "profile": None}
+
+    def test_admin_who_accepts_propagates_setup_failure(self, monkeypatch):
+        # A RuntimeError from setup (e.g. discovery failed) surfaces as a non-zero exit, not a stack
+        # trace bubbling out of configure.
+        import typer
+
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
+        monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: True)
+        monkeypatch.setattr(
+            "ucode.cli.setup_command",
+            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("no agents")),
+        )
+        with pytest.raises(typer.Exit) as exc:
+            self._resolve([("https://w", None)])
+        assert exc.value.exit_code == 1
 
     def test_non_admin_is_never_prompted_for_setup(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")

@@ -409,29 +409,32 @@ def is_workspace_admin(workspace: str, token: str) -> bool | None:
 _WORKSPACE_BUDGETS_API_PATH = "/api/ai-gateway/v2/workspace-metrics/budgets"
 
 
-# Alert-config scope that carries a per-user threshold. A budget's coding-agent spend routing only
-# works when it has one: the gateway's `recommendModel` measures the caller's spend against a
-# per-user threshold, so a budget with only a shared (workspace-wide) alert reports no spend and
-# leaves every tier inert. The listing exposes `scope_type` but not the alert's action, so ucode can
-# only check for the scope's presence; the server enforces the (block) action on config create.
 _PER_USER_ALERT_SCOPE = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
+_BLOCK_ACTION_TYPE = "BLOCK_USAGE"
 
 
-def _has_per_user_alert(entry: dict) -> bool:
-    """Whether a raw budget entry carries a per-user alert threshold."""
+def _has_per_user_block(entry: dict) -> bool:
+    """Whether a raw budget entry has a per-user alert threshold that hard-blocks usage.
+
+    True only when some alert is per-user scoped *and* carries a ``BLOCK_USAGE`` action; a per-user
+    alert with only an email notification does not enforce spend routing.
+    """
     for alert in entry.get("alert_configurations") or []:
-        if isinstance(alert, dict) and alert.get("scope_type") == _PER_USER_ALERT_SCOPE:
-            return True
+        if not isinstance(alert, dict) or alert.get("scope_type") != _PER_USER_ALERT_SCOPE:
+            continue
+        for action in alert.get("action_configurations") or []:
+            if isinstance(action, dict) and action.get("action_type") == _BLOCK_ACTION_TYPE:
+                return True
     return False
 
 
 def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str | None]:
     """List the AI Gateway budgets that apply to this workspace.
 
-    Returns ``(budgets, reason)`` where each budget is ``{"id", "display_name", "has_per_user_alert"}``.
+    Returns ``(budgets, reason)`` where each budget is ``{"id", "display_name", "has_per_user_block"}``.
     ``reason`` is None on success, otherwise it explains why the list is empty. ucode never creates
-    budgets — an admin picks an existing one to attach a spend-routing policy to. ``has_per_user_alert``
-    lets the picker hide budgets that can't drive spend routing (see ``_PER_USER_ALERT_SCOPE``).
+    budgets — an admin picks an existing one to attach a spend-routing policy to. ``has_per_user_block``
+    lets the picker hide budgets that can't enforce spend routing (see ``_has_per_user_block``).
     """
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}{_WORKSPACE_BUDGETS_API_PATH}"
@@ -455,7 +458,7 @@ def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str 
             {
                 "id": budget_id,
                 "display_name": display_name if isinstance(display_name, str) else "",
-                "has_per_user_alert": _has_per_user_alert(entry),
+                "has_per_user_block": _has_per_user_block(entry),
             }
         )
     if not budgets:
@@ -1328,10 +1331,18 @@ def build_auth_shell_command(
 # part after the prefix is exactly the model string agents send (no
 # `databricks-` infix — that only appears on the inner destination name).
 _MODEL_SERVICE_NAME_PREFIX = "model-services/"
-# The metastore-scope listing returns services from EVERY schema (e.g.
-# `main.user.foo`, `temp.*`, internal DLT schemas). We only want the
-# Databricks-managed foundation models under `system.ai`.
+# The listing can return services from EVERY schema (e.g. `main.user.foo`,
+# `temp.*`, internal DLT schemas). We only want the Databricks-managed
+# foundation models under `system.ai`.
 _MODEL_SERVICE_REQUIRED_PREFIX = "system.ai."
+# Scope the listing to the `system.ai` schema via the `parent` query param
+# (`schemas/{catalog}.{schema}`). Without it the endpoint walks the ENTIRE
+# metastore — hundreds of unrelated services across dozens of ~2s pages, then
+# discards all but `system.ai.*` client-side (a ~50s walk on a busy workspace).
+# Parent-scoped, the same set comes back in a single page (~1s). The endpoint
+# ignores the other filters (`catalog_name`/`schema_name`/`filter`), so `parent`
+# is the only server-side narrowing that works.
+_MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 
 # Supported OSS chat families, matched by name substring. Add an entry to
 # support a new family.
@@ -1473,11 +1484,14 @@ def list_model_services(
 ) -> tuple[list[str], str | None]:
     """List all `system.ai.*` model ids via the UC model-services API.
 
-    Pages through ``/api/2.1/unity-catalog/model-services`` (metastore scope)
-    with a bounded ``page_size`` (the endpoint 499s without one) and returns the
-    de-duplicated, sorted list of ``system.ai.<model-name>`` ids. Returns
-    (ids, reason); reason is None on success, otherwise it describes why the
-    list is empty (HTTP/network error or no services).
+    Pages through ``/api/2.1/unity-catalog/model-services`` scoped to the
+    ``system.ai`` schema (``parent=schemas/system.ai``) with a bounded
+    ``page_size`` (the endpoint 499s without one) and returns the de-duplicated,
+    sorted list of ``system.ai.<model-name>`` ids. Returns (ids, reason); reason
+    is None on success, otherwise it describes why the list is empty (HTTP/network
+    error or no services). Scoping matters: the unscoped metastore listing walks
+    every schema across dozens of ~2s pages (~50s on a busy workspace) only to
+    keep the same ``system.ai.*`` subset — see ``_MODEL_SERVICE_PARENT_SCHEMA``.
 
     A successful result is memoized per workspace for the life of the process; pass
     ``use_cache=False`` to force a fresh walk.
@@ -1493,7 +1507,10 @@ def list_model_services(
     seen_tokens: set[str] = set()
     last_reason: str | None = None
     for _ in range(max_pages):
-        params: dict[str, str] = {"page_size": str(page_size)}
+        params: dict[str, str] = {
+            "parent": _MODEL_SERVICE_PARENT_SCHEMA,
+            "page_size": str(page_size),
+        }
         if page_token:
             params["page_token"] = page_token
         url = f"https://{hostname}/api/2.1/unity-catalog/model-services?{urlencode(params)}"
@@ -1649,6 +1666,47 @@ def fetch_model_recommendation(workspace: str, token: str) -> tuple[dict, str | 
     if not isinstance(payload, dict):
         return {}, "recommendModel returned an unexpected response shape"
     return payload, None
+
+
+# The gateway's per-model price catalog (USD per million tokens), sourced from the same Zippy data
+# the server uses to bill external-model spend. We read it to estimate per-model cost from token
+# counts, since no API returns per-model dollars directly.
+_EXTERNAL_PROVIDER_MODELS_API_PATH = "/api/ai-gateway/v2/external-provider-models"
+_EXTERNAL_PROVIDER_MODELS_PAGE_SIZE = 1000
+_EXTERNAL_PROVIDER_MODELS_MAX_PAGES = 20
+
+
+def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict], str | None]:
+    """List external-provider models and their `base_pricing` (USD per million tokens) via the gateway.
+
+    Returns ``(models, reason)`` with each model the raw API entry; ``reason`` is non-None on failure
+    (callers omit cost rather than fail).
+    """
+    hostname = workspace_hostname(workspace)
+    base_url = f"https://{hostname}{_EXTERNAL_PROVIDER_MODELS_API_PATH}"
+    models: list[dict] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(_EXTERNAL_PROVIDER_MODELS_MAX_PAGES):
+        params: dict[str, str] = {"page_size": str(_EXTERNAL_PROVIDER_MODELS_PAGE_SIZE)}
+        if page_token:
+            params["page_token"] = page_token
+        payload, reason = _http_get_json(f"{base_url}?{urlencode(params)}", token, timeout=30)
+        if payload is None:
+            # Return what we have if a later page blips; only the first-page failure is fatal.
+            return (models, None) if models else ([], reason or "unknown error")
+        if not isinstance(payload, dict):
+            return [], "external-provider-models returned an unexpected response shape"
+        for entry in payload.get("models") or []:
+            if isinstance(entry, dict) and entry.get("model_name"):
+                models.append(entry)
+        page_token = payload.get("next_page_token") or None
+        if not page_token or page_token in seen_tokens:
+            break
+        seen_tokens.add(page_token)
+    if not models:
+        return [], "external-provider-models listing returned no models"
+    return models, None
 
 
 # Every field ucode's manifest can set, as `update_mask` paths for a PATCH. The server rejects a
