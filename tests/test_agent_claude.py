@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -468,75 +469,101 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
         assert written[0]["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
 
-class TestWriteToolConfigNativeSettings:
-    """use_as_global_settings: also write Claude Code's own ~/.claude/settings.json."""
+FAKE_MANAGED_PATH = Path("/tmp/ucode-test/managed-settings.json")
 
-    def _patch(self, monkeypatch, writes, existing_by_path=None):
+
+class TestWriteToolConfigManagedSettings:
+    """use_as_global_settings: also write Claude Code's OS managed-settings.json (via sudo, mocked)."""
+
+    def _patch(self, monkeypatch, private_writes, managed_writes, existing_by_path=None):
         existing_by_path = existing_by_path or {}
         monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        # Deep-copy the seeded existing content so the compose step can't mutate the fixture.
         monkeypatch.setattr(
-            claude, "read_json_safe", lambda path: dict(existing_by_path.get(str(path), {}))
+            claude,
+            "read_json_safe",
+            lambda path: json.loads(json.dumps(existing_by_path.get(str(path), {}))),
         )
         monkeypatch.setattr(
-            claude, "write_json_file", lambda path, payload: writes.append((str(path), payload))
+            claude,
+            "write_json_file",
+            lambda path, payload: private_writes.append((str(path), payload)),
         )
         monkeypatch.setattr(claude, "save_state", lambda state: None)
         monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
-        # Keep the enterprise managed-settings checks deterministic regardless of the host machine.
-        monkeypatch.setattr(claude, "_managed_relayed_conflicts", lambda: None)
-        monkeypatch.setattr(claude, "managed_settings_model_overrides", lambda: None)
+        # Deterministic managed path, and a mocked sudo writer so NO real sudo/`/etc` write happens.
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: FAKE_MANAGED_PATH)
 
-    def test_writes_native_file_when_flagged(self, monkeypatch):
-        writes: list = []
-        self._patch(monkeypatch, writes)
-        state = {"workspace": WS, "codex_models": [], "write_native_config": True}
+        def fake_write_managed(path, text, *, display):
+            managed_writes.append((str(path), text))
+            return "written"
+
+        monkeypatch.setattr(claude, "write_managed_file", fake_write_managed)
+
+    def test_writes_managed_file_when_flagged(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
         result = claude.write_tool_config(state, "databricks-claude-sonnet-4")
-        paths = [p for p, _ in writes]
-        assert str(claude.CLAUDE_SETTINGS_PATH) in paths
-        assert str(claude.CLAUDE_NATIVE_SETTINGS_PATH) in paths
+        # Private file still written; managed file written too.
+        assert str(claude.CLAUDE_SETTINGS_PATH) in [p for p, _ in private_writes]
+        assert [p for p, _ in managed_writes] == [str(FAKE_MANAGED_PATH)]
         native = result["managed_configs"]["claude"]["native"]
-        assert native[0]["path"] == str(claude.CLAUDE_NATIVE_SETTINGS_PATH)
+        assert native[0]["path"] == str(FAKE_MANAGED_PATH)
         assert native[0]["format"] == "json"
 
-    def test_native_file_preserves_user_keys(self, monkeypatch):
-        writes: list = []
-        existing = {str(claude.CLAUDE_NATIVE_SETTINGS_PATH): {"env": {"MY_OWN": "keep"}}}
-        self._patch(monkeypatch, writes, existing)
-        state = {"workspace": WS, "codex_models": [], "write_native_config": True}
+    def test_managed_file_preserves_other_keys(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        # An IT-authored key already in the managed file must survive the merge.
+        existing = {str(FAKE_MANAGED_PATH): {"env": {"MY_OWN": "keep"}}}
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
-        native = next(p for path, p in writes if path == str(claude.CLAUDE_NATIVE_SETTINGS_PATH))
-        # The user's own key survives; ucode's gateway keys are merged in alongside it.
-        assert native["env"]["MY_OWN"] == "keep"
-        assert native["env"]["ANTHROPIC_BASE_URL"]
-        assert native["apiKeyHelper"]
+        _, text = managed_writes[0]
+        written = json.loads(text)
+        assert written["env"]["MY_OWN"] == "keep"
+        assert written["env"]["ANTHROPIC_BASE_URL"]
+        assert written["apiKeyHelper"]
 
-    def test_no_native_write_by_default(self, monkeypatch):
-        writes: list = []
-        self._patch(monkeypatch, writes)
+    def test_no_managed_write_by_default(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
         state = {"workspace": WS, "codex_models": []}
         result = claude.write_tool_config(state, "databricks-claude-sonnet-4")
-        paths = [p for p, _ in writes]
-        assert str(claude.CLAUDE_NATIVE_SETTINGS_PATH) not in paths
+        assert managed_writes == []
         assert "native" not in result["managed_configs"]["claude"]
 
-    def test_relayed_skips_native_write(self, monkeypatch):
-        writes: list = []
+    def test_relayed_skips_managed_write(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
         warns: list = []
-        self._patch(monkeypatch, writes)
+        self._patch(monkeypatch, private_writes, managed_writes)
         monkeypatch.setattr(claude, "print_warning", lambda msg: warns.append(msg))
         monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
-        state = {"workspace": WS, "codex_models": [], "write_native_config": True}
+        state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
         result = claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
-        paths = [p for p, _ in writes]
-        assert str(claude.CLAUDE_NATIVE_SETTINGS_PATH) not in paths
+        assert managed_writes == []
         assert result["managed_configs"]["claude"].get("native") is None
         assert any("bare `claude`" in w for w in warns)
 
 
-class TestClaudeRevertNativeConfig:
-    def test_prunes_only_tracked_keys(self, tmp_path):
-        native_path = tmp_path / "settings.json"
-        native_path.write_text(
+class TestClaudeRevertManagedConfig:
+    @staticmethod
+    def _mock_sudo_prune(monkeypatch):
+        # Route the sudo write straight to disk (the descriptor path is a tmp file) — never real sudo.
+        def fake_prune(path, text, *, display):
+            Path(path).write_text(text, encoding="utf-8")
+            return "written"
+
+        monkeypatch.setattr(claude, "prune_managed_file", fake_prune)
+
+    def test_prunes_only_tracked_keys(self, tmp_path, monkeypatch):
+        self._mock_sudo_prune(monkeypatch)
+        managed_path = tmp_path / "managed-settings.json"
+        managed_path.write_text(
             json.dumps({"env": {"ANTHROPIC_BASE_URL": "x", "MY": "keep"}, "apiKeyHelper": "h"}),
             encoding="utf-8",
         )
@@ -546,7 +573,7 @@ class TestClaudeRevertNativeConfig:
                     "keys": [],
                     "native": [
                         {
-                            "path": str(native_path),
+                            "path": str(managed_path),
                             "format": "json",
                             "keys": [["env", "ANTHROPIC_BASE_URL"], ["apiKeyHelper"]],
                         }
@@ -554,18 +581,20 @@ class TestClaudeRevertNativeConfig:
                 }
             }
         }
-        assert claude.revert_native_config(state) == "ucode entries removed"
-        assert json.loads(native_path.read_text()) == {"env": {"MY": "keep"}}
+        assert claude.revert_managed_config(state) == "ucode entries removed"
+        assert json.loads(managed_path.read_text()) == {"env": {"MY": "keep"}}
 
-    def test_returns_none_without_native_tracking(self):
+    def test_returns_none_without_native_tracking(self, monkeypatch):
+        self._mock_sudo_prune(monkeypatch)
         state = {"managed_configs": {"claude": {"keys": []}}}
-        assert claude.revert_native_config(state) is None
+        assert claude.revert_managed_config(state) is None
 
-    def test_preserves_user_hooks_under_managed_events(self, tmp_path):
+    def test_preserves_user_hooks_under_managed_events(self, tmp_path, monkeypatch):
         # Regression: the descriptor's `keys` include whole hook-event paths (["hooks","PreToolUse"],
         # ["hooks","Stop"], ...). Path-pruning those deleted the user's own hooks registered under the
         # same events. Revert must surgically strip only ucode's marker-matched hooks, symmetric with
         # the write path.
+        self._mock_sudo_prune(monkeypatch)
         user_pre = {"matcher": "Bash", "hooks": [{"type": "command", "command": "my-linter"}]}
         ucode_pre = {
             "matcher": "Agent|Task",
@@ -573,7 +602,7 @@ class TestClaudeRevertNativeConfig:
         }
         user_stop = {"hooks": [{"type": "command", "command": "my-notify"}]}
         ucode_stop = {"hooks": [{"type": "command", "command": "mlflow autolog claude stop-hook"}]}
-        native_path = tmp_path / "settings.json"
+        native_path = tmp_path / "managed-settings.json"
         native_path.write_text(
             json.dumps(
                 {
@@ -608,7 +637,7 @@ class TestClaudeRevertNativeConfig:
                 }
             }
         }
-        assert claude.revert_native_config(state) == "ucode entries removed"
+        assert claude.revert_managed_config(state) == "ucode entries removed"
         result = json.loads(native_path.read_text())
         # ucode's env key gone, the user's kept.
         assert result["env"] == {"MY": "keep"}

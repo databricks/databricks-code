@@ -1515,7 +1515,7 @@ class TestSummary:
         assert "models:" not in out
 
     def test_scope_label_only_for_global_capable_agents(self, capsys):
-        # claude/codex can be machine-wide, so they carry the scope; gemini can't, so it doesn't.
+        # claude/codex can use global settings, so they carry the scope; gemini can't, so it doesn't.
         manifest = {
             "default_agent": "claude",
             "enabled_agents": {
@@ -1528,10 +1528,10 @@ class TestSummary:
         }
         wizard._render_summary(WORKSPACE, manifest)
         out = capsys.readouterr().out
-        assert "machine-wide" in out
-        # The gemini line names its model but carries no per-user/machine-wide scope.
+        assert "global settings" in out
+        # The gemini line names its model but carries no global-settings/ucode-only scope.
         gemini_line = next(line for line in out.splitlines() if "gemini-3-flash" in line)
-        assert "per-user" not in gemini_line and "machine-wide" not in gemini_line
+        assert "ucode-only" not in gemini_line and "global settings" not in gemini_line
 
 
 class TestSetupFromFile:

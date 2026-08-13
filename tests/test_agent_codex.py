@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -654,57 +655,66 @@ class TestCodexLaunch:
         assert fallbacks == []
 
 
-class TestCodexNativeConfig:
-    """use_as_global_settings: also write the native ~/.codex/config.toml so a bare `codex` works."""
+class TestCodexManagedConfig:
+    """use_as_global_settings: also write Codex's OS managed_config.toml (via sudo, mocked)."""
 
     def _patch(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
-        native_path = tmp_path / ".codex" / "config.toml"
+        managed_path = tmp_path / "etc-codex" / "managed_config.toml"
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
         monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "codex-ucode-config.backup.toml")
-        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", native_path)
         monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
         monkeypatch.setattr(codex, "save_state", lambda state: None)
-        return config_path, native_path
+        # Deterministic managed path + a mocked sudo writer that writes straight to disk, so the test
+        # can read the TOML back and NO real sudo/`/etc` write ever happens.
+        monkeypatch.setattr(codex, "_managed_config_path", lambda: managed_path)
 
-    def test_writes_native_config_when_flagged(self, tmp_path, monkeypatch):
-        _, native_path = self._patch(tmp_path, monkeypatch)
-        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_native_config": True}
+        def fake_write_managed(path, text, *, display):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(text, encoding="utf-8")
+            return "written"
+
+        monkeypatch.setattr(codex, "write_managed_file", fake_write_managed)
+        return config_path, managed_path
+
+    def test_writes_managed_config_when_flagged(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
         result = codex.write_tool_config(state)
 
-        doc = read_toml_safe(native_path)
+        doc = read_toml_safe(managed_path)
         assert doc["model_provider"] == "ucode-databricks"
         assert doc["model"] == "gpt-5"
         assert "ucode-databricks" in doc["model_providers"]
         native = result["managed_configs"]["codex"]["native"]
-        assert native[0]["path"] == str(native_path)
+        assert native[0]["path"] == str(managed_path)
         assert native[0]["format"] == "toml"
 
-    def test_native_config_preserves_user_keys(self, tmp_path, monkeypatch):
-        _, native_path = self._patch(tmp_path, monkeypatch)
-        native_path.parent.mkdir(parents=True, exist_ok=True)
-        native_path.write_text(
+    def test_managed_config_preserves_other_keys(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        managed_path.parent.mkdir(parents=True, exist_ok=True)
+        managed_path.write_text(
             'model = "my-own"\napproval_policy = "on-request"\n', encoding="utf-8"
         )
-        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_native_config": True}
+        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
         codex.write_tool_config(state)
 
-        doc = read_toml_safe(native_path)
-        # ucode pins its own model, but the user's unrelated keys survive.
+        doc = read_toml_safe(managed_path)
+        # ucode pins its own model, but other keys already in the managed file survive.
         assert doc["approval_policy"] == "on-request"
         assert doc["model"] == "gpt-5"
 
-    def test_no_native_write_by_default(self, tmp_path, monkeypatch):
-        _, native_path = self._patch(tmp_path, monkeypatch)
+    def test_no_managed_write_by_default(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
         state = {"workspace": WS, "codex_models": ["gpt-5"]}
         result = codex.write_tool_config(state)
-        assert not native_path.exists()
+        assert not managed_path.exists()
         assert "native" not in result["managed_configs"]["codex"]
 
-    def test_revert_strips_native_entries(self, tmp_path, monkeypatch):
-        _, native_path = self._patch(tmp_path, monkeypatch)
-        native_path.parent.mkdir(parents=True, exist_ok=True)
-        native_path.write_text(
+    def test_revert_strips_managed_entries(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        managed_path.parent.mkdir(parents=True, exist_ok=True)
+        managed_path.write_text(
             'model = "gpt-5"\nmodel_provider = "ucode-databricks"\napproval_policy = "on-request"\n'
             '\n[model_providers.ucode-databricks]\nbase_url = "x"\n',
             encoding="utf-8",
@@ -713,12 +723,12 @@ class TestCodexNativeConfig:
             "managed_configs": {
                 "codex": {
                     "keys": [],
-                    "native": [{"path": str(native_path), "format": "toml", "keys": []}],
+                    "native": [{"path": str(managed_path), "format": "toml", "keys": []}],
                 }
             }
         }
-        assert codex.revert_native_config(state) == "ucode entries removed"
-        doc = read_toml_safe(native_path)
+        assert codex.revert_managed_config(state) == "ucode entries removed"
+        doc = read_toml_safe(managed_path)
         assert "model_provider" not in doc
         assert "model" not in doc
         assert "model_providers" not in doc
@@ -727,4 +737,4 @@ class TestCodexNativeConfig:
 
     def test_revert_returns_none_without_native(self):
         state = {"managed_configs": {"codex": {"keys": []}}}
-        assert codex.revert_native_config(state) is None
+        assert codex.revert_managed_config(state) is None

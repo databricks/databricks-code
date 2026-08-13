@@ -32,6 +32,7 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
+from ucode.managed_files import prune_managed_file, write_managed_file
 from ucode.smart_routing.claude_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
@@ -44,10 +45,6 @@ from ucode.ui import print_err, print_note, print_success, print_warning
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
-# Claude Code's own user-scope settings file, read by a bare `claude` with no flags. ucode writes
-# here (in addition to the private file above) only when the managed config sets
-# use_as_global_settings, so a developer who launches `claude` directly still hits the gateway.
-CLAUDE_NATIVE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "settings.json"
 
 SPEC: ToolSpec = {
     "binary": "claude",
@@ -563,9 +560,9 @@ def write_tool_config(
 
     write_json_file(CLAUDE_SETTINGS_PATH, _compose(read_json_safe(CLAUDE_SETTINGS_PATH)))
 
-    native_configs = None
-    if state.get("write_native_config"):
-        native_configs = _write_native_settings(_compose, managed_keys, relayed)
+    managed_descriptors = None
+    if state.get("write_managed_config"):
+        managed_descriptors = _write_managed_settings(_compose, managed_keys, relayed)
 
     if web_search_model:
         _register_web_search_mcp(state["workspace"], web_search_model, state.get("profile"))
@@ -577,20 +574,22 @@ def write_tool_config(
     else:
         state.pop("claude_relayed", None)
         state.pop("relayed_proxy_port", None)
-    state = mark_tool_managed(state, "claude", managed_keys, native=native_configs)
+    state = mark_tool_managed(state, "claude", managed_keys, native=managed_descriptors)
     save_state(state)
     return state
 
 
-def _write_native_settings(
+def _write_managed_settings(
     compose: Callable[[dict], dict], managed_keys: list[list[str]], relayed: bool
 ) -> list[dict] | None:
-    """Mirror ucode's managed config into Claude Code's native ~/.claude/settings.json.
+    """Write ucode's config into Claude Code's OS managed-settings.json so a bare `claude` works.
 
-    Runs only under use_as_global_settings so a bare `claude` reaches the gateway. The same compose
-    (merge overlay + prune stale keys) that produced the private file is applied to the user's own
-    settings, so their unrelated keys survive. Returns the native descriptor for revert tracking, or
-    None when nothing was written.
+    Runs only under use_as_global_settings. The managed file is root-owned and the highest-precedence
+    scope, so it applies whether or not `ucode` launches `claude`. The same compose (merge overlay +
+    prune stale keys) that produced the private file is applied to the existing managed file, so any
+    real IT-authored keys already there survive. The write goes through the isaac-style sudo path
+    (drift-suppressed, so no password prompt when unchanged). Returns the descriptor for revert
+    tracking, or None when nothing was written.
 
     Relayed launches are skipped: they depend on a per-session loopback refresh proxy that only runs
     during `ucode claude`, so a bare `claude` could not reach the gateway anyway.
@@ -598,36 +597,30 @@ def _write_native_settings(
     if relayed:
         print_warning(
             "Claude subscription-relay launches use a per-session proxy a bare `claude` can't "
-            "reach, so ucode did not write ~/.claude/settings.json for machine-wide use. Launch "
-            "with `ucode claude` to use the relay."
+            "reach, so ucode did not write the managed settings file. Launch with `ucode claude` "
+            "to use the relay."
         )
         return None
-    write_json_file(
-        CLAUDE_NATIVE_SETTINGS_PATH, compose(read_json_safe(CLAUDE_NATIVE_SETTINGS_PATH))
-    )
-    # Enterprise managed settings outrank the user scope per key and can't be excluded, so warn when
-    # they'd shadow what we just wrote — a bare `claude` would silently ignore ucode's config there.
-    conflict = _managed_relayed_conflicts()
-    overrides = managed_settings_model_overrides()
-    if conflict:
-        conflict_path, keys = conflict
+    path = _managed_settings_path()
+    if path is None:
         print_warning(
-            f"Enterprise managed settings at {conflict_path} set {', '.join(keys)}, which override "
-            "~/.claude/settings.json — a bare `claude` may not route through the gateway."
+            "Machine-wide Claude settings aren't supported on this platform; skipped the managed "
+            "settings write."
         )
-    elif overrides:
-        print_warning(
-            f"Enterprise managed settings at {overrides} pin a model, which overrides the workspace "
-            "default a bare `claude` would otherwise use."
-        )
-    return [{"path": str(CLAUDE_NATIVE_SETTINGS_PATH), "format": "json", "keys": managed_keys}]
+        return None
+    desired = json.dumps(compose(read_json_safe(path)), indent=2)
+    status = write_managed_file(path, desired, display="Claude Code")
+    if status == "skipped":
+        return None
+    return [{"path": str(path), "format": "json", "keys": managed_keys}]
 
 
-def revert_native_config(state: dict) -> str | None:
-    """Surgically strip ucode's keys from native config files it wrote under use_as_global_settings.
+def revert_managed_config(state: dict) -> str | None:
+    """Surgically strip ucode's keys from the managed settings file it wrote under
+    use_as_global_settings, writing the pruned file back via sudo.
 
     Returns a short status ("ucode entries removed" / "unchanged") for the revert summary, or None
-    when ucode never wrote a native file for claude.
+    when ucode never wrote a managed file for claude.
     """
     native = ((state.get("managed_configs") or {}).get("claude") or {}).get("native")
     if not isinstance(native, list) or not native:
@@ -663,8 +656,12 @@ def revert_native_config(state: dict) -> str | None:
             if json.dumps(doc.get("hooks"), sort_keys=True) != before:
                 file_changed = True
         if file_changed:
-            write_json_file(path, doc)
-            changed = True
+            # Root-owned managed file: write the pruned content back via sudo (drift-suppressed).
+            if (
+                prune_managed_file(path, json.dumps(doc, indent=2), display="Claude Code")
+                != "skipped"
+            ):
+                changed = True
     return "ucode entries removed" if changed else "unchanged"
 
 

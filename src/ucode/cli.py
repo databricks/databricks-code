@@ -999,11 +999,12 @@ def revert() -> int:
     # Older Codex (< 0.134.0) had ucode edit the shared ~/.codex/config.toml in
     # place; restoring the per-profile file above does not undo that.
     legacy_codex_stripped = revert_legacy_shared_config()
-    # Native config files written under use_as_global_settings (a bare `claude` / `codex` reading
-    # the tool's own config): surgically strip ucode's keys, never touching the user's own settings.
-    native_reverts = {
-        "claude": claude_agent.revert_native_config(state),
-        "codex": codex_agent.revert_native_config(state),
+    # OS managed settings files written under use_as_global_settings (the highest-precedence config a
+    # bare `claude` / `codex` reads): surgically strip ucode's keys via sudo, never touching other
+    # keys. Runs before clear_state so the tracked descriptors are still available.
+    managed_reverts = {
+        "claude": claude_agent.revert_managed_config(state),
+        "codex": codex_agent.revert_managed_config(state),
     }
     clear_state()
 
@@ -1013,9 +1014,9 @@ def revert() -> int:
         print_kv(f"{spec['display']} config", "restored" if results[tool] else "unchanged")
     if legacy_codex_stripped:
         print_kv("Codex shared config", "ucode entries removed")
-    for tool, status in native_reverts.items():
+    for tool, status in managed_reverts.items():
         if status:
-            print_kv(f"{TOOL_SPECS[tool]['display']} native config", status)
+            print_kv(f"{TOOL_SPECS[tool]['display']} managed config", status)
     print_kv("Pi settings", "restored" if pi_settings_restored else "unchanged")
     for client, spec in MCP_CLIENTS.items():
         print_kv(

@@ -829,7 +829,9 @@ def _render_summary(workspace: str, manifest: dict) -> None:
             detail = f"{detail} via {provider}"
         # Only agents that can use global settings carry the scope label; for the rest it's not a choice.
         if tool in GLOBAL_SETTINGS_AGENTS:
-            scope = "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
+            scope = (
+                "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
+            )
             lines.append(kv_line(display, f"{detail} ({scope})"))
         else:
             lines.append(kv_line(display, detail))

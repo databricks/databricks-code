@@ -204,19 +204,19 @@ class TestGlobalSettings:
         managed = {"enabled_agents": {"gemini": {"use_as_global_settings": True}}}
         assert managed_use_as_global_settings(managed, "gemini") is False
 
-    def test_resolve_sets_transient_write_native_config(self):
+    def test_resolve_sets_transient_write_managed_config(self):
         resolved = resolve_state(MANAGED, _state(), "claude")
-        assert resolved["write_native_config"] is True
+        assert resolved["write_managed_config"] is True
 
     def test_resolve_omits_flag_when_not_opted_in(self):
         resolved = resolve_state(MANAGED, _state(), "codex")
-        assert "write_native_config" not in resolved
+        assert "write_managed_config" not in resolved
 
-    def test_write_native_config_is_not_persisted(self):
+    def test_write_managed_config_is_not_persisted(self):
         # It lives only for the config-write; save_state (via _without_managed_overlay) drops it so
-        # a later non-managed launch never writes native files.
+        # a later non-managed launch never writes the managed settings file.
         resolved = resolve_state(MANAGED, _state(), "claude")
-        assert "write_native_config" not in _without_managed_overlay(resolved)
+        assert "write_managed_config" not in _without_managed_overlay(resolved)
 
 
 class TestStateFileIsNotRewritten:
