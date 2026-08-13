@@ -425,6 +425,20 @@ class TestModelServiceExists:
         assert exists is None
         assert "500" in reason
 
+    def test_not_found_means_absent(self, monkeypatch):
+        # A 404 is the catalog/schema not existing, so the model can't either — a definitive "no"
+        # the caller re-prompts on, not an inconclusive "couldn't verify".
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (
+                None,
+                'HTTP 404 Not Found: {"error_code":"NOT_FOUND","message":"Resource not found"}',
+            ),
+        )
+        exists, _ = db_mod.model_service_exists(WS, "token", "maikjn.default.aar")
+        assert exists is False
+
     def test_paginates_until_found(self, monkeypatch):
         pages = {
             None: {

@@ -1056,6 +1056,15 @@ class TestCustomModelEntry:
         assert config["default_model"] == "main.real.model"
         assert err.called
 
+    def test_short_reason_drops_the_json_body(self):
+        # The warning for an inconclusive check should show the status, not the raw error blob.
+        assert (
+            wizard._short_reason('HTTP 500 Server Error: {"error_code":"INTERNAL"}')
+            == "HTTP 500 Server Error"
+        )
+        assert wizard._short_reason("network error: timed out") == "network error: timed out"
+        assert wizard._short_reason(None) == "unknown error"
+
     def test_unverifiable_custom_model_is_accepted_with_a_warning(self):
         # An inconclusive check (transient error / no token) must not block a possibly-valid model.
         with (

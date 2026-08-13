@@ -683,6 +683,19 @@ def _custom_option_rows(options: list[tuple[str, str]]) -> list[tuple[str, str]]
     return list(options[:_MODEL_PICKER_LIMIT]) + [(_CUSTOM_MODEL, _CUSTOM_MODEL_LABEL)]
 
 
+def _short_reason(reason: str | None) -> str:
+    """A one-line reason fit for a prompt, without the raw JSON body the transport appends.
+
+    HTTP failures come back as ``HTTP <code> <reason>: <body-excerpt>`` (the body is a JSON error
+    blob for gateway/UC errors); an admin at a prompt wants the status, not the payload. Keeps the
+    ``HTTP <code> <reason>`` head and drops a ``{...}`` body, leaving plain reasons (``network
+    error: ...``) untouched.
+    """
+    if not reason:
+        return "unknown error"
+    return reason.split(": {", 1)[0].strip()
+
+
 def _verify_custom_model(state: dict, model: str) -> tuple[bool | None, str | None]:
     """Whether ``model`` is a model service on the workspace; None when the check can't run.
 
@@ -714,7 +727,8 @@ def _prompt_custom_model(state: dict) -> str:
             return model
         if exists is None:
             print_warning(
-                f"Couldn't verify '{model}' on this workspace ({reason}); using it as typed."
+                f"Couldn't verify '{model}' on this workspace ({_short_reason(reason)}); "
+                "using it as typed."
             )
             return model
         print_err(

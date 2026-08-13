@@ -1542,6 +1542,14 @@ def list_model_services(
     return [], last_reason or "model-services listing returned no models"
 
 
+def _is_not_found_reason(reason: str | None) -> bool:
+    """True when an HTTP reason describes a 404 / NOT_FOUND (a resource that isn't there)."""
+    if not reason:
+        return False
+    lowered = reason.lower()
+    return "http 404" in lowered or "not_found" in lowered
+
+
 def model_service_exists(
     workspace: str, token: str, full_name: str, *, max_pages: int = 100
 ) -> tuple[bool | None, str | None]:
@@ -1551,10 +1559,17 @@ def model_service_exists(
     model services in the typed name's own schema (``parent=schemas/<catalog>.<schema>``, the same
     scoped listing :func:`list_model_services` uses for ``system.ai``) and checks for the name.
 
-    Returns ``(exists, reason)``. ``exists`` is None when the check couldn't run — a name that isn't
-    a three-part UC path, or an HTTP/network error — so the caller can treat "couldn't verify" as
-    distinct from "doesn't exist" and avoid blocking a valid model on a transient failure. Never
-    cached: it targets a user schema, not the memoized ``system.ai`` walk.
+    Returns ``(exists, reason)``:
+
+    - ``True`` — the name is a model service in that schema.
+    - ``False`` — the schema exists but has no such service, or the API returned 404/NOT_FOUND (the
+      catalog or schema in the name doesn't exist, so the model can't either). Both are a definitive
+      "no" the caller can re-prompt on.
+    - ``None`` — the check couldn't run: a name that isn't a three-part UC path, or a non-404
+      HTTP/network error. The caller treats this as "couldn't verify" rather than "doesn't exist" so
+      a transient failure never blocks a valid model.
+
+    Never cached: it targets a user schema, not the memoized ``system.ai`` walk.
     """
     parts = [part.strip() for part in full_name.split(".")]
     if len(parts) != 3 or not all(parts):
@@ -1572,7 +1587,10 @@ def model_service_exists(
         url = f"https://{hostname}/api/2.1/unity-catalog/model-services?{urlencode(params)}"
         payload, reason = _get_model_services_page(url, token)
         if payload is None:
-            return None, reason
+            # A 404 means the catalog/schema in the typed name doesn't exist on this workspace, so
+            # neither can the model — a definitive "no". Every other failure (auth, 5xx, network) is
+            # inconclusive: don't block a possibly-valid model on a blip.
+            return (False, reason) if _is_not_found_reason(reason) else (None, reason)
         data = cast(dict, payload) if isinstance(payload, dict) else {}
         for service in data.get("model_services", []):
             if not isinstance(service, dict):
