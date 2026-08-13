@@ -80,10 +80,10 @@ GLOBAL_SETTINGS_FILES = {
 
 # What `use_as_global_settings` actually does, in plain terms. `{binary}` is filled in per agent.
 GLOBAL_SETTINGS_BLURB = (
-    "Yes writes the gateway config into that file (needs sudo once), so a bare `{binary}` reaches "
-    "the Databricks gateway on its own — you don't have to launch it through ucode. No writes a "
-    "ucode-only settings file instead, so `{binary}` uses the gateway only when started with "
-    "`ucode {binary}`."
+    "Answer yes to write the gateway config into that file (needs sudo once), so a bare `{binary}` "
+    "reaches the Databricks gateway on its own — you don't have to launch it through ucode. Answer "
+    "no to write a ucode-only settings file instead, so `{binary}` uses the gateway only when "
+    "started with `ucode {binary}`."
 )
 
 BUDGET_POLICY_BLURB = (
