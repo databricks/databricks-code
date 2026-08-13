@@ -254,6 +254,17 @@ def format_usd(amount: Decimal) -> str:
     return f"${amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,}"
 
 
+def format_cost_usd(amount: Decimal) -> str:
+    """Like `format_usd`, but keeps more precision for sub-cent per-model costs.
+
+    A model that cost a fraction of a cent would round to ``$0.00`` at two
+    decimals and read as free, so amounts under a cent show four decimals.
+    """
+    if Decimal(0) < amount < Decimal("0.01"):
+        return f"${amount.quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)}"
+    return format_usd(amount)
+
+
 def format_meter(fraction: float, width: int = 30) -> str:
     """Text meter for `fraction` of a whole, clamped to [0, 1]."""
     clamped = min(max(fraction, 0.0), 1.0)
