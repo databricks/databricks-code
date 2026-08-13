@@ -409,13 +409,6 @@ def is_workspace_admin(workspace: str, token: str) -> bool | None:
 _WORKSPACE_BUDGETS_API_PATH = "/api/ai-gateway/v2/workspace-metrics/budgets"
 
 
-# A budget's coding-agent spend routing only works when it has a per-user alert threshold that also
-# hard-blocks: the gateway's `recommendModel` measures the caller's spend against a per-user
-# threshold (a shared, workspace-wide alert reports no per-user spend and leaves every tier inert),
-# and the routing policy is only enforced when that threshold carries a `BLOCK_USAGE` action rather
-# than an email notification alone. The listing exposes each alert's `scope_type` and its
-# `action_configurations`, so ucode can check both directly instead of leaning on the server to
-# reject unusable budgets at config-create time.
 _PER_USER_ALERT_SCOPE = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
 _BLOCK_ACTION_TYPE = "BLOCK_USAGE"
 
