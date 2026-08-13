@@ -71,19 +71,20 @@ from ucode.ui import (
     spinner,
 )
 
-# What `use_as_global_settings` actually does, in plain terms. Admins are choosing between a
-# machine-wide managed settings file and a per-user one, which is not obvious from the field name.
+# What `use_as_global_settings` actually does, in plain terms. Admins are choosing whether to write
+# the agent's own global settings file (so it points at the gateway even when launched directly) or
+# a ucode-specific one (so the agent only routes through the gateway when launched via ucode).
 GLOBAL_SETTINGS_BLURB = (
-    "Write this agent's config to the machine's managed settings file, which applies to every "
-    "user on the machine and cannot be overridden locally. Answer no to write the per-user "
-    "settings file instead, which developers can still change."
+    "Answer Yes to write this agent's own global settings file, so it points at the Databricks "
+    "gateway even when launched directly, without ucode. Answer no to write a ucode-specific "
+    "settings file instead, so the agent only routes through the gateway when launched via ucode."
 )
 
 BUDGET_POLICY_BLURB = (
     "A budget policy moves developers onto cheaper agents and models as the workspace spends "
     "against a budget — for example Claude Code on Opus by default, then Sonnet at 80%, then "
-    "OpenCode on Kimi at 100%. It only changes the default; developers can still pick anything "
-    "they have access to. Hard caps stay with the budget's own blocking threshold."
+    "OpenCode on Kimi at 100%. It only changes the default; developers can still pick any Model "
+    "Service to which they have access. Hard caps stay with the budget's own blocking threshold."
 )
 
 
@@ -353,7 +354,7 @@ def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | No
     if tool in SINGLE_MODEL_AGENTS:
         return {
             "default_model": _require_selection(
-                f"Select the model for {display}:", [(model, model) for model in options]
+                f"Select the default model for {display}:", [(model, model) for model in options]
             )
         }
 
@@ -707,19 +708,20 @@ def _prompt_budget_policy(
         )
         return None
 
-    # Spend routing only works on a budget with a per-user threshold; without one the gateway reports
-    # no spend and every tier stays inert. The listing can't reveal the alert's action, so this hides
-    # the clearly-unusable budgets and the server rejects the rest on create.
-    usable = [budget for budget in budgets if budget.get("has_per_user_alert")]
+    # Spend routing only works on a budget with a per-user threshold that hard-blocks: without a
+    # per-user threshold the gateway reports no spend and every tier stays inert, and without a
+    # BLOCK_USAGE action the policy is never enforced (an email-only alert does not gate spend). The
+    # listing now exposes each alert's action, so hide the budgets that can't enforce routing.
+    usable = [budget for budget in budgets if budget.get("has_per_user_block")]
     if not usable:
         print_warning(
-            "None of this workspace's AI Gateway budgets have a per-user threshold configured, which "
-            "spend routing requires. Add a per-user alert threshold to a budget in the Databricks "
-            "console, then re-run `ucode setup`."
+            "None of this workspace's AI Gateway budgets have a per-user threshold with a usage "
+            "block configured, which spend routing enforces. Add a per-user alert threshold with a "
+            "block action to a budget in the Databricks console, then re-run `ucode setup`."
         )
         return None
     print_note(
-        "Showing only budgets with a per-user threshold configured, which spend routing needs."
+        "Showing only budgets with a per-user hard block configured, which spend routing enforces."
     )
 
     budget_id = prompt_for_selection(
@@ -734,6 +736,13 @@ def _prompt_budget_policy(
         return None
 
     policy: dict = {"budget_id": budget_id}
+    # Remember the budget's own name so the summary can show it beside the policy name. It's a local
+    # display aid only — `_budget_policy_payload` doesn't serialize it, so it never reaches the API.
+    budget_display_name = next(
+        (budget["display_name"] for budget in usable if budget["id"] == budget_id), ""
+    )
+    if budget_display_name:
+        policy["budget_display_name"] = budget_display_name
     display_name = prompt_for_text("Policy name", default="coding-agents-tiered-routing")
     if display_name:
         policy["display_name"] = display_name
@@ -818,7 +827,7 @@ def _render_summary(workspace: str, manifest: dict) -> None:
         provider = model_config.get("model_provider_service")
         if provider:
             detail = f"{detail} via {provider}"
-        scope = "machine-wide" if agent_config.get("use_as_global_settings") else "per-user"
+        scope = "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
         lines.append(kv_line(display, f"{detail} ({scope})"))
         # Spell out the per-family slots and model lists: the one-line default alone doesn't show
         # which families an admin configured, which is most of what they chose for claude.
@@ -845,8 +854,9 @@ def _render_summary(workspace: str, manifest: dict) -> None:
     if isinstance(policy, dict):
         tiers = policy.get("tiers") or []
         lines.append(
-            kv_line("Budget policy", policy.get("display_name") or policy.get("budget_id") or "set")
+            kv_line("Budget", policy.get("budget_display_name") or policy.get("budget_id") or "set")
         )
+        lines.append(kv_line("Policy name", policy.get("display_name") or "unnamed"))
         for tier in tiers:
             agent = tier.get("default_agent")
             display = TOOL_SPECS.get(agent, {}).get("display", agent)
@@ -994,8 +1004,17 @@ def _print_next_steps() -> None:
     print_note("Publish it to the workspace:  ucode apply")
 
 
-def setup_command(from_file: str | None = None) -> int:
+def setup_command(
+    from_file: str | None = None,
+    *,
+    workspace: str | None = None,
+    profile: str | None = None,
+) -> int:
     """Author the workspace's managed coding-agent config interactively.
+
+    ``workspace``/``profile`` let a caller that has already resolved (and authenticated against) a
+    workspace hand it in so the admin isn't prompted to pick one again — e.g. `ucode configure`
+    launching setup after its admin offer. When ``workspace`` is None the flow prompts as usual.
 
     Returns a process exit code. Raises RuntimeError for actionable failures (not an admin, no
     agents available) and KeyboardInterrupt when the admin aborts a picker; the CLI maps both.
@@ -1011,7 +1030,8 @@ def setup_command(from_file: str | None = None) -> int:
     print_note("Author the managed coding config for this workspace.")
     print_note("Developers pull it automatically when they run ucode.")
 
-    workspace, profile = _prompt_for_configuration()
+    if workspace is None:
+        workspace, profile = _prompt_for_configuration()
     # `configure_shared_state` below authenticates too and prints its own success line, so this one
     # stays quiet rather than reporting the same thing twice. It still has to run first: the admin
     # gate and the existing-config check both need a token before discovery.
@@ -1067,7 +1087,8 @@ def setup_command(from_file: str | None = None) -> int:
             "model_config": _prompt_models_for_agent(tool, state, provider_service)
         }
         agent_config["use_as_global_settings"] = prompt_yes_no_default(
-            f"Apply {TOOL_SPECS[tool]['display']} config machine-wide? ({GLOBAL_SETTINGS_BLURB})",
+            f"Write {TOOL_SPECS[tool]['display']}'s config to its global settings file? "
+            f"({GLOBAL_SETTINGS_BLURB})",
             default=False,
         )
         enabled_agents[tool] = agent_config

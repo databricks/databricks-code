@@ -83,6 +83,7 @@ from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
     apply_managed_mcp_servers,
+    apply_managed_skills,
     configure_mcp_command,
     configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
@@ -261,10 +262,18 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
         "the agents, models, MCPs, and skills once, and every developer picks them up automatically."
     )
     if prompt_yes_no("Set one up now with `ucode setup`?"):
-        print_note(
-            "Run `ucode setup` to author your workspace's managed config, then `ucode apply`."
-        )
-        raise typer.Exit(0)
+        # Launch the setup flow in place rather than telling them to re-run a command. Reuse the
+        # workspace/profile we already resolved and authenticated against so setup doesn't prompt
+        # for them again.
+        try:
+            code = setup_command(workspace=workspace, profile=profile)
+        except RuntimeError as exc:
+            print_err(str(exc))
+            raise typer.Exit(1) from None
+        except KeyboardInterrupt:
+            print_err("Interrupted.")
+            raise typer.Exit(130) from None
+        raise typer.Exit(code or 0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
@@ -1450,6 +1459,33 @@ def _register_managed_mcp_servers(managed: dict, tool: str, state: dict) -> None
         print_note(f"Registered workspace MCP server(s) for {TOOL_SPECS[tool]['display']}: {names}")
 
 
+def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
+    """Register the managed config's skill schemas on ``tool``'s skills MCP connection.
+
+    Sibling of :func:`_register_managed_mcp_servers` for the skills registry: the managed config
+    lists the skill schemas the admin published, and nothing else on the launch path routes them to
+    the agent. ``apply_managed_skills`` persists the connection (and the applied set, for diffing a
+    later removal) into ``state`` itself. A failure here never blocks the launch.
+    """
+    try:
+        applied = apply_managed_skills(
+            state,
+            managed,
+            tool,
+            state["workspace"],
+            state.get("profile"),
+            use_pat=bool(state.get("use_pat")),
+        )
+    except RuntimeError as exc:
+        print_warning(f"Could not register your workspace's skills: {exc}")
+        return
+    if applied:
+        names = ", ".join(applied)
+        print_note(
+            f"Registered workspace skill schema(s) for {TOOL_SPECS[tool]['display']}: {names}"
+        )
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -1700,6 +1736,7 @@ def _launch_tool(
         # unmanaged).
         if managed is not None and not skip_preflight:
             _register_managed_mcp_servers(managed, tool, state)
+            _apply_managed_skills(managed, tool, state)
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
     except RuntimeError as exc:
