@@ -573,9 +573,14 @@ class TestModelProviderLaunch:
         return names[0]
 
     @staticmethod
-    def _skip_if_no_permission(combined: str, provider: str) -> None:
+    def _skip_if_provider_unusable(combined: str, provider: str) -> None:
+        # Environmental provider-account conditions, not ucode bugs: the test only proves routing
+        # reaches the provider, so skip (rather than fail) when the account lacks a grant on the
+        # connection or has run out of credits — state outside the code under test.
         if "USE CONNECTION" in combined or "EXECUTE" in combined:
             pytest.skip(f"no permission on provider {provider}: {combined[:200]}")
+        if "Credit balance is too low" in combined:
+            pytest.skip(f"provider {provider} account is out of credits: {combined[:200]}")
 
     def test_launch_claude_through_provider(
         self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
@@ -613,7 +618,7 @@ class TestModelProviderLaunch:
         }
         result = _run_agent(claude.validate_cmd("claude"), env=env, timeout=90)
         combined = (result.stdout + result.stderr).strip()
-        self._skip_if_no_permission(combined, provider)
+        self._skip_if_provider_unusable(combined, provider)
         assert result.returncode == 0 and combined, (
             f"provider={provider} rc={result.returncode} "
             f"stdout={result.stdout[:300]!r} stderr={result.stderr[:300]!r}"
@@ -650,7 +655,7 @@ class TestModelProviderLaunch:
         except subprocess.TimeoutExpired:
             pytest.fail(f"provider={provider} timed out after {timeout_seconds}s")
         combined = (result.stdout + result.stderr).strip()
-        self._skip_if_no_permission(combined, provider)
+        self._skip_if_provider_unusable(combined, provider)
         assert result.returncode == 0 and combined, (
             f"provider={provider} rc={result.returncode} "
             f"stdout={result.stdout[:300]!r} stderr={result.stderr[:300]!r}"
