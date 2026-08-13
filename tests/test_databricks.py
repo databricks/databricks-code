@@ -378,6 +378,71 @@ class TestDiscoverModelServices:
         assert calls["n"] == 3  # two failures, third succeeds
 
 
+class TestModelServiceExists:
+    def test_true_when_listed_in_its_schema(self, monkeypatch):
+        urls: list[str] = []
+
+        def fake_get(url, token, timeout=30):
+            urls.append(url)
+            return {"model_services": [_model_service("main.aarushi.claude-opus-4-5")]}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        exists, reason = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert (exists, reason) == (True, None)
+        # Scoped to the typed name's own schema, not system.ai.
+        assert all("parent=schemas%2Fmain.aarushi" in u for u in urls)
+
+    def test_false_when_schema_has_no_such_service(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (
+                {"model_services": [_model_service("main.aarushi.some-other-model")]},
+                None,
+            ),
+        )
+        exists, reason = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert (exists, reason) == (False, None)
+
+    def test_bad_name_is_inconclusive(self, monkeypatch):
+        def fail(*a, **k):
+            raise AssertionError("should not hit the API for a malformed name")
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fail)
+        for bad in ("just-a-name", "main.aarushi", "main..model", "main.aarushi.model.extra"):
+            exists, reason = db_mod.model_service_exists(WS, "token", bad)
+            assert exists is None and reason
+
+    def test_http_error_is_inconclusive_not_absent(self, monkeypatch):
+        # A transient failure must read as "couldn't verify", never "doesn't exist" — the caller
+        # would otherwise reject a valid model on a blip.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (None, "HTTP 500 Server Error"),
+        )
+        exists, reason = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert exists is None
+        assert "500" in reason
+
+    def test_paginates_until_found(self, monkeypatch):
+        pages = {
+            None: {
+                "model_services": [_model_service("main.aarushi.other")],
+                "next_page_token": "n",
+            },
+            "n": {"model_services": [_model_service("main.aarushi.claude-opus-4-5")]},
+        }
+
+        def fake_get(url, token, timeout=30):
+            tok = url.split("page_token=")[1].split("&")[0] if "page_token=" in url else None
+            return pages[tok], None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        exists, _ = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert exists is True
+
+
 class TestListModelProviderServices:
     _PAYLOAD = {
         "model_provider_services": [
