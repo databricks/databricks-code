@@ -401,19 +401,12 @@ def download_managed_skills_on_launch(
 ) -> list[str]:
     """Download admin-published skills to disk so the agent's ``/skills`` lists them.
 
-    Runs on the managed launch path (see ``cli._apply_managed_skills``), where the
-    managed config only *registers* the skills MCP connection -- nothing writes the
-    skill bundles to ``.claude/skills`` / ``.agents/skills``, so the agent's on-disk
-    ``/skills`` picker stays empty. For each ``<catalog>.<schema>`` location this
-    lists the schema's finalized skills and writes only those whose bundle is not
-    already on disk, so a launch where everything is already downloaded costs one
-    cheap listing call per schema and writes nothing.
-
-    Existing skills are left untouched with no overwrite prompt: the launch path
-    must never block on input, and a developer's own same-named skill must never be
-    clobbered silently. Everything is best-effort -- a failure listing a schema or
-    fetching a bundle warns and is skipped, and the function never raises -- so it
-    can never block the launch. Returns the bundle names newly written to disk.
+    Runs on the managed launch path: the config only registers the skills MCP
+    connection, so nothing else writes the bundles that ``/skills`` reads. Writes
+    only skills not already on disk -- no overwrite prompt, so the launch never
+    blocks on input and a developer's own same-named skill is never clobbered.
+    Best-effort and never raises, so it can't block the launch. Returns the bundle
+    names newly written.
     """
     roots = skill_dir_roots(path)
     written: list[str] = []
