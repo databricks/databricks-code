@@ -1447,6 +1447,9 @@ def _print_next_steps(manifest: dict) -> None:
         # would report "run `ucode setup` first".
         print_note("Dry run — nothing was saved. Re-run without --dry-run to author the config.")
         return
+    # These sections aren't required to publish — call them out as optional so an admin doesn't read
+    # a config with none configured as unfinished.
+    print_note("[dim]Optional — configure any of these, or skip straight to publishing:[/dim]")
     for line in _section_status_lines(manifest):
         console.print(line)
     print_panel(
