@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts import prompt_cache_repro as repro
 
 
@@ -100,5 +102,26 @@ def test_request_uses_explicit_in_memory(monkeypatch):
 
 def test_state_round_trip(tmp_path: Path):
     state_file = tmp_path / "cache.json"
-    state_file.write_text(json.dumps({"assistant_text": "ack"}))
-    assert repro._load_saved(state_file)["assistant_text"] == "ack"
+    saved = {
+        "key": "cache-key",
+        "model": "system.ai.gpt-5-6-sol",
+        "context_chars": 24_000,
+        "assistant_text": "ack",
+    }
+    state_file.write_text(json.dumps(saved))
+    assert repro._load_saved(state_file) == saved
+
+
+@pytest.mark.parametrize(
+    "saved",
+    [
+        {"assistant_text": "ack"},
+        {"key": "k", "model": "m", "context_chars": True, "assistant_text": "ack"},
+        {"key": "k", "model": "m", "context_chars": 100, "assistant_text": "ack"},
+    ],
+)
+def test_malformed_state_has_controlled_error(tmp_path: Path, saved):
+    state_file = tmp_path / "bad-cache.json"
+    state_file.write_text(json.dumps(saved))
+    with pytest.raises(RuntimeError, match="not a valid cache repro state"):
+        repro._load_saved(state_file)

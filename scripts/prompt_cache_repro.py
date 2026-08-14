@@ -194,7 +194,19 @@ def _load_saved(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Could not read state file {path}: {exc}") from exc
-    if not isinstance(value, dict) or not isinstance(value.get("assistant_text"), str):
+    if not isinstance(value, dict):
+        raise RuntimeError(f"State file {path} is not a valid cache repro state")
+    valid_strings = all(
+        isinstance(value.get(field), str) and bool(value[field])
+        for field in ("key", "model", "assistant_text")
+    )
+    context_chars = value.get("context_chars")
+    valid_context = (
+        isinstance(context_chars, int)
+        and not isinstance(context_chars, bool)
+        and context_chars >= 1024
+    )
+    if not valid_strings or not valid_context:
         raise RuntimeError(f"State file {path} is not a valid cache repro state")
     return value
 
