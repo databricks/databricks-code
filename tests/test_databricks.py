@@ -1134,9 +1134,9 @@ class TestDiscoverGeminiModels:
         assert reason is None
         assert models[0] == "databricks-gemini-3-5-flash"
 
-    def test_codex_discovery_keeps_alphabetical_order(self, monkeypatch):
-        # Codex passes no sort_key, so ordering must stay the plain alphabetical
-        # default — guarding against the gemini change leaking across tools.
+    def test_codex_discovery_orders_newest_version_first(self, monkeypatch):
+        # Codex orders newest model version first (like gemini), so the picker's top choice and
+        # default is the newest gpt, not the alphabetically-first one.
         payload = {
             "endpoints": [
                 {
@@ -1152,7 +1152,7 @@ class TestDiscoverGeminiModels:
                         ]
                     },
                 }
-                for name in ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
+                for name in ["databricks-gpt-4-1", "databricks-gpt-5-2-codex"]
             ]
         }
         monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
@@ -1160,7 +1160,7 @@ class TestDiscoverGeminiModels:
         models, reason = db_mod.discover_codex_models(WS, "token")
 
         assert reason is None
-        assert models == ["databricks-gpt-4-1", "databricks-gpt-5-2-codex"]
+        assert models == ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
 
 
 class TestResolvePatToken:

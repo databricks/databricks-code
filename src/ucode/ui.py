@@ -92,6 +92,19 @@ def print_panel(title: str, lines: list[str]) -> None:
     console.print(Panel("\n".join(lines), title=title, style="blue", expand=False))
 
 
+def print_warning_panel(message: str, *, title: str = "Warning") -> None:
+    """Render a warning as a boxed panel, for a blocker that should stand out from inline notes.
+
+    A `!` marker keeps it visually of a kind with :func:`print_warning`, but the box gives a
+    dead-end message (e.g. "no budgets exist, nothing to do") the weight to be read before the flow
+    exits, rather than scrolling past as one more line.
+    """
+    console.print()
+    console.print(
+        Panel(f"[bold yellow]![/bold yellow] {message}", title=title, style="yellow", expand=False)
+    )
+
+
 def print_note(text: str) -> None:
     console.print(f"[dim]•[/dim] {text}")
 

@@ -179,24 +179,35 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 
 ### Managed config for a workspace (admins)
 
+Author the coding config your developers pick up automatically, instead of asking each of them to
+run `ucode configure` by hand. Restricted to workspace admins. `ucode setup help` prints the whole
+sequence; the short version is one command for the agents and models, then a command per optional
+section, then publish:
+
 ```bash
-ucode setup
+ucode setup                 # agents and models (start here)
+ucode setup mcp             # managed MCP servers
+ucode setup skills          # managed skills
+ucode setup budget-policy   # spend-based routing
+ucode apply                 # publish it to the workspace
 ```
 
-Author the coding config your developers pick up automatically, instead of asking each of them to
-run `ucode configure` by hand. Restricted to workspace admins.
+`ucode setup` walks through the agents to enable and which one bare `ucode` launches, then per agent:
+Databricks-hosted models or an external Model Provider Service, the models to expose, and (for Claude
+Code and Codex) whether the config writes the agent's own OS-level settings file or a ucode-only one.
+Claude Code is asked one model per family (opus/sonnet/haiku/fable), since it selects models by family
+alias; any family can be skipped.
 
-The flow walks through the agents to enable and which one bare `ucode` launches, then per agent:
-Databricks-hosted models or an external Model Provider Service, the models to expose, and whether
-the config applies machine-wide or per user. Claude Code is asked one model per family
-(opus/sonnet/haiku/fable), since Claude Code selects models by family alias; any family can be
-skipped. It then offers tracing, managed MCP servers, skills, and a spend-based budget policy that
-switches the default agent and model as the workspace burns through a budget.
+The optional sections each edit their own part of the same config, so you can add an MCP server or
+change a budget tier later without walking the whole flow. `ucode setup skills --location
+main.default,other.schema` skips the prompt. `ucode setup budget-policy` sets a spend-based policy
+that switches the default agent and model as the workspace burns through a budget. Answering these
+also runs the matching `ucode configure` step, which does configure this machine.
 
-The result is written to `~/.ucode/managed-state.json` — the one local managed-config file — which
-`ucode apply` publishes to the workspace. Your own agent configs are left alone, with one exception:
-answering yes to tracing, MCP servers, or skills runs the matching `ucode configure` step, which
-does configure this machine.
+Everything is written to `~/.ucode/managed-state.json` — the one local managed-config file — which
+`ucode apply` publishes. Re-running `ucode setup` keeps the MCP servers, skills, tracing table, and
+budget policy already authored, rather than clearing them; to drop one, edit the file and reload it
+with `ucode setup --from-file`.
 
 ```bash
 # Review the manifest and the exact payload `ucode apply` would publish.
@@ -209,7 +220,7 @@ ucode setup --from-file ./managed-config.json
 Once the manifest looks right, publish it:
 
 ```bash
-# Validate, show what would change, and ask before publishing.
+# Validate, show a diff against what's live, and ask before publishing.
 ucode apply
 
 # Publish without the confirmation prompt (for CI).
@@ -217,9 +228,11 @@ ucode apply --yes
 ```
 
 `apply` updates the workspace's existing config in place rather than replacing it, so a failed
-publish leaves the current config intact. It is still a whole-manifest write: every field ucode
-authors is sent, so anything skipped in a re-run is cleared rather than carried over. Developers
-pick the new config up on their next ucode run.
+publish leaves the current config intact. It shows a diff of exactly what changes against the
+published config before asking to confirm, and does nothing when the two already match. It is a
+whole-manifest write — every field ucode authors is sent — but because `ucode setup` carries the
+other sections forward, a re-run no longer silently drops them. Developers pick the new config up on
+their next ucode run.
 
 ---
 
@@ -247,10 +260,14 @@ pick the new config up on their next ucode run.
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
 | `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
-| `ucode setup` | Author the workspace's managed coding config (workspace admins only) |
+| `ucode setup` | Author the managed config's agents and models (workspace admins only) |
+| `ucode setup mcp` | Add or change the managed config's MCP servers |
+| `ucode setup skills [--location a.b,c.d]` | Add or change the managed config's skills |
+| `ucode setup budget-policy` | Set the managed config's spend-based routing policy |
+| `ucode setup help` | Walk through the whole setup sequence, marking what's already configured |
 | `ucode setup show` | Print the authored config and the payload `ucode apply` would publish |
 | `ucode setup --from-file <file>` | Load a hand-written managed config instead of running the prompts |
-| `ucode apply` | Publish the authored managed config to the workspace (workspace admins only) |
+| `ucode apply` | Publish the authored managed config to the workspace, after a diff and confirmation (admins only) |
 | `ucode apply --yes` | Publish without the confirmation prompt |
 
 ## Managed Local Files

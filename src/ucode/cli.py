@@ -80,7 +80,15 @@ from ucode.managed_resolve import (
     recommended_agent,
     resolve_state,
 )
-from ucode.managed_wizard import apply_command, setup_command, show_command
+from ucode.managed_wizard import (
+    apply_command,
+    setup_budget_policy_command,
+    setup_command,
+    setup_help_command,
+    setup_mcp_command,
+    setup_skills_command,
+    show_command,
+)
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
@@ -263,8 +271,9 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
     if not is_admin:
         return
     print_note(
-        "✨ New: as a workspace admin you can publish a managed config with `ucode setup` — set "
-        "the agents, models, MCPs, and skills once, and every developer picks them up automatically."
+        "✨ New: as a workspace admin you can publish a managed config with `ucode setup` — set the "
+        "agents and models once (then MCP servers and skills with `ucode setup mcp` / `skills`), and "
+        "every developer picks them up automatically."
     )
     if prompt_yes_no("Set one up now with `ucode setup`?"):
         # Launch the setup flow in place rather than telling them to re-run a command. Reuse the
@@ -714,7 +723,7 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
         return _use_databricks()
 
     choice = prompt_for_selection(
-        f"How should {display} be configured?",
+        f"How should {display} get its models?",
         [
             ("databricks", "Databricks Hosted"),
             ("mps", "External Models"),
@@ -1044,7 +1053,9 @@ mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
 setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(
-    setup_app, name="setup", help="Author the workspace's managed coding config (admins only)."
+    setup_app,
+    name="setup",
+    help="Author the workspace's managed coding config (admins only). See `ucode setup help`.",
 )
 
 
@@ -2614,7 +2625,10 @@ def setup(
         ),
     ] = None,
 ) -> None:
-    """Author the managed coding config for your workspace (workspace admins only)."""
+    """Choose the agents and models for your workspace's managed config (admins only).
+
+    MCP servers, skills, and the budget policy have their own commands — see `ucode setup help`.
+    """
     if ctx.invoked_subcommand is not None:
         return
     # `typer.Exit` subclasses RuntimeError, so it must be raised outside the try — inside, the
@@ -2628,6 +2642,80 @@ def setup(
     except KeyboardInterrupt:
         print_err("Interrupted.")
         raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@setup_app.command("mcp")
+def setup_mcp_cmd() -> None:
+    """Choose the MCP servers the managed config gives developers (admins only)."""
+    # Same `typer.Exit`/RuntimeError ordering trap as the `setup` callback above.
+    try:
+        install_databricks_cli()
+        code = setup_mcp_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@setup_app.command("skills")
+def setup_skills_cmd(
+    location: Annotated[
+        str | None,
+        typer.Option(
+            "--location",
+            help="Skill schemas to publish as `<catalog>.<schema>` (comma-separated for several). "
+            "Skips the prompt.",
+        ),
+    ] = None,
+) -> None:
+    """Choose the skills the managed config gives developers (admins only)."""
+    try:
+        install_databricks_cli()
+        # None means "prompt"; an explicit `--location` is parsed to the list to publish.
+        locations = None if location is None else _parse_skill_locations(location)
+        code = setup_skills_command(locations)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@setup_app.command("budget-policy")
+def setup_budget_policy_cmd() -> None:
+    """Route developers to cheaper agents as the workspace spends its budget (admins only)."""
+    try:
+        install_databricks_cli()
+        code = setup_budget_policy_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@setup_app.command("help")
+def setup_help_cmd() -> None:
+    """Walk through the managed-config setup: every command, in order, and what's already done."""
+    # No auth and no CLI install: this reads the local draft only, so it works before `ucode
+    # configure` and on a machine without the Databricks CLI.
+    try:
+        code = setup_help_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
     if code:
         raise typer.Exit(code)
 
