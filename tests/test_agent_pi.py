@@ -243,6 +243,7 @@ class TestRenderOverlayCompatFlags:
         overlay, _ = _overlay("claude-sonnet", claude_models={"sonnet": "claude-sonnet"})
         compat = overlay["providers"]["databricks-claude"]["compat"]
         assert compat["supportsEagerToolInputStreaming"] is False
+        assert compat["sendSessionAffinityHeaders"] is True
 
     def test_openai_and_gemini_have_no_compat_flags(self):
         # Their gateway routes accept pi's request shape as-is.

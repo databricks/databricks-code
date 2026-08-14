@@ -213,8 +213,14 @@ def render_overlay(
             "authHeader": True,
             # Gateway's Anthropic translator rejects per-tool
             # `eager_input_streaming` on the streaming + tools path. Pi sends
-            # the legacy beta header instead when this is false.
-            "compat": {"supportsEagerToolInputStreaming": False},
+            # the legacy beta header instead when this is false. Session
+            # affinity keeps a Pi conversation on one AI Gateway destination,
+            # which is important when traffic splitting is configured because
+            # prompt caches are destination-local.
+            "compat": {
+                "supportsEagerToolInputStreaming": False,
+                "sendSessionAffinityHeaders": True,
+            },
             "headers": ua_headers,
             "models": [_pi_claude_model_entry(m) for m in claude_ids],
         }
