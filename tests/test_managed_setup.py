@@ -7,13 +7,8 @@ property pins the write side to the read side, so the two cannot drift as the pr
 
 from __future__ import annotations
 
-import json
-import stat
-
 import pytest
 
-import ucode.config_io as config_io_mod
-import ucode.managed_setup as managed_setup_mod
 from ucode.managed_config import (
     AGENT_ENUM_TO_TOOL,
     MCP_TYPE_ENUM_TO_TAG,
@@ -24,11 +19,8 @@ from ucode.managed_setup import (
     MCP_TAG_TO_TYPE_ENUM,
     claude_family_for_model,
     claude_model_slots,
-    load_managed_settings,
-    managed_settings_workspace,
     model_families_for_agent,
     model_options_for_agent,
-    save_managed_settings,
     serialize_managed_config,
     supports_provider_service,
     validate_manifest,
@@ -590,6 +582,33 @@ class TestValidate:
         errors = validate_manifest(manifest, state)
         assert any("not available on this workspace" in e for e in errors)
 
+    def test_custom_model_is_accepted_via_the_marker(self):
+        # A hand-typed model service outside the discovered inventory is listed in `custom_models`
+        # (it was verified to exist when entered), so the inventory check must not reject it.
+        manifest = {
+            "default_agent": "codex",
+            "enabled_agents": {
+                "codex": {
+                    "model_config": {
+                        "default_model": "main.aarushi.gpt-5-custom",
+                        "custom_models": ["main.aarushi.gpt-5-custom"],
+                    }
+                }
+            },
+        }
+        assert validate_manifest(manifest, STATE) == []
+
+    def test_unmarked_custom_model_is_still_rejected(self):
+        # Without the marker the same id is an unknown model — the marker is what vouches for it.
+        manifest = {
+            "default_agent": "codex",
+            "enabled_agents": {
+                "codex": {"model_config": {"default_model": "main.aarushi.gpt-5-custom"}}
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("not available on this workspace" in e for e in errors)
+
     def test_model_check_skipped_without_state(self):
         manifest = {
             "default_agent": "claude",
@@ -906,78 +925,3 @@ class TestValidate:
             "mcp_servers": [{"type": "bogus"}],
         }
         assert len(validate_manifest(manifest, STATE)) >= 3
-
-
-class TestPersistence:
-    def test_round_trips_through_disk(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(
-            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
-        )
-        manifest = _full_manifest()
-        save_managed_settings(WORKSPACE, manifest)
-        assert load_managed_settings(WORKSPACE) == manifest
-
-    def test_stores_the_workspace_alongside_the_manifest(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed-settings.json"
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
-        save_managed_settings(WORKSPACE, _minimal_manifest())
-        assert json.loads(path.read_text())["workspace"] == WORKSPACE
-        assert managed_settings_workspace() == WORKSPACE
-
-    def test_load_is_workspace_scoped(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(
-            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
-        )
-        save_managed_settings(WORKSPACE, _minimal_manifest())
-        # A manifest authored for another workspace must not be published to this one.
-        assert load_managed_settings("https://other.example.com") is None
-
-    def test_load_without_a_workspace_returns_whatever_is_on_disk(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(
-            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
-        )
-        save_managed_settings(WORKSPACE, _minimal_manifest())
-        assert load_managed_settings() == _minimal_manifest()
-
-    def test_load_returns_none_when_absent(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "missing.json")
-        assert load_managed_settings(WORKSPACE) is None
-        assert managed_settings_workspace() is None
-
-    def test_dry_run_writes_nothing(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed-settings.json"
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
-        monkeypatch.setattr(config_io_mod, "is_dry_run", lambda: True)
-        save_managed_settings(WORKSPACE, _minimal_manifest())
-        assert not path.exists()
-
-    def test_corrupt_file_reads_as_absent(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed-settings.json"
-        path.write_text("{not json", encoding="utf-8")
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
-        assert load_managed_settings(WORKSPACE) is None
-
-    def test_serialized_payload_is_json_encodable(self, tmp_path, monkeypatch):
-        # `ucode apply` POSTs this, so it must survive json.dumps with no custom encoder.
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(
-            managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
-        )
-        save_managed_settings(WORKSPACE, _full_manifest())
-        manifest = load_managed_settings(WORKSPACE)
-        assert manifest is not None
-        assert json.loads(json.dumps(serialize_managed_config(manifest)))
-
-    def test_settings_file_is_user_only(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed-settings.json"
-        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        monkeypatch.setattr(managed_setup_mod, "MANAGED_SETTINGS_PATH", path)
-        save_managed_settings(WORKSPACE, _minimal_manifest())
-        assert stat.S_IMODE(path.stat().st_mode) & 0o077 == 0

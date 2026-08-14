@@ -104,6 +104,11 @@ def print_warning(message: str) -> None:
     console.print(f"[bold yellow]![/bold yellow] {message}")
 
 
+def print_warning_err(message: str) -> None:
+    """``print_warning`` on stderr, for when stdout is a machine-read stream."""
+    err_console.print(f"[bold yellow]![/bold yellow] {message}")
+
+
 def print_err(message: str) -> None:
     err_console.print(f"[bold red]ERROR[/bold red] {message}")
 
@@ -249,6 +254,17 @@ def format_usd(amount: Decimal) -> str:
     return f"${amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,}"
 
 
+def format_cost_usd(amount: Decimal) -> str:
+    """Like `format_usd`, but keeps more precision for sub-cent per-model costs.
+
+    A model that cost a fraction of a cent would round to ``$0.00`` at two
+    decimals and read as free, so amounts under a cent show four decimals.
+    """
+    if Decimal(0) < amount < Decimal("0.01"):
+        return f"${amount.quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)}"
+    return format_usd(amount)
+
+
 def format_meter(fraction: float, width: int = 30) -> str:
     """Text meter for `fraction` of a whole, clamped to [0, 1]."""
     clamped = min(max(fraction, 0.0), 1.0)
@@ -289,23 +305,48 @@ def prompt_for_workspace(
     """Ask the user for a workspace URL, offering profiles as quick-select.
 
     `profiles` is a list of (host_url, profile_name) tuples. Caller fetches
-    them — `ui.py` stays Databricks-agnostic. Returns ``(url, profile_name)``;
-    profile_name is ``None`` when the user typed a URL manually.
+    them — `ui.py` stays Databricks-agnostic. Duplicate hosts (multiple
+    profiles pointing at the same workspace) are shown separately; the picker
+    returns the exact (host, profile_name) the user selected. Returns
+    ``(url, profile_name)``; profile_name is ``None`` when the user typed a
+    URL manually.
     """
     console.print()
     console.print(Panel(description, title="ucode setup", style="bold blue", expand=False))
 
     if profiles:
-        choices = [
-            questionary.Choice(title=host, value=(host, profile_name))
-            for host, profile_name in profiles
+        name_header = "Profile Name"
+        url_header = "Workspace URL"
+        # Clamp so a single very long profile name can't push the URL column
+        # off-screen on an 80-col terminal — questionary doesn't wrap row
+        # titles cleanly, and a wrapped row breaks the picker visually.
+        max_name_width = 40
+        name_width = min(
+            max_name_width,
+            max(len(name_header), *(len(name) for _, name in profiles)),
+        )
+        # Match the 2-char cursor gutter so the header line aligns with rows.
+        header_title = f"  {name_header.ljust(name_width)}  {url_header}"
+        choices: list[questionary.Choice | questionary.Separator] = [
+            questionary.Separator(header_title)
         ]
+        for host, profile_name in profiles:
+            display_name = (
+                profile_name
+                if len(profile_name) <= name_width
+                else profile_name[: name_width - 1] + "…"
+            )
+            row_title = f"{display_name.ljust(name_width)}  {host}"
+            # Value carries the full untruncated profile name so downstream
+            # `--profile` calls always use the real name, not the display form.
+            choices.append(questionary.Choice(title=row_title, value=(host, profile_name)))
         choices.append(questionary.Choice(title="Enter a different URL", value=None))
         style = questionary.Style(
             [
                 ("highlighted", "fg:cyan bold"),
                 ("pointer", "fg:cyan bold"),
                 ("answer", "fg:cyan"),
+                ("separator", "fg:white bold"),
             ]
         )
         choice = questionary.select(

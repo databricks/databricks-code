@@ -2,8 +2,9 @@
 
 Workspace admins run this to build the ``CodingAgentConfig`` their developers will pull. It walks
 the admin through agents, per-agent models, tracing, MCP servers, skills, and a spend-routing budget
-policy, then writes the manifest to ``~/.ucode/managed-settings.json``. Publishing it to the
-workspace is ``ucode apply`` (a separate command, so an admin can review the file first).
+policy, then writes the manifest to ``~/.ucode/managed-state.json`` (the one local managed-config
+file, owned by :mod:`ucode.managed_config`). Publishing it to the workspace is ``ucode apply`` (a
+separate command, so an admin can review the file first).
 
 Serialization, validation, and the per-agent model catalogs live in :mod:`ucode.managed_setup`; this
 module is the interaction layer on top of them. Sub-flows an admin already knows — tracing, MCP,
@@ -14,11 +15,11 @@ back out of ``state.json``, so there is exactly one picker per concern in the co
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
 from ucode.agents import TOOL_SPECS, check_gateway_endpoint
-from ucode.config_io import is_dry_run
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
     all_users_can_use_schema,
@@ -32,16 +33,22 @@ from ucode.databricks import (
     is_workspace_admin,
     list_model_provider_services,
     list_workspace_budgets,
+    map_claude_family_models,
+    model_service_exists,
     service_usable_for_tool,
     update_coding_agent_config,
 )
-from ucode.managed_config import get_managed_config
+from ucode.managed_config import (
+    get_managed_config,
+    load_managed_state,
+    managed_state_workspace,
+    save_managed_state,
+)
 from ucode.managed_setup import (
     CLAUDE_SLOT_FOR_FAMILY,
     claude_family_candidates,
-    load_managed_settings,
+    claude_family_for_model,
     model_options_for_agent,
-    save_managed_settings,
     serialize_managed_config,
     supports_provider_service,
     validate_manifest,
@@ -49,6 +56,7 @@ from ucode.managed_setup import (
 from ucode.state import load_state
 from ucode.ui import (
     console,
+    format_usd,
     kv_line,
     print_err,
     print_heading,
@@ -66,19 +74,20 @@ from ucode.ui import (
     spinner,
 )
 
-# What `use_as_global_settings` actually does, in plain terms. Admins are choosing between a
-# machine-wide managed settings file and a per-user one, which is not obvious from the field name.
+# What `use_as_global_settings` actually does, in plain terms. Admins are choosing whether to write
+# the agent's own global settings file (so it points at the gateway even when launched directly) or
+# a ucode-specific one (so the agent only routes through the gateway when launched via ucode).
 GLOBAL_SETTINGS_BLURB = (
-    "Write this agent's config to the machine's managed settings file, which applies to every "
-    "user on the machine and cannot be overridden locally. Answer no to write the per-user "
-    "settings file instead, which developers can still change."
+    "Answer Yes to write this agent's own global settings file, so it points at the Databricks "
+    "gateway even when launched directly, without ucode. Answer no to write a ucode-specific "
+    "settings file instead, so the agent only routes through the gateway when launched via ucode."
 )
 
 BUDGET_POLICY_BLURB = (
     "A budget policy moves developers onto cheaper agents and models as the workspace spends "
     "against a budget — for example Claude Code on Opus by default, then Sonnet at 80%, then "
-    "OpenCode on Kimi at 100%. It only changes the default; developers can still pick anything "
-    "they have access to. Hard caps stay with the budget's own blocking threshold."
+    "OpenCode on Kimi at 100%. It only changes the default; developers can still pick any Model "
+    "Service to which they have access. Hard caps stay with the budget's own blocking threshold."
 )
 
 
@@ -95,29 +104,47 @@ def _tracing_table_from_state(state: dict) -> str | None:
     return destination if isinstance(destination, str) and destination else None
 
 
-def _mcp_type_for_url(url: str) -> str | None:
-    """Classify a registered MCP server's URL into a managed-config type tag.
+def _mcp_server_from_url(url: str) -> tuple[str, str] | None:
+    """Derive a managed-config ``(name, type)`` entry from a registered server's resolved URL.
 
     ``state.json`` stores each MCP server's resolved URL but not its type, while the managed config
-    stores ``{name, type}`` and lets the developer's ucode rebuild the URL. The URL shape is the only
-    signal available, so map it back. Returns None for a URL that matches nothing known, so unknown
-    servers are skipped rather than published with a guessed type.
+    stores ``{name, type}`` and lets the developer's ucode rebuild the URL. So map the URL back to the
+    type *and* the identifier the ai-gateway ``McpServer.name`` field is meant to hold for that type
+    (a UC name for a UC service, a Genie space id for a genie space, a `<catalog>.<schema>` for
+    vector-search / uc-functions, a connection name for external). Deriving ``name`` from the URL —
+    rather than reusing the local display slug — is what lets the developer's ucode reconstruct the
+    URL on launch. Returns None for a URL that matches nothing reconstructable (e.g. an app's
+    off-workspace host), so those are skipped rather than published unusably.
     """
-    if "/ai-gateway/mcp-services/" in url:
-        return "mcp-service"
+    stripped = url.rstrip("/")
+    marker = "/ai-gateway/mcp-services/"
+    if marker in url:
+        # `.../mcp-services/<catalog>.<schema>.<svc>` — store the dash form the launch path expects.
+        service = url.split(marker, 1)[1].split("/", 1)[0]
+        return service.replace(".", "-"), "mcp-service"
     for fragment, tag in (
         ("/api/2.0/mcp/external/", "external"),
         ("/api/2.0/mcp/genie/", "genie-space"),
+    ):
+        if fragment in url:
+            # external -> connection name; genie -> space id. Both are the single trailing segment.
+            return url.split(fragment, 1)[1].split("/", 1)[0], tag
+    for fragment, tag in (
         ("/api/2.0/mcp/vector-search/", "vector-search"),
         ("/api/2.0/mcp/functions/", "uc-functions"),
     ):
         if fragment in url:
-            return tag
-    if url.rstrip("/").endswith("/api/2.0/mcp/sql"):
-        return "sql"
-    # Databricks apps are the residual case: an arbitrary app host with a /mcp suffix.
-    if url.rstrip("/").endswith("/mcp"):
-        return "app"
+            # `.../<catalog>/<schema>` — store the `<catalog>.<schema>` the launch path splits back.
+            rest = url.split(fragment, 1)[1].split("/")
+            if len(rest) >= 2 and rest[0] and rest[1]:
+                return f"{rest[0]}.{rest[1]}", tag
+            return None
+    if stripped.endswith("/api/2.0/mcp/sql"):
+        return "databricks-sql", "sql"
+    # Databricks apps are the residual case: an arbitrary app host with a /mcp suffix. Its host isn't
+    # reconstructable from the workspace + an id, so it can't be published to the managed config yet.
+    if stripped.endswith("/mcp"):
+        return None
     return None
 
 
@@ -130,6 +157,7 @@ def _mcp_servers_from_state(state: dict) -> list[dict]:
     from ucode.mcp import SKILLS_MCP_KIND
 
     servers: list[dict] = []
+    seen: set[str] = set()
     for entry in state.get("mcp_servers") or []:
         if not isinstance(entry, dict) or entry.get("kind") == SKILLS_MCP_KIND:
             continue
@@ -137,11 +165,18 @@ def _mcp_servers_from_state(state: dict) -> list[dict]:
         url = entry.get("url")
         if not isinstance(name, str) or not name or not isinstance(url, str):
             continue
-        tag = _mcp_type_for_url(url)
-        if tag is None:
-            print_warning(f"Skipping MCP server '{name}': unrecognized URL shape ({url}).")
+        resolved = _mcp_server_from_url(url)
+        if resolved is None:
+            print_warning(
+                f"Skipping MCP server '{name}': ucode can't publish it to a managed config "
+                f"(unrecognized or app-hosted URL: {url})."
+            )
             continue
-        servers.append({"name": name, "type": tag})
+        config_name, tag = resolved
+        if config_name in seen:
+            continue
+        seen.add(config_name)
+        servers.append({"name": config_name, "type": tag})
     return servers
 
 
@@ -286,7 +321,17 @@ def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | No
         service_name = provider_service["name"]
         model_config["model_provider_service"] = service_name
         targets = provider_service_model_options(provider_service)
-        if targets:
+        if tool == "claude" and _pins_family_models(targets):
+            # `targets` (not the raw service) publishes explicit Claude models, and `render_overlay`
+            # pins each family to a chosen version from them — Bedrock slugs
+            # (`us.anthropic.claude-opus-4-8-v1:0`) or canonical Anthropic ids (`claude-opus-4-8`).
+            # So Claude needs a default *per family*, not one overall, mirroring the Databricks-hosted
+            # path. (A service with no enumerable targets pins nothing and takes a single default —
+            # handled below.) Keyed on `targets`, the same list the prompt consumes, so the decision
+            # and the prompt can't disagree — `allow_all_targets` zeroes `targets`, so it correctly
+            # falls through to the single-default branch even if the raw service also lists Claude.
+            model_config.update(_prompt_claude_provider_family_models(targets, service_name))
+        elif targets:
             model_config["default_model"] = _require_selection(
                 f"Default model for {display} (from {service_name}):",
                 [(target, target) for target in targets],
@@ -309,22 +354,22 @@ def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | No
         print_warning(f"No models were discovered for {display} on this workspace.")
         return {"default_model": _require_text(f"Default model for {display}")}
 
+    custom: list[str] = []
     if tool in SINGLE_MODEL_AGENTS:
-        return {
-            "default_model": _require_selection(
-                f"Select the model for {display}:", [(model, model) for model in options]
-            )
-        }
+        model = _select_hosted_model(
+            f"Select the default model for {display}:", options, state, custom
+        )
+        single: dict = {"default_model": model}
+        if custom:
+            single["custom_models"] = custom
+        return single
 
     # Nothing pre-checked: the first option is whatever discovery sorted first, not a
     # recommendation — for pi it is a Claude model, for codex the oldest GPT. Pre-checking it made
     # "hit Enter" produce an arbitrary config. (A worthwhile follow-up is to pre-check the models
-    # this workspace was configured with last time, which `load_managed_settings` already loads for
+    # this workspace was configured with last time, which `load_managed_state` already loads for
     # the agent picker, so a re-run becomes an edit rather than a re-entry.)
-    picked = _require_multi_selection(
-        f"Select models for {display}:",
-        [(model, model) for model in options],
-    )
+    picked = _select_hosted_models_multi(f"Select models for {display}:", options, state, custom)
     if len(picked) == 1:
         model_config["default_model"] = picked[0]
     else:
@@ -333,6 +378,8 @@ def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | No
         )
 
     model_config["models"] = picked
+    if custom:
+        model_config["custom_models"] = list(dict.fromkeys(custom))
     return model_config
 
 
@@ -375,32 +422,39 @@ def _prompt_claude_models(state: dict) -> dict:
         "don't want configured — it falls back to the overall default."
     )
     slots: dict[str, str] = {}
+    custom: list[str] = []
     for family in ANTHROPIC_FAMILIES:
         family_models = candidates.get(family)
         if not family_models:
             continue
-        choice = prompt_for_selection(
-            f"Default {family} model:",
-            [(model, model) for model in family_models] + [(_SKIP_FAMILY, f"(skip {family})")],
-            searchable=True,
-        )
+        rows = [(model, model) for model in family_models[:_MODEL_PICKER_LIMIT]] + [
+            (_CUSTOM_MODEL, _CUSTOM_MODEL_LABEL),
+            (_SKIP_FAMILY, f"(skip {family})"),
+        ]
+        choice = prompt_for_selection(f"Default {family} model:", rows, searchable=True)
         if choice is None:
             raise KeyboardInterrupt
-        if choice != _SKIP_FAMILY:
-            slots[CLAUDE_SLOT_FOR_FAMILY[family]] = choice
+        if choice == _SKIP_FAMILY:
+            continue
+        if choice == _CUSTOM_MODEL:
+            choice = _prompt_custom_model(state)
+            custom.append(choice)
+        slots[CLAUDE_SLOT_FOR_FAMILY[family]] = choice
 
     if not slots:
         # Every slot skipped is a legitimate, minimal config: the proto leaves `models` optional and
         # each unset slot falls back to `default_model`, so one model covers every family. Pick it
         # from the same candidates rather than asking the admin to type an id.
         print_note(f"No families configured, so {display} will use a single model for all of them.")
-        every_model = [m for family_models in candidates.values() for m in family_models]
-        return {
-            "default_model": _require_selection(
-                f"Which model should {display} use?",
-                [(m, m) for m in dict.fromkeys(every_model)],
-            )
-        }
+        every_model = list(dict.fromkeys(m for fm in candidates.values() for m in fm))
+        fallback_custom: list[str] = []
+        model = _select_hosted_model(
+            f"Which model should {display} use?", every_model, state, fallback_custom
+        )
+        single: dict = {"default_model": model}
+        if fallback_custom:
+            single["custom_models"] = fallback_custom
+        return single
 
     chosen = list(dict.fromkeys(slots.values()))
     model_config: dict = {"models": slots}
@@ -412,6 +466,122 @@ def _prompt_claude_models(state: dict) -> dict:
     else:
         model_config["default_model"] = _require_selection(
             f"Which of those is {display}'s overall default?", [(m, m) for m in chosen]
+        )
+    if custom:
+        model_config["custom_models"] = list(dict.fromkeys(custom))
+    return model_config
+
+
+def _pins_family_models(targets: list[str]) -> bool:
+    """True when Claude behind a service is pinned per family at launch.
+
+    Keyed on the *behavior*, not the vendor: when a service publishes explicit Claude targets — a
+    Bedrock provider-side slug like ``us.anthropic.claude-opus-4-8-v1:0`` *or* a canonical Anthropic
+    id like ``claude-opus-4-8`` — ``render_overlay`` pins each ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` to
+    a chosen version, so the wizard prompts one model per family, mirroring the Databricks-hosted
+    path. No Claude-family targets (``allow_all_targets`` zeroes the list, or a relayed subscription
+    lists none) means nothing is pinned — Claude Code's canonical names route fine — so it takes a
+    single default.
+
+    Takes the *enumerated* targets (``provider_service_model_options`` output), the exact list the
+    per-family prompt consumes, so the decision and the prompt can't disagree. Reading the raw
+    ``service["targets"]`` here would diverge: an ``allow_all_targets`` service that still lists
+    Claude models would test True but hand the prompt an empty list, aborting the wizard.
+    """
+    return bool(map_claude_family_models(targets))
+
+
+def _prompt_claude_provider_family_models(targets: list[str], service_name: str) -> dict:
+    """Claude family slots (and overall default) chosen from a service's own Claude target ids.
+
+    The Databricks-hosted path (:func:`_prompt_claude_models`) prompts per family because Claude
+    Code addresses models by family alias; the same holds behind a Model Provider Service, except
+    the ids are the service's own — Bedrock provider-side slugs or canonical Anthropic ids rather
+    than ``system.ai.*``. ``render_overlay`` pins each ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` from
+    them, so a single overall default would leave the other families unpinned.
+
+    Targets are grouped by family via :func:`claude_family_for_model`, which matches the
+    ``claude-<family>-`` segment in any spelling (``anthropic.claude-…`` Bedrock or bare
+    ``claude-…`` canonical). A target that names no family is offered only as the overall default.
+    Falls back to a single default when nothing maps to a family at all.
+    """
+    display = TOOL_SPECS["claude"]["display"]
+    by_family: dict[str, list[str]] = {}
+    for target in targets:
+        family = claude_family_for_model(target)
+        if family:
+            by_family.setdefault(family, []).append(target)
+
+    if not by_family:
+        # No target maps to a Claude family (unusual for a Bedrock Claude service); the most this can
+        # honestly ask for is one overall default.
+        return {
+            "default_model": _require_selection(
+                f"Default model for {display} (from {service_name}):",
+                [(t, t) for t in targets],
+            )
+        }
+
+    # Quick setup: fill each family with the service's newest id (highest version, broadest region),
+    # the same pick a developer's own `ucode configure` would make. The alternative is choosing a
+    # specific id per family — e.g. to pin an older, validated version or a particular region.
+    # map_claude_family_models covers opus/sonnet/haiku but not fable, so a fable-only service has
+    # nothing to quick-fill — only offer quick setup when it would actually populate a slot.
+    family_models = map_claude_family_models(targets)
+    if family_models:
+        print_note(
+            "Quick setup fills each Claude family with the newest model this service offers. Answer "
+            "no to choose a specific model per family instead (pin an older version, a region)."
+        )
+    if family_models and prompt_yes_no_default("Quick setup?", default=True):
+        slots = {CLAUDE_SLOT_FOR_FAMILY[family]: model for family, model in family_models.items()}
+        # Overall default = the highest-tier family the service offers, not whichever target happened
+        # to sort first. Fable is last: it's the premium opt-in model, a poor default. `family_models`
+        # is non-empty here, so `next` always finds one.
+        default_family = next(
+            fam for fam in ("opus", "sonnet", "haiku", "fable") if fam in family_models
+        )
+        model_config = {"models": slots, "default_model": family_models[default_family]}
+        summary = ", ".join(
+            f"{fam}={slots[CLAUDE_SLOT_FOR_FAMILY[fam]]}"
+            for fam in ANTHROPIC_FAMILIES
+            if CLAUDE_SLOT_FOR_FAMILY[fam] in slots
+        )
+        print_success(f"{display}: {summary} (default: {default_family})")
+        return model_config
+
+    print_note(
+        f"Claude Code picks a model by family, so set a default per family from {service_name}. "
+        "Skip any family you don't want configured — it falls back to the overall default."
+    )
+    slots: dict[str, str] = {}
+    for family in ANTHROPIC_FAMILIES:
+        family_targets = by_family.get(family)
+        if not family_targets:
+            continue
+        choice = prompt_for_selection(
+            f"Default {family} model:",
+            [(t, t) for t in family_targets] + [(_SKIP_FAMILY, f"(skip {family})")],
+            searchable=True,
+        )
+        if choice is None:
+            raise KeyboardInterrupt
+        if choice != _SKIP_FAMILY:
+            slots[CLAUDE_SLOT_FOR_FAMILY[family]] = choice
+
+    model_config: dict = {}
+    if slots:
+        model_config["models"] = slots
+    chosen = list(dict.fromkeys(slots.values()))
+    if len(chosen) == 1:
+        model_config["default_model"] = chosen[0]
+        print_success(f"Overall default for {display}: {chosen[0]} (the only model configured)")
+    else:
+        # Offered over every target, not just the slots: `default_model` needn't be a family model,
+        # and a mixed-catalog service may expose one an admin wants as the overall default.
+        options = chosen or list(targets)
+        model_config["default_model"] = _require_selection(
+            f"Which of those is {display}'s overall default?", [(m, m) for m in options]
         )
     return model_config
 
@@ -501,6 +671,114 @@ def _require_text(prompt: str) -> str:
         print_err("Please enter a model id.")
 
 
+# Discovered model lists run long (a dozen-plus ids on a real workspace), so each hosted-model picker
+# shows only the most relevant few and offers an explicit "type your own" row. Typing a model covers
+# both a discovered id past the shown few and a custom model service outside `system.ai` that
+# discovery never lists at all.
+_MODEL_PICKER_LIMIT = 5
+_CUSTOM_MODEL = "__custom_model__"
+_CUSTOM_MODEL_LABEL = "✎ Enter a custom model…"
+
+
+def _custom_option_rows(options: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The first few model rows plus a 'type your own' row, for a hosted-model picker."""
+    return list(options[:_MODEL_PICKER_LIMIT]) + [(_CUSTOM_MODEL, _CUSTOM_MODEL_LABEL)]
+
+
+def _short_reason(reason: str | None) -> str:
+    """A one-line reason fit for a prompt, without the raw JSON body the transport appends.
+
+    HTTP failures come back as ``HTTP <code> <reason>: <body-excerpt>`` (the body is a JSON error
+    blob for gateway/UC errors); an admin at a prompt wants the status, not the payload. Keeps the
+    ``HTTP <code> <reason>`` head and drops a ``{...}`` body, leaving plain reasons (``network
+    error: ...``) untouched.
+    """
+    if not reason:
+        return "unknown error"
+    return reason.split(": {", 1)[0].strip()
+
+
+def _verify_custom_model(state: dict, model: str) -> tuple[bool | None, str | None]:
+    """Whether ``model`` is a model service on the workspace; None when the check can't run.
+
+    Mirrors how ``_claude_candidates`` reaches the workspace — a token from ``state`` — and turns a
+    missing workspace or a failed token fetch into an inconclusive result rather than an error.
+    """
+    workspace = state.get("workspace")
+    if not workspace:
+        return None, "no workspace in local state"
+    try:
+        token = get_databricks_token(workspace, state.get("profile"))
+    except (RuntimeError, OSError) as exc:
+        # OSError covers a missing `databricks` binary (get_databricks_token shells out).
+        return None, str(exc)
+    return model_service_exists(workspace, token, model)
+
+
+def _prompt_custom_model(state: dict) -> str:
+    """Prompt for a custom model-service id, re-asking until it exists on the workspace.
+
+    A typo shouldn't get baked into a published config, so the id is checked against the workspace's
+    model services and a miss is re-prompted. An inconclusive check (no workspace/token, or a
+    transient API error) is accepted with a warning rather than blocking a possibly-valid model.
+    """
+    while True:
+        model = _require_text("Custom model (catalog.schema.model)")
+        exists, reason = _verify_custom_model(state, model)
+        if exists:
+            return model
+        if exists is None:
+            print_warning(
+                f"Couldn't verify '{model}' on this workspace ({_short_reason(reason)}); "
+                "using it as typed."
+            )
+            return model
+        print_err(
+            f"'{model}' isn't a model service on this workspace. Check the name and try again "
+            "(expected catalog.schema.model, e.g. main.default.claude-opus-4-5)."
+        )
+
+
+def _select_hosted_model(
+    prompt: str, options: list[str], state: dict, custom_sink: list[str]
+) -> str:
+    """Single-select over the top few ``options`` plus a custom-entry row.
+
+    Records any custom id in ``custom_sink`` so the caller can mark it in
+    ``model_config.custom_models``, which keeps validation from rejecting a model discovery didn't
+    surface.
+    """
+    choice = _require_selection(prompt, _custom_option_rows([(m, m) for m in options]))
+    if choice == _CUSTOM_MODEL:
+        model = _prompt_custom_model(state)
+        custom_sink.append(model)
+        return model
+    return choice
+
+
+def _select_hosted_models_multi(
+    prompt: str, options: list[str], state: dict, custom_sink: list[str]
+) -> list[str]:
+    """Multi-select over the top few ``options`` plus a custom-entry row; requires one pick.
+
+    Selecting the custom row prompts for custom model ids — as many as the admin wants, since a
+    multi-select agent (opencode, pi) can carry a whole list — and folds them into the picks. Records
+    each custom id in ``custom_sink`` (see :func:`_select_hosted_model`).
+    """
+    rows = _custom_option_rows([(m, m) for m in options])
+    picked = _require_multi_selection(prompt, rows)
+    models = [p for p in picked if p != _CUSTOM_MODEL]
+    if _CUSTOM_MODEL in picked:
+        while True:
+            custom = _prompt_custom_model(state)
+            if custom not in models:
+                models.append(custom)
+                custom_sink.append(custom)
+            if not prompt_yes_no_default("Add another custom model?", default=False):
+                break
+    return models
+
+
 def configured_models_for_agent(agent_config: dict) -> list[str]:
     """Models an agent was configured with, in the manifest's own vocabulary.
 
@@ -552,19 +830,20 @@ def _prompt_budget_policy(
         )
         return None
 
-    # Spend routing only works on a budget with a per-user threshold; without one the gateway reports
-    # no spend and every tier stays inert. The listing can't reveal the alert's action, so this hides
-    # the clearly-unusable budgets and the server rejects the rest on create.
-    usable = [budget for budget in budgets if budget.get("has_per_user_alert")]
+    # Spend routing only works on a budget with a per-user threshold that hard-blocks: without a
+    # per-user threshold the gateway reports no spend and every tier stays inert, and without a
+    # BLOCK_USAGE action the policy is never enforced (an email-only alert does not gate spend). The
+    # listing now exposes each alert's action, so hide the budgets that can't enforce routing.
+    usable = [budget for budget in budgets if budget.get("has_per_user_block")]
     if not usable:
         print_warning(
-            "None of this workspace's AI Gateway budgets have a per-user threshold configured, which "
-            "spend routing requires. Add a per-user alert threshold to a budget in the Databricks "
-            "console, then re-run `ucode setup`."
+            "None of this workspace's AI Gateway budgets have a per-user threshold with a usage "
+            "block configured, which spend routing enforces. Add a per-user alert threshold with a "
+            "block action to a budget in the Databricks console, then re-run `ucode setup`."
         )
         return None
     print_note(
-        "Showing only budgets with a per-user threshold configured, which spend routing needs."
+        "Showing only budgets with a per-user hard block configured, which spend routing enforces."
     )
 
     budget_id = prompt_for_selection(
@@ -579,9 +858,26 @@ def _prompt_budget_policy(
         return None
 
     policy: dict = {"budget_id": budget_id}
+    # Remember the budget's own name so the summary can show it beside the policy name. It's a local
+    # display aid only — `_budget_policy_payload` doesn't serialize it, so it never reaches the API.
+    budget_display_name = next(
+        (budget["display_name"] for budget in usable if budget["id"] == budget_id), ""
+    )
+    if budget_display_name:
+        policy["budget_display_name"] = budget_display_name
     display_name = prompt_for_text("Policy name", default="coding-agents-tiered-routing")
     if display_name:
         policy["display_name"] = display_name
+
+    # The per-user monthly cap the budget was created with. Tiers are picked as percentages of it, so
+    # showing the dollar amount (and what each percentage works out to) tells the admin what the total
+    # possible per-user spend even is. None when the listing couldn't read it — then we just skip the
+    # dollar hints and prompt in percent as before.
+    threshold = next(
+        (budget.get("per_user_threshold") for budget in usable if budget["id"] == budget_id), None
+    )
+    if threshold is not None:
+        print_note(f"This budget's per-user limit is {format_usd(threshold)} per month.")
 
     tiers: list[dict] = []
     seen_percentages: set[float] = set()
@@ -596,6 +892,13 @@ def _prompt_budget_policy(
         if fraction in seen_percentages:
             print_err("That percentage is already used by another tier; pick a different one.")
             continue
+        if threshold is not None:
+            # Echo the dollars this percentage stands for, so the admin can sanity-check the tier
+            # against the real per-user cap instead of reasoning about percentages in a vacuum.
+            print_note(
+                f"  {fraction * 100:g}% of {format_usd(threshold)} is "
+                f"{format_usd(threshold * Decimal(str(fraction)))}."
+            )
         agent = prompt_for_selection(
             f"Tier {index}: which agent becomes the default?",
             [(tool, TOOL_SPECS[tool]["display"]) for tool in enabled_agents],
@@ -663,7 +966,7 @@ def _render_summary(workspace: str, manifest: dict) -> None:
         provider = model_config.get("model_provider_service")
         if provider:
             detail = f"{detail} via {provider}"
-        scope = "machine-wide" if agent_config.get("use_as_global_settings") else "per-user"
+        scope = "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
         lines.append(kv_line(display, f"{detail} ({scope})"))
         # Spell out the per-family slots and model lists: the one-line default alone doesn't show
         # which families an admin configured, which is most of what they chose for claude.
@@ -690,8 +993,9 @@ def _render_summary(workspace: str, manifest: dict) -> None:
     if isinstance(policy, dict):
         tiers = policy.get("tiers") or []
         lines.append(
-            kv_line("Budget policy", policy.get("display_name") or policy.get("budget_id") or "set")
+            kv_line("Budget", policy.get("budget_display_name") or policy.get("budget_id") or "set")
         )
+        lines.append(kv_line("Policy name", policy.get("display_name") or "unnamed"))
         for tier in tiers:
             agent = tier.get("default_agent")
             display = TOOL_SPECS.get(agent, {}).get("display", agent)
@@ -769,7 +1073,7 @@ def _delete_existing_config(workspace: str, token: str, existing: dict) -> None:
     """Delete the workspace's published config after confirming. Raises RuntimeError on failure.
 
     Deleting leaves the workspace with no managed config, so every developer falls back to their own
-    settings on their next ucode run — confirm before doing it, and honor ``--dry-run``.
+    settings on their next ucode run — confirm before doing it.
     """
     name = existing.get("name")
     if not isinstance(name, str):
@@ -783,9 +1087,6 @@ def _delete_existing_config(workspace: str, token: str, existing: dict) -> None:
     )
     if not prompt_yes_no_default("Delete the existing managed config?", default=False):
         print_note("Nothing was deleted.")
-        return
-    if is_dry_run():
-        print_success("Dry run: the config was not deleted.")
         return
     with spinner("Deleting the managed config..."):
         delete_reason = delete_coding_agent_config(workspace, token, name)
@@ -829,9 +1130,9 @@ def setup_from_file(path: str) -> int:
             print_note(error)
         return 1
 
-    save_managed_settings(workspace, manifest)
+    save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
-    print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-settings.json")
+    print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-state.json")
     _print_next_steps()
     return 0
 
@@ -839,14 +1140,20 @@ def setup_from_file(path: str) -> int:
 def _print_next_steps() -> None:
     console.print()
     print_heading("Next steps")
-    # Deliberately only `apply`. There is no way yet to try the authored config locally: the
-    # manifest describes what developers should get, while `ucode configure --dry-run` previews
-    # this machine's own agent configs, so pointing at it implied a local test it doesn't perform.
     print_note("Publish it to the workspace:  ucode apply")
 
 
-def setup_command(from_file: str | None = None) -> int:
+def setup_command(
+    from_file: str | None = None,
+    *,
+    workspace: str | None = None,
+    profile: str | None = None,
+) -> int:
     """Author the workspace's managed coding-agent config interactively.
+
+    ``workspace``/``profile`` let a caller that has already resolved (and authenticated against) a
+    workspace hand it in so the admin isn't prompted to pick one again — e.g. `ucode configure`
+    launching setup after its admin offer. When ``workspace`` is None the flow prompts as usual.
 
     Returns a process exit code. Raises RuntimeError for actionable failures (not an admin, no
     agents available) and KeyboardInterrupt when the admin aborts a picker; the CLI maps both.
@@ -862,7 +1169,8 @@ def setup_command(from_file: str | None = None) -> int:
     print_note("Author the managed coding config for this workspace.")
     print_note("Developers pull it automatically when they run ucode.")
 
-    workspace, profile = _prompt_for_configuration()
+    if workspace is None:
+        workspace, profile = _prompt_for_configuration()
     # `configure_shared_state` below authenticates too and prints its own success line, so this one
     # stays quiet rather than reporting the same thing twice. It still has to run first: the admin
     # gate and the existing-config check both need a token before discovery.
@@ -873,8 +1181,7 @@ def setup_command(from_file: str | None = None) -> int:
     if not _handle_existing_config(workspace, token):
         return 0
 
-    # Discover the workspace's models and gateway URLs. This also logs in and persists local state,
-    # which is what lets the admin dry-run the config on their own machine afterwards.
+    # Discover the workspace's models and gateway URLs. This also logs in and persists local state.
     state = configure_shared_state(workspace, profile=profile, force_login=False)
     workspace = state.get("workspace") or workspace
     profile = state.get("profile") or profile
@@ -886,7 +1193,7 @@ def setup_command(from_file: str | None = None) -> int:
             "serves models for at least one agent."
         )
 
-    previous = load_managed_settings(workspace) or {}
+    previous = load_managed_state(workspace) or {}
     previously_enabled = [
         tool for tool in (previous.get("enabled_agents") or {}) if tool in TOOL_SPECS
     ]
@@ -919,7 +1226,8 @@ def setup_command(from_file: str | None = None) -> int:
             "model_config": _prompt_models_for_agent(tool, state, provider_service)
         }
         agent_config["use_as_global_settings"] = prompt_yes_no_default(
-            f"Apply {TOOL_SPECS[tool]['display']} config machine-wide? ({GLOBAL_SETTINGS_BLURB})",
+            f"Write {TOOL_SPECS[tool]['display']}'s config to its global settings file? "
+            f"({GLOBAL_SETTINGS_BLURB})",
             default=False,
         )
         enabled_agents[tool] = agent_config
@@ -935,7 +1243,10 @@ def setup_command(from_file: str | None = None) -> int:
     if prompt_yes_no_default("Set up managed MCP servers for this workspace?", default=False):
         from ucode.mcp import configure_mcp_command
 
-        configure_mcp_command()
+        # Managed configs can't carry a Databricks app (its host isn't reconstructable from the
+        # workspace), so hide apps from the picker rather than let an admin pick one that is then
+        # dropped from the published config.
+        configure_mcp_command(exclude_sources={"apps"})
         mcp_servers = _mcp_servers_from_state(load_state())
         if mcp_servers:
             manifest["mcp_servers"] = mcp_servers
@@ -969,18 +1280,20 @@ def setup_command(from_file: str | None = None) -> int:
             print_note(error)
         return 1
 
-    save_managed_settings(workspace, manifest)
+    save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
     console.print()
-    print_success("Saved to ~/.ucode/managed-settings.json")
+    print_success("Saved to ~/.ucode/managed-state.json")
     _print_next_steps()
     return 0
 
 
 def show_command() -> int:
     """Print the authored manifest and the proto-JSON `ucode apply` would publish."""
-    workspace = load_state().get("workspace")
-    manifest = load_managed_settings(workspace)
+    # Fall back to the workspace the on-disk file was authored for, so `ucode setup --show` still
+    # works before `ucode configure` has put a workspace in local state.
+    workspace = load_state().get("workspace") or managed_state_workspace()
+    manifest = load_managed_state(workspace)
     if manifest is None:
         print_note("No managed config has been authored yet. Run `ucode setup` to create one.")
         return 0
@@ -1070,7 +1383,7 @@ def apply_command(*, yes: bool = False) -> int:
     if not workspace:
         workspace, profile = _prompt_for_configuration()
 
-    manifest = load_managed_settings(workspace)
+    manifest = load_managed_state(workspace)
     if manifest is None:
         raise RuntimeError(
             "No managed config has been authored for this workspace. Run `ucode setup` first "
@@ -1086,7 +1399,7 @@ def apply_command(*, yes: bool = False) -> int:
         print_err("The authored config is not valid, so it was not published:")
         for error in errors:
             print_note(error)
-        print_note("Re-run `ucode setup` to fix it, or edit ~/.ucode/managed-settings.json.")
+        print_note("Re-run `ucode setup` to fix it, or edit ~/.ucode/managed-state.json.")
         return 1
 
     token = get_databricks_token(workspace, profile)

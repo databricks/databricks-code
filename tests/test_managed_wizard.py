@@ -8,6 +8,7 @@ managed-config types, the admin gate, and the per-agent model-config shapes.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
@@ -16,7 +17,7 @@ from typer.testing import CliRunner
 
 import ucode.cli as cli_mod
 import ucode.config_io as config_io_mod
-import ucode.managed_setup as managed_setup_mod
+import ucode.managed_config as managed_config_mod
 import ucode.managed_wizard as wizard
 from ucode.cli import app
 from ucode.managed_setup import validate_manifest
@@ -43,11 +44,9 @@ STATE = {
 
 @pytest.fixture(autouse=True)
 def _isolate_settings(tmp_path, monkeypatch):
-    """Point the manifest path at a tmp dir so no test touches the real ~/.ucode."""
+    """Point the managed-config file at a tmp dir so no test touches the real ~/.ucode."""
     monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-    monkeypatch.setattr(
-        managed_setup_mod, "MANAGED_SETTINGS_PATH", tmp_path / "managed-settings.json"
-    )
+    monkeypatch.setattr(managed_config_mod, "MANAGED_STATE_PATH", tmp_path / "managed-state.json")
     monkeypatch.setattr(config_io_mod, "_dry_run", False)
 
 
@@ -72,32 +71,46 @@ class TestTracingReadback:
         assert wizard._tracing_table_from_state({"tracing": "on"}) is None
 
 
-class TestMcpUrlClassification:
+class TestMcpServerFromUrl:
     @pytest.mark.parametrize(
         ("url", "expected"),
         [
-            ("https://ws.example.com/ai-gateway/mcp-services/system.ai.github", "mcp-service"),
-            ("https://ws.example.com/api/2.0/mcp/external/jira-prod", "external"),
-            ("https://ws.example.com/api/2.0/mcp/genie/01ef", "genie-space"),
-            ("https://ws.example.com/api/2.0/mcp/vector-search/main/default", "vector-search"),
-            ("https://ws.example.com/api/2.0/mcp/functions/main/default", "uc-functions"),
-            ("https://ws.example.com/api/2.0/mcp/sql", "sql"),
-            ("https://mcp-myapp-123.aws.databricksapps.com/mcp", "app"),
+            # mcp-service stores the dash form the launch path rebuilds the dotted URL from.
+            (
+                "https://ws.example.com/ai-gateway/mcp-services/system.ai.github",
+                ("system-ai-github", "mcp-service"),
+            ),
+            ("https://ws.example.com/api/2.0/mcp/external/jira-prod", ("jira-prod", "external")),
+            ("https://ws.example.com/api/2.0/mcp/genie/01ef", ("01ef", "genie-space")),
+            # vector-search / uc-functions store `<catalog>.<schema>`, not the local display slug.
+            (
+                "https://ws.example.com/api/2.0/mcp/vector-search/my_cat/my_schema",
+                ("my_cat.my_schema", "vector-search"),
+            ),
+            (
+                "https://ws.example.com/api/2.0/mcp/functions/dev_cat/dev_fixture",
+                ("dev_cat.dev_fixture", "uc-functions"),
+            ),
+            ("https://ws.example.com/api/2.0/mcp/sql", ("databricks-sql", "sql")),
         ],
     )
     def test_known_urls(self, url, expected):
-        assert wizard._mcp_type_for_url(url) == expected
+        assert wizard._mcp_server_from_url(url) == expected
 
-    def test_trailing_slash_is_tolerated(self):
-        assert wizard._mcp_type_for_url("https://ws.example.com/api/2.0/mcp/sql/") == "sql"
+    def test_apps_are_not_publishable(self):
+        # An app's host isn't reconstructable from the workspace + an id, so it can't be published.
+        assert (
+            wizard._mcp_server_from_url("https://mcp-myapp-123.aws.databricksapps.com/mcp") is None
+        )
 
     def test_unknown_url_yields_none(self):
-        # Better to skip a server than publish it with a guessed type.
-        assert wizard._mcp_type_for_url("https://example.com/something/else") is None
+        assert wizard._mcp_server_from_url("https://example.com/something/else") is None
 
-    def test_sql_is_not_confused_for_app(self):
-        # Both end in a fixed segment; sql must win since it is checked first.
-        assert wizard._mcp_type_for_url("https://ws.example.com/api/2.0/mcp/sql") == "sql"
+    def test_vector_search_needs_both_catalog_and_schema(self):
+        assert (
+            wizard._mcp_server_from_url("https://ws.example.com/api/2.0/mcp/functions/onlycat")
+            is None
+        )
 
 
 class TestMcpServersFromState:
@@ -111,9 +124,25 @@ class TestMcpServersFromState:
                 {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
             ]
         }
+        # The published name comes from the URL (the identifier the server field holds), not the
+        # local display name.
         assert wizard._mcp_servers_from_state(state) == [
-            {"name": "databricks-github", "type": "mcp-service"},
+            {"name": "system-ai-github", "type": "mcp-service"},
             {"name": "databricks-sql", "type": "sql"},
+        ]
+
+    def test_publishes_catalog_schema_for_uc_functions(self):
+        # The lossy local slug is replaced with the dotted catalog.schema the launch path can split.
+        state = {
+            "mcp_servers": [
+                {
+                    "name": "databricks-functions-dev-cat-dev-fixture",
+                    "url": f"{WORKSPACE}/api/2.0/mcp/functions/dev_cat/dev_fixture",
+                },
+            ]
+        }
+        assert wizard._mcp_servers_from_state(state) == [
+            {"name": "dev_cat.dev_fixture", "type": "uc-functions"},
         ]
 
     def test_skips_the_skills_registry_entry(self):
@@ -133,8 +162,13 @@ class TestMcpServersFromState:
         }
         assert wizard._mcp_servers_from_state(state) == [{"name": "databricks-sql", "type": "sql"}]
 
-    def test_skips_unclassifiable_servers(self):
-        state = {"mcp_servers": [{"name": "mystery", "url": "https://example.com/nope"}]}
+    def test_skips_apps_and_unclassifiable_servers(self):
+        state = {
+            "mcp_servers": [
+                {"name": "mystery", "url": "https://example.com/nope"},
+                {"name": "databricks-app-x", "url": "https://x-1.databricksapps.com/mcp"},
+            ]
+        }
         assert wizard._mcp_servers_from_state(state) == []
 
     def test_skips_entries_missing_name_or_url(self):
@@ -246,7 +280,6 @@ class TestExistingConfigHandling:
             ),
             patch.object(wizard, "prompt_for_selection", return_value="delete"),
             patch.object(wizard, "prompt_yes_no_default", return_value=True),
-            patch.object(wizard, "is_dry_run", return_value=False),
             patch.object(wizard, "delete_coding_agent_config", return_value=None) as delete,
         ):
             assert wizard._handle_existing_config(WORKSPACE, "token") is False
@@ -267,21 +300,6 @@ class TestExistingConfigHandling:
             assert wizard._handle_existing_config(WORKSPACE, "token") is False
         assert not delete.called
 
-    def test_delete_honors_dry_run(self):
-        with (
-            patch.object(
-                wizard,
-                "get_managed_config",
-                return_value=({"name": "cfg/1", "enabled_agents": {}}, None),
-            ),
-            patch.object(wizard, "prompt_for_selection", return_value="delete"),
-            patch.object(wizard, "prompt_yes_no_default", return_value=True),
-            patch.object(wizard, "is_dry_run", return_value=True),
-            patch.object(wizard, "delete_coding_agent_config") as delete,
-        ):
-            assert wizard._handle_existing_config(WORKSPACE, "token") is False
-        assert not delete.called
-
     def test_delete_failure_raises(self):
         with (
             patch.object(
@@ -291,7 +309,6 @@ class TestExistingConfigHandling:
             ),
             patch.object(wizard, "prompt_for_selection", return_value="delete"),
             patch.object(wizard, "prompt_yes_no_default", return_value=True),
-            patch.object(wizard, "is_dry_run", return_value=False),
             patch.object(wizard, "delete_coding_agent_config", return_value="HTTP 500"),
             pytest.raises(RuntimeError, match="Could not delete"),
         ):
@@ -484,11 +501,13 @@ class TestModelPrompting:
         assert config == {"default_model": "system.ai.claude-opus-4-8"}
         assert "models" not in config
         assert not text.called, "should pick from candidates, not ask for free text"
-        # The final prompt offers every candidate across all families.
+        # The final prompt offers every candidate across all families (all fit under the picker
+        # limit here), plus the custom-entry row.
         assert set(offered[-1]) == {
             "system.ai.claude-opus-5",
             "system.ai.claude-opus-4-8",
             "system.ai.claude-sonnet-5",
+            wizard._CUSTOM_MODEL,
         }
 
     def test_older_claude_version_passes_validation(self):
@@ -618,28 +637,27 @@ class TestModelPrompting:
 
     def test_provider_service_offers_its_targets(self):
         # The service's own targets are the model vocabulary the manifest must use, so the admin
-        # picks from them rather than typing an id from memory.
+        # picks from them rather than typing an id from memory. Uses codex here: it takes one model
+        # from any service (Claude with explicit targets is prompted per family — see the Bedrock/
+        # Anthropic per-family tests below).
         service = {
-            "name": "main.default.anthropic-mps",
-            "provider_type": "anthropic",
-            "targets": ["claude-sonnet-4-6", "claude-opus-4-8"],
+            "name": "main.default.openai-mps",
+            "provider_type": "openai",
+            "targets": ["gpt-5-6", "gpt-5-6-sol"],
             "allow_all_targets": False,
         }
         with (
-            patch.object(wizard, "prompt_for_selection", return_value="claude-opus-4-8") as select,
+            patch.object(wizard, "prompt_for_selection", return_value="gpt-5-6") as select,
             patch.object(wizard, "prompt_for_text") as text,
         ):
-            config = wizard._prompt_models_for_agent("claude", STATE, service)
+            config = wizard._prompt_models_for_agent("codex", STATE, service)
         assert config == {
-            "model_provider_service": "main.default.anthropic-mps",
-            "default_model": "claude-opus-4-8",
+            "model_provider_service": "main.default.openai-mps",
+            "default_model": "gpt-5-6",
         }
         assert not text.called, "should not fall back to free text when targets are known"
         # Offered sorted, so the picker order is stable run to run.
-        assert [value for value, _ in select.call_args[0][1]] == [
-            "claude-opus-4-8",
-            "claude-sonnet-4-6",
-        ]
+        assert [value for value, _ in select.call_args[0][1]] == ["gpt-5-6", "gpt-5-6-sol"]
 
     def test_provider_service_falls_back_to_text_when_targets_unknown(self):
         # allow_all_targets passes the provider's whole catalog through; there is nothing to list.
@@ -682,6 +700,224 @@ class TestModelPrompting:
         ):
             config = wizard._prompt_models_for_agent("pi", {}, None)
         assert config == {"default_model": "some-model"}
+
+    def test_bedrock_claude_prompts_per_family(self):
+        # render_overlay pins ANTHROPIC_DEFAULT_<FAMILY>_MODEL from a Bedrock service's provider-side
+        # ids (Claude Code can't route its canonical names there), so Claude needs a default per
+        # family — a single overall default would leave the other families unpinned.
+        service = {
+            "name": "main.default.bedrock",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": [
+                "anthropic.claude-opus-4-1",
+                "anthropic.claude-opus-4-8",
+                "anthropic.claude-sonnet-4-6",
+                "anthropic.claude-haiku-4-5",
+            ],
+        }
+        asked: list[str] = []
+
+        def fake_selection(prompt, options, **kwargs):
+            asked.append(prompt)
+            return options[0][0]
+
+        with (
+            # Decline quick setup to exercise the per-family prompts.
+            patch.object(wizard, "prompt_yes_no_default", return_value=False),
+            patch.object(wizard, "prompt_for_selection", side_effect=fake_selection),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert [p for p in asked if p.startswith("Default ")] == [
+            "Default opus model:",
+            "Default sonnet model:",
+            "Default haiku model:",
+        ]
+        assert config["model_provider_service"] == "main.default.bedrock"
+        assert config["models"] == {
+            "default_opus_model": "anthropic.claude-opus-4-1",
+            "default_sonnet_model": "anthropic.claude-sonnet-4-6",
+            "default_haiku_model": "anthropic.claude-haiku-4-5",
+        }
+        # Slots carry the service's own provider-side ids, not workspace `system.ai.*` ids.
+        assert all(m.startswith("anthropic.") for m in config["models"].values())
+        assert config["default_model"] in service["targets"]
+
+    def test_bedrock_claude_skipped_family_is_omitted(self):
+        service = {
+            "name": "main.default.bedrock",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": ["anthropic.claude-opus-4-8", "anthropic.claude-sonnet-4-6"],
+        }
+        # pick=-1 selects the trailing "(skip <family>)" option for every family.
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=False),
+            patch.object(wizard, "prompt_for_selection", side_effect=lambda p, o, **k: o[-1][0]),
+            patch.object(wizard, "print_note"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert "models" not in config
+        assert config["default_model"] in service["targets"]
+
+    def test_bedrock_codex_still_takes_a_single_model(self):
+        # Only Claude pins per family; codex through any provider takes one model.
+        service = {
+            "name": "main.default.bedrock-oai",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": ["gpt-5-6", "gpt-5-6-sol"],
+        }
+        asked: list[str] = []
+        with (
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=lambda p, o, **k: (asked.append(p), o[0][0])[1],
+            ),
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, service)
+        assert len(asked) == 1
+        assert "models" not in config
+
+    def test_anthropic_claude_with_explicit_targets_prompts_per_family(self):
+        # An Anthropic service that publishes explicit canonical targets IS pinned per family by
+        # render_overlay (each ANTHROPIC_DEFAULT_<FAMILY>_MODEL to a chosen version), so the wizard
+        # prompts per family — same as Bedrock, just canonical ids instead of provider slugs.
+        service = {
+            "name": "main.default.ant",
+            "provider_type": "anthropic",
+            "allow_all_targets": False,
+            "targets": ["claude-opus-4-8", "claude-sonnet-4-6"],
+        }
+        asked: list[str] = []
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=False),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=lambda p, o, **k: (asked.append(p), o[0][0])[1],
+            ),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert [p for p in asked if p.startswith("Default ")] == [
+            "Default opus model:",
+            "Default sonnet model:",
+        ]
+        assert config["models"] == {
+            "default_opus_model": "claude-opus-4-8",
+            "default_sonnet_model": "claude-sonnet-4-6",
+        }
+
+    def test_quick_setup_fills_newest_per_family_without_per_family_prompts(self):
+        # Quick setup (default yes) auto-fills each family with the service's newest id — same pick
+        # map_claude_family_models makes — and asks no per-family questions.
+        service = {
+            "name": "main.default.bedrock",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": [
+                "anthropic.claude-opus-4-1",
+                "anthropic.claude-opus-4-8",
+                "anthropic.claude-sonnet-4-6",
+            ],
+        }
+        selections: list[str] = []
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=lambda p, o, **k: selections.append(p) or o[0][0],
+            ),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        # No per-family (or overall-default) picker was shown — quick setup asked nothing.
+        assert selections == []
+        assert config["models"] == {
+            "default_opus_model": "anthropic.claude-opus-4-8",  # newest opus, not 4-1
+            "default_sonnet_model": "anthropic.claude-sonnet-4-6",
+        }
+        # Overall default is opus (the flagship), not sonnet.
+        assert config["default_model"] == "anthropic.claude-opus-4-8"
+
+    def test_quick_setup_default_is_flagship_not_target_order(self):
+        # Regression: the overall default must be the highest-tier family (opus), not whichever
+        # target sorts first — here haiku leads the list but opus must still win.
+        service = {
+            "name": "main.default.bedrock",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": [
+                "us.anthropic.claude-haiku-4-5",
+                "us.anthropic.claude-sonnet-5",
+                "us.anthropic.claude-opus-5",
+            ],
+        }
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert config["default_model"] == "us.anthropic.claude-opus-5"
+
+    def test_quick_setup_default_falls_to_sonnet_without_opus(self):
+        service = {
+            "name": "main.default.bedrock",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": False,
+            "targets": ["us.anthropic.claude-haiku-4-5", "us.anthropic.claude-sonnet-5"],
+        }
+        with (
+            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert config["default_model"] == "us.anthropic.claude-sonnet-5"
+
+    def test_anthropic_claude_allow_all_takes_a_single_default(self):
+        # No explicit targets (allow_all) means nothing is pinned — Claude Code's canonical names
+        # route fine — so it falls back to a single free-text default, not per-family slots.
+        service = {
+            "name": "main.default.ant-all",
+            "provider_type": "anthropic",
+            "allow_all_targets": True,
+            "targets": [],
+        }
+        with (
+            patch.object(wizard, "prompt_for_text", return_value="claude-sonnet-5"),
+            patch.object(wizard, "print_note"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        assert "models" not in config
+        assert config["default_model"] == "claude-sonnet-5"
+
+    def test_allow_all_with_explicit_claude_targets_does_not_abort(self):
+        # Regression: a service that is allow_all_targets AND lists Claude targets. The family
+        # decision must key on the enumerated targets (which allow_all zeroes), not the raw service —
+        # otherwise it takes the per-family branch with an empty list and aborts the wizard.
+        service = {
+            "name": "main.default.weird",
+            "provider_type": "amazon_bedrock",
+            "allow_all_targets": True,
+            "targets": ["us.anthropic.claude-opus-5", "us.anthropic.claude-sonnet-5"],
+        }
+        with (
+            patch.object(wizard, "prompt_for_text", return_value="typed-model"),
+            patch.object(wizard, "print_note"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, service)
+        # Falls through to the single free-text default; no per-family slots, no KeyboardInterrupt.
+        assert "models" not in config
+        assert config["default_model"] == "typed-model"
 
     def test_empty_selection_is_re_prompted(self):
         # An agent with no default_model can't be the config's default_agent (the server rejects
@@ -785,6 +1021,129 @@ OPENAI_SERVICE = {
     "allow_all_targets": False,
     "relayed": False,
 }
+
+
+class TestCustomModelEntry:
+    """The hosted-model pickers let an admin type a model service discovery didn't list."""
+
+    def test_single_agent_can_enter_a_verified_custom_model(self):
+        # Selecting the custom row prompts for a path, verifies it exists, and records it so
+        # validation won't reject a model outside the discovered inventory.
+        with (
+            patch.object(wizard, "prompt_for_selection", return_value=wizard._CUSTOM_MODEL),
+            patch.object(wizard, "prompt_for_text", return_value="main.aarushi.gpt-5-custom"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(True, None)) as exists,
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, None)
+        assert config == {
+            "default_model": "main.aarushi.gpt-5-custom",
+            "custom_models": ["main.aarushi.gpt-5-custom"],
+        }
+        exists.assert_called_once_with(WORKSPACE, "tok", "main.aarushi.gpt-5-custom")
+
+    def test_custom_model_reprompts_until_it_exists(self):
+        # A typo shouldn't get baked into a published config — a miss re-asks.
+        with (
+            patch.object(wizard, "prompt_for_selection", return_value=wizard._CUSTOM_MODEL),
+            patch.object(
+                wizard, "prompt_for_text", side_effect=["main.typo.model", "main.real.model"]
+            ),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", side_effect=[(False, None), (True, None)]),
+            patch.object(wizard, "print_err") as err,
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, None)
+        assert config["default_model"] == "main.real.model"
+        assert err.called
+
+    def test_multi_select_agent_can_add_several_custom_models(self):
+        # opencode/pi carry a model list, so the custom row keeps prompting until the admin declines.
+        with (
+            patch.object(wizard, "prompt_for_multi_selection", return_value=[wizard._CUSTOM_MODEL]),
+            patch.object(
+                wizard, "prompt_for_text", side_effect=["main.default.a", "main.default.b"]
+            ),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_for_selection", return_value="main.default.a"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(True, None)),
+        ):
+            config = wizard._prompt_models_for_agent("pi", STATE, None)
+        assert config["models"] == ["main.default.a", "main.default.b"]
+        assert config["custom_models"] == ["main.default.a", "main.default.b"]
+        assert config["default_model"] == "main.default.a"
+
+    def test_short_reason_drops_the_json_body(self):
+        # The warning for an inconclusive check should show the status, not the raw error blob.
+        assert (
+            wizard._short_reason('HTTP 500 Server Error: {"error_code":"INTERNAL"}')
+            == "HTTP 500 Server Error"
+        )
+        assert wizard._short_reason("network error: timed out") == "network error: timed out"
+        assert wizard._short_reason(None) == "unknown error"
+
+    def test_unverifiable_custom_model_is_accepted_with_a_warning(self):
+        # An inconclusive check (transient error / no token) must not block a possibly-valid model.
+        with (
+            patch.object(wizard, "prompt_for_selection", return_value=wizard._CUSTOM_MODEL),
+            patch.object(wizard, "prompt_for_text", return_value="main.aarushi.maybe"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(None, "HTTP 500")),
+            patch.object(wizard, "print_warning") as warn,
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, None)
+        assert config["default_model"] == "main.aarushi.maybe"
+        assert warn.called
+
+    def test_picker_shows_only_the_top_few_plus_custom(self):
+        # A long list is truncated so the custom row is reachable without scrolling past everything.
+        state = {**STATE, "codex_models": [f"system.ai.gpt-5-{i}" for i in range(10)]}
+        offered: list[list[str]] = []
+
+        def fake_sel(prompt, options, **kwargs):
+            offered.append([v for v, _ in options])
+            return options[0][0]
+
+        with patch.object(wizard, "prompt_for_selection", side_effect=fake_sel):
+            wizard._prompt_models_for_agent("codex", state, None)
+        rows = offered[0]
+        assert rows[-1] == wizard._CUSTOM_MODEL
+        assert len(rows) == wizard._MODEL_PICKER_LIMIT + 1  # top few + the custom row
+
+    def test_claude_family_custom_model_slots_and_validates(self):
+        # A custom id chosen for a family lands in that slot, is marked custom, and survives
+        # validation even though discovery never listed it.
+        candidates = {"opus": ["system.ai.claude-opus-5"]}
+
+        def fake_sel(prompt, options, **kwargs):
+            values = [v for v, _ in options]
+            if wizard._CUSTOM_MODEL in values:
+                return wizard._CUSTOM_MODEL
+            return values[0]
+
+        with (
+            patch.object(wizard, "_claude_candidates", return_value=candidates),
+            patch.object(wizard, "prompt_for_selection", side_effect=fake_sel),
+            patch.object(wizard, "prompt_for_text", return_value="main.aarushi.claude-opus-4-5"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(True, None)),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, None)
+        assert config["models"]["default_opus_model"] == "main.aarushi.claude-opus-4-5"
+        assert config["custom_models"] == ["main.aarushi.claude-opus-4-5"]
+        assert (
+            validate_manifest(
+                {
+                    "default_agent": "claude",
+                    "enabled_agents": {"claude": {"model_config": config}},
+                },
+                STATE,
+            )
+            == []
+        )
 
 
 class TestProviderServiceSpinner:
@@ -1000,10 +1359,10 @@ class TestBudgetPolicy:
             assert wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE) is None
         assert warn.called
 
-    def test_no_per_user_budgets_warns_and_yields_none(self):
-        # Spend routing needs a per-user threshold; a workspace whose only budgets lack one has
-        # nothing usable to attach a policy to.
-        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": False}]
+    def test_no_per_user_block_budgets_warns_and_yields_none(self):
+        # Spend routing needs a per-user threshold that hard-blocks; a workspace whose only budgets
+        # lack one has nothing usable to attach a policy to.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": False}]
         with (
             patch.object(wizard, "prompt_yes_no_default", return_value=True),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1012,12 +1371,12 @@ class TestBudgetPolicy:
             assert wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE) is None
         assert warn.called
 
-    def test_only_per_user_budgets_are_offered(self):
-        # The picker hides budgets without a per-user threshold rather than letting the admin pick
-        # one that would leave every tier inert.
+    def test_only_per_user_block_budgets_are_offered(self):
+        # The picker hides budgets without a per-user hard block rather than letting the admin pick
+        # one that would leave every tier inert or unenforced.
         budgets = [
-            {"id": "no-per-user", "display_name": "shared-only", "has_per_user_alert": False},
-            {"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True},
+            {"id": "no-block", "display_name": "email-only", "has_per_user_block": False},
+            {"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True},
         ]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
@@ -1037,7 +1396,7 @@ class TestBudgetPolicy:
         assert policy is not None and policy["budget_id"] == BUDGET_ID
 
     def test_percentages_are_stored_as_fractions(self):
-        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1053,6 +1412,8 @@ class TestBudgetPolicy:
             policy = wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
         assert policy is not None
         assert policy["budget_id"] == BUDGET_ID
+        # The picked budget's name is remembered for the summary.
+        assert policy["budget_display_name"] == "eng"
         assert policy["tiers"] == [
             {
                 "spending_percentage": 0.8,
@@ -1060,6 +1421,54 @@ class TestBudgetPolicy:
                 "default_model": "system.ai.claude-opus-4-8",
             }
         ]
+
+    def test_shows_per_user_threshold_and_tier_dollars(self):
+        # The admin picks tiers as percentages, so surface the budget's per-user monthly cap and what
+        # each percentage works out to in dollars — otherwise a percentage is a number in a vacuum.
+        budgets = [
+            {
+                "id": BUDGET_ID,
+                "display_name": "eng",
+                "has_per_user_block": True,
+                "per_user_threshold": Decimal("500.00"),
+            }
+        ]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
+            ),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+            patch.object(wizard, "print_note") as note,
+        ):
+            wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        notes = " ".join(str(call.args[0]) for call in note.call_args_list)
+        assert "$500" in notes  # the per-user monthly cap
+        assert "$400" in notes  # 80% of $500
+
+    def test_missing_threshold_skips_the_dollar_hints(self):
+        # A budget whose threshold couldn't be read still works; the prompt just omits the dollars.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
+            ),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+            patch.object(wizard, "print_note") as note,
+        ):
+            policy = wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        notes = " ".join(str(call.args[0]) for call in note.call_args_list)
+        assert "$" not in notes
+        assert policy is not None and policy["tiers"][0]["spending_percentage"] == 0.8
 
     def test_offers_only_the_models_the_agent_was_configured_with(self):
         # Pi's catalog spans every family, so offering the workspace catalog would present four
@@ -1072,7 +1481,7 @@ class TestBudgetPolicy:
                 }
             }
         }
-        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1101,7 +1510,7 @@ class TestBudgetPolicy:
                 }
             }
         }
-        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1120,7 +1529,7 @@ class TestBudgetPolicy:
     def test_falls_back_to_the_catalog_when_an_agent_lists_nothing(self):
         # An agent configured through a provider service has no enumerable list; better to offer the
         # catalog than nothing at all.
-        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1137,7 +1546,7 @@ class TestBudgetPolicy:
         assert offered == ["system.ai.gemini-3-flash"]
 
     def test_authored_policy_validates(self):
-        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1171,10 +1580,10 @@ class TestBudgetPolicy:
                 }
             }
         }
-        # `has_per_user_alert` is required since the budget-threshold gate landed on main: spend
-        # routing needs a per-user threshold, so a budget without one is filtered out and the policy
-        # flow returns before the tier loop this test exercises.
-        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_alert": True}]
+        # `has_per_user_block` is required since the budget-threshold gate landed on main: spend
+        # routing needs a per-user threshold that hard-blocks, so a budget without one is filtered
+        # out and the policy flow returns before the tier loop this test exercises.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
             patch.object(wizard, "prompt_yes_no_default", side_effect=[True, True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
@@ -1298,13 +1707,13 @@ class TestSetupFromFile:
         path = self._write(tmp_path, self._valid())
         with patch.object(wizard, "load_state", return_value=STATE):
             assert wizard.setup_from_file(str(path)) == 0
-        assert managed_setup_mod.load_managed_settings(WORKSPACE) == self._valid()
+        assert managed_config_mod.load_managed_state(WORKSPACE) == self._valid()
 
     def test_invalid_manifest_returns_1_and_saves_nothing(self, tmp_path):
         path = self._write(tmp_path, {"enabled_agents": {"claude": {}}})
         with patch.object(wizard, "load_state", return_value=STATE):
             assert wizard.setup_from_file(str(path)) == 1
-        assert managed_setup_mod.load_managed_settings(WORKSPACE) is None
+        assert managed_config_mod.load_managed_state(WORKSPACE) is None
 
     def test_missing_file_is_actionable(self, tmp_path):
         with patch.object(wizard, "load_state", return_value=STATE):
@@ -1343,7 +1752,7 @@ class TestShowCommand:
                 "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}}
             },
         }
-        managed_setup_mod.save_managed_settings(WORKSPACE, manifest)
+        managed_config_mod.save_managed_state(WORKSPACE, manifest)
         with patch.object(wizard, "load_state", return_value={"workspace": WORKSPACE}):
             assert wizard.show_command() == 0
         out = capsys.readouterr().out
@@ -1390,6 +1799,47 @@ class TestSummaryPanel:
             },
         )
         assert "[prod] tiered routing" in capsys.readouterr().out
+
+    def test_shows_both_budget_and_policy_names(self, capsys):
+        # An admin checks the policy against two distinct things: which budget it tracks and what the
+        # policy itself is called. The summary must surface both, not collapse to one.
+        wizard._render_summary(
+            WORKSPACE,
+            {
+                "default_agent": "claude",
+                "enabled_agents": {
+                    "claude": {"model_config": {"default_model": "system.ai.claude-opus-5"}}
+                },
+                "budget_policy": {
+                    "budget_id": "19165ea4-ff8d-4fbb-b6ce-fc5abe7e1c57",
+                    "budget_display_name": "eng-budget",
+                    "display_name": "tiered routing",
+                    "tiers": [],
+                },
+            },
+        )
+        out = capsys.readouterr().out
+        assert "eng-budget" in out
+        assert "tiered routing" in out
+
+    def test_falls_back_to_budget_id_without_a_budget_name(self, capsys):
+        # `--from-file` and server-read manifests carry no `budget_display_name`, so the budget id is
+        # all there is to show.
+        wizard._render_summary(
+            WORKSPACE,
+            {
+                "default_agent": "claude",
+                "enabled_agents": {
+                    "claude": {"model_config": {"default_model": "system.ai.claude-opus-5"}}
+                },
+                "budget_policy": {
+                    "budget_id": "19165ea4-ff8d-4fbb-b6ce-fc5abe7e1c57",
+                    "display_name": "tiered routing",
+                    "tiers": [],
+                },
+            },
+        )
+        assert "19165ea4-ff8d-4fbb-b6ce-fc5abe7e1c57" in capsys.readouterr().out
 
 
 class TestCancelledPromptsAbort:
@@ -1491,7 +1941,7 @@ class TestSearchablePickers:
         assert seen[0].get("searchable") is True
 
     def test_budget_and_tier_pickers_are_searchable(self):
-        budgets = [{"id": "budget-1", "display_name": "eng", "has_per_user_alert": True}]
+        budgets = [{"id": "budget-1", "display_name": "eng", "has_per_user_block": True}]
         searchable_prompts: list[str] = []
 
         def fake_sel(prompt, options, **kwargs):
@@ -1560,7 +2010,7 @@ class TestApplyCommand:
                 wizard.apply_command()
 
     def test_creates_when_no_config_exists(self):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         created = {}
 
         def fake_create(workspace, token, payload):
@@ -1575,7 +2025,7 @@ class TestApplyCommand:
     def test_updates_in_place_when_a_config_exists(self):
         # Delete-then-create would leave the workspace with no config if the create failed, so an
         # existing config must be PATCHed rather than replaced.
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         existing = {"name": "coding-agent-configs/abc", "enabled_agents": {"codex": {}}}
         updated = {}
         created = {"called": False}
@@ -1601,7 +2051,7 @@ class TestApplyCommand:
 
     def test_invalid_manifest_is_not_published(self):
         # `default_agent` names an agent that isn't enabled.
-        managed_setup_mod.save_managed_settings(
+        managed_config_mod.save_managed_state(
             WORKSPACE, {"default_agent": "codex", "enabled_agents": {"claude": {}}}
         )
         created = {"called": False}
@@ -1619,7 +2069,7 @@ class TestApplyCommand:
         # `apply` process used to reject a model it had just offered:
         #   claude: model 'system.ai.claude-opus-4-1' is not available on this workspace.
         # `apply` re-fetches the full listing rather than trusting what `setup` left in state.
-        managed_setup_mod.save_managed_settings(
+        managed_config_mod.save_managed_state(
             WORKSPACE,
             {
                 "default_agent": "claude",
@@ -1657,7 +2107,7 @@ class TestApplyCommand:
     def test_a_failed_inventory_fetch_does_not_block_publishing(self):
         # The re-fetch is best-effort: a transient listing failure must not turn into a refusal to
         # publish a manifest that validates against what state already knows.
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         published: dict = {}
 
         def fake_create(workspace, token, payload):
@@ -1674,7 +2124,7 @@ class TestApplyCommand:
         assert published
 
     def test_declining_the_prompt_publishes_nothing(self):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         created = {"called": False}
 
         def fake_create(*a, **k):
@@ -1688,7 +2138,7 @@ class TestApplyCommand:
         assert created["called"] is False
 
     def test_yes_skips_the_prompt(self):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
 
         def refuse(*a, **k):
             raise AssertionError("--yes must not prompt")
@@ -1696,7 +2146,7 @@ class TestApplyCommand:
         assert self._run(yes=True, prompt_yes_no_default=refuse) == 0
 
     def test_non_admin_is_rejected_before_publishing(self):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         created = {"called": False}
 
         def fake_create(*a, **k):
@@ -1711,7 +2161,7 @@ class TestApplyCommand:
 
     def test_unreadable_existing_config_refuses_to_publish(self):
         # Publishing without knowing whether a config exists risks silently overwriting one.
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         created = {"called": False}
 
         def fake_create(*a, **k):
@@ -1726,7 +2176,7 @@ class TestApplyCommand:
         assert created["called"] is False
 
     def test_existing_config_without_a_resource_name_is_an_error(self):
-        managed_setup_mod.save_managed_settings(WORKSPACE, self.MANIFEST)
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         with pytest.raises(RuntimeError, match="resource name"):
             self._run(get_managed_config=lambda *a, **k: ({"enabled_agents": {}}, None))
 
@@ -1852,15 +2302,6 @@ class TestCliWiring:
         ):
             runner.invoke(app, ["setup", "--from-file", "/tmp/x.json"])
         assert setup.call_args.kwargs["from_file"] == "/tmp/x.json"
-
-    def test_dry_run_sets_the_flag(self):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.setup_command", return_value=0),
-            patch("ucode.cli.set_dry_run") as set_flag,
-        ):
-            runner.invoke(app, ["setup", "--dry-run"])
-        set_flag.assert_called_once_with(True)
 
     def test_show_exits_zero(self):
         with patch("ucode.cli.show_command", return_value=0):
