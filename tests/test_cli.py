@@ -2251,10 +2251,10 @@ class TestFetchManagedConfig:
     """The launch path's managed-config read, which gates both the allowlist and model discovery."""
 
     @staticmethod
-    def _fetch(state, *, skip_preflight=False):
+    def _fetch(state):
         import ucode.cli as cli_mod
 
-        return cli_mod._fetch_managed_config(state, skip_preflight=skip_preflight)
+        return cli_mod._fetch_managed_config(state)
 
     def test_fetches_fresh_when_enabled(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
@@ -2277,21 +2277,17 @@ class TestFetchManagedConfig:
             )
         assert self._fetch({"workspace": "https://w"}) is None
 
-    def test_skip_preflight_reads_the_cache_without_fetching(self, monkeypatch):
-        # Headless launchers pass --skip-preflight to avoid per-launch network calls.
+    def test_skip_managed_config_makes_the_fetch_a_no_op(self, monkeypatch):
+        # --skip-managed-config clears the enabling env var, so the read behaves as feature-off:
+        # no fetch, no cache read, no network — just None.
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr(
             "ucode.cli.refresh_managed_config", lambda state: pytest.fail("should not fetch")
         )
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: {"enabled_agents": {}})
-        assert self._fetch({"workspace": "https://w"}, skip_preflight=True) == {
-            "enabled_agents": {}
-        }
+        import ucode.cli as cli_mod
 
-    def test_skip_preflight_with_an_empty_cache_is_none(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: {})
-        assert self._fetch({"workspace": "https://w"}, skip_preflight=True) is None
+        cli_mod._disable_managed_config_if_requested(True)
+        assert self._fetch({"workspace": "https://w"}) is None
 
 
 class TestManagedConfigDecidesDiscoveryFromFreshRead:
@@ -2626,25 +2622,60 @@ class TestBareUcode:
         assert launched == []
         assert "Ask a workspace admin" in result.output
 
-    def test_skip_preflight_has_no_config_to_pick_an_agent_from(self, monkeypatch):
-        # --skip-preflight is deliberately unmanaged, so bare `ucode` cannot resolve an agent. It
-        # must say that rather than report "no config found", which would be wrong.
+    def test_dry_run_uses_the_cache_and_does_not_fetch(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         monkeypatch.setattr(
             "ucode.cli.refresh_managed_config",
-            lambda state: pytest.fail("--skip-preflight must not fetch"),
+            lambda state: pytest.fail("--dry-run must not fetch"),
         )
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: self.MANAGED)
+        launched: list[tuple] = []
         monkeypatch.setattr(
-            "ucode.cli.load_managed_state",
-            lambda ws: pytest.fail("--skip-preflight must not read the cache"),
+            "ucode.cli._launch_tool", lambda tool, ctx, **kw: launched.append((tool, kw))
+        )
+        result = runner.invoke(app, ["--dry-run"])
+        assert result.exit_code == 0, result.output
+        # The config bare `ucode` already read is handed down, so the launch path does not refetch.
+        assert launched[0][1]["managed"] == self.MANAGED
+
+    def test_skip_preflight_still_resolves_an_agent_from_the_managed_config(self, monkeypatch):
+        # --skip-preflight is now only about auth/gateway re-validation, decoupled from managed
+        # config, so bare `ucode --skip-preflight` still fetches the config and picks its agent.
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
+        monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
+        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
+        managed = {
+            "default_agent": "claude",
+            "enabled_agents": {"claude": {"model_config": {"default_model": "m"}}},
+        }
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: managed)
+        monkeypatch.setattr("ucode.cli._fetch_budget_recommendation", lambda state, m: None)
+        monkeypatch.setattr("ucode.cli._print_managed_summary", lambda *a, **k: None)
+        seen: dict = {}
+        monkeypatch.setattr(
+            "ucode.cli._launch_tool",
+            lambda tool, ctx, **kw: seen.update({"tool": tool, **kw}),
         )
         result = runner.invoke(app, ["--skip-preflight"])
-        assert result.exit_code == 1
-        assert "ucode <agent> --skip-preflight" in result.output
-        assert "No managed coding agent config was found" not in result.output
+        assert result.exit_code == 0, result.output
+        assert seen["tool"] == "claude"
+        assert seen["skip_preflight"] is True
+
+    def test_skip_managed_config_behaves_as_feature_off(self, monkeypatch):
+        # --skip-managed-config clears the enabling env var, so bare `ucode` has no config to pick an
+        # agent from and just prints help — exactly the feature-off behavior, no fetch.
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr(
+            "ucode.cli.refresh_managed_config",
+            lambda state: pytest.fail("--skip-managed-config must not fetch"),
+        )
+        result = runner.invoke(app, ["--skip-managed-config"])
+        assert result.exit_code == 0, result.output
+        assert "Usage:" in result.output
 
     @pytest.mark.parametrize("env_value", [None, "", "0"])
     def test_prints_help_when_the_env_var_is_off(self, monkeypatch, env_value):
@@ -2670,6 +2701,29 @@ class TestBareUcode:
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 0, result.output
+
+    def test_launcher_skip_managed_config_does_not_fetch(self, monkeypatch):
+        # `ucode claude --skip-managed-config` clears the env var, so the launch never reads the
+        # workspace's managed config and falls back to the developer's own settings.
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr(
+            "ucode.cli.refresh_managed_config",
+            lambda state: pytest.fail("--skip-managed-config must not fetch"),
+        )
+        state = dict(MINIMAL_STATE)
+        with (
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.apply_pat_environment"),
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli.get_databricks_token", return_value="tok"),
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, ["claude", "--skip-managed-config"])
+        assert result.exit_code == 0, result.output
+        assert "managed coding agent config" not in result.output
 
 
 class TestBudgetRecommendationAtLaunch:
