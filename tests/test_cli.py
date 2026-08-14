@@ -1447,6 +1447,48 @@ class TestConfigureAgentsSelection:
         with pytest.raises(RuntimeError, match="Codex"):
             cli_mod.configure_workspace_command(selected_tools=["claude", "codex"])
 
+    def test_picker_selected_profile_flows_to_configure_shared_state(self, monkeypatch):
+        """Picker's (host, profile) tuple must reach configure_shared_state's
+        `profile` kwarg, otherwise downstream --profile calls fall back to
+        host-based resolution and silently pick the wrong profile."""
+        import ucode.cli as cli_mod
+
+        monkeypatch.setattr(
+            cli_mod,
+            "_prompt_for_configuration",
+            lambda tool=None: ("https://shared.cloud.databricks.com", "picked-profile"),
+        )
+        captured: dict = {}
+
+        def fake_configure_shared_state(
+            workspace,
+            profile=None,
+            tools=None,
+            force_login=False,
+            use_pat=False,
+            fable_enabled=None,
+            databricks_ai_tools_enabled=None,
+        ):
+            captured["workspace"] = workspace
+            captured["profile"] = profile
+            return {**MINIMAL_STATE, "workspace": workspace, "profile": profile}
+
+        monkeypatch.setattr(cli_mod, "configure_shared_state", fake_configure_shared_state)
+        monkeypatch.setattr(cli_mod, "save_state", lambda state: None)
+        monkeypatch.setattr(cli_mod, "check_gateway_endpoint", lambda state, tool: True)
+        monkeypatch.setattr(cli_mod, "prompt_for_tools", lambda available: ["claude"])
+        monkeypatch.setattr(cli_mod, "_maybe_select_provider_service", lambda tool, state: state)
+        monkeypatch.setattr(cli_mod, "install_tool_binary", lambda *args, **kwargs: True)
+        monkeypatch.setattr(
+            cli_mod,
+            "configure_selected_tools",
+            lambda state, tools: {**state, "available_tools": tools},
+        )
+        monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
+
+        assert cli_mod.configure_workspace_command() == 0
+        assert captured["profile"] == "picked-profile"
+
     def test_multiple_workspaces_configure_all_and_use_first(self, monkeypatch):
         import ucode.cli as cli_mod
 

@@ -15,6 +15,7 @@ back out of ``state.json``, so there is exactly one picker per concern in the co
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
@@ -33,6 +34,7 @@ from ucode.databricks import (
     list_model_provider_services,
     list_workspace_budgets,
     map_claude_family_models,
+    model_service_exists,
     service_usable_for_tool,
     update_coding_agent_config,
 )
@@ -54,6 +56,7 @@ from ucode.managed_setup import (
 from ucode.state import load_state
 from ucode.ui import (
     console,
+    format_usd,
     kv_line,
     print_err,
     print_heading,
@@ -351,22 +354,22 @@ def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | No
         print_warning(f"No models were discovered for {display} on this workspace.")
         return {"default_model": _require_text(f"Default model for {display}")}
 
+    custom: list[str] = []
     if tool in SINGLE_MODEL_AGENTS:
-        return {
-            "default_model": _require_selection(
-                f"Select the default model for {display}:", [(model, model) for model in options]
-            )
-        }
+        model = _select_hosted_model(
+            f"Select the default model for {display}:", options, state, custom
+        )
+        single: dict = {"default_model": model}
+        if custom:
+            single["custom_models"] = custom
+        return single
 
     # Nothing pre-checked: the first option is whatever discovery sorted first, not a
     # recommendation — for pi it is a Claude model, for codex the oldest GPT. Pre-checking it made
     # "hit Enter" produce an arbitrary config. (A worthwhile follow-up is to pre-check the models
     # this workspace was configured with last time, which `load_managed_state` already loads for
     # the agent picker, so a re-run becomes an edit rather than a re-entry.)
-    picked = _require_multi_selection(
-        f"Select models for {display}:",
-        [(model, model) for model in options],
-    )
+    picked = _select_hosted_models_multi(f"Select models for {display}:", options, state, custom)
     if len(picked) == 1:
         model_config["default_model"] = picked[0]
     else:
@@ -375,6 +378,8 @@ def _prompt_models_for_agent(tool: str, state: dict, provider_service: dict | No
         )
 
     model_config["models"] = picked
+    if custom:
+        model_config["custom_models"] = list(dict.fromkeys(custom))
     return model_config
 
 
@@ -417,32 +422,39 @@ def _prompt_claude_models(state: dict) -> dict:
         "don't want configured — it falls back to the overall default."
     )
     slots: dict[str, str] = {}
+    custom: list[str] = []
     for family in ANTHROPIC_FAMILIES:
         family_models = candidates.get(family)
         if not family_models:
             continue
-        choice = prompt_for_selection(
-            f"Default {family} model:",
-            [(model, model) for model in family_models] + [(_SKIP_FAMILY, f"(skip {family})")],
-            searchable=True,
-        )
+        rows = [(model, model) for model in family_models[:_MODEL_PICKER_LIMIT]] + [
+            (_CUSTOM_MODEL, _CUSTOM_MODEL_LABEL),
+            (_SKIP_FAMILY, f"(skip {family})"),
+        ]
+        choice = prompt_for_selection(f"Default {family} model:", rows, searchable=True)
         if choice is None:
             raise KeyboardInterrupt
-        if choice != _SKIP_FAMILY:
-            slots[CLAUDE_SLOT_FOR_FAMILY[family]] = choice
+        if choice == _SKIP_FAMILY:
+            continue
+        if choice == _CUSTOM_MODEL:
+            choice = _prompt_custom_model(state)
+            custom.append(choice)
+        slots[CLAUDE_SLOT_FOR_FAMILY[family]] = choice
 
     if not slots:
         # Every slot skipped is a legitimate, minimal config: the proto leaves `models` optional and
         # each unset slot falls back to `default_model`, so one model covers every family. Pick it
         # from the same candidates rather than asking the admin to type an id.
         print_note(f"No families configured, so {display} will use a single model for all of them.")
-        every_model = [m for family_models in candidates.values() for m in family_models]
-        return {
-            "default_model": _require_selection(
-                f"Which model should {display} use?",
-                [(m, m) for m in dict.fromkeys(every_model)],
-            )
-        }
+        every_model = list(dict.fromkeys(m for fm in candidates.values() for m in fm))
+        fallback_custom: list[str] = []
+        model = _select_hosted_model(
+            f"Which model should {display} use?", every_model, state, fallback_custom
+        )
+        single: dict = {"default_model": model}
+        if fallback_custom:
+            single["custom_models"] = fallback_custom
+        return single
 
     chosen = list(dict.fromkeys(slots.values()))
     model_config: dict = {"models": slots}
@@ -455,6 +467,8 @@ def _prompt_claude_models(state: dict) -> dict:
         model_config["default_model"] = _require_selection(
             f"Which of those is {display}'s overall default?", [(m, m) for m in chosen]
         )
+    if custom:
+        model_config["custom_models"] = list(dict.fromkeys(custom))
     return model_config
 
 
@@ -657,6 +671,114 @@ def _require_text(prompt: str) -> str:
         print_err("Please enter a model id.")
 
 
+# Discovered model lists run long (a dozen-plus ids on a real workspace), so each hosted-model picker
+# shows only the most relevant few and offers an explicit "type your own" row. Typing a model covers
+# both a discovered id past the shown few and a custom model service outside `system.ai` that
+# discovery never lists at all.
+_MODEL_PICKER_LIMIT = 5
+_CUSTOM_MODEL = "__custom_model__"
+_CUSTOM_MODEL_LABEL = "✎ Enter a custom model…"
+
+
+def _custom_option_rows(options: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The first few model rows plus a 'type your own' row, for a hosted-model picker."""
+    return list(options[:_MODEL_PICKER_LIMIT]) + [(_CUSTOM_MODEL, _CUSTOM_MODEL_LABEL)]
+
+
+def _short_reason(reason: str | None) -> str:
+    """A one-line reason fit for a prompt, without the raw JSON body the transport appends.
+
+    HTTP failures come back as ``HTTP <code> <reason>: <body-excerpt>`` (the body is a JSON error
+    blob for gateway/UC errors); an admin at a prompt wants the status, not the payload. Keeps the
+    ``HTTP <code> <reason>`` head and drops a ``{...}`` body, leaving plain reasons (``network
+    error: ...``) untouched.
+    """
+    if not reason:
+        return "unknown error"
+    return reason.split(": {", 1)[0].strip()
+
+
+def _verify_custom_model(state: dict, model: str) -> tuple[bool | None, str | None]:
+    """Whether ``model`` is a model service on the workspace; None when the check can't run.
+
+    Mirrors how ``_claude_candidates`` reaches the workspace — a token from ``state`` — and turns a
+    missing workspace or a failed token fetch into an inconclusive result rather than an error.
+    """
+    workspace = state.get("workspace")
+    if not workspace:
+        return None, "no workspace in local state"
+    try:
+        token = get_databricks_token(workspace, state.get("profile"))
+    except (RuntimeError, OSError) as exc:
+        # OSError covers a missing `databricks` binary (get_databricks_token shells out).
+        return None, str(exc)
+    return model_service_exists(workspace, token, model)
+
+
+def _prompt_custom_model(state: dict) -> str:
+    """Prompt for a custom model-service id, re-asking until it exists on the workspace.
+
+    A typo shouldn't get baked into a published config, so the id is checked against the workspace's
+    model services and a miss is re-prompted. An inconclusive check (no workspace/token, or a
+    transient API error) is accepted with a warning rather than blocking a possibly-valid model.
+    """
+    while True:
+        model = _require_text("Custom model (catalog.schema.model)")
+        exists, reason = _verify_custom_model(state, model)
+        if exists:
+            return model
+        if exists is None:
+            print_warning(
+                f"Couldn't verify '{model}' on this workspace ({_short_reason(reason)}); "
+                "using it as typed."
+            )
+            return model
+        print_err(
+            f"'{model}' isn't a model service on this workspace. Check the name and try again "
+            "(expected catalog.schema.model, e.g. main.default.claude-opus-4-5)."
+        )
+
+
+def _select_hosted_model(
+    prompt: str, options: list[str], state: dict, custom_sink: list[str]
+) -> str:
+    """Single-select over the top few ``options`` plus a custom-entry row.
+
+    Records any custom id in ``custom_sink`` so the caller can mark it in
+    ``model_config.custom_models``, which keeps validation from rejecting a model discovery didn't
+    surface.
+    """
+    choice = _require_selection(prompt, _custom_option_rows([(m, m) for m in options]))
+    if choice == _CUSTOM_MODEL:
+        model = _prompt_custom_model(state)
+        custom_sink.append(model)
+        return model
+    return choice
+
+
+def _select_hosted_models_multi(
+    prompt: str, options: list[str], state: dict, custom_sink: list[str]
+) -> list[str]:
+    """Multi-select over the top few ``options`` plus a custom-entry row; requires one pick.
+
+    Selecting the custom row prompts for custom model ids — as many as the admin wants, since a
+    multi-select agent (opencode, pi) can carry a whole list — and folds them into the picks. Records
+    each custom id in ``custom_sink`` (see :func:`_select_hosted_model`).
+    """
+    rows = _custom_option_rows([(m, m) for m in options])
+    picked = _require_multi_selection(prompt, rows)
+    models = [p for p in picked if p != _CUSTOM_MODEL]
+    if _CUSTOM_MODEL in picked:
+        while True:
+            custom = _prompt_custom_model(state)
+            if custom not in models:
+                models.append(custom)
+                custom_sink.append(custom)
+            if not prompt_yes_no_default("Add another custom model?", default=False):
+                break
+    return models
+
+
 def configured_models_for_agent(agent_config: dict) -> list[str]:
     """Models an agent was configured with, in the manifest's own vocabulary.
 
@@ -747,6 +869,16 @@ def _prompt_budget_policy(
     if display_name:
         policy["display_name"] = display_name
 
+    # The per-user monthly cap the budget was created with. Tiers are picked as percentages of it, so
+    # showing the dollar amount (and what each percentage works out to) tells the admin what the total
+    # possible per-user spend even is. None when the listing couldn't read it — then we just skip the
+    # dollar hints and prompt in percent as before.
+    threshold = next(
+        (budget.get("per_user_threshold") for budget in usable if budget["id"] == budget_id), None
+    )
+    if threshold is not None:
+        print_note(f"This budget's per-user limit is {format_usd(threshold)} per month.")
+
     tiers: list[dict] = []
     seen_percentages: set[float] = set()
     seen_combos: set[tuple[str, str]] = set()
@@ -760,6 +892,13 @@ def _prompt_budget_policy(
         if fraction in seen_percentages:
             print_err("That percentage is already used by another tier; pick a different one.")
             continue
+        if threshold is not None:
+            # Echo the dollars this percentage stands for, so the admin can sanity-check the tier
+            # against the real per-user cap instead of reasoning about percentages in a vacuum.
+            print_note(
+                f"  {fraction * 100:g}% of {format_usd(threshold)} is "
+                f"{format_usd(threshold * Decimal(str(fraction)))}."
+            )
         agent = prompt_for_selection(
             f"Tier {index}: which agent becomes the default?",
             [(tool, TOOL_SPECS[tool]["display"]) for tool in enabled_agents],

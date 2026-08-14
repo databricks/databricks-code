@@ -386,6 +386,11 @@ def _validate_agent_models(tool: str, agent_config: dict, known: set[str]) -> li
     Skipped entirely when the agent routes through a Model Provider Service: those model ids come
     from the provider's own catalog, not from UC model services, so the workspace inventory says
     nothing about them.
+
+    ``model_config.custom_models`` lists ids the admin typed by hand for a model discovery didn't
+    surface (a model service outside ``system.ai``). Those were verified to exist when entered (see
+    ``managed_wizard._prompt_custom_model``), so they're excluded from the inventory check — the
+    discovered inventory legitimately doesn't contain them.
     """
     model_config = agent_config.get("model_config")
     if not isinstance(model_config, dict):
@@ -393,6 +398,7 @@ def _validate_agent_models(tool: str, agent_config: dict, known: set[str]) -> li
     if model_config.get("model_provider_service"):
         return []
 
+    custom = {m for m in model_config.get("custom_models", []) if isinstance(m, str) and m}
     referenced: list[str] = []
     default_model = model_config.get("default_model")
     if isinstance(default_model, str) and default_model:
@@ -406,7 +412,7 @@ def _validate_agent_models(tool: str, agent_config: dict, known: set[str]) -> li
     return [
         f"{tool}: model '{model}' is not available on this workspace."
         for model in dict.fromkeys(referenced)
-        if model not in known
+        if model not in known and model not in custom
     ]
 
 

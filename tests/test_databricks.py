@@ -31,6 +31,7 @@ from ucode.databricks import (
     discover_sql_warehouses,
     ensure_databricks_cli_version,
     ensure_pat_bearer,
+    get_databricks_profiles,
     get_databricks_token,
     install_ai_tools,
     list_databricks_apps,
@@ -376,6 +377,85 @@ class TestDiscoverModelServices:
         assert reason is None
         assert ids == ["system.ai.gpt-5"]
         assert calls["n"] == 3  # two failures, third succeeds
+
+
+class TestModelServiceExists:
+    def test_true_when_listed_in_its_schema(self, monkeypatch):
+        urls: list[str] = []
+
+        def fake_get(url, token, timeout=30):
+            urls.append(url)
+            return {"model_services": [_model_service("main.aarushi.claude-opus-4-5")]}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        exists, reason = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert (exists, reason) == (True, None)
+        # Scoped to the typed name's own schema, not system.ai.
+        assert all("parent=schemas%2Fmain.aarushi" in u for u in urls)
+
+    def test_false_when_schema_has_no_such_service(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (
+                {"model_services": [_model_service("main.aarushi.some-other-model")]},
+                None,
+            ),
+        )
+        exists, reason = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert (exists, reason) == (False, None)
+
+    def test_bad_name_is_inconclusive(self, monkeypatch):
+        def fail(*a, **k):
+            raise AssertionError("should not hit the API for a malformed name")
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fail)
+        for bad in ("just-a-name", "main.aarushi", "main..model", "main.aarushi.model.extra"):
+            exists, reason = db_mod.model_service_exists(WS, "token", bad)
+            assert exists is None and reason
+
+    def test_http_error_is_inconclusive_not_absent(self, monkeypatch):
+        # A transient failure must read as "couldn't verify", never "doesn't exist" — the caller
+        # would otherwise reject a valid model on a blip.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (None, "HTTP 500 Server Error"),
+        )
+        exists, reason = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert exists is None
+        assert "500" in reason
+
+    def test_not_found_means_absent(self, monkeypatch):
+        # A 404 is the catalog/schema not existing, so the model can't either — a definitive "no"
+        # the caller re-prompts on, not an inconclusive "couldn't verify".
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (
+                None,
+                'HTTP 404 Not Found: {"error_code":"NOT_FOUND","message":"Resource not found"}',
+            ),
+        )
+        exists, _ = db_mod.model_service_exists(WS, "token", "maikjn.default.aar")
+        assert exists is False
+
+    def test_paginates_until_found(self, monkeypatch):
+        pages = {
+            None: {
+                "model_services": [_model_service("main.aarushi.other")],
+                "next_page_token": "n",
+            },
+            "n": {"model_services": [_model_service("main.aarushi.claude-opus-4-5")]},
+        }
+
+        def fake_get(url, token, timeout=30):
+            tok = url.split("page_token=")[1].split("&")[0] if "page_token=" in url else None
+            return pages[tok], None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+        exists, _ = db_mod.model_service_exists(WS, "token", "main.aarushi.claude-opus-4-5")
+        assert exists is True
 
 
 class TestListModelProviderServices:
@@ -1488,6 +1568,63 @@ class TestGetDatabricksToken:
         assert "stale or invalid" in message
         assert "databricks auth logout --profile example-profile" in message
         assert f"databricks auth login --host {WS} --profile example-profile" in message
+
+
+class TestGetDatabricksProfiles:
+    def _patched_run(self, monkeypatch, payload: dict, returncode: int = 0) -> None:
+        def fake_run(args, **kwargs):
+            return subprocess.CompletedProcess(args, returncode, stdout=json.dumps(payload))
+
+        monkeypatch.setattr(db_mod, "run", fake_run)
+
+    def test_keeps_duplicate_hosts_as_separate_entries(self, monkeypatch):
+        self._patched_run(
+            monkeypatch,
+            {
+                "profiles": [
+                    {"host": WS, "name": "first", "auth_type": "databricks-cli"},
+                    {"host": WS, "name": "second", "auth_type": "databricks-cli"},
+                    {
+                        "host": "https://other.databricks.com",
+                        "name": "third",
+                        "auth_type": "databricks-cli",
+                    },
+                ]
+            },
+        )
+        profiles = get_databricks_profiles()
+        assert profiles == [
+            (WS, "first"),
+            (WS, "second"),
+            ("https://other.databricks.com", "third"),
+        ]
+
+    def test_skips_pat_profiles(self, monkeypatch):
+        self._patched_run(
+            monkeypatch,
+            {
+                "profiles": [
+                    {"host": WS, "name": "oauth", "auth_type": "databricks-cli"},
+                    {"host": WS, "name": "tokenized", "auth_type": "pat"},
+                ]
+            },
+        )
+        assert get_databricks_profiles() == [(WS, "oauth")]
+
+    def test_strips_trailing_slash_on_host(self, monkeypatch):
+        self._patched_run(
+            monkeypatch,
+            {
+                "profiles": [
+                    {"host": f"{WS}/", "name": "p", "auth_type": "databricks-cli"},
+                ]
+            },
+        )
+        assert get_databricks_profiles() == [(WS, "p")]
+
+    def test_returns_empty_on_non_zero_exit(self, monkeypatch):
+        self._patched_run(monkeypatch, {"profiles": []}, returncode=1)
+        assert get_databricks_profiles() == []
 
 
 class TestListDatabricksConnections:
@@ -2732,6 +2869,68 @@ class TestListWorkspaceBudgets:
         )
         budgets, _ = list_workspace_budgets("https://ws", "token")
         assert budgets[0]["has_per_user_block"] is False
+
+    def test_extracts_per_user_block_threshold(self, monkeypatch):
+        # The per-user hard block's `quantity_threshold` is the monthly dollar cap; it's read off the
+        # same alert `has_per_user_block` gates on so the tier prompt can show it. A per-user alert
+        # without a block action (email only) contributes no threshold.
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "capped",
+                        "display_name": "capped",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "quantity_threshold": "500.00",
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "email_only",
+                        "display_name": "email only",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "quantity_threshold": "500.00",
+                                "action_configurations": [{"action_type": self.EMAIL}],
+                            }
+                        ],
+                    },
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        by_id = {b["id"]: b for b in budgets}
+        assert by_id["capped"]["per_user_threshold"] == Decimal("500.00")
+        assert by_id["email_only"]["per_user_threshold"] is None
+
+    def test_missing_threshold_is_none_but_block_still_flagged(self, monkeypatch):
+        # A hard block with no (or unparseable) `quantity_threshold` still enforces routing, so the
+        # budget stays offerable — the tier prompt just omits the dollar hint.
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "b",
+                        "display_name": "x",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        assert budgets[0]["has_per_user_block"] is True
+        assert budgets[0]["per_user_threshold"] is None
 
 
 class TestDiscoverSqlWarehouses:
