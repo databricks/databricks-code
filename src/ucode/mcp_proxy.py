@@ -41,7 +41,7 @@ from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStre
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.stdio import stdio_server
 
-from ucode.databricks import get_databricks_token
+from ucode.databricks import ensure_pat_bearer, get_databricks_token
 
 # Exit code used when the proxy cannot authenticate. MCP clients surface a
 # non-zero exit far more usefully than a startup timeout, so bail out with this
@@ -126,7 +126,7 @@ async def _pump(
             await dest.send(message)
 
 
-async def _run(url: str, workspace: str, profile: str | None, use_pat: bool) -> None:
+async def _run(url: str, workspace: str, profile: str | None) -> None:
     httpx = _httpx()
     auth = _build_token_auth(workspace, profile)
     # 2.x-native shape: hand the transport a pre-built AsyncClient carrying our
@@ -175,7 +175,19 @@ def serve(url: str, workspace: str, profile: str | None = None, *, use_pat: bool
 
     Authentication is checked up front: a dead profile is a terminal condition,
     and failing here (fast, with the CLI's own message) is far better than
-    letting the client wait out its MCP startup timeout with no explanation."""
+    letting the client wait out its MCP startup timeout with no explanation.
+
+    ``use_pat`` selects static personal-access-token auth: ``databricks auth
+    token`` only reads OAuth caches, so a PAT profile's token must be exported as
+    ``DATABRICKS_BEARER`` first (``ensure_pat_bearer``) — then every per-request
+    mint takes that short-circuit. OAuth needs no such step."""
+    if use_pat and not ensure_pat_bearer(profile):
+        _fail_fast(
+            "--use-pat is set but no personal access token was found for profile "
+            f"'{profile or '<none>'}' in ~/.databrickscfg (expected auth_type = pat). "
+            "Set DATABRICKS_BEARER, or reconfigure the profile."
+        )
+
     # Pre-flight the token before opening the bridge. Without this, the first
     # token failure surfaces from inside the transport's task group, where it can
     # stall the process instead of erroring out.
@@ -185,7 +197,7 @@ def serve(url: str, workspace: str, profile: str | None = None, *, use_pat: bool
         _fail_fast(str(exc))
 
     try:
-        anyio.run(_run, url, workspace, profile, use_pat)
+        anyio.run(_run, url, workspace, profile)
     except BaseException as exc:  # noqa: BLE001 - re-raised unless it's an auth failure
         # The token can still expire mid-session; report that the same way
         # rather than letting the ExceptionGroup surface as a hang or traceback.

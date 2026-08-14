@@ -177,19 +177,63 @@ class TestServe:
         monkeypatch.setattr(mcp_proxy, "_preflight_token", lambda ws, profile: None)
         monkeypatch.setattr(mcp_proxy.anyio, "run", fake_run)
 
-        mcp_proxy.serve(URL, WS, "uc-dogfood", use_pat=True)
+        mcp_proxy.serve(URL, WS, "uc-dogfood")
 
         assert captured["func"] is mcp_proxy._run
-        assert captured["args"] == (URL, WS, "uc-dogfood", True)
+        # PAT is resolved inside the token mint, so _run takes no use_pat arg.
+        assert captured["args"] == (URL, WS, "uc-dogfood")
 
-    def test_defaults_profile_none_and_use_pat_false(self, monkeypatch):
+    def test_defaults_profile_none(self, monkeypatch):
         captured: dict = {}
         monkeypatch.setattr(mcp_proxy, "_preflight_token", lambda ws, profile: None)
         monkeypatch.setattr(mcp_proxy.anyio, "run", lambda func, *args: captured.update(args=args))
 
         mcp_proxy.serve(URL, WS)
 
-        assert captured["args"] == (URL, WS, None, False)
+        assert captured["args"] == (URL, WS, None)
+
+    def test_use_pat_exports_the_bearer_before_serving(self, monkeypatch):
+        # PAT auth: the profile's static token must be exported (ensure_pat_bearer)
+        # before the token preflight, so the per-request mint's DATABRICKS_BEARER
+        # short-circuit returns it. `databricks auth token` can't read a PAT itself.
+        order: list[str] = []
+        monkeypatch.setattr(
+            mcp_proxy, "ensure_pat_bearer", lambda profile: order.append(f"pat:{profile}") or True
+        )
+        monkeypatch.setattr(
+            mcp_proxy, "_preflight_token", lambda ws, profile: order.append("preflight")
+        )
+        monkeypatch.setattr(mcp_proxy.anyio, "run", lambda func, *args: order.append("bridge"))
+
+        mcp_proxy.serve(URL, WS, "patprof", use_pat=True)
+
+        assert order == ["pat:patprof", "preflight", "bridge"]
+
+    def test_use_pat_without_a_resolvable_pat_exits_before_serving(self, monkeypatch, capsys):
+        started: list[str] = []
+        monkeypatch.setattr(mcp_proxy, "ensure_pat_bearer", lambda profile: False)
+        monkeypatch.setattr(mcp_proxy, "_preflight_token", lambda ws, profile: None)
+        monkeypatch.setattr(mcp_proxy.anyio, "run", lambda func, *args: started.append("bridge"))
+
+        with pytest.raises(SystemExit) as excinfo:
+            mcp_proxy.serve(URL, WS, "nopat", use_pat=True)
+
+        assert excinfo.value.code == mcp_proxy.AUTH_FAILURE_EXIT_CODE
+        assert started == []  # never opened the bridge
+        assert "no personal access token" in capsys.readouterr().err
+
+    def test_oauth_path_never_touches_pat(self, monkeypatch):
+        # Without use_pat, ensure_pat_bearer must not be consulted at all.
+        called: list[str] = []
+        monkeypatch.setattr(
+            mcp_proxy, "ensure_pat_bearer", lambda profile: called.append(profile) or True
+        )
+        monkeypatch.setattr(mcp_proxy, "_preflight_token", lambda ws, profile: None)
+        monkeypatch.setattr(mcp_proxy.anyio, "run", lambda func, *args: None)
+
+        mcp_proxy.serve(URL, WS, "oauthprof", use_pat=False)
+
+        assert called == []
 
     def test_preflights_auth_before_opening_the_bridge(self, monkeypatch):
         # Order matters: a dead profile must be caught before the stdio bridge

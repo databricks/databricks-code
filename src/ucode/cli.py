@@ -1080,15 +1080,21 @@ def mcp_proxy_cmd(
         str | None, typer.Option("--profile", help="Databricks CLI profile.")
     ] = None,
     use_pat: Annotated[
-        bool, typer.Option("--use-pat", help="Use the profile's static PAT instead of OAuth.")
+        bool,
+        typer.Option(
+            "--use-pat",
+            help="Authenticate with the profile's static personal access token (from "
+            "~/.databrickscfg) instead of OAuth. Set automatically for workspaces configured "
+            "with `ucode configure --profiles <name> --use-pat`.",
+        ),
     ] = False,
 ) -> None:
     """Bridge a coding agent's stdio MCP transport to a Databricks MCP endpoint.
 
     Each configured client spawns this as a local stdio MCP server (see
     `ucode configure mcp`); it forwards messages to ``--url`` and injects a
-    freshly-minted OAuth bearer on every upstream request, so the token never
-    expires mid-session. Not meant for interactive use — the agent manages this
+    freshly-minted token on every upstream request, so it never expires
+    mid-session. Not meant for interactive use — the agent manages this
     process's lifecycle."""
     from ucode.mcp_proxy import serve
 
