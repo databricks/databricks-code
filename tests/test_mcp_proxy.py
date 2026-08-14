@@ -15,11 +15,44 @@ WS = "https://example.databricks.com"
 URL = f"{WS}/api/2.0/mcp/functions/system/ai"
 
 
-def test_httpx_is_a_direct_runtime_dependency():
+def _runtime_dependencies() -> list[str]:
     project = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())[
         "project"
     ]
-    assert any(dependency.startswith("httpx") for dependency in project["dependencies"])
+    return project["dependencies"]
+
+
+def test_httpx_is_a_direct_runtime_dependency():
+    assert any(dependency.startswith("httpx") for dependency in _runtime_dependencies())
+
+
+def test_mcp_dependency_is_capped_below_2():
+    # mcp 2.x renamed `streamablehttp_client` and swapped httpx for httpx2, which
+    # breaks `mcp_proxy`'s imports. A fresh install resolved 2.0.0 off an
+    # unconstrained `mcp>=1.28.0` and every MCP server failed to connect (#307).
+    # The cap is the fix; this guards against it being loosened without porting
+    # the proxy to the 2.x client API.
+    mcp_specs = [d for d in _runtime_dependencies() if d.replace(" ", "").startswith("mcp")]
+    assert mcp_specs, "mcp must be a direct dependency"
+    assert all("<2" in spec.replace(" ", "") for spec in mcp_specs), mcp_specs
+
+
+def test_installed_mcp_sdk_is_supported_and_the_proxy_imports():
+    # The newest dependency version the metadata allows must actually work. This
+    # runs against whatever `mcp` the environment resolved (the newest under the
+    # cap in a clean install), asserts it satisfies the pin, and confirms the
+    # symbols `mcp_proxy` imports still exist there — the clean-install guard
+    # from #307's acceptance criteria, at test time.
+    from importlib.metadata import version
+
+    from packaging.version import Version
+
+    installed = Version(version("mcp"))
+    assert installed < Version("2"), f"mcp {installed} violates the <2 cap"
+    # Importing the module is the real check: it binds streamablehttp_client and
+    # stdio_server at module load, so a rename in the resolved SDK fails here.
+    assert mcp_proxy.streamablehttp_client is not None
+    assert mcp_proxy.stdio_server is not None
 
 
 class TestDatabricksTokenAuth:

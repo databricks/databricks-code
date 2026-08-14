@@ -30,6 +30,12 @@ import sys
 import anyio
 import httpx
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+
+# NOTE: `mcp` is capped `<2` in pyproject because 2.x renamed
+# `streamablehttp_client` to `streamable_http_client` (and swapped httpx for
+# httpx2), so these imports fail against it. That ImportError is caught and
+# translated at the `ucode mcp-proxy` cli import site (see cli.py), because this
+# module is exactly what can't import and so can't host the handler itself.
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.stdio import stdio_server
 
