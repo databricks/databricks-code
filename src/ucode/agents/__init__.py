@@ -22,7 +22,7 @@ from ucode.databricks import (
     get_databricks_token,
     install_ai_tools,
     install_databricks_cli,
-    map_bedrock_claude_models,
+    map_claude_family_models,
     resolve_provider_service,
 )
 from ucode.state import get_provider_service, load_state, save_state
@@ -317,13 +317,18 @@ def resolve_provider_models(
 ) -> tuple[dict | None, str | None, bool]:
     """Validate ``provider`` for ``tool`` and return the model ids to pin.
 
-    Returns ``(provider_models, error, relayed)``. ``provider_models`` is a
-    ``{family: model_id}`` dict for a Bedrock-backed claude service (whose
-    provider-side ids must be pinned explicitly), or None for an Anthropic/
-    canonical service or when ``provider`` is None. ``relayed`` is True for a
-    credential-less Anthropic subscription relay, which the launch path wires
-    with the relayed overlay + refresh proxy. A non-None ``error`` means the
-    provider is invalid for the tool and the caller should not launch.
+    Returns ``(provider_models, error, relayed)``. ``provider_models`` is a ``{family: model_id}``
+    dict for a Bedrock-backed claude service (whose provider-side ids must be pinned explicitly), or
+    None for an Anthropic/canonical service or when ``provider`` is None. ``relayed`` is True for a
+    credential-less Anthropic subscription relay, which the launch path wires with the relayed
+    overlay + refresh proxy. A non-None ``error`` means the provider is invalid for the tool and the
+    caller should not launch.
+
+    This is the *developer-configured* path (``ucode configure`` then ``ucode claude``) and its
+    behaviour is deliberately unchanged: only Bedrock pins, re-derived from the service's live
+    targets. The *managed* path pins from the admin's authored manifest slots instead — see
+    ``managed_resolve.managed_provider_family_models`` and its launch call site — so an admin's
+    chosen versions win rather than being re-derived here.
     """
     if not provider:
         return None, None, False
@@ -333,7 +338,7 @@ def resolve_provider_models(
         return None, error, False
     relayed = bool(service.get("relayed"))
     if service["provider_type"] in BEDROCK_PROVIDER_TYPES:
-        return map_bedrock_claude_models(service.get("targets") or []), None, relayed
+        return map_claude_family_models(service.get("targets") or []), None, relayed
     return None, None, relayed
 
 
@@ -345,6 +350,7 @@ def configure_tool(
     provider_models: dict[str, str] | None = None,
     relayed: bool = False,
     route_root_model: str | None = None,
+    custom_model: str | None = None,
 ) -> dict:
     result: dict | tuple[dict, str]
     if tool == "codex":
@@ -352,7 +358,8 @@ def configure_tool(
     elif tool == "claude":
         # A Model Provider Service routes by header and pins no Databricks
         # model, so the usual "model required" guard doesn't apply to claude.
-        if not model and not provider:
+        # `custom_model` (from `ucode claude --model`) likewise supplies the model.
+        if not model and not provider and not custom_model:
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         result = claude.write_tool_config(
             state,
@@ -361,6 +368,7 @@ def configure_tool(
             provider_models=provider_models,
             relayed=relayed,
             route_root_model=route_root_model,
+            custom_model=custom_model,
         )
     else:
         # provider routing is claude/codex-only; every other tool needs a model.

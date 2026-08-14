@@ -281,7 +281,14 @@ class TestResolveProviderModels:
         assert (models, error, relayed) == (None, None, False)
 
     def test_anthropic_returns_no_models(self, monkeypatch):
-        self._patch(monkeypatch, {"provider_type": "anthropic", "targets": []}, None)
+        # The developer-configured path is deliberately unchanged: an Anthropic service pins nothing
+        # even with explicit targets — Claude Code's canonical names route fine. (The managed path
+        # pins from authored manifest slots instead; see managed_resolve.)
+        self._patch(
+            monkeypatch,
+            {"provider_type": "anthropic", "targets": ["claude-sonnet-5", "claude-haiku-4-5"]},
+            None,
+        )
         models, error, relayed = agents_mod.resolve_provider_models(
             "claude", self._STATE, "main.a.svc"
         )

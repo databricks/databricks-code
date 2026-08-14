@@ -4,32 +4,28 @@ This module owns the admin-write half of the managed config, mirroring the devel
 :mod:`ucode.managed_config`:
 
 - which models an admin may pick for each agent (:func:`model_options_for_agent`),
-- validating a manifest before it is published (:func:`validate_manifest`),
+- validating a manifest before it is published (:func:`validate_manifest`), and
 - serializing ucode's internal manifest shape into proto-JSON ``CodingAgentConfig``
-  (:func:`serialize_managed_config`), and
-- persisting the authored manifest to ``~/.ucode/managed-settings.json``.
+  (:func:`serialize_managed_config`).
 
 The manifest shape here is exactly the one :func:`ucode.managed_config.normalize_managed_config`
 produces, so ``serialize`` then ``normalize`` round-trips to the input. The enum maps are derived by
 inverting that module's maps rather than restated, so a new agent or MCP type only has to be added
 once.
 
-``managed-settings.json`` (authored by an admin, published by ``ucode apply``) is distinct from
-``managed-state.json`` (pulled from the workspace by a developer, owned by ``managed_config``).
+Local persistence is not duplicated here: the authored manifest is saved to and loaded from the one
+local file, ``~/.ucode/managed-state.json``, via :func:`ucode.managed_config.save_managed_state` and
+:func:`ucode.managed_config.load_managed_state` — the same file the launch path pulls into.
 
-The interactive wizard that calls these helpers, and the publish step, live in later changes; this
-module deliberately stops at "catalogs + validate + serialize + persist".
+The interactive wizard that calls these helpers, and the publish step, live in
+:mod:`ucode.managed_wizard`.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import uuid
-from pathlib import Path
 from typing import cast
 
-import ucode.config_io as config_io
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
     model_version_sort_key,
@@ -39,8 +35,6 @@ from ucode.managed_config import (
     AGENT_ENUM_TO_TOOL,
     MCP_TYPE_ENUM_TO_TAG,
 )
-
-MANAGED_SETTINGS_PATH = config_io.APP_DIR / "managed-settings.json"
 
 # ucode tool name -> CodingAgent proto enum, and ucode MCP type tag -> McpServerType proto enum.
 # Inverted from the read side's maps so the two directions cannot drift: adding an agent to
@@ -547,6 +541,7 @@ def _validate_budget_policy(budget_policy: dict, enabled_agents: dict[str, dict]
             )
 
     percentages: list[float] = []
+    combos: list[tuple[str, str]] = []
     tiers = budget_policy.get("tiers")
     for index, tier in enumerate(tiers if isinstance(tiers, list) else []):
         if not isinstance(tier, dict):
@@ -584,60 +579,17 @@ def _validate_budget_policy(budget_policy: dict, enabled_agents: dict[str, dict]
                 )
         if not tier_model:
             errors.append(f"budget_policy.tiers[{index}]: default_model is required.")
+        if tier_agent and tier_model:
+            combos.append((str(tier_agent), str(tier_model)))
 
     if len(set(percentages)) != len(percentages):
         errors.append("budget_policy tier spending_percentage values must be unique.")
+    # Two tiers with the same agent+model are a no-op: the server picks the highest crossed tier, so
+    # the second never changes what the lower one already selected. Flagging it catches a tier the
+    # admin meant to be a real step-down but left unchanged.
+    if len(set(combos)) != len(combos):
+        errors.append(
+            "budget_policy tiers must each route to a different agent/model — two tiers with the "
+            "same pair make the higher one a no-op."
+        )
     return errors
-
-
-def save_managed_settings(workspace: str, manifest: dict) -> None:
-    """Persist the authored manifest to ``~/.ucode/managed-settings.json``. No-op in dry-run.
-
-    Stored alongside its workspace so ``ucode apply`` can refuse to publish a manifest that was
-    authored against a different workspace.
-    """
-    if config_io.is_dry_run():
-        return
-    payload = {"workspace": workspace, "config": manifest}
-    config_io.ensure_parent_dir(MANAGED_SETTINGS_PATH)
-    try:
-        MANAGED_SETTINGS_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    except OSError as exc:
-        raise RuntimeError(
-            f"Failed to write managed settings file: {MANAGED_SETTINGS_PATH}"
-        ) from exc
-    _restrict_permissions(MANAGED_SETTINGS_PATH)
-
-
-def _restrict_permissions(path: Path) -> None:
-    """Best-effort chmod 0600, matching how ``managed_config`` protects ``managed-state.json``.
-
-    An unpublished manifest can name internal catalogs, budgets, and MCP servers, so it should not
-    be group- or world-readable. No-op where unsupported (e.g. Windows).
-    """
-    try:
-        os.chmod(path, 0o600)
-    except (OSError, NotImplementedError):
-        pass
-
-
-def load_managed_settings(workspace: str | None = None) -> dict | None:
-    """Load the authored manifest, or None when absent (or authored for another workspace).
-
-    Passing ``workspace`` scopes the read the way :func:`ucode.managed_config.load_managed_state`
-    does, so a manifest left over from a different workspace is ignored rather than published to the
-    wrong place. Omit it to read whatever is on disk.
-    """
-    data = config_io.read_json_safe(MANAGED_SETTINGS_PATH)
-    if not data:
-        return None
-    if workspace is not None and data.get("workspace") != workspace:
-        return None
-    manifest = data.get("config")
-    return manifest if isinstance(manifest, dict) else None
-
-
-def managed_settings_workspace() -> str | None:
-    """The workspace the on-disk manifest was authored for, or None when there is no manifest."""
-    workspace = config_io.read_json_safe(MANAGED_SETTINGS_PATH).get("workspace")
-    return workspace if isinstance(workspace, str) and workspace else None

@@ -19,6 +19,7 @@ from ucode.databricks import (
     _run_databricks_cli_installer,
     _scrub_databrickscfg,
     _scrub_json,
+    all_users_can_use_schema,
     build_auth_shell_command,
     build_auth_token_argv,
     build_databricks_cli_env,
@@ -36,6 +37,7 @@ from ucode.databricks import (
     list_databricks_apps,
     list_databricks_connections,
     list_genie_spaces,
+    list_workspace_budgets,
     resolve_current_budget_spend,
     upgrade_databricks_cli,
     workspace_hostname,
@@ -355,6 +357,9 @@ class TestDiscoverModelServices:
         assert ids == ["system.ai.gpt-5"]
         assert reason is None
         assert all("page_size=" in u for u in urls)
+        # Scope to the `system.ai` schema so the endpoint returns just the
+        # foundation models rather than walking the whole metastore.
+        assert all("parent=schemas%2Fsystem.ai" in u for u in urls)
 
     def test_retries_page_before_giving_up(self, monkeypatch):
         payload = {"model_services": [_model_service("system.ai.gpt-5")]}
@@ -487,9 +492,9 @@ class TestListModelProviderServices:
         assert names == ["main.schema1.openai-svc"]
 
 
-class TestMapBedrockClaudeModels:
+class TestMapClaudeFamilyModels:
     def test_maps_families(self):
-        models = db_mod.map_bedrock_claude_models(
+        models = db_mod.map_claude_family_models(
             [
                 "us.anthropic.claude-sonnet-4-6",
                 "global.anthropic.claude-opus-4-8",
@@ -504,13 +509,13 @@ class TestMapBedrockClaudeModels:
         }
 
     def test_prefers_highest_version(self):
-        models = db_mod.map_bedrock_claude_models(
+        models = db_mod.map_claude_family_models(
             ["us.anthropic.claude-sonnet-4-5", "us.anthropic.claude-sonnet-4-6"]
         )
         assert models["sonnet"] == "us.anthropic.claude-sonnet-4-6"
 
     def test_region_tie_break_prefers_global(self):
-        models = db_mod.map_bedrock_claude_models(
+        models = db_mod.map_claude_family_models(
             [
                 "us.anthropic.claude-opus-4-8",
                 "global.anthropic.claude-opus-4-8",
@@ -519,8 +524,20 @@ class TestMapBedrockClaudeModels:
         )
         assert models["opus"] == "global.anthropic.claude-opus-4-8"
 
+    def test_maps_canonical_anthropic_ids(self):
+        # An Anthropic service publishes canonical ids (no region prefix); the same mapper groups
+        # them by family and picks the highest version, so per-family pinning works there too.
+        models = db_mod.map_claude_family_models(
+            ["claude-sonnet-5", "claude-haiku-4-5", "claude-opus-4-8"]
+        )
+        assert models == {
+            "sonnet": "claude-sonnet-5",
+            "haiku": "claude-haiku-4-5",
+            "opus": "claude-opus-4-8",
+        }
+
     def test_empty_when_no_claude(self):
-        assert db_mod.map_bedrock_claude_models(["amazon.titan-text-express-v1"]) == {}
+        assert db_mod.map_claude_family_models(["amazon.titan-text-express-v1"]) == {}
 
 
 class TestProviderServicePagination:
@@ -2198,8 +2215,9 @@ class TestModelServicesCache:
         claude, _codex, _gemini, _oss, _reason = db_mod.discover_model_services(WS, "tok")
         unbucketed, _ = db_mod.discover_claude_models_unbucketed(WS, "tok")
         assert calls["n"] == 1
-        # Both views still come back intact: newest-per-family, and the full list.
-        assert claude["opus"] == "system.ai.claude-opus-5"
+        # Both views still come back intact: newest-per-family (pinned to opus-4-8
+        # for smart-routing compatibility by _prefer_opus_4_8), and the full list.
+        assert claude["opus"] == "system.ai.claude-opus-4-8"
         assert unbucketed == ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]
 
     def test_use_cache_false_forces_a_fresh_walk(self, monkeypatch):
@@ -2655,6 +2673,18 @@ class TestResolveCurrentBudgetSpend:
         spend, _ = resolve_current_budget_spend("https://ws", "token")
         assert spend is None
 
+    def test_threshold_without_spend_is_zero_spend(self, monkeypatch):
+        # A per-user threshold with no spend yet this period is $0 spent, not "no budget" — the
+        # developer should still see their budget rather than a blank.
+        monkeypatch.setattr(
+            db_mod,
+            "_http_post_json",
+            lambda url, token, payload, timeout=10: ({"effective_threshold": "100"}, None),
+        )
+        spend, reason = resolve_current_budget_spend("https://ws", "token")
+        assert spend == (Decimal(0), Decimal("100"))
+        assert reason is None
+
     def test_malformed_decimal_is_no_spend(self, monkeypatch):
         monkeypatch.setattr(
             db_mod,
@@ -2674,6 +2704,80 @@ class TestResolveCurrentBudgetSpend:
         spend, reason = resolve_current_budget_spend("https://ws", "token")
         assert spend is None
         assert "not a JSON object" in reason
+
+
+class TestListWorkspaceBudgets:
+    PER_USER = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
+    SHARED = "ALERT_CONFIGURATION_SCOPE_TYPE_SHARED"
+
+    def _stub(self, monkeypatch, payload):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
+        )
+
+    BLOCK = "BLOCK_USAGE"
+    EMAIL = "EMAIL_NOTIFICATION"
+
+    def test_flags_per_user_block_presence(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "blocks",
+                        "display_name": "per-user block",
+                        "alert_configurations": [
+                            {"scope_type": self.SHARED},
+                            {
+                                "scope_type": self.PER_USER,
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            },
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "email_only",
+                        "display_name": "per-user email only",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "action_configurations": [
+                                    {"action_type": self.EMAIL, "target": "a@b.com"}
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "shared_block",
+                        "display_name": "shared block only",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.SHARED,
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
+                    },
+                ]
+            },
+        )
+        budgets, reason = list_workspace_budgets("https://ws", "token")
+        assert reason is None
+        by_id = {b["id"]: b for b in budgets}
+        # Only a per-user threshold that also carries a BLOCK_USAGE action enforces spend routing.
+        assert by_id["blocks"]["has_per_user_block"] is True
+        assert by_id["email_only"]["has_per_user_block"] is False
+        assert by_id["shared_block"]["has_per_user_block"] is False
+
+    def test_missing_alert_configs_is_not_per_user_block(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {"budget_configuration_id": "b", "display_name": "x"}
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        assert budgets[0]["has_per_user_block"] is False
 
 
 class TestDiscoverSqlWarehouses:
@@ -2741,3 +2845,67 @@ class TestDiscoverSqlWarehouses:
         )
         with pytest.raises(RuntimeError, match="No usable SQL warehouse"):
             discover_sql_warehouses(WS, "token")
+
+
+class TestAllUsersCanUseSchema:
+    def _stub(self, monkeypatch, payload, reason=None):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, reason)
+        )
+
+    def test_true_when_account_users_have_use_schema(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "USE_SCHEMA"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is True
+
+    def test_true_when_account_users_have_all_privileges(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "ALL_PRIVILEGES"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is True
+
+    def test_false_when_no_use_schema(self, monkeypatch):
+        # An empty assignment list is what the API returns when the group has no grant on the schema.
+        self._stub(monkeypatch, {})
+        assert all_users_can_use_schema("https://ws", "tok", "main.tien_le") is False
+
+    def test_false_when_only_unrelated_privileges(self, monkeypatch):
+        self._stub(
+            monkeypatch,
+            {
+                "privilege_assignments": [
+                    {"principal": "account users", "privileges": [{"privilege": "MANAGE"}]}
+                ]
+            },
+        )
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is False
+
+    def test_none_when_the_call_fails(self, monkeypatch):
+        self._stub(monkeypatch, None, reason="HTTP 403 Forbidden")
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is None
+
+    def test_none_on_unexpected_shape(self, monkeypatch):
+        self._stub(monkeypatch, [])
+        assert all_users_can_use_schema("https://ws", "tok", "main.default") is None
+
+    def test_requests_the_account_users_principal(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, timeout=30: (seen.setdefault("url", url), ({}, None))[1],
+        )
+        all_users_can_use_schema("https://ws", "tok", "main.tien_le")
+        assert "effective-permissions/schema/main.tien_le" in seen["url"]
+        assert "principal=account%20users" in seen["url"]

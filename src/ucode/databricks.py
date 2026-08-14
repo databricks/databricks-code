@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple, cast, overload
 from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from databricks.sql.exc import ServerOperationError
 
@@ -409,12 +409,32 @@ def is_workspace_admin(workspace: str, token: str) -> bool | None:
 _WORKSPACE_BUDGETS_API_PATH = "/api/ai-gateway/v2/workspace-metrics/budgets"
 
 
+_PER_USER_ALERT_SCOPE = "ALERT_CONFIGURATION_SCOPE_TYPE_PER_USER"
+_BLOCK_ACTION_TYPE = "BLOCK_USAGE"
+
+
+def _has_per_user_block(entry: dict) -> bool:
+    """Whether a raw budget entry has a per-user alert threshold that hard-blocks usage.
+
+    True only when some alert is per-user scoped *and* carries a ``BLOCK_USAGE`` action; a per-user
+    alert with only an email notification does not enforce spend routing.
+    """
+    for alert in entry.get("alert_configurations") or []:
+        if not isinstance(alert, dict) or alert.get("scope_type") != _PER_USER_ALERT_SCOPE:
+            continue
+        for action in alert.get("action_configurations") or []:
+            if isinstance(action, dict) and action.get("action_type") == _BLOCK_ACTION_TYPE:
+                return True
+    return False
+
+
 def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str | None]:
     """List the AI Gateway budgets that apply to this workspace.
 
-    Returns ``(budgets, reason)`` where each budget is ``{"id": ..., "display_name": ...}``.
+    Returns ``(budgets, reason)`` where each budget is ``{"id", "display_name", "has_per_user_block"}``.
     ``reason`` is None on success, otherwise it explains why the list is empty. ucode never creates
-    budgets — an admin picks an existing one to attach a spend-routing policy to.
+    budgets — an admin picks an existing one to attach a spend-routing policy to. ``has_per_user_block``
+    lets the picker hide budgets that can't enforce spend routing (see ``_has_per_user_block``).
     """
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}{_WORKSPACE_BUDGETS_API_PATH}"
@@ -438,6 +458,7 @@ def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str 
             {
                 "id": budget_id,
                 "display_name": display_name if isinstance(display_name, str) else "",
+                "has_per_user_block": _has_per_user_block(entry),
             }
         )
     if not budgets:
@@ -1342,10 +1363,18 @@ def build_auth_shell_command(
 # part after the prefix is exactly the model string agents send (no
 # `databricks-` infix — that only appears on the inner destination name).
 _MODEL_SERVICE_NAME_PREFIX = "model-services/"
-# The metastore-scope listing returns services from EVERY schema (e.g.
-# `main.user.foo`, `temp.*`, internal DLT schemas). We only want the
-# Databricks-managed foundation models under `system.ai`.
+# The listing can return services from EVERY schema (e.g. `main.user.foo`,
+# `temp.*`, internal DLT schemas). We only want the Databricks-managed
+# foundation models under `system.ai`.
 _MODEL_SERVICE_REQUIRED_PREFIX = "system.ai."
+# Scope the listing to the `system.ai` schema via the `parent` query param
+# (`schemas/{catalog}.{schema}`). Without it the endpoint walks the ENTIRE
+# metastore — hundreds of unrelated services across dozens of ~2s pages, then
+# discards all but `system.ai.*` client-side (a ~50s walk on a busy workspace).
+# Parent-scoped, the same set comes back in a single page (~1s). The endpoint
+# ignores the other filters (`catalog_name`/`schema_name`/`filter`), so `parent`
+# is the only server-side narrowing that works.
+_MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 
 # Supported OSS chat families, matched by name substring. Add an entry to
 # support a new family.
@@ -1487,11 +1516,14 @@ def list_model_services(
 ) -> tuple[list[str], str | None]:
     """List all `system.ai.*` model ids via the UC model-services API.
 
-    Pages through ``/api/2.1/unity-catalog/model-services`` (metastore scope)
-    with a bounded ``page_size`` (the endpoint 499s without one) and returns the
-    de-duplicated, sorted list of ``system.ai.<model-name>`` ids. Returns
-    (ids, reason); reason is None on success, otherwise it describes why the
-    list is empty (HTTP/network error or no services).
+    Pages through ``/api/2.1/unity-catalog/model-services`` scoped to the
+    ``system.ai`` schema (``parent=schemas/system.ai``) with a bounded
+    ``page_size`` (the endpoint 499s without one) and returns the de-duplicated,
+    sorted list of ``system.ai.<model-name>`` ids. Returns (ids, reason); reason
+    is None on success, otherwise it describes why the list is empty (HTTP/network
+    error or no services). Scoping matters: the unscoped metastore listing walks
+    every schema across dozens of ~2s pages (~50s on a busy workspace) only to
+    keep the same ``system.ai.*`` subset — see ``_MODEL_SERVICE_PARENT_SCHEMA``.
 
     A successful result is memoized per workspace for the life of the process; pass
     ``use_cache=False`` to force a fresh walk.
@@ -1507,7 +1539,10 @@ def list_model_services(
     seen_tokens: set[str] = set()
     last_reason: str | None = None
     for _ in range(max_pages):
-        params: dict[str, str] = {"page_size": str(page_size)}
+        params: dict[str, str] = {
+            "parent": _MODEL_SERVICE_PARENT_SCHEMA,
+            "page_size": str(page_size),
+        }
         if page_token:
             params["page_token"] = page_token
         url = f"https://{hostname}/api/2.1/unity-catalog/model-services?{urlencode(params)}"
@@ -1553,6 +1588,20 @@ def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[
     return [m for m in ids if "claude-" in m.lower()], None
 
 
+def _prefer_opus_4_8(models: dict[str, str], all_ids: list[str]) -> None:
+    """Swap the opus slot to claude-opus-4-8 when it's available.
+
+    Discovery picks the newest opus (opus-5) but smart routing's
+    CLAUDE_ROUTE_ARMS require claude-opus-4-8. Pin to 4-8 when both
+    exist so the routing availability check passes.
+    """
+    opus = models.get("opus")
+    if opus and "claude-opus-5" in opus:
+        opus_48 = next((m for m in all_ids if "claude-opus-4-8" in m), None)
+        if opus_48:
+            models["opus"] = opus_48
+
+
 def discover_model_services(
     workspace: str, token: str
 ) -> tuple[dict[str, str], list[str], list[str], list[str], str | None]:
@@ -1583,6 +1632,12 @@ def discover_model_services(
         )
         if candidates:
             claude_models[family] = candidates[0]
+    # Smart routing's CLAUDE_ROUTE_ARMS require claude-opus-4-8, but the
+    # newest-wins sort above picks opus-5 when both exist — making the
+    # routing availability check fail. Pin opus-4-8 when it's available so
+    # routing works with the currently-deployed task_v1 router. Revert to
+    # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
+    _prefer_opus_4_8(claude_models, ids)
 
     codex_models = [m for m in ids if "gpt-" in m]
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
@@ -1643,6 +1698,47 @@ def fetch_model_recommendation(workspace: str, token: str) -> tuple[dict, str | 
     if not isinstance(payload, dict):
         return {}, "recommendModel returned an unexpected response shape"
     return payload, None
+
+
+# The gateway's per-model price catalog (USD per million tokens), sourced from the same Zippy data
+# the server uses to bill external-model spend. We read it to estimate per-model cost from token
+# counts, since no API returns per-model dollars directly.
+_EXTERNAL_PROVIDER_MODELS_API_PATH = "/api/ai-gateway/v2/external-provider-models"
+_EXTERNAL_PROVIDER_MODELS_PAGE_SIZE = 1000
+_EXTERNAL_PROVIDER_MODELS_MAX_PAGES = 20
+
+
+def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict], str | None]:
+    """List external-provider models and their `base_pricing` (USD per million tokens) via the gateway.
+
+    Returns ``(models, reason)`` with each model the raw API entry; ``reason`` is non-None on failure
+    (callers omit cost rather than fail).
+    """
+    hostname = workspace_hostname(workspace)
+    base_url = f"https://{hostname}{_EXTERNAL_PROVIDER_MODELS_API_PATH}"
+    models: list[dict] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(_EXTERNAL_PROVIDER_MODELS_MAX_PAGES):
+        params: dict[str, str] = {"page_size": str(_EXTERNAL_PROVIDER_MODELS_PAGE_SIZE)}
+        if page_token:
+            params["page_token"] = page_token
+        payload, reason = _http_get_json(f"{base_url}?{urlencode(params)}", token, timeout=30)
+        if payload is None:
+            # Return what we have if a later page blips; only the first-page failure is fatal.
+            return (models, None) if models else ([], reason or "unknown error")
+        if not isinstance(payload, dict):
+            return [], "external-provider-models returned an unexpected response shape"
+        for entry in payload.get("models") or []:
+            if isinstance(entry, dict) and entry.get("model_name"):
+                models.append(entry)
+        page_token = payload.get("next_page_token") or None
+        if not page_token or page_token in seen_tokens:
+            break
+        seen_tokens.add(page_token)
+    if not models:
+        return [], "external-provider-models listing returned no models"
+    return models, None
 
 
 # Every field ucode's manifest can set, as `update_mask` paths for a PATCH. The server rejects a
@@ -1977,6 +2073,43 @@ def get_model_provider_service(
     return entry, None
 
 
+# The group every workspace user belongs to. USE_SCHEMA granted to it (directly or inherited from
+# the catalog) is what lets an arbitrary developer pull a config that routes through an MPS in that
+# schema; without it they hit "User does not have USE_SCHEMA on Schema <catalog>.<schema>".
+_ALL_WORKSPACE_USERS_GROUP = "account users"
+
+
+def all_users_can_use_schema(workspace: str, token: str, schema_full_name: str) -> bool | None:
+    """Whether the `account users` group has USE_SCHEMA on ``<catalog>.<schema>``.
+
+    Uses UC's effective-permissions API, so a USE_SCHEMA inherited from a catalog-level grant counts.
+    Returns True/False, or None when the check itself could not be made (API unreachable or an
+    unexpected shape) — callers treat None as "unknown" and skip the warning rather than cry wolf.
+
+    A False here is only a heuristic: a workspace may instead grant access through team groups or
+    individual users, so callers must warn rather than block on it.
+    """
+    hostname = workspace_hostname(workspace)
+    principal = quote(_ALL_WORKSPACE_USERS_GROUP)
+    url = (
+        f"https://{hostname}/api/2.1/unity-catalog/effective-permissions/"
+        f"schema/{schema_full_name}?principal={principal}"
+    )
+    payload, reason = _http_get_json(url, token, timeout=30)
+    if reason is not None or not isinstance(payload, dict):
+        return None
+    for assignment in payload.get("privilege_assignments") or []:
+        if not isinstance(assignment, dict):
+            continue
+        for entry in assignment.get("privileges") or []:
+            if isinstance(entry, dict) and entry.get("privilege") in (
+                "USE_SCHEMA",
+                "ALL_PRIVILEGES",
+            ):
+                return True
+    return False
+
+
 def is_model_provider_feature_unavailable(reason: str | None) -> bool:
     """True when a model-provider-services API failure means the workspace
     simply hasn't enabled the feature (HTTP 400 "feature is not available"),
@@ -2012,7 +2145,7 @@ def service_usable_for_tool(tool: str, service: dict) -> bool:
     if not tool_supports_provider_type(tool, provider_type):
         return False
     if provider_type in BEDROCK_PROVIDER_TYPES:
-        return bool(map_bedrock_claude_models(service.get("targets") or []))
+        return bool(map_claude_family_models(service.get("targets") or []))
     return True
 
 
@@ -2052,7 +2185,7 @@ def resolve_provider_service(
             f"Model provider service '{service_name}' is a '{provider_type}' provider, "
             f"which {tool} can't route to (supported: {supported})."
         )
-    if provider_type in BEDROCK_PROVIDER_TYPES and not map_bedrock_claude_models(
+    if provider_type in BEDROCK_PROVIDER_TYPES and not map_claude_family_models(
         match.get("targets") or []
     ):
         return None, (
@@ -2062,12 +2195,11 @@ def resolve_provider_service(
     return match, None
 
 
-# Bedrock exposes Claude under provider-side ids like
-# `us.anthropic.claude-sonnet-4-6`, `global.anthropic.claude-opus-4-8`, or the
-# region-less `anthropic.claude-opus-4-8`. We map each service target to a
-# Claude family and keep the best id per family. Claude Code only takes one
-# default per family; users switch to any other listed region profile at runtime
-# with `/model <full-id>` or `--model`.
+# A Model Provider Service exposes Claude under per-family target ids: Bedrock as provider-side
+# slugs (`us.anthropic.claude-sonnet-4-6`, `global.anthropic.claude-opus-4-8`, region-less
+# `anthropic.claude-opus-4-8`), Anthropic as canonical names (`claude-sonnet-5`). Either way we map
+# each target to a Claude family and keep the best id per family. Claude Code takes one default per
+# family; users switch to any other listed id at runtime with `/model <full-id>` or `--model`.
 _BEDROCK_CLAUDE_FAMILIES = ("opus", "sonnet", "haiku")
 # When the same model/version is offered under several cross-region inference
 # profiles, prefer the broadest-routing one as the pinned default.
@@ -2094,11 +2226,14 @@ def _bedrock_sort_key(model_id: str) -> tuple:
     return (version, _bedrock_region_rank(model_id))
 
 
-def map_bedrock_claude_models(targets: list[str]) -> dict[str, str]:
-    """Map Bedrock service targets to ``{family: model_id}`` for opus/sonnet/
-    haiku, choosing the highest-versioned id per family and, on a version tie,
-    the broadest-routing region profile. Targets that don't name a Claude family
-    are ignored."""
+def map_claude_family_models(targets: list[str]) -> dict[str, str]:
+    """Map a service's Claude targets to ``{family: model_id}`` for opus/sonnet/haiku.
+
+    Chooses the highest-versioned id per family and, on a version tie, the broadest-routing region
+    profile (Bedrock targets carry a region prefix; canonical Anthropic ids rank equal, so version
+    alone decides). Targets that don't name a Claude family are ignored, so a mixed catalog (e.g. a
+    Bedrock service also exposing Titan embeddings) yields only the Claude families.
+    """
     best_key: dict[str, tuple] = {}
     result: dict[str, str] = {}
     for model_id in targets:
@@ -2523,6 +2658,8 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
         )
         if candidates:
             result[family] = candidates[0]
+    # Same opus-4-8 pin as discover_model_services — see comment there.
+    _prefer_opus_4_8(result, raw_ids)
     if result:
         return result, None
     if not raw_ids:
@@ -2722,12 +2859,22 @@ def resolve_current_budget_spend(
     if not isinstance(payload, dict):
         return None, "response was not a JSON object"
 
-    # Per the server's BudgetSpend.fromProto, a spend with no threshold to
-    # measure against counts as no spend.
-    spend = _parse_decimal(payload.get("current_spend"))
+    # The threshold is what anchors the spend: a caller with a per-user threshold but no spend yet
+    # this period gets `effective_threshold` set and `current_spend` omitted (see the server's
+    # per-user spend resolution). Treat an *absent* spend as $0 rather than "no budget", so a
+    # developer who hasn't spent anything still sees their budget instead of a blank. With no
+    # threshold there is nothing to measure against, so that genuinely counts as no spend.
     threshold = _parse_decimal(payload.get("effective_threshold"))
-    if spend is None or threshold is None:
+    if threshold is None:
         return None, "workspace reported no coding-agent budget spend"
+    raw_spend = payload.get("current_spend")
+    if raw_spend is None:
+        spend: Decimal | None = Decimal(0)
+    else:
+        # Present but unparseable is corrupt data, not zero spend — don't silently mask it.
+        spend = _parse_decimal(raw_spend)
+        if spend is None:
+            return None, "workspace reported no coding-agent budget spend"
     return (spend, threshold), None
 
 

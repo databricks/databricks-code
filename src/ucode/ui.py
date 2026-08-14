@@ -21,6 +21,23 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 console = Console(highlight=False)
 err_console = Console(stderr=True, highlight=False)
 
+# questionary scrolls a window over a long choice list, but doesn't advertise it. Past this many
+# options the list can't all be on screen, so the pickers append a "↑/↓ scroll" note to their
+# instruction line. Matches mcp.py's MCP_PICKER_VISIBLE_ROWS so both picker families agree.
+_SCROLL_HINT_THRESHOLD = 10
+
+
+def _with_scroll_hint(instruction: str, option_count: int) -> str:
+    """Append a scroll affordance when the option list is too long to fully show at once.
+
+    The hint is discoverability only — questionary already scrolls; users just can't tell there is
+    more below the fold. Short lists are left alone so the instruction stays terse.
+    """
+    if option_count > _SCROLL_HINT_THRESHOLD:
+        return f"{instruction[:-1]}, ↑/↓ scroll)" if instruction.endswith(")") else instruction
+    return instruction
+
+
 # Output verbosity. "normal" (default) renders decorative panels; "low" trades
 # them for terse single-line output. Set once at CLI entry via set_verbosity.
 _verbosity = "normal"
@@ -85,6 +102,11 @@ def print_success(message: str) -> None:
 
 def print_warning(message: str) -> None:
     console.print(f"[bold yellow]![/bold yellow] {message}")
+
+
+def print_warning_err(message: str) -> None:
+    """``print_warning`` on stderr, for when stdout is a machine-read stream."""
+    err_console.print(f"[bold yellow]![/bold yellow] {message}")
 
 
 def print_err(message: str) -> None:
@@ -230,6 +252,17 @@ def format_token_count(token_count: int) -> str:
 
 def format_usd(amount: Decimal) -> str:
     return f"${amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,}"
+
+
+def format_cost_usd(amount: Decimal) -> str:
+    """Like `format_usd`, but keeps more precision for sub-cent per-model costs.
+
+    A model that cost a fraction of a cent would round to ``$0.00`` at two
+    decimals and read as free, so amounts under a cent show four decimals.
+    """
+    if Decimal(0) < amount < Decimal("0.01"):
+        return f"${amount.quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)}"
+    return format_usd(amount)
 
 
 def format_meter(fraction: float, width: int = 30) -> str:
@@ -385,6 +418,7 @@ def prompt_for_multi_selection(
     instruction = "(space to toggle, enter to confirm)"
     if searchable:
         instruction = "(type to filter, space to toggle, enter to confirm)"
+    instruction = _with_scroll_hint(instruction, len(options))
     answer = questionary.checkbox(
         prompt,
         choices=choices,
@@ -494,13 +528,15 @@ def prompt_for_selection(
         ]
     )
     choices = [questionary.Choice(title=label, value=value) for value, label in options]
+    instruction = "(type to filter, arrow keys to move)" if searchable else "(use arrow keys)"
+    instruction = _with_scroll_hint(instruction, len(options))
     answer = questionary.select(
         prompt,
         choices=choices,
         style=style,
         pointer="›",
         qmark="",
-        instruction="(type to filter, arrow keys to move)" if searchable else "(use arrow keys)",
+        instruction=instruction,
         use_search_filter=searchable,
         use_jk_keys=not searchable,
     ).ask()

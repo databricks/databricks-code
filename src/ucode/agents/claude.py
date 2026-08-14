@@ -249,6 +249,7 @@ def render_overlay(
     relayed: bool = False,
     relayed_base_url: str | None = None,
     route_root_model: str | None = None,
+    custom_model: str | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Claude settings.json.
 
@@ -314,10 +315,23 @@ def render_overlay(
     _ = model  # API stability; no longer pinned via env.
     if route_root_model:
         env["ANTHROPIC_MODEL"] = route_root_model
+    # `ucode claude --model <id>` pins an arbitrary Databricks model id for this launch. It CANNOT
+    # go in ANTHROPIC_MODEL: Claude Code validates that value client-side against the models it knows
+    # (via the apiKeyHelper auth path ucode uses) and rejects a raw id with "may not exist ... run
+    # /model". The family-alias vars (ANTHROPIC_DEFAULT_*_MODEL) are passed through unchecked, so pin
+    # the id into all of them — a raw id carries no signal of its family (opus/sonnet/haiku), and
+    # overriding every slot makes the model take effect no matter which one Claude Code resolves
+    # (root session, a tier switch, or a subagent). Wins over the discovered-model aliases below.
+    if custom_model and not provider:
+        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = custom_model
+        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = custom_model
+        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = custom_model
+        if fable_enabled:
+            env["ANTHROPIC_DEFAULT_FABLE_MODEL"] = custom_model
     # A Bedrock-backed provider needs its provider-side ids pinned verbatim
     # (Claude Code's canonical names aren't routable there). These come from the
     # service's targets, already de-duped to one id per family upstream.
-    if provider and provider_models:
+    elif provider and provider_models:
         if provider_models.get("opus"):
             env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = provider_models["opus"]
         if provider_models.get("sonnet"):
@@ -466,6 +480,7 @@ def write_tool_config(
     provider_models: dict[str, str] | None = None,
     relayed: bool = False,
     route_root_model: str | None = None,
+    custom_model: str | None = None,
 ) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
     web_search_model = _resolve_web_search_model(state)
@@ -485,6 +500,7 @@ def write_tool_config(
         relayed=relayed,
         relayed_base_url=relayed_base_url,
         route_root_model=route_root_model,
+        custom_model=custom_model,
     )
     tracing_env_vars = tracing_env(state, "claude")
     stop_hook_command = claude_tracing_stop_hook_command() if tracing_env_vars else None

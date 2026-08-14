@@ -1,9 +1,10 @@
 """Resolve the effective agent settings from the managed config plus local ucode state.
 
-The admin-authored manifest (``~/.ucode/managed-state.json``, written by
-:mod:`ucode.managed_config`) and the developer's own ucode state (``~/.ucode/state.json``) stay
-separate files — they are never merged on disk. Instead this module resolves them *per key* at
-config-write time: whatever the manifest specifies wins, and anything it leaves unset falls back to
+The managed config (``~/.ucode/managed-state.json`` — authored by ``ucode setup`` and refreshed
+from the workspace at launch, both through :mod:`ucode.managed_config`) and the developer's own
+ucode state (``~/.ucode/state.json``) stay separate files — they are never merged on disk. Instead
+this module resolves them *per key* at config-write time: whatever the manifest specifies wins, and
+anything it leaves unset falls back to
 the developer's ucode state. The resolved view is what gets rendered into the agent config files
 (e.g. ``~/.claude/ucode-settings.json``), so managed settings take precedence for every ``ucode``
 command without either file being rewritten.
@@ -183,6 +184,44 @@ def managed_default_model(managed: dict, tool: str) -> str | None:
     pins it explicitly, so the admin's choice holds even for agents that would otherwise pick their
     own default."""
     return _str(_agent_model_config(managed, tool).get("default_model"))
+
+
+def managed_provider_family_models(managed: dict) -> dict[str, str] | None:
+    """Claude's authored per-family models for launch, when a managed config routes it through a
+    Model Provider Service.
+
+    The launch path pins each ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` from this so a *managed* launch
+    uses exactly the versions the admin chose in ``ucode setup`` — rather than
+    ``resolve_provider_models`` re-deriving "newest per family" from the service's live targets. It
+    returns the manifest's own family slots (``{opus: id, sonnet: id, ...}``), i.e. what the wizard's
+    per-family prompt authored.
+
+    Falls back to the single ``default_model`` (mapped to its family) when the manifest carries no
+    slots — the case where the service is ``allow_all_targets`` so setup could only ask for one
+    overall default. Returns None when neither is present, leaving the launch path to its usual
+    provider handling.
+
+    TODO: when the service is ``allow_all_targets`` an admin can't enumerate a per-family choice yet.
+    A list-models API for provider services would let the wizard offer the full catalog per family;
+    until then the single default is the best the manifest can express.
+    """
+    from ucode.managed_setup import claude_family_for_model
+
+    config = _agent_model_config(managed, "claude")
+    slots: dict[str, str] = {}
+    raw_slots = _as_dict(config.get("models"))
+    for slot, family in _CLAUDE_FAMILY_SLOTS.items():
+        model = _str(raw_slots.get(slot))
+        if model:
+            slots[family] = model
+    if slots:
+        return slots
+    default_model = _str(config.get("default_model"))
+    if default_model:
+        family = claude_family_for_model(default_model)
+        if family:
+            return {family: default_model}
+    return None
 
 
 def recommended_agent(recommendation: dict | None, managed: dict) -> str | None:
