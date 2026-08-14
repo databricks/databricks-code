@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -466,6 +467,82 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
         assert written[0]["env"]["ENABLE_PROMPT_CACHING_1H"] == "1"
         assert written[0]["env"]["ENABLE_TOOL_SEARCH"] == "1"
         assert written[0]["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
+
+
+FAKE_MANAGED_PATH = Path("/tmp/ucode-test/managed-settings.json")
+
+
+class TestWriteToolConfigManagedSettings:
+    """use_as_global_settings: also write Claude Code's OS managed-settings.json (via sudo, mocked)."""
+
+    def _patch(self, monkeypatch, private_writes, managed_writes, existing_by_path=None):
+        existing_by_path = existing_by_path or {}
+        monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
+        # Deep-copy the seeded existing content so the compose step can't mutate the fixture.
+        monkeypatch.setattr(
+            claude,
+            "read_json_safe",
+            lambda path: json.loads(json.dumps(existing_by_path.get(str(path), {}))),
+        )
+        monkeypatch.setattr(
+            claude,
+            "write_json_file",
+            lambda path, payload: private_writes.append((str(path), payload)),
+        )
+        monkeypatch.setattr(claude, "save_state", lambda state: None)
+        monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
+        # Deterministic managed path, and a mocked sudo writer so NO real sudo/`/etc` write happens.
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: FAKE_MANAGED_PATH)
+
+        def fake_write_managed(path, text, *, display):
+            managed_writes.append((str(path), text))
+            return "written"
+
+        monkeypatch.setattr(claude, "write_managed_file", fake_write_managed)
+
+    def test_writes_managed_file_when_flagged(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        # Private file still written; managed file written too.
+        assert str(claude.CLAUDE_SETTINGS_PATH) in [p for p, _ in private_writes]
+        assert [p for p, _ in managed_writes] == [str(FAKE_MANAGED_PATH)]
+
+    def test_managed_file_preserves_other_keys(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        # An IT-authored key already in the managed file must survive the merge.
+        existing = {str(FAKE_MANAGED_PATH): {"env": {"MY_OWN": "keep"}}}
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        _, text = managed_writes[0]
+        written = json.loads(text)
+        assert written["env"]["MY_OWN"] == "keep"
+        assert written["env"]["ANTHROPIC_BASE_URL"]
+        assert written["apiKeyHelper"]
+
+    def test_no_managed_write_by_default(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        state = {"workspace": WS, "codex_models": []}
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        assert managed_writes == []
+
+    def test_relayed_skips_managed_write(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        warns: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        monkeypatch.setattr(claude, "print_warning", lambda msg: warns.append(msg))
+        monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
+        state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
+        claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
+        assert managed_writes == []
+        assert any("bare `claude`" in w for w in warns)
 
 
 class TestRegisterWebSearchMcp:

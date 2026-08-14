@@ -19,7 +19,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
-from ucode.agents import TOOL_SPECS, check_gateway_endpoint
+from ucode.agents import GLOBAL_SETTINGS_AGENTS, TOOL_SPECS, check_gateway_endpoint
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
     all_users_can_use_schema,
@@ -74,13 +74,19 @@ from ucode.ui import (
     spinner,
 )
 
-# What `use_as_global_settings` actually does, in plain terms. Admins are choosing whether to write
-# the agent's own global settings file (so it points at the gateway even when launched directly) or
-# a ucode-specific one (so the agent only routes through the gateway when launched via ucode).
+# The OS-level managed settings file `use_as_global_settings` writes for each agent — named in the
+# prompt so an admin sees exactly what answering "yes" touches.
+GLOBAL_SETTINGS_FILES = {
+    "claude": "Claude Code's managed-settings.json",
+    "codex": "Codex's managed_config.toml",
+}
+
+# What `use_as_global_settings` actually does, in plain terms. `{binary}` is filled in per agent.
 GLOBAL_SETTINGS_BLURB = (
-    "Answer Yes to write this agent's own global settings file, so it points at the Databricks "
-    "gateway even when launched directly, without ucode. Answer no to write a ucode-specific "
-    "settings file instead, so the agent only routes through the gateway when launched via ucode."
+    "Answer yes to write the gateway config into that file (needs sudo once), so a bare `{binary}` "
+    "reaches the Databricks gateway on its own — you don't have to launch it through ucode. Answer "
+    "no to write a ucode-only settings file instead, so `{binary}` uses the gateway only when "
+    "started with `ucode {binary}`."
 )
 
 BUDGET_POLICY_BLURB = (
@@ -966,8 +972,14 @@ def _render_summary(workspace: str, manifest: dict) -> None:
         provider = model_config.get("model_provider_service")
         if provider:
             detail = f"{detail} via {provider}"
-        scope = "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
-        lines.append(kv_line(display, f"{detail} ({scope})"))
+        # Only agents that can use global settings carry the scope label; for the rest it's not a choice.
+        if tool in GLOBAL_SETTINGS_AGENTS:
+            scope = (
+                "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
+            )
+            lines.append(kv_line(display, f"{detail} ({scope})"))
+        else:
+            lines.append(kv_line(display, detail))
         # Spell out the per-family slots and model lists: the one-line default alone doesn't show
         # which families an admin configured, which is most of what they chose for claude.
         models = model_config.get("models")
@@ -1225,11 +1237,16 @@ def setup_command(
         agent_config: dict = {
             "model_config": _prompt_models_for_agent(tool, state, provider_service)
         }
-        agent_config["use_as_global_settings"] = prompt_yes_no_default(
-            f"Write {TOOL_SPECS[tool]['display']}'s config to its global settings file? "
-            f"({GLOBAL_SETTINGS_BLURB})",
-            default=False,
-        )
+        # Only claude and codex have an OS-level managed settings file that a bare `claude`/`codex`
+        # reads (`/etc/claude-code/managed-settings.json`, `/etc/codex/managed_config.toml`); the
+        # other agents don't, so we don't offer them the choice.
+        if tool in GLOBAL_SETTINGS_AGENTS:
+            binary = TOOL_SPECS[tool]["binary"]
+            agent_config["use_as_global_settings"] = prompt_yes_no_default(
+                f"Write {TOOL_SPECS[tool]['display']}'s config to {GLOBAL_SETTINGS_FILES[tool]}? "
+                f"({GLOBAL_SETTINGS_BLURB.format(binary=binary)})",
+                default=False,
+            )
         enabled_agents[tool] = agent_config
 
     manifest: dict = {"default_agent": default_agent, "enabled_agents": enabled_agents}

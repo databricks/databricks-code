@@ -289,3 +289,7 @@ class TestMarkToolManaged:
         result = mark_tool_managed(state, "codex", [["profile"]])
         assert "gemini" in result["managed_configs"]
         assert "codex" in result["managed_configs"]
+
+    def test_records_only_keys(self):
+        result = mark_tool_managed({}, "codex", [["model"]])
+        assert result["managed_configs"]["codex"] == {"keys": [["model"]]}

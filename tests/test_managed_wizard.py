@@ -1688,6 +1688,25 @@ class TestSummary:
         assert "system.ai.gemini-3-flash" in out
         assert "models:" not in out
 
+    def test_scope_label_only_for_global_capable_agents(self, capsys):
+        # claude/codex can use global settings, so they carry the scope; gemini can't, so it doesn't.
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {"default_model": "system.ai.claude-opus-4-8"},
+                    "use_as_global_settings": True,
+                },
+                "gemini": {"model_config": {"default_model": "system.ai.gemini-3-flash"}},
+            },
+        }
+        wizard._render_summary(WORKSPACE, manifest)
+        out = capsys.readouterr().out
+        assert "global settings" in out
+        # The gemini line names its model but carries no global-settings/ucode-only scope.
+        gemini_line = next(line for line in out.splitlines() if "gemini-3-flash" in line)
+        assert "ucode-only" not in gemini_line and "global settings" not in gemini_line
+
 
 class TestSetupFromFile:
     def _write(self, tmp_path, payload):

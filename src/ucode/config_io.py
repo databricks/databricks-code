@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import tomlkit
 import tomlkit.exceptions
@@ -107,10 +107,47 @@ def deep_merge_dict(base: dict, overlay: dict) -> dict:
     return base
 
 
+def prune_key_paths(doc: dict, key_paths: list[list[str]]) -> bool:
+    """Surgically remove each ``key_path`` from a nested dict, dropping emptied parents.
+
+    ``key_paths`` is a list of paths like ``[["env", "ANTHROPIC_BASE_URL"], ["apiKeyHelper"]]``.
+    Only the exact leaves are removed; sibling keys the user set themselves stay untouched, and a
+    parent dict left empty by the removal is dropped too. Returns True if anything changed.
+
+    Used to undo ucode's writes to an agent's *native* config file (which it shares with the
+    user's own settings), where restoring a backup would clobber edits made since ucode first ran.
+    """
+    changed = False
+    for path in key_paths:
+        if _prune_one(doc, list(path)):
+            changed = True
+    return changed
+
+
+def _prune_one(node: object, path: list[str]) -> bool:
+    if not path or not isinstance(node, dict):
+        return False
+    mapping = cast("dict[str, object]", node)
+    key = path[0]
+    if key not in mapping:
+        return False
+    if len(path) == 1:
+        mapping.pop(key, None)
+        return True
+    child = mapping.get(key)
+    removed = _prune_one(child, path[1:])
+    if removed and isinstance(child, dict) and not child:
+        mapping.pop(key, None)
+    return removed
+
+
 def read_json_safe(path: Path) -> dict:
-    if not path.exists():
-        return {}
+    # `path.exists()` is inside the try: stat-ing a file under a root-locked dir (e.g. a
+    # root-owned /etc/codex) raises PermissionError, which must read as "absent/unreadable → {}"
+    # rather than crash a launch that only wanted to merge into it.
     try:
+        if not path.exists():
+            return {}
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
@@ -118,9 +155,11 @@ def read_json_safe(path: Path) -> dict:
 
 
 def read_toml_safe(path: Path) -> tomlkit.TOMLDocument:
-    if not path.exists():
-        return tomlkit.document()
+    # See read_json_safe: keep `path.exists()` inside the try so a PermissionError on a locked
+    # parent directory is treated as an empty document rather than propagating.
     try:
+        if not path.exists():
+            return tomlkit.document()
         return tomlkit.parse(path.read_text(encoding="utf-8"))
     except (OSError, tomlkit.exceptions.TOMLKitError):
         return tomlkit.document()

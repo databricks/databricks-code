@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+import tomlkit
+
 from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
     APP_DIR,
@@ -24,6 +26,7 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
+from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
@@ -354,6 +357,15 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         enabled=smart_routing_enabled(state) and provider is None,
     )
     write_toml_file(CODEX_CONFIG_PATH, doc)
+    # use_as_global_settings: also write the modern overlay to Codex's OS managed config
+    # (/etc/codex/managed_config.toml), the highest-precedence scope a bare `codex` reads — so it
+    # defaults to the gateway without `--profile ucode`. codex auth self-refreshes via
+    # `ucode auth-token`, so the file keeps working. The write goes through the sudo path in
+    # `managed_files`.
+    if state.get("write_managed_config"):
+        _write_managed_config(
+            workspace, chosen_model, databricks_profile, bool(state.get("use_pat")), provider
+        )
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
     return state
@@ -365,6 +377,48 @@ def _is_gpt_family(model: str) -> bool:
     if tail.startswith("system.ai."):
         tail = tail[len("system.ai.") :]
     return tail.startswith("gpt-")
+
+
+def _managed_config_path() -> Path | None:
+    """OS-level Codex managed config file, or None on unsupported platforms.
+
+    Linux and macOS use ``/etc/codex/managed_config.toml`` (root-owned, highest precedence). See
+    https://learn.chatgpt.com/docs/enterprise/managed-configuration. Codex also supports a
+    ``~/.codex/managed_config.toml`` on Windows, but ucode's write path is sudo/Unix-only
+    (see :func:`managed_files.managed_files_supported`), so Windows returns None here too.
+    """
+    if current_os() in (OS.LINUX, OS.MACOS):
+        return Path("/etc/codex/managed_config.toml")
+    return None
+
+
+def _write_managed_config(
+    workspace: str,
+    model: str | None,
+    databricks_profile: str | None,
+    use_pat: bool,
+    provider: str | None,
+) -> None:
+    """Merge the modern overlay into Codex's OS managed_config.toml, preserving any other keys there.
+
+    Written via the sudo path in `managed_files` (drift-suppressed).
+    """
+    path = _managed_config_path()
+    if path is None:
+        print_warning_err(
+            "Machine-wide Codex settings aren't supported on this platform; skipped the managed "
+            "config write."
+        )
+        return
+    overlay = render_overlay(
+        workspace, model, databricks_profile, use_pat=use_pat, provider=provider
+    )
+    doc = read_toml_safe(path)
+    deep_merge_dict(doc, overlay)
+    if provider:
+        # deep_merge can't drop keys; clear a `model` a prior non-provider run pinned.
+        doc.pop("model", None)
+    write_managed_file(path, tomlkit.dumps(doc), display="Codex")
 
 
 def default_model(state: dict) -> str | None:

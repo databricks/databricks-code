@@ -76,6 +76,7 @@ from ucode.managed_resolve import (
     managed_provider_service,
     managed_supplies_models,
     managed_unservable_models,
+    managed_use_as_global_settings,
     recommended_agent,
     resolve_state,
 )
@@ -90,7 +91,10 @@ from ucode.mcp import (
     purge_cross_workspace_mcp_residue,
     revert_mcp_configs,
 )
-from ucode.skills_download import configure_skills_download_command
+from ucode.skills_download import (
+    configure_skills_download_command,
+    download_managed_skills_on_launch,
+)
 from ucode.smart_routing import claude_routing, codex_routing
 from ucode.state import (
     STATE_PATH,
@@ -1462,13 +1466,47 @@ def _register_managed_mcp_servers(managed: dict, tool: str, state: dict) -> None
         print_note(f"Registered workspace MCP server(s) for {TOOL_SPECS[tool]['display']}: {names}")
 
 
+def _managed_skill_locations(managed: dict) -> list[str]:
+    """The ``<catalog>.<schema>`` skill locations the admin published, or ``[]``."""
+    return [
+        loc
+        for loc in ((managed.get("skills") or {}).get("names") or [])
+        if isinstance(loc, str) and loc
+    ]
+
+
+def _download_managed_skills(managed: dict, state: dict) -> None:
+    """Download the admin-published skill schemas to disk (user scope).
+
+    Registering the skills MCP connection (see :func:`_apply_managed_skills`) exposes the skill
+    *tools* over the gateway, but the agent's ``/skills`` picker reads skill bundles from
+    ``~/.claude/skills`` / ``~/.agents/skills`` on disk. Without this download those directories stay
+    empty, so a workspace-published skill never shows up in ``/skills``. Skills already on disk are
+    left untouched, so a steady-state launch only lists each schema and writes nothing. Best-effort:
+    a failure here never blocks the launch.
+    """
+    locations = _managed_skill_locations(managed)
+    if not locations:
+        return
+    try:
+        token = get_databricks_token(state["workspace"], state.get("profile"))
+        written = download_managed_skills_on_launch(state["workspace"], token, locations)
+    except RuntimeError as exc:
+        print_warning(f"Could not download your workspace's skills: {exc}")
+        return
+    if written:
+        print_note(f"Downloaded workspace skill(s) to disk: {', '.join(written)}")
+
+
 def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
-    """Register the managed config's skill schemas on ``tool``'s skills MCP connection.
+    """Register the managed config's skill schemas on ``tool``'s skills MCP connection and disk.
 
     Sibling of :func:`_register_managed_mcp_servers` for the skills registry: the managed config
     lists the skill schemas the admin published, and nothing else on the launch path routes them to
     the agent. ``apply_managed_skills`` persists the connection (and the applied set, for diffing a
-    later removal) into ``state`` itself. A failure here never blocks the launch.
+    later removal) into ``state`` itself, then ``_download_managed_skills`` writes the skill bundles
+    to disk so the agent's ``/skills`` picker lists them. A failure in either step never blocks the
+    launch.
     """
     try:
         applied = apply_managed_skills(
@@ -1481,12 +1519,13 @@ def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
         )
     except RuntimeError as exc:
         print_warning(f"Could not register your workspace's skills: {exc}")
-        return
-    if applied:
-        names = ", ".join(applied)
-        print_note(
-            f"Registered workspace skill schema(s) for {TOOL_SPECS[tool]['display']}: {names}"
-        )
+    else:
+        if applied:
+            names = ", ".join(applied)
+            print_note(
+                f"Registered workspace skill schema(s) for {TOOL_SPECS[tool]['display']}: {names}"
+            )
+    _download_managed_skills(managed, state)
 
 
 def _launch_tool(
@@ -1570,8 +1609,10 @@ def _launch_tool(
                 )
             # The enterprise scope outranks the --settings file ucode writes, so a model pinned
             # there quietly beats the admin's — point at the file rather than let the mismatch
-            # look like a ucode bug.
-            if tool == "claude":
+            # look like a ucode bug. Suppressed under use_as_global_settings: there ucode itself
+            # authored that managed-settings file, so its model keys are the admin's config, not an
+            # external override.
+            if tool == "claude" and not managed_use_as_global_settings(managed, "claude"):
                 overrides = claude_agent.managed_settings_model_overrides()
                 if overrides is not None:
                     print_warning(
@@ -1679,11 +1720,16 @@ def _launch_tool(
             # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
             if model and tool != "claude":
                 resolved_model = model
-            # Claude Code's enterprise managed-settings scope (e.g. an Isaac/dbexec install)
+            # Claude Code's enterprise managed-settings scope (e.g. a dbexec install)
             # outranks the --settings file ucode writes AND can't be excluded with --setting-sources,
             # so a model pinned there silently wins over `--model`. Warn so a launch that ignores the
             # requested model looks like the misconfiguration it is, not a ucode bug.
-            if model and tool == "claude":
+            # Suppressed when ucode authored the managed-settings file itself (use_as_global_settings)
+            # — the pinned model is then ucode's own, deliberately applied, not a surprise override.
+            managed_owns_claude = managed is not None and managed_use_as_global_settings(
+                managed, "claude"
+            )
+            if model and tool == "claude" and not managed_owns_claude:
                 enterprise = claude_agent.managed_settings_model_overrides()
                 if enterprise is not None:
                     print_warning(
