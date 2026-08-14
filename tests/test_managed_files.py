@@ -104,13 +104,3 @@ class TestClearImmutableStatDenied:
             managed_files.subprocess, "run", lambda *a, **k: pytest.fail("should not shell out")
         )
         assert managed_files._clear_immutable(_StatDenied()) is False
-
-
-class TestPruneManagedFile:
-    def test_prune_is_noop_when_already_absent(self, tmp_path, monkeypatch):
-        # Revert on a file that never held ucode's keys: pruned text == existing -> no sudo.
-        path = tmp_path / "managed.json"
-        path.write_text("pruned", encoding="utf-8")
-        calls = _capture_sudo(monkeypatch)
-        assert managed_files.prune_managed_file(path, "pruned", display="X") == "unchanged"
-        assert calls == []

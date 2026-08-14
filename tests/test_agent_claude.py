@@ -505,13 +505,10 @@ class TestWriteToolConfigManagedSettings:
         managed_writes: list = []
         self._patch(monkeypatch, private_writes, managed_writes)
         state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
-        result = claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
         # Private file still written; managed file written too.
         assert str(claude.CLAUDE_SETTINGS_PATH) in [p for p, _ in private_writes]
         assert [p for p, _ in managed_writes] == [str(FAKE_MANAGED_PATH)]
-        native = result["managed_configs"]["claude"]["native"]
-        assert native[0]["path"] == str(FAKE_MANAGED_PATH)
-        assert native[0]["format"] == "json"
 
     def test_managed_file_preserves_other_keys(self, monkeypatch):
         private_writes: list = []
@@ -532,9 +529,8 @@ class TestWriteToolConfigManagedSettings:
         managed_writes: list = []
         self._patch(monkeypatch, private_writes, managed_writes)
         state = {"workspace": WS, "codex_models": []}
-        result = claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
         assert managed_writes == []
-        assert "native" not in result["managed_configs"]["claude"]
 
     def test_relayed_skips_managed_write(self, monkeypatch):
         private_writes: list = []
@@ -544,108 +540,9 @@ class TestWriteToolConfigManagedSettings:
         monkeypatch.setattr(claude, "print_warning", lambda msg: warns.append(msg))
         monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
         state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
-        result = claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
+        claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
         assert managed_writes == []
-        assert result["managed_configs"]["claude"].get("native") is None
         assert any("bare `claude`" in w for w in warns)
-
-
-class TestClaudeRevertManagedConfig:
-    @staticmethod
-    def _mock_sudo_prune(monkeypatch):
-        # Route the sudo write straight to disk (the descriptor path is a tmp file) — never real sudo.
-        def fake_prune(path, text, *, display):
-            Path(path).write_text(text, encoding="utf-8")
-            return "written"
-
-        monkeypatch.setattr(claude, "prune_managed_file", fake_prune)
-
-    def test_prunes_only_tracked_keys(self, tmp_path, monkeypatch):
-        self._mock_sudo_prune(monkeypatch)
-        managed_path = tmp_path / "managed-settings.json"
-        managed_path.write_text(
-            json.dumps({"env": {"ANTHROPIC_BASE_URL": "x", "MY": "keep"}, "apiKeyHelper": "h"}),
-            encoding="utf-8",
-        )
-        state = {
-            "managed_configs": {
-                "claude": {
-                    "keys": [],
-                    "native": [
-                        {
-                            "path": str(managed_path),
-                            "format": "json",
-                            "keys": [["env", "ANTHROPIC_BASE_URL"], ["apiKeyHelper"]],
-                        }
-                    ],
-                }
-            }
-        }
-        assert claude.revert_managed_config(state) == "ucode entries removed"
-        assert json.loads(managed_path.read_text()) == {"env": {"MY": "keep"}}
-
-    def test_returns_none_without_native_tracking(self, monkeypatch):
-        self._mock_sudo_prune(monkeypatch)
-        state = {"managed_configs": {"claude": {"keys": []}}}
-        assert claude.revert_managed_config(state) is None
-
-    def test_preserves_user_hooks_under_managed_events(self, tmp_path, monkeypatch):
-        # Regression: the descriptor's `keys` include whole hook-event paths (["hooks","PreToolUse"],
-        # ["hooks","Stop"], ...). Path-pruning those deleted the user's own hooks registered under the
-        # same events. Revert must surgically strip only ucode's marker-matched hooks, symmetric with
-        # the write path.
-        self._mock_sudo_prune(monkeypatch)
-        user_pre = {"matcher": "Bash", "hooks": [{"type": "command", "command": "my-linter"}]}
-        ucode_pre = {
-            "matcher": "Agent|Task",
-            "hooks": [{"type": "command", "command": "auth claude-router-hook route-subagent"}],
-        }
-        user_stop = {"hooks": [{"type": "command", "command": "my-notify"}]}
-        ucode_stop = {"hooks": [{"type": "command", "command": "mlflow autolog claude stop-hook"}]}
-        native_path = tmp_path / "managed-settings.json"
-        native_path.write_text(
-            json.dumps(
-                {
-                    "env": {"ANTHROPIC_BASE_URL": "x", "MY": "keep"},
-                    "hooks": {
-                        "PreToolUse": [user_pre, ucode_pre],
-                        "SessionStart": [
-                            {"hooks": [{"type": "command", "command": "auth claude-router-hook s"}]}
-                        ],
-                        "Stop": [user_stop, ucode_stop],
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        state = {
-            "managed_configs": {
-                "claude": {
-                    "keys": [],
-                    "native": [
-                        {
-                            "path": str(native_path),
-                            "format": "json",
-                            "keys": [
-                                ["env", "ANTHROPIC_BASE_URL"],
-                                ["hooks", "PreToolUse"],
-                                ["hooks", "SessionStart"],
-                                ["hooks", "Stop"],
-                            ],
-                        }
-                    ],
-                }
-            }
-        }
-        assert claude.revert_managed_config(state) == "ucode entries removed"
-        result = json.loads(native_path.read_text())
-        # ucode's env key gone, the user's kept.
-        assert result["env"] == {"MY": "keep"}
-        # The user's own hooks survive; ucode's marker-matched hooks and the now-empty
-        # SessionStart event are gone.
-        assert result["hooks"]["PreToolUse"] == [user_pre]
-        assert result["hooks"]["Stop"] == [user_stop]
-        assert "SessionStart" not in result["hooks"]
 
 
 class TestRegisterWebSearchMcp:

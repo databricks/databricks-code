@@ -246,20 +246,6 @@ class TestHydrateState:
         assert "codex" not in result["managed_configs"]
         assert "claude" not in result["managed_configs"]
 
-    def test_preserves_native_tracking(self):
-        native = [
-            {"path": "/home/u/.claude/settings.json", "format": "json", "keys": [["env", "X"]]}
-        ]
-        state = {"managed_configs": {"claude": {"keys": [["env", "X"]], "native": native}}}
-        result = hydrate_state(state)
-        # Without preserving `native`, `ucode revert` would strand ucode's keys in the user's file.
-        assert result["managed_configs"]["claude"]["native"] == native
-
-    def test_drops_non_list_native(self):
-        state = {"managed_configs": {"claude": {"keys": [], "native": "bogus"}}}
-        result = hydrate_state(state)
-        assert "native" not in result["managed_configs"]["claude"]
-
 
 class TestBuildAgentState:
     def test_returns_empty_without_workspace(self):
@@ -304,33 +290,6 @@ class TestMarkToolManaged:
         assert "gemini" in result["managed_configs"]
         assert "codex" in result["managed_configs"]
 
-    def test_records_native_descriptor(self):
-        native = [{"path": "/x/config.toml", "format": "toml", "keys": [["model_provider"]]}]
-        result = mark_tool_managed({}, "codex", [["model"]], native=native)
-        assert result["managed_configs"]["codex"] == {"keys": [["model"]], "native": native}
-
-    def test_no_native_key_when_none(self):
-        result = mark_tool_managed({}, "claude", [["env", "X"]])
-        assert result["managed_configs"]["claude"] == {"keys": [["env", "X"]]}
-        assert "native" not in result["managed_configs"]["claude"]
-
-    def test_preserves_prior_native_when_native_is_none(self):
-        # A re-launch that writes no native file (use_as_global_settings unset, a relayed Claude
-        # launch, or a legacy-layout Codex launch) must not drop the descriptor from the launch that
-        # did write ucode's keys — otherwise `ucode revert` can no longer prune them.
-        native = [{"path": "/x/config.toml", "format": "toml", "keys": [["model_provider"]]}]
-        state = mark_tool_managed({}, "codex", [["model"]], native=native)
-        result = mark_tool_managed(state, "codex", [["model"]], native=None)
-        assert result["managed_configs"]["codex"]["native"] == native
-
-    def test_native_none_without_prior_leaves_no_native(self):
-        state = mark_tool_managed({}, "claude", [["env", "X"]])
-        result = mark_tool_managed(state, "claude", [["env", "Y"]], native=None)
-        assert "native" not in result["managed_configs"]["claude"]
-
-    def test_new_native_replaces_prior(self):
-        first = [{"path": "/a", "format": "json", "keys": [["a"]]}]
-        second = [{"path": "/b", "format": "json", "keys": [["b"]]}]
-        state = mark_tool_managed({}, "claude", [["env", "X"]], native=first)
-        result = mark_tool_managed(state, "claude", [["env", "X"]], native=second)
-        assert result["managed_configs"]["claude"]["native"] == second
+    def test_records_only_keys(self):
+        result = mark_tool_managed({}, "codex", [["model"]])
+        assert result["managed_configs"]["codex"] == {"keys": [["model"]]}

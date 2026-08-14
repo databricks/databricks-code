@@ -26,7 +26,7 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
-from ucode.managed_files import write_managed_file
+from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
@@ -362,12 +362,11 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     # defaults to the gateway without `--profile ucode`. codex auth self-refreshes via
     # `ucode auth-token`, so the file keeps working. The write goes through the sudo path in
     # `managed_files`.
-    managed_descriptors = None
     if state.get("write_managed_config"):
-        managed_descriptors = _write_managed_config(
+        _write_managed_config(
             workspace, chosen_model, databricks_profile, bool(state.get("use_pat")), provider
         )
-    state = mark_tool_managed(state, "codex", MANAGED_KEYS, native=managed_descriptors)
+    state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
     return state
 
@@ -375,14 +374,13 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
 def _managed_config_path() -> Path | None:
     """OS-level Codex managed config file, or None on unsupported platforms.
 
-    Linux and macOS both use ``/etc/codex/managed_config.toml`` (root-owned, highest precedence);
-    Windows uses ``~/.codex/managed_config.toml``. See
-    https://learn.chatgpt.com/docs/enterprise/managed-configuration.
+    Linux and macOS use ``/etc/codex/managed_config.toml`` (root-owned, highest precedence). See
+    https://learn.chatgpt.com/docs/enterprise/managed-configuration. Codex also supports a
+    ``~/.codex/managed_config.toml`` on Windows, but ucode's write path is sudo/Unix-only
+    (see :func:`managed_files.managed_files_supported`), so Windows returns None here too.
     """
-    if sys.platform == "darwin" or sys.platform.startswith("linux"):
+    if current_os() in (OS.LINUX, OS.MACOS):
         return Path("/etc/codex/managed_config.toml")
-    if sys.platform.startswith("win"):
-        return Path.home() / ".codex" / "managed_config.toml"
     return None
 
 
@@ -392,11 +390,10 @@ def _write_managed_config(
     databricks_profile: str | None,
     use_pat: bool,
     provider: str | None,
-) -> list[dict] | None:
+) -> None:
     """Merge the modern overlay into Codex's OS managed_config.toml, preserving any other keys there.
 
-    Written via the sudo path in `managed_files` (drift-suppressed). Returns the descriptor for
-    revert tracking, or None when nothing was written.
+    Written via the sudo path in `managed_files` (drift-suppressed).
     """
     path = _managed_config_path()
     if path is None:
@@ -404,7 +401,7 @@ def _write_managed_config(
             "Machine-wide Codex settings aren't supported on this platform; skipped the managed "
             "config write."
         )
-        return None
+        return
     overlay = render_overlay(
         workspace, model, databricks_profile, use_pat=use_pat, provider=provider
     )
@@ -413,53 +410,7 @@ def _write_managed_config(
     if provider:
         # deep_merge can't drop keys; clear a `model` a prior non-provider run pinned.
         doc.pop("model", None)
-    status = write_managed_file(path, tomlkit.dumps(doc), display="Codex")
-    if status == "skipped":
-        return None
-    return [{"path": str(path), "format": "toml", "keys": [list(k) for k in MANAGED_KEYS]}]
-
-
-def _strip_modern_ucode_entries(doc: tomlkit.TOMLDocument) -> bool:
-    """Surgically remove ucode's *modern* keys from an in-memory Codex config document.
-
-    Drops the top-level ``model_provider = "ucode-databricks"`` selector (and the ``model`` pinned
-    alongside it) and the ``[model_providers.ucode-databricks]`` block, leaving the user's other keys
-    intact. Mirrors :func:`_strip_legacy_ucode_entries`. Returns True if anything was removed.
-    """
-    changed = False
-    if doc.get("model_provider") == CODEX_MODEL_PROVIDER_NAME:
-        doc.pop("model_provider", None)
-        # ucode pins `model` only alongside its own provider, so remove it when the provider is ours.
-        doc.pop("model", None)
-        changed = True
-    providers = doc.get("model_providers")
-    if isinstance(providers, dict) and CODEX_MODEL_PROVIDER_NAME in providers:
-        providers.pop(CODEX_MODEL_PROVIDER_NAME, None)
-        if not providers:
-            doc.pop("model_providers", None)
-        changed = True
-    return changed
-
-
-def revert_managed_config(state: dict) -> str | None:
-    """Strip ucode's modern keys from Codex's managed config if it was written under global settings,
-    writing the pruned file back via sudo.
-
-    Returns a short status for the revert summary, or None when ucode never wrote the managed file.
-    """
-    native = ((state.get("managed_configs") or {}).get("codex") or {}).get("native")
-    if not isinstance(native, list) or not native:
-        return None
-    changed = False
-    for descriptor in native:
-        path = Path(descriptor.get("path", ""))
-        if not path or not path.exists():
-            continue
-        doc = read_toml_safe(path)
-        if _strip_modern_ucode_entries(doc):
-            if write_managed_file(path, tomlkit.dumps(doc), display="Codex") != "skipped":
-                changed = True
-    return "ucode entries removed" if changed else "unchanged"
+    write_managed_file(path, tomlkit.dumps(doc), display="Codex")
 
 
 def default_model(state: dict) -> str | None:

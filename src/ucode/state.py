@@ -124,14 +124,7 @@ def hydrate_state(state: dict) -> dict:
     for tool, entry in managed_configs.items():
         if isinstance(entry, dict):
             keys = entry.get("keys") if isinstance(entry.get("keys"), list) else []
-            norm: dict = {"keys": keys}
-            # Preserve native-file tracking so `ucode revert` can surgically prune the agent's
-            # own config file (e.g. ~/.claude/settings.json) it wrote under use_as_global_settings.
-            # Dropping it here would silently strand ucode's keys in the user's file forever.
-            native = entry.get("native")
-            if isinstance(native, list):
-                norm["native"] = native
-            normalized[tool] = norm
+            normalized[tool] = {"keys": keys}
         elif entry:
             normalized[tool] = {"keys": []}
     hydrated["managed_configs"] = normalized
@@ -243,27 +236,10 @@ def clear_state() -> None:
         raise RuntimeError(f"Failed to clear state file: {STATE_PATH}") from exc
 
 
-def mark_tool_managed(
-    state: dict, tool: str, managed_keys: list, native: list[dict] | None = None
-) -> dict:
-    """Record which config keys ucode manages for ``tool``.
-
-    ``native`` optionally describes the native config file(s) ucode also wrote under
-    ``use_as_global_settings`` — each ``{"path": str, "format": "json"|"toml", "keys": [...]}`` — so
-    ``ucode revert`` can prune only ucode's keys from the user's shared file.
-
-    ``native=None`` means "this launch wrote no native file", not "clear the tracking": the prior
-    descriptor is preserved so revert can still find keys an earlier launch wrote.
-    """
+def mark_tool_managed(state: dict, tool: str, managed_keys: list) -> dict:
+    """Record which config keys ucode manages for ``tool``."""
     managed_configs = dict(state.get("managed_configs") or {})
-    entry: dict = {"keys": list(managed_keys)}
-    if native:
-        entry["native"] = native
-    else:
-        prior_native = (managed_configs.get(tool) or {}).get("native")
-        if isinstance(prior_native, list) and prior_native:
-            entry["native"] = prior_native
-    managed_configs[tool] = entry
+    managed_configs[tool] = {"keys": list(managed_keys)}
     state["managed_configs"] = managed_configs
     state["last_tool"] = tool
     return state

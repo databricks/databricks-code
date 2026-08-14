@@ -680,15 +680,12 @@ class TestCodexManagedConfig:
     def test_writes_managed_config_when_flagged(self, tmp_path, monkeypatch):
         _, managed_path = self._patch(tmp_path, monkeypatch)
         state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
-        result = codex.write_tool_config(state)
+        codex.write_tool_config(state)
 
         doc = read_toml_safe(managed_path)
         assert doc["model_provider"] == "ucode-databricks"
         assert doc["model"] == "gpt-5"
         assert "ucode-databricks" in doc["model_providers"]
-        native = result["managed_configs"]["codex"]["native"]
-        assert native[0]["path"] == str(managed_path)
-        assert native[0]["format"] == "toml"
 
     def test_managed_config_preserves_other_keys(self, tmp_path, monkeypatch):
         _, managed_path = self._patch(tmp_path, monkeypatch)
@@ -707,34 +704,5 @@ class TestCodexManagedConfig:
     def test_no_managed_write_by_default(self, tmp_path, monkeypatch):
         _, managed_path = self._patch(tmp_path, monkeypatch)
         state = {"workspace": WS, "codex_models": ["gpt-5"]}
-        result = codex.write_tool_config(state)
+        codex.write_tool_config(state)
         assert not managed_path.exists()
-        assert "native" not in result["managed_configs"]["codex"]
-
-    def test_revert_strips_managed_entries(self, tmp_path, monkeypatch):
-        _, managed_path = self._patch(tmp_path, monkeypatch)
-        managed_path.parent.mkdir(parents=True, exist_ok=True)
-        managed_path.write_text(
-            'model = "gpt-5"\nmodel_provider = "ucode-databricks"\napproval_policy = "on-request"\n'
-            '\n[model_providers.ucode-databricks]\nbase_url = "x"\n',
-            encoding="utf-8",
-        )
-        state = {
-            "managed_configs": {
-                "codex": {
-                    "keys": [],
-                    "native": [{"path": str(managed_path), "format": "toml", "keys": []}],
-                }
-            }
-        }
-        assert codex.revert_managed_config(state) == "ucode entries removed"
-        doc = read_toml_safe(managed_path)
-        assert "model_provider" not in doc
-        assert "model" not in doc
-        assert "model_providers" not in doc
-        # The user's own key is left intact.
-        assert doc["approval_policy"] == "on-request"
-
-    def test_revert_returns_none_without_native(self):
-        state = {"managed_configs": {"codex": {"keys": []}}}
-        assert codex.revert_managed_config(state) is None

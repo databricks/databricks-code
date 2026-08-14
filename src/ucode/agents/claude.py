@@ -10,7 +10,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -22,7 +21,6 @@ from ucode.config_io import (
     ToolSpec,
     backup_existing_file,
     deep_merge_dict,
-    prune_key_paths,
     read_json_safe,
     write_json_file,
 )
@@ -32,7 +30,7 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
-from ucode.managed_files import prune_managed_file, write_managed_file
+from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing.claude_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
@@ -138,9 +136,9 @@ _RELAYED_SETTING_SOURCES = "project,local"
 def _managed_settings_path() -> Path | None:
     """OS-specific location of Claude Code's enterprise managed-settings.json.
     Returns None on unsupported platforms."""
-    if sys.platform.startswith("linux"):
+    if current_os() is OS.LINUX:
         return Path("/etc/claude-code/managed-settings.json")
-    if sys.platform == "darwin":
+    if current_os() is OS.MACOS:
         return Path("/Library/Application Support/ClaudeCode/managed-settings.json")
     return None
 
@@ -560,9 +558,8 @@ def write_tool_config(
 
     write_json_file(CLAUDE_SETTINGS_PATH, _compose(read_json_safe(CLAUDE_SETTINGS_PATH)))
 
-    managed_descriptors = None
     if state.get("write_managed_config"):
-        managed_descriptors = _write_managed_settings(_compose, managed_keys, relayed)
+        _write_managed_settings(_compose, relayed)
 
     if web_search_model:
         _register_web_search_mcp(state["workspace"], web_search_model, state.get("profile"))
@@ -574,22 +571,19 @@ def write_tool_config(
     else:
         state.pop("claude_relayed", None)
         state.pop("relayed_proxy_port", None)
-    state = mark_tool_managed(state, "claude", managed_keys, native=managed_descriptors)
+    state = mark_tool_managed(state, "claude", managed_keys)
     save_state(state)
     return state
 
 
-def _write_managed_settings(
-    compose: Callable[[dict], dict], managed_keys: list[list[str]], relayed: bool
-) -> list[dict] | None:
+def _write_managed_settings(compose: Callable[[dict], dict], relayed: bool) -> None:
     """Write ucode's config into Claude Code's OS managed-settings.json so a bare `claude` works.
 
     Runs only under use_as_global_settings. The managed file is root-owned and the highest-precedence
     scope, so it applies whether or not `ucode` launches `claude`. The same compose (merge overlay +
     prune stale keys) that produced the private file is applied to the existing managed file, so any
     real IT-authored keys already there survive. The write goes through the sudo path in
-    `managed_files` (drift-suppressed, so no password prompt when unchanged). Returns the descriptor
-    for revert tracking, or None when nothing was written.
+    `managed_files` (drift-suppressed, so no password prompt when unchanged).
 
     Relayed launches are skipped: they depend on a per-session loopback refresh proxy that only runs
     during `ucode claude`, so a bare `claude` could not reach the gateway anyway.
@@ -600,69 +594,16 @@ def _write_managed_settings(
             "reach, so ucode did not write the managed settings file. Launch with `ucode claude` "
             "to use the relay."
         )
-        return None
+        return
     path = _managed_settings_path()
     if path is None:
         print_warning(
             "Machine-wide Claude settings aren't supported on this platform; skipped the managed "
             "settings write."
         )
-        return None
+        return
     desired = json.dumps(compose(read_json_safe(path)), indent=2)
-    status = write_managed_file(path, desired, display="Claude Code")
-    if status == "skipped":
-        return None
-    return [{"path": str(path), "format": "json", "keys": managed_keys}]
-
-
-def revert_managed_config(state: dict) -> str | None:
-    """Surgically strip ucode's keys from the managed settings file it wrote under
-    use_as_global_settings, writing the pruned file back via sudo.
-
-    Returns a short status ("ucode entries removed" / "unchanged") for the revert summary, or None
-    when ucode never wrote a managed file for claude.
-    """
-    native = ((state.get("managed_configs") or {}).get("claude") or {}).get("native")
-    if not isinstance(native, list) or not native:
-        return None
-    changed = False
-    for descriptor in native:
-        path = Path(descriptor.get("path", ""))
-        keys = descriptor.get("keys") or []
-        if not path or not path.exists():
-            continue
-        doc = read_json_safe(path)
-        # Hook-event keys ([`hooks`, <event>]) address the user's own shared hook arrays. Pruning the
-        # whole path would delete every hook they registered under that event, not just ucode's — so
-        # route those through the same marker-matched removers the write path uses (symmetric with
-        # `sync_smart_routing_hooks` / `_upsert_tracing_stop_hook` in `write_tool_config`). Only plain,
-        # ucode-owned key paths go to `prune_key_paths`.
-        plain_keys: list[list[str]] = []
-        touches_routing_hooks = False
-        touches_tracing_stop_hook = False
-        for key in keys:
-            if len(key) == 2 and key[0] == "hooks" and key[1] in CLAUDE_ROUTING_HOOK_EVENTS:
-                touches_routing_hooks = True
-            elif len(key) == 2 and key[0] == "hooks" and key[1] == "Stop":
-                touches_tracing_stop_hook = True
-            else:
-                plain_keys.append(key)
-        file_changed = prune_key_paths(doc, plain_keys)
-        if touches_routing_hooks and remove_smart_routing_hooks(doc):
-            file_changed = True
-        if touches_tracing_stop_hook:
-            before = json.dumps(doc.get("hooks"), sort_keys=True)
-            _remove_tracing_stop_hook(doc)
-            if json.dumps(doc.get("hooks"), sort_keys=True) != before:
-                file_changed = True
-        if file_changed:
-            # Root-owned managed file: write the pruned content back via sudo (drift-suppressed).
-            if (
-                prune_managed_file(path, json.dumps(doc, indent=2), display="Claude Code")
-                != "skipped"
-            ):
-                changed = True
-    return "ucode entries removed" if changed else "unchanged"
+    write_managed_file(path, desired, display="Claude Code")
 
 
 def _is_tracing_stop_hook(hook: object) -> bool:

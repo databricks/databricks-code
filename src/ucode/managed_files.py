@@ -22,6 +22,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from enum import Enum
 from pathlib import Path
 
 from ucode.config_io import is_dry_run
@@ -31,9 +32,34 @@ from ucode.ui import console, print_err, print_warning
 _SUDO = "/usr/bin/sudo"
 
 
+class OS(Enum):
+    """The host OS families this module distinguishes, off `sys.platform`."""
+
+    LINUX = "linux"
+    MACOS = "macos"
+    WINDOWS = "windows"
+    OTHER = "other"
+
+
+def current_os() -> OS:
+    """Map `sys.platform` onto :class:`OS` (lowercased, so a mixed-case value can't slip through)."""
+    platform = sys.platform.lower()
+    if platform.startswith("linux"):
+        return OS.LINUX
+    if platform == "darwin":
+        return OS.MACOS
+    if platform.startswith("win"):
+        return OS.WINDOWS
+    return OS.OTHER
+
+
 def managed_files_supported() -> bool:
-    """True on the platforms whose managed-settings write path is implemented (Linux, macOS)."""
-    return sys.platform == "darwin" or sys.platform.startswith("linux")
+    """True on the platforms whose managed-settings write path is implemented (Linux, macOS).
+
+    The write path needs `sudo` (`sudo cp`, `chattr`/`chflags`), which is Unix-only — so Windows and
+    any other platform are unsupported.
+    """
+    return current_os() in (OS.LINUX, OS.MACOS)
 
 
 def _read_existing(path: Path) -> str:
@@ -122,7 +148,7 @@ def _clear_immutable(path: Path) -> bool:
             return False
     except OSError:
         return False
-    if sys.platform == "darwin":
+    if current_os() is OS.MACOS:
         result = subprocess.run(
             ["/usr/bin/stat", "-f", "%Sf", str(path)], capture_output=True, text=True, check=False
         )
@@ -153,20 +179,10 @@ def _report_sudo_failure(path: Path, display: str, exc: subprocess.CalledProcess
     cp_failed = len(cmd) >= 2 and cmd[1] == "cp"
     if cp_failed and "Operation not permitted" in stderr:
         quoted = shlex.quote(str(path))
-        clear_cmd = f"sudo {'chflags noschg' if sys.platform == 'darwin' else 'chattr -i'} {quoted}"
+        clear_cmd = f"sudo {'chflags noschg' if current_os() is OS.MACOS else 'chattr -i'} {quoted}"
         print_err(
             f"{display}: {path} appears to be immutable. Clear the immutable attribute and re-run:\n"
             f"  {clear_cmd}\n  ucode ..."
         )
     else:
         print_err(f"{display}: failed to write managed settings at {path}: {stderr or exc}")
-
-
-def prune_managed_file(path: Path, pruned_text: str, *, display: str) -> str:
-    """Write back a managed file with ucode's keys removed (used by ``ucode revert``).
-
-    ``pruned_text`` is the file's content with ucode's entries stripped. Goes through the same
-    drift-suppressed sudo write, so when ucode's keys weren't present the write is a no-op with no
-    password prompt.
-    """
-    return write_managed_file(path, pruned_text, display=display)
