@@ -415,3 +415,20 @@ class TestWriteToolConfigStaleProviderCleanup:
 
         written = json.loads(config_file.read_text())
         assert written["model"] == "databricks-anthropic/claude-sonnet"
+
+
+class TestLoopbackBaseUrls:
+    def test_swaps_host_to_loopback_keeps_gateway_path(self):
+        out = opencode._loopback_base_urls(_base_urls(), 5599)
+        assert out["anthropic"] == "http://127.0.0.1:5599/ai-gateway/anthropic/v1"
+        assert out["gemini"] == "http://127.0.0.1:5599/ai-gateway/gemini/v1beta"
+        assert out["oss"] == "http://127.0.0.1:5599/ai-gateway/mlflow/v1"
+
+    def test_all_providers_share_one_loopback_port(self):
+        out = opencode._loopback_base_urls(_base_urls(), 7002)
+        assert {u.split("/")[2] for u in out.values()} == {"127.0.0.1:7002"}
+
+
+class TestLaunchUsesProxyNotFileRefresh:
+    def test_no_background_file_refresher_remains(self):
+        assert not hasattr(opencode, "_refresh_forever")
