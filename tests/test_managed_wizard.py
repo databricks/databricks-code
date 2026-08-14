@@ -501,11 +501,13 @@ class TestModelPrompting:
         assert config == {"default_model": "system.ai.claude-opus-4-8"}
         assert "models" not in config
         assert not text.called, "should pick from candidates, not ask for free text"
-        # The final prompt offers every candidate across all families.
+        # The final prompt offers every candidate across all families (all fit under the picker
+        # limit here), plus the custom-entry row.
         assert set(offered[-1]) == {
             "system.ai.claude-opus-5",
             "system.ai.claude-opus-4-8",
             "system.ai.claude-sonnet-5",
+            wizard._CUSTOM_MODEL,
         }
 
     def test_older_claude_version_passes_validation(self):
@@ -1019,6 +1021,129 @@ OPENAI_SERVICE = {
     "allow_all_targets": False,
     "relayed": False,
 }
+
+
+class TestCustomModelEntry:
+    """The hosted-model pickers let an admin type a model service discovery didn't list."""
+
+    def test_single_agent_can_enter_a_verified_custom_model(self):
+        # Selecting the custom row prompts for a path, verifies it exists, and records it so
+        # validation won't reject a model outside the discovered inventory.
+        with (
+            patch.object(wizard, "prompt_for_selection", return_value=wizard._CUSTOM_MODEL),
+            patch.object(wizard, "prompt_for_text", return_value="main.aarushi.gpt-5-custom"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(True, None)) as exists,
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, None)
+        assert config == {
+            "default_model": "main.aarushi.gpt-5-custom",
+            "custom_models": ["main.aarushi.gpt-5-custom"],
+        }
+        exists.assert_called_once_with(WORKSPACE, "tok", "main.aarushi.gpt-5-custom")
+
+    def test_custom_model_reprompts_until_it_exists(self):
+        # A typo shouldn't get baked into a published config — a miss re-asks.
+        with (
+            patch.object(wizard, "prompt_for_selection", return_value=wizard._CUSTOM_MODEL),
+            patch.object(
+                wizard, "prompt_for_text", side_effect=["main.typo.model", "main.real.model"]
+            ),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", side_effect=[(False, None), (True, None)]),
+            patch.object(wizard, "print_err") as err,
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, None)
+        assert config["default_model"] == "main.real.model"
+        assert err.called
+
+    def test_multi_select_agent_can_add_several_custom_models(self):
+        # opencode/pi carry a model list, so the custom row keeps prompting until the admin declines.
+        with (
+            patch.object(wizard, "prompt_for_multi_selection", return_value=[wizard._CUSTOM_MODEL]),
+            patch.object(
+                wizard, "prompt_for_text", side_effect=["main.default.a", "main.default.b"]
+            ),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_for_selection", return_value="main.default.a"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(True, None)),
+        ):
+            config = wizard._prompt_models_for_agent("pi", STATE, None)
+        assert config["models"] == ["main.default.a", "main.default.b"]
+        assert config["custom_models"] == ["main.default.a", "main.default.b"]
+        assert config["default_model"] == "main.default.a"
+
+    def test_short_reason_drops_the_json_body(self):
+        # The warning for an inconclusive check should show the status, not the raw error blob.
+        assert (
+            wizard._short_reason('HTTP 500 Server Error: {"error_code":"INTERNAL"}')
+            == "HTTP 500 Server Error"
+        )
+        assert wizard._short_reason("network error: timed out") == "network error: timed out"
+        assert wizard._short_reason(None) == "unknown error"
+
+    def test_unverifiable_custom_model_is_accepted_with_a_warning(self):
+        # An inconclusive check (transient error / no token) must not block a possibly-valid model.
+        with (
+            patch.object(wizard, "prompt_for_selection", return_value=wizard._CUSTOM_MODEL),
+            patch.object(wizard, "prompt_for_text", return_value="main.aarushi.maybe"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(None, "HTTP 500")),
+            patch.object(wizard, "print_warning") as warn,
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, None)
+        assert config["default_model"] == "main.aarushi.maybe"
+        assert warn.called
+
+    def test_picker_shows_only_the_top_few_plus_custom(self):
+        # A long list is truncated so the custom row is reachable without scrolling past everything.
+        state = {**STATE, "codex_models": [f"system.ai.gpt-5-{i}" for i in range(10)]}
+        offered: list[list[str]] = []
+
+        def fake_sel(prompt, options, **kwargs):
+            offered.append([v for v, _ in options])
+            return options[0][0]
+
+        with patch.object(wizard, "prompt_for_selection", side_effect=fake_sel):
+            wizard._prompt_models_for_agent("codex", state, None)
+        rows = offered[0]
+        assert rows[-1] == wizard._CUSTOM_MODEL
+        assert len(rows) == wizard._MODEL_PICKER_LIMIT + 1  # top few + the custom row
+
+    def test_claude_family_custom_model_slots_and_validates(self):
+        # A custom id chosen for a family lands in that slot, is marked custom, and survives
+        # validation even though discovery never listed it.
+        candidates = {"opus": ["system.ai.claude-opus-5"]}
+
+        def fake_sel(prompt, options, **kwargs):
+            values = [v for v, _ in options]
+            if wizard._CUSTOM_MODEL in values:
+                return wizard._CUSTOM_MODEL
+            return values[0]
+
+        with (
+            patch.object(wizard, "_claude_candidates", return_value=candidates),
+            patch.object(wizard, "prompt_for_selection", side_effect=fake_sel),
+            patch.object(wizard, "prompt_for_text", return_value="main.aarushi.claude-opus-4-5"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(True, None)),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, None)
+        assert config["models"]["default_opus_model"] == "main.aarushi.claude-opus-4-5"
+        assert config["custom_models"] == ["main.aarushi.claude-opus-4-5"]
+        assert (
+            validate_manifest(
+                {
+                    "default_agent": "claude",
+                    "enabled_agents": {"claude": {"model_config": config}},
+                },
+                STATE,
+            )
+            == []
+        )
 
 
 class TestProviderServiceSpinner:

@@ -840,6 +840,11 @@ def list_profile_entries() -> list[dict]:
     """Return raw profile dicts ({"name", "host", "auth_type", ...}) from
     `databricks auth profiles`.
 
+    Each non-PAT profile is returned individually — duplicate hosts (multiple
+    profiles pointing at the same workspace) appear as separate entries so the
+    workspace picker can offer each profile by name. Order matches the CLI's
+    own ordering.
+
     Returns ``[]`` on any failure (CLI missing, timeout, non-zero exit, JSON
     decode error). When ``UCODE_DEBUG=1`` each dropout path logs *why* the
     result was empty so a silently-disappearing workspace picker is
@@ -871,8 +876,7 @@ def get_databricks_profiles() -> list[tuple[str, str]]:
     """Return [(host_url, profile_name), ...] from Databricks CLI profiles."""
     profiles = list_profile_entries()
 
-    # dict dedupes by host (first non-PAT profile wins).
-    out: dict[str, str] = {}
+    out: list[tuple[str, str]] = []
     pat = 0
     for p in profiles:
         host = (p.get("host") or "").rstrip("/")
@@ -882,13 +886,13 @@ def get_databricks_profiles() -> list[tuple[str, str]]:
         if p.get("auth_type") == "pat":
             pat += 1
             continue
-        out.setdefault(host, name)
+        out.append((host, name))
 
     _debug(
         "get_databricks_profiles",
         f"returned={len(out)} total={len(profiles)} pat={pat}",
     )
-    return list(out.items())
+    return out
 
 
 def find_profile_name_for_host(workspace: str) -> str | None:
@@ -1449,6 +1453,10 @@ def _model_service_id(service: dict) -> str | None:
 _MODEL_SERVICES_PAGE_SIZE = 100
 _MODEL_SERVICES_PAGE_RETRIES = 4
 
+# Substrings that mark a failure reason (`HTTP <code> <phrase>: <body>`) as a 404 / NOT_FOUND:
+# the HTTP status line and the Databricks `error_code` carried in the response body.
+_NOT_FOUND_REASON_MARKERS = ("http 404", "not_found")
+
 
 def _get_model_services_page(
     url: str, token: str, *, retries: int = _MODEL_SERVICES_PAGE_RETRIES
@@ -1565,6 +1573,74 @@ def list_model_services(
             _MODEL_SERVICES_CACHE[workspace] = list(deduped)
         return deduped, None
     return [], last_reason or "model-services listing returned no models"
+
+
+def _is_not_found_reason(reason: str | None) -> bool:
+    """True when an HTTP reason describes a 404 / NOT_FOUND (a resource that isn't there)."""
+    if not reason:
+        return False
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _NOT_FOUND_REASON_MARKERS)
+
+
+def model_service_exists(
+    workspace: str, token: str, full_name: str, *, max_pages: int = 100
+) -> tuple[bool | None, str | None]:
+    """Whether ``<catalog>.<schema>.<model>`` is a UC model service on this workspace.
+
+    Used to quick-check a hand-typed custom model before an admin pins a config to it. Lists the
+    model services in the typed name's own schema (``parent=schemas/<catalog>.<schema>``, the same
+    scoped listing :func:`list_model_services` uses for ``system.ai``) and checks for the name.
+
+    Returns ``(exists, reason)``:
+
+    - ``True`` — the name is a model service in that schema.
+    - ``False`` — the schema exists but has no such service, or the API returned 404/NOT_FOUND (the
+      catalog or schema in the name doesn't exist, so the model can't either). Both are a definitive
+      "no" the caller can re-prompt on.
+    - ``None`` — the check couldn't run: a name that isn't a three-part UC path, or a non-404
+      HTTP/network error. The caller treats this as "couldn't verify" rather than "doesn't exist" so
+      a transient failure never blocks a valid model.
+
+    Never cached: it targets a user schema, not the memoized ``system.ai`` walk.
+    """
+    parts = [part.strip() for part in full_name.split(".")]
+    if len(parts) != 3 or not all(parts):
+        return None, "a model service is named <catalog>.<schema>.<model>"
+    catalog, schema, _model = parts
+    normalized = f"{catalog}.{schema}.{_model}"
+    parent = f"schemas/{catalog}.{schema}"
+    hostname = workspace_hostname(workspace)
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(max_pages):
+        params: dict[str, str] = {"parent": parent, "page_size": str(_MODEL_SERVICES_PAGE_SIZE)}
+        if page_token:
+            params["page_token"] = page_token
+        url = f"https://{hostname}/api/2.1/unity-catalog/model-services?{urlencode(params)}"
+        payload, reason = _get_model_services_page(url, token)
+        if payload is None:
+            # A 404 means the catalog/schema in the typed name doesn't exist on this workspace, so
+            # neither can the model — a definitive "no". Every other failure (auth, 5xx, network) is
+            # inconclusive: don't block a possibly-valid model on a blip.
+            return (False, reason) if _is_not_found_reason(reason) else (None, reason)
+        data = cast(dict, payload) if isinstance(payload, dict) else {}
+        for service in data.get("model_services", []):
+            if not isinstance(service, dict):
+                continue
+            name = service.get("name")
+            if not isinstance(name, str):
+                continue
+            name = name.strip()
+            if name.startswith(_MODEL_SERVICE_NAME_PREFIX):
+                name = name[len(_MODEL_SERVICE_NAME_PREFIX) :]
+            if name == normalized:
+                return True, None
+        page_token = data.get("next_page_token") or None
+        if not page_token or page_token in seen_tokens:
+            break
+        seen_tokens.add(page_token)
+    return False, None
 
 
 def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[str], str | None]:
@@ -1691,6 +1767,47 @@ def fetch_model_recommendation(workspace: str, token: str) -> tuple[dict, str | 
     if not isinstance(payload, dict):
         return {}, "recommendModel returned an unexpected response shape"
     return payload, None
+
+
+# The gateway's per-model price catalog (USD per million tokens), sourced from the same Zippy data
+# the server uses to bill external-model spend. We read it to estimate per-model cost from token
+# counts, since no API returns per-model dollars directly.
+_EXTERNAL_PROVIDER_MODELS_API_PATH = "/api/ai-gateway/v2/external-provider-models"
+_EXTERNAL_PROVIDER_MODELS_PAGE_SIZE = 1000
+_EXTERNAL_PROVIDER_MODELS_MAX_PAGES = 20
+
+
+def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict], str | None]:
+    """List external-provider models and their `base_pricing` (USD per million tokens) via the gateway.
+
+    Returns ``(models, reason)`` with each model the raw API entry; ``reason`` is non-None on failure
+    (callers omit cost rather than fail).
+    """
+    hostname = workspace_hostname(workspace)
+    base_url = f"https://{hostname}{_EXTERNAL_PROVIDER_MODELS_API_PATH}"
+    models: list[dict] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(_EXTERNAL_PROVIDER_MODELS_MAX_PAGES):
+        params: dict[str, str] = {"page_size": str(_EXTERNAL_PROVIDER_MODELS_PAGE_SIZE)}
+        if page_token:
+            params["page_token"] = page_token
+        payload, reason = _http_get_json(f"{base_url}?{urlencode(params)}", token, timeout=30)
+        if payload is None:
+            # Return what we have if a later page blips; only the first-page failure is fatal.
+            return (models, None) if models else ([], reason or "unknown error")
+        if not isinstance(payload, dict):
+            return [], "external-provider-models returned an unexpected response shape"
+        for entry in payload.get("models") or []:
+            if isinstance(entry, dict) and entry.get("model_name"):
+                models.append(entry)
+        page_token = payload.get("next_page_token") or None
+        if not page_token or page_token in seen_tokens:
+            break
+        seen_tokens.add(page_token)
+    if not models:
+        return [], "external-provider-models listing returned no models"
+    return models, None
 
 
 # Every field ucode's manifest can set, as `update_mask` paths for a PATCH. The server rejects a
