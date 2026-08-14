@@ -165,7 +165,8 @@ ucode configure skills --location main.default,ml.prod --mcp
   same.
 - **Download mode** (with `--location`, no `--mcp`) writes each skill flat as `<leaf>/SKILL.md`
   (plus its bundled files) into both `.claude/skills/` and `.agents/skills/`. `--path` (an existing
-  absolute directory) is optional; when omitted, skills are written under your home directory. Any
+  absolute directory) is optional; when omitted, skills are written to Claude Code's config
+  directory (`~/.claude` by default, or `CLAUDE_CONFIG_DIR` when set) and `~/.agents/skills`. Any
   pre-existing skill dir prompts before it's overwritten. It then registers a schema-less skills
   MCP connection, leaving any prior `--mcp` scope untouched. `--skill <name>[,<name>…]` narrows the
   download to the named skills (by leaf name) from the schema instead of all of them; requested
@@ -260,7 +261,7 @@ pick the new config up on their next ucode run.
 | File | Tool |
 |------|------|
 | `~/.codex/config.toml` | Codex |
-| `~/.claude/settings.json` | Claude Code |
+| `~/.claude/settings.json` | Claude Code (set `CLAUDE_CONFIG_DIR` to use a different directory) |
 | `~/.gemini/.env` | Gemini CLI |
 | `~/.config/opencode/opencode.json` | OpenCode |
 | `~/.copilot/.env` | GitHub Copilot CLI |

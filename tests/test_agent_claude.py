@@ -25,6 +25,27 @@ class TestClaudeSpec:
         assert claude.SPEC["display"] == "Claude Code"
 
 
+class TestClaudeConfigDir:
+    def test_defaults_to_home_dot_claude(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        assert claude.claude_config_dir() == tmp_path / ".claude"
+
+    def test_env_var_overrides_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "work"))
+        assert claude.claude_config_dir() == tmp_path / "work"
+
+    def test_env_var_expands_tilde(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "~/claude-work")
+        assert claude.claude_config_dir() == tmp_path / "claude-work"
+
+    def test_blank_env_var_falls_back_to_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "   ")
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        assert claude.claude_config_dir() == tmp_path / ".claude"
+
+
 class TestRenderOverlay:
     def test_does_not_set_anthropic_model_env(self):
         # We deliberately don't pin ANTHROPIC_MODEL: when set, Claude Code's
@@ -319,7 +340,7 @@ class TestRenderOverlayUserAgent:
 
 class TestRenderOverlayWebSearchDisable:
     def test_settings_overlay_never_includes_mcp_servers(self):
-        # MCP servers belong in ~/.claude.json, not settings.json.
+        # MCP servers belong in Claude Code's .claude.json, not settings.json.
         overlay, _ = claude.render_overlay(WS, "s4", disable_web_search=True)
         assert "mcpServers" not in overlay
 
@@ -754,7 +775,7 @@ class TestBuildClaudeArgv:
         assert "--setting-sources" not in argv
 
     def test_relayed_excludes_user_scope_via_setting_sources(self, monkeypatch):
-        # Relayed must drop the user scope so a stale ~/.claude/settings.json
+        # Relayed must drop the user scope so a stale user-scope settings.json
         # apiKeyHelper can't merge through and shadow the subscription OAuth.
         monkeypatch.setattr(claude, "read_json_safe", lambda p: {"env": {}})
         argv = claude._build_claude_argv("claude", ["-p", "hi"], relayed=True)

@@ -6,11 +6,11 @@ ucode state (``~/.ucode/state.json``) stay separate files — they are never mer
 this module resolves them *per key* at config-write time: whatever the manifest specifies wins, and
 anything it leaves unset falls back to
 the developer's ucode state. The resolved view is what gets rendered into the agent config files
-(e.g. ``~/.claude/ucode-settings.json``), so managed settings take precedence for every ``ucode``
-command without either file being rewritten.
+(e.g. ``~/.claude/ucode-settings.json``, under ``$CLAUDE_CONFIG_DIR`` when that is set), so managed
+settings take precedence for every ``ucode`` command without either file being rewritten.
 
 Only settings the developer set *through* ucode participate in the fallback. Settings they wrote by
-hand outside ucode (``~/.claude/settings.json``, etc.) are not read here — Claude Code merges
+hand outside ucode (Claude Code's own ``settings.json``, etc.) are not read here — Claude Code merges
 those scopes itself at launch, underneath the file ucode passes via ``--settings``.
 
 Everything here is pure: no I/O, no mutation of the inputs. Fetching and persisting the manifest,

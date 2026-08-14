@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode
 
+from ucode.agents.claude import claude_config_dir
 from ucode.databricks import (
     _http_get_bytes,
     _http_get_json,
@@ -25,7 +26,9 @@ from ucode.ui import (
 )
 
 # `.claude/skills` (Claude) + `.agents/skills` (the alias other agents read).
+# Project scope only — user scope resolves the Claude root via `claude_config_dir()`.
 SKILL_BASE_DIR_NAMES = (".claude/skills", ".agents/skills")
+AGENTS_SKILL_DIR_NAME = ".agents/skills"
 
 SKILL_FILES_API_PREFIX = "Skills"
 
@@ -197,19 +200,20 @@ def fetch_skill_bundle(
 
 
 def skill_dir_roots(project_dir: str | None) -> list[Path]:
-    """The ``.claude/skills`` and ``.agents/skills`` roots to download into.
+    """The Claude and ``.agents/skills`` roots to download into.
 
-    ``project_dir`` must be an existing absolute directory when given; when
-    omitted, roots default to the user's home directory (user scope).
+    ``project_dir`` must be an existing absolute directory when given; both roots
+    are then relative to it. When omitted (user scope), the Claude root is
+    ``<claude config dir>/skills`` — honoring ``$CLAUDE_CONFIG_DIR`` so skills land
+    where the launched ``claude`` reads them — and the alias root stays under home.
     """
     if project_dir is None:
-        base = Path.home()
-    else:
-        base = Path(project_dir)
-        if not base.is_absolute():
-            raise ValueError(f"--path must be an absolute path, got `{project_dir}`.")
-        if not base.is_dir():
-            raise ValueError(f"--path directory does not exist: `{project_dir}`.")
+        return [claude_config_dir() / "skills", Path.home() / AGENTS_SKILL_DIR_NAME]
+    base = Path(project_dir)
+    if not base.is_absolute():
+        raise ValueError(f"--path must be an absolute path, got `{project_dir}`.")
+    if not base.is_dir():
+        raise ValueError(f"--path directory does not exist: `{project_dir}`.")
     return [base / name for name in SKILL_BASE_DIR_NAMES]
 
 

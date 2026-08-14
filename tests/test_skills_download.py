@@ -298,8 +298,20 @@ class TestSkillDirRoots:
         assert roots == [tmp_path / ".claude/skills", tmp_path / ".agents/skills"]
 
     def test_defaults_to_home_when_omitted(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         monkeypatch.setattr(sd.Path, "home", classmethod(lambda cls: tmp_path))
         roots = skill_dir_roots(None)
+        assert roots == [tmp_path / ".claude/skills", tmp_path / ".agents/skills"]
+
+    def test_user_scope_claude_root_follows_claude_config_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-work"))
+        monkeypatch.setattr(sd.Path, "home", classmethod(lambda cls: tmp_path))
+        roots = skill_dir_roots(None)
+        assert roots == [tmp_path / "claude-work/skills", tmp_path / ".agents/skills"]
+
+    def test_project_scope_ignores_claude_config_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-work"))
+        roots = skill_dir_roots(str(tmp_path))
         assert roots == [tmp_path / ".claude/skills", tmp_path / ".agents/skills"]
 
     def test_relative_path_rejected(self):

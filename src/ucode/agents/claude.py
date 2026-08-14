@@ -1,4 +1,5 @@
-"""Claude Code agent: writes ~/.claude/settings.json env block."""
+"""Claude Code agent: writes the settings.json env block into Claude Code's config
+directory (``~/.claude`` by default, or ``$CLAUDE_CONFIG_DIR`` when set)."""
 
 from __future__ import annotations
 
@@ -40,7 +41,14 @@ from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_err, print_note, print_success, print_warning
 
-CLAUDE_CONFIG_DIR = Path.home() / ".claude"
+
+def claude_config_dir() -> Path:
+    """Claude Code's user config directory: ``$CLAUDE_CONFIG_DIR`` if set, else ``~/.claude``."""
+    override = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    return Path(override).expanduser() if override else Path.home() / ".claude"
+
+
+CLAUDE_CONFIG_DIR = claude_config_dir()
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
 
@@ -255,7 +263,7 @@ def render_overlay(
     """Return (overlay, managed_key_paths) for Claude settings.json.
 
     NOTE: MCP servers are NOT written here. Claude Code reads `mcpServers`
-    from `~/.claude.json`, not `~/.claude/settings.json` — registration goes
+    from `.claude.json`, not `settings.json` — registration goes
     through `claude mcp add-json` (see `_register_web_search_mcp`).
 
     When `provider` is set (a `<catalog>.<schema>.<name>` Model Provider
