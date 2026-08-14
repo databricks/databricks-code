@@ -396,6 +396,50 @@ def download_skills(
         )
 
 
+def download_managed_skills_on_launch(
+    workspace: str, token: str, locations: list[str], path: str | None = None
+) -> list[str]:
+    """Download admin-published skills to disk so the agent's ``/skills`` lists them.
+
+    Runs on the managed launch path (see ``cli._apply_managed_skills``), where the
+    managed config only *registers* the skills MCP connection -- nothing writes the
+    skill bundles to ``.claude/skills`` / ``.agents/skills``, so the agent's on-disk
+    ``/skills`` picker stays empty. For each ``<catalog>.<schema>`` location this
+    lists the schema's finalized skills and writes only those whose bundle is not
+    already on disk, so a launch where everything is already downloaded costs one
+    cheap listing call per schema and writes nothing.
+
+    Existing skills are left untouched with no overwrite prompt: the launch path
+    must never block on input, and a developer's own same-named skill must never be
+    clobbered silently. Everything is best-effort -- a failure listing a schema or
+    fetching a bundle warns and is skipped, and the function never raises -- so it
+    can never block the launch. Returns the bundle names newly written to disk.
+    """
+    roots = skill_dir_roots(path)
+    written: list[str] = []
+    for location in locations:
+        if location.count(".") != 1:
+            continue
+        catalog, schema = location.split(".")
+        refs, reason = list_schema_skills(workspace, token, catalog, schema)
+        if reason:
+            print_warning(f"Could not list workspace skills in `{location}`: {reason}.")
+            continue
+        refs = _reject_bundle_name_collisions(refs, location=location)
+        missing = [ref for ref in refs if not existing_skill_on_disk(roots, ref.bundle_name)]
+        if not missing:
+            continue
+        bundles = _fetch_bundles(workspace, token, catalog, schema, missing)
+        for ref in missing:
+            files, reason = bundles[ref.securable_name]
+            if reason or files is None:
+                print_warning(f"Skipping `{location}.{ref.securable_name}`: {reason}.")
+                continue
+            write_skill(roots, ref, files)
+            written.append(ref.bundle_name)
+    return written
+
+
 def configure_skills_download_command(
     locations: list[str], *, path: str | None, skills: set[str] | None = None
 ) -> int:

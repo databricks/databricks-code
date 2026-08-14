@@ -90,7 +90,10 @@ from ucode.mcp import (
     purge_cross_workspace_mcp_residue,
     revert_mcp_configs,
 )
-from ucode.skills_download import configure_skills_download_command
+from ucode.skills_download import (
+    configure_skills_download_command,
+    download_managed_skills_on_launch,
+)
 from ucode.smart_routing import claude_routing, codex_routing
 from ucode.state import (
     STATE_PATH,
@@ -1456,13 +1459,47 @@ def _register_managed_mcp_servers(managed: dict, tool: str, state: dict) -> None
         print_note(f"Registered workspace MCP server(s) for {TOOL_SPECS[tool]['display']}: {names}")
 
 
+def _managed_skill_locations(managed: dict) -> list[str]:
+    """The ``<catalog>.<schema>`` skill locations the admin published, or ``[]``."""
+    return [
+        loc
+        for loc in ((managed.get("skills") or {}).get("names") or [])
+        if isinstance(loc, str) and loc
+    ]
+
+
+def _download_managed_skills(managed: dict, state: dict) -> None:
+    """Download the admin-published skill schemas to disk (user scope).
+
+    Registering the skills MCP connection (see :func:`_apply_managed_skills`) exposes the skill
+    *tools* over the gateway, but the agent's ``/skills`` picker reads skill bundles from
+    ``~/.claude/skills`` / ``~/.agents/skills`` on disk. Without this download those directories stay
+    empty, so a workspace-published skill never shows up in ``/skills``. Skills already on disk are
+    left untouched, so a steady-state launch only lists each schema and writes nothing. Best-effort:
+    a failure here never blocks the launch.
+    """
+    locations = _managed_skill_locations(managed)
+    if not locations:
+        return
+    try:
+        token = get_databricks_token(state["workspace"], state.get("profile"))
+        written = download_managed_skills_on_launch(state["workspace"], token, locations)
+    except RuntimeError as exc:
+        print_warning(f"Could not download your workspace's skills: {exc}")
+        return
+    if written:
+        print_note(f"Downloaded workspace skill(s) to disk: {', '.join(written)}")
+
+
 def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
-    """Register the managed config's skill schemas on ``tool``'s skills MCP connection.
+    """Register the managed config's skill schemas on ``tool``'s skills MCP connection and disk.
 
     Sibling of :func:`_register_managed_mcp_servers` for the skills registry: the managed config
     lists the skill schemas the admin published, and nothing else on the launch path routes them to
     the agent. ``apply_managed_skills`` persists the connection (and the applied set, for diffing a
-    later removal) into ``state`` itself. A failure here never blocks the launch.
+    later removal) into ``state`` itself, then ``_download_managed_skills`` writes the skill bundles
+    to disk so the agent's ``/skills`` picker lists them. A failure in either step never blocks the
+    launch.
     """
     try:
         applied = apply_managed_skills(
@@ -1475,12 +1512,13 @@ def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
         )
     except RuntimeError as exc:
         print_warning(f"Could not register your workspace's skills: {exc}")
-        return
-    if applied:
-        names = ", ".join(applied)
-        print_note(
-            f"Registered workspace skill schema(s) for {TOOL_SPECS[tool]['display']}: {names}"
-        )
+    else:
+        if applied:
+            names = ", ".join(applied)
+            print_note(
+                f"Registered workspace skill schema(s) for {TOOL_SPECS[tool]['display']}: {names}"
+            )
+    _download_managed_skills(managed, state)
 
 
 def _launch_tool(

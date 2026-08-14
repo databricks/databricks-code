@@ -681,6 +681,76 @@ class TestConfigureSkillsCommand:
         mock_download.assert_not_called()
 
 
+class TestApplyManagedSkills:
+    """The launch path both registers the skills MCP connection and downloads bundles to disk."""
+
+    def _state(self):
+        return {"workspace": "https://example.databricks.com", "profile": "prod"}
+
+    def test_downloads_managed_skill_schemas_to_disk(self):
+        managed = {"skills": {"names": ["main.default", "ml.prod"]}}
+        with (
+            patch("ucode.cli.apply_managed_skills", return_value=["main.default"]) as mock_apply,
+            patch("ucode.cli.get_databricks_token", return_value="tok") as mock_token,
+            patch(
+                "ucode.cli.download_managed_skills_on_launch", return_value=["triage"]
+            ) as mock_dl,
+        ):
+            from ucode import cli
+
+            cli._apply_managed_skills(managed, "claude", self._state())
+
+        mock_apply.assert_called_once()
+        mock_token.assert_called_once_with("https://example.databricks.com", "prod")
+        mock_dl.assert_called_once_with(
+            "https://example.databricks.com", "tok", ["main.default", "ml.prod"]
+        )
+
+    def test_no_managed_skills_skips_the_download(self):
+        with (
+            patch("ucode.cli.apply_managed_skills", return_value=[]),
+            patch("ucode.cli.get_databricks_token") as mock_token,
+            patch("ucode.cli.download_managed_skills_on_launch") as mock_dl,
+        ):
+            from ucode import cli
+
+            cli._apply_managed_skills({}, "claude", self._state())
+
+        mock_token.assert_not_called()
+        mock_dl.assert_not_called()
+
+    def test_download_still_runs_when_mcp_registration_fails(self):
+        # A failure registering the MCP connection must not stop the disk download — the two are
+        # independent ways skills reach the agent, and /skills depends only on the disk write.
+        with (
+            patch("ucode.cli.apply_managed_skills", side_effect=RuntimeError("boom")),
+            patch("ucode.cli.get_databricks_token", return_value="tok"),
+            patch("ucode.cli.download_managed_skills_on_launch", return_value=[]) as mock_dl,
+        ):
+            from ucode import cli
+
+            cli._apply_managed_skills(
+                {"skills": {"names": ["main.default"]}}, "claude", self._state()
+            )
+
+        mock_dl.assert_called_once()
+
+    def test_download_failure_never_blocks_launch(self):
+        with (
+            patch("ucode.cli.apply_managed_skills", return_value=[]),
+            patch("ucode.cli.get_databricks_token", side_effect=RuntimeError("no auth")),
+            patch("ucode.cli.download_managed_skills_on_launch") as mock_dl,
+        ):
+            from ucode import cli
+
+            # Must not raise.
+            cli._apply_managed_skills(
+                {"skills": {"names": ["main.default"]}}, "claude", self._state()
+            )
+
+        mock_dl.assert_not_called()
+
+
 class TestStatusSkillsSection:
     def _run(self, state):
         with patch("ucode.cli.load_state", return_value=state):
