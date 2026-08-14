@@ -1765,6 +1765,7 @@ SkipManagedConfigOption = Annotated[
         "--skip-managed-config",
         help="Ignore your workspace's managed coding-agent config for this run, as if managed "
         "configs were switched off — use your own local settings instead.",
+        hidden=True,
     ),
 ]
 
