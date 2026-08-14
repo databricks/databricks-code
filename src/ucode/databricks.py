@@ -51,8 +51,8 @@ WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
 AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
-# v1.0.0 is the release that ships `databricks aitools`.
-MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
+# v1.12.0 adds AI Tools support for every coding agent supported by ucode.
+MIN_DATABRICKS_CLI_VERSION = (1, 12, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 
 
