@@ -1064,26 +1064,6 @@ def mcp_web_search_cmd() -> None:
     serve()
 
 
-def _unsupported_mcp_sdk_message(cause: ImportError) -> str:
-    """Actionable message for an `mcp` SDK too new to import (e.g. mcp 2.x).
-
-    `mcp` is capped `<2` in pyproject because 2.x renamed `streamablehttp_client`
-    (and swapped httpx for httpx2), so `ucode.mcp_proxy` won't import against it.
-    Built here rather than in `mcp_proxy` because that module is exactly what
-    fails to import."""
-    try:
-        from importlib.metadata import version
-
-        installed = version("mcp")
-    except Exception:  # noqa: BLE001 - best-effort; only enriches the message
-        installed = "unknown"
-    return (
-        f"The installed `mcp` SDK ({installed}) is not compatible with `ucode mcp-proxy` "
-        f"({cause}). ucode requires mcp>=1.28.0,<2. Reinstall with a supported version, e.g.:\n"
-        '  uv tool install --force --with "mcp<2" git+https://github.com/databricks/ucode'
-    )
-
-
 @app.command("mcp-proxy", hidden=True)
 def mcp_proxy_cmd(
     url: Annotated[
@@ -1110,17 +1090,7 @@ def mcp_proxy_cmd(
     freshly-minted OAuth bearer on every upstream request, so the token never
     expires mid-session. Not meant for interactive use — the agent manages this
     process's lifecycle."""
-    # Importing the proxy pulls in the `mcp` SDK. An incompatible version (mcp
-    # 2.x renamed `streamablehttp_client`) raises ImportError here; translate it
-    # into an actionable reinstall message instead of an opaque stack trace that
-    # the coding agent reports as a generic "MCP server failed to connect". The
-    # message is built inline because `ucode.mcp_proxy` is exactly what won't
-    # import, so it can't be relied on for the helper.
-    try:
-        from ucode.mcp_proxy import serve
-    except ImportError as exc:
-        print_err(_unsupported_mcp_sdk_message(exc))
-        raise typer.Exit(1) from exc
+    from ucode.mcp_proxy import serve
 
     state = load_state()
     workspace = host or state.get("workspace")

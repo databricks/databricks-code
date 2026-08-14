@@ -26,45 +26,55 @@ def test_httpx_is_a_direct_runtime_dependency():
     assert any(dependency.startswith("httpx") for dependency in _runtime_dependencies())
 
 
-def test_mcp_dependency_is_capped_below_2():
-    # mcp 2.x renamed `streamablehttp_client` and swapped httpx for httpx2, which
-    # breaks `mcp_proxy`'s imports. A fresh install resolved 2.0.0 off an
-    # unconstrained `mcp>=1.28.0` and every MCP server failed to connect (#307).
-    # The cap is the fix; this guards against it being loosened without porting
-    # the proxy to the 2.x client API.
+def test_mcp_dependency_is_uncapped():
+    # The proxy works against both mcp 1.x (httpx) and mcp 2.x (httpx2) via a
+    # single code path (see mcp_proxy._httpx / _run), so `mcp` must NOT be capped
+    # below 2 — a fresh install resolving mcp 2.x should work, not break (#307).
     mcp_specs = [d for d in _runtime_dependencies() if d.replace(" ", "").startswith("mcp")]
     assert mcp_specs, "mcp must be a direct dependency"
-    assert all("<2" in spec.replace(" ", "") for spec in mcp_specs), mcp_specs
+    assert not any("<2" in spec.replace(" ", "") for spec in mcp_specs), mcp_specs
 
 
-def test_installed_mcp_sdk_is_supported_and_the_proxy_imports():
-    # The newest dependency version the metadata allows must actually work. This
-    # runs against whatever `mcp` the environment resolved (the newest under the
-    # cap in a clean install), asserts it satisfies the pin, and confirms the
-    # symbols `mcp_proxy` imports still exist there — the clean-install guard
-    # from #307's acceptance criteria, at test time.
+def test_selected_httpx_matches_the_installed_mcp_sdk():
+    # `_httpx()` must return the HTTP flavor the installed SDK is built on:
+    # httpx2 for mcp 2.x, httpx for mcp 1.x. Using the wrong one makes the
+    # transport reject our AsyncClient/Auth.
     from importlib.metadata import version
 
     from packaging.version import Version
 
-    installed = Version(version("mcp"))
-    assert installed < Version("2"), f"mcp {installed} violates the <2 cap"
-    # Importing the module is the real check: it binds streamablehttp_client and
-    # stdio_server at module load, so a rename in the resolved SDK fails here.
-    assert mcp_proxy.streamablehttp_client is not None
+    selected = mcp_proxy._httpx().__name__
+    if Version(version("mcp")) >= Version("2"):
+        assert selected == "httpx2"
+    else:
+        assert selected == "httpx"
+
+
+def test_proxy_imports_the_streamable_http_client_shared_by_both_majors():
+    # `streamable_http_client` (2.x-native, and re-exported by mcp 1.28+) is the
+    # symbol the single code path relies on; a rename in a resolved SDK fails here.
+    assert mcp_proxy.streamable_http_client is not None
     assert mcp_proxy.stdio_server is not None
 
 
 class TestDatabricksTokenAuth:
     def test_injects_bearer_from_minted_token(self, monkeypatch):
         monkeypatch.setattr(mcp_proxy, "get_databricks_token", lambda ws, profile: "tok-123")
-        auth = mcp_proxy._DatabricksTokenAuth(WS, "uc-dogfood", use_pat=False)
+        auth = mcp_proxy._build_token_auth(WS, "uc-dogfood")
 
         request = httpx.Request("POST", URL)
         # auth_flow is a generator that yields the (mutated) request.
         list(auth.auth_flow(request))
 
         assert request.headers["Authorization"] == "Bearer tok-123"
+
+    def test_auth_is_an_instance_of_the_selected_httpx_auth(self, monkeypatch):
+        # The auth must subclass the *same* httpx flavor's Auth as the transport,
+        # or the SDK's AsyncClient won't accept it.
+        monkeypatch.setattr(mcp_proxy, "get_databricks_token", lambda ws, profile: "t")
+        auth = mcp_proxy._build_token_auth(WS, None)
+
+        assert isinstance(auth, mcp_proxy._httpx().Auth)
 
     def test_calls_get_token_with_workspace_and_profile(self, monkeypatch):
         calls: list[tuple[str, str | None]] = []
@@ -73,7 +83,7 @@ class TestDatabricksTokenAuth:
             "get_databricks_token",
             lambda ws, profile: calls.append((ws, profile)) or "t",
         )
-        auth = mcp_proxy._DatabricksTokenAuth(WS, "myprofile", use_pat=False)
+        auth = mcp_proxy._build_token_auth(WS, "myprofile")
 
         list(auth.auth_flow(httpx.Request("POST", URL)))
 
@@ -84,7 +94,7 @@ class TestDatabricksTokenAuth:
         # picked up mid-session without the proxy tracking expiry itself.
         tokens = iter(["first", "second"])
         monkeypatch.setattr(mcp_proxy, "get_databricks_token", lambda ws, profile: next(tokens))
-        auth = mcp_proxy._DatabricksTokenAuth(WS, None, use_pat=False)
+        auth = mcp_proxy._build_token_auth(WS, None)
 
         r1 = httpx.Request("POST", URL)
         r2 = httpx.Request("POST", URL)
@@ -96,7 +106,7 @@ class TestDatabricksTokenAuth:
 
     def test_auth_flow_yields_the_same_request(self, monkeypatch):
         monkeypatch.setattr(mcp_proxy, "get_databricks_token", lambda ws, profile: "t")
-        auth = mcp_proxy._DatabricksTokenAuth(WS, None, use_pat=False)
+        auth = mcp_proxy._build_token_auth(WS, None)
 
         request = httpx.Request("POST", URL)
         yielded = list(auth.auth_flow(request))
@@ -104,14 +114,14 @@ class TestDatabricksTokenAuth:
         assert yielded == [request]
 
     def test_dead_auth_becomes_a_terminal_proxy_auth_error(self, monkeypatch):
-        # A raw RuntimeError escaping auth_flow tears through httpx's transport
-        # task group and stalls the proxy until the client's startup timeout.
+        # A raw RuntimeError escaping auth_flow tears through the transport's task
+        # group and stalls the proxy until the client's startup timeout.
         # Translating it keeps the failure reportable by `serve`.
         def boom(ws, profile):
             raise RuntimeError("no access token; run `databricks auth login`")
 
         monkeypatch.setattr(mcp_proxy, "get_databricks_token", boom)
-        auth = mcp_proxy._DatabricksTokenAuth(WS, "p", use_pat=False)
+        auth = mcp_proxy._build_token_auth(WS, "p")
 
         with pytest.raises(mcp_proxy.ProxyAuthError, match="databricks auth login"):
             list(auth.auth_flow(httpx.Request("POST", URL)))

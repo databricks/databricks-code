@@ -7,12 +7,20 @@ local **stdio** server. The agent spawns and reaps the proxy as a child process
 — ucode owns no long-lived process and no background refresh thread. The proxy
 speaks stdio to the agent and streamable-HTTP to Databricks, and mints a fresh
 token from the Databricks CLI profile on **every** upstream HTTP request via an
-``httpx.Auth`` hook, so the bearer never goes stale mid-session.
+httpx ``Auth`` hook, so the bearer never goes stale mid-session.
 
 This replaces the previous per-client header auth (static ``Bearer
 ${OAUTH_TOKEN}``, Claude ``headersHelper``, Cursor literal-token rewrites): one
 uniform mechanism, token refresh in a single place, and the proxy is an
 invisible implementation detail baked into each client's config.
+
+MCP SDK compatibility (1.x and 2.x). The proxy uses the SDK's *2.x-native* call
+shape — ``streamable_http_client(url, http_client=<AsyncClient>)`` — which both
+mcp 1.28+ and mcp 2.x export (1.x's older ``streamablehttp_client`` is a thin
+deprecated shim over it). The only thing that differs across the major versions
+is the HTTP library: mcp 1.x builds on ``httpx``, mcp 2.x on ``httpx2``. We
+resolve whichever the installed SDK uses (see ``_httpx``) and build the client
+and auth from that, so a single code path works against both — no version cap.
 
 Auth failures are terminal and are reported *fast*. When the Databricks CLI
 can't mint a token (expired refresh token, logged-out profile), the proxy prints
@@ -26,17 +34,11 @@ especially confusing -- the user needs to be told to re-run
 from __future__ import annotations
 
 import sys
+from types import ModuleType
 
 import anyio
-import httpx
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
-
-# NOTE: `mcp` is capped `<2` in pyproject because 2.x renamed
-# `streamablehttp_client` to `streamable_http_client` (and swapped httpx for
-# httpx2), so these imports fail against it. That ImportError is caught and
-# translated at the `ucode mcp-proxy` cli import site (see cli.py), because this
-# module is exactly what can't import and so can't host the handler itself.
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server.stdio import stdio_server
 
 from ucode.databricks import get_databricks_token
@@ -45,6 +47,25 @@ from ucode.databricks import get_databricks_token
 # non-zero exit far more usefully than a startup timeout, so bail out with this
 # instead of letting the process hang until the client's timeout fires.
 AUTH_FAILURE_EXIT_CODE = 2
+
+
+def _httpx() -> ModuleType:
+    """Return the httpx module the installed MCP SDK is built on.
+
+    mcp 2.x moved from ``httpx`` to ``httpx2`` and passes an ``AsyncClient`` of
+    that flavor into ``streamable_http_client``. We must construct our client and
+    ``Auth`` from the *same* module the SDK uses, or the transport rejects it.
+    Prefer ``httpx2`` (mcp 2.x) and fall back to ``httpx`` (mcp 1.x)."""
+    # Imported dynamically: httpx2 ships only with mcp 2.x, so a static `import
+    # httpx2` is unresolvable under the mcp 1.x that's pinned for type-checking
+    # and CI. importlib keeps the type checker out of it while the runtime picks
+    # the right flavor.
+    from importlib import import_module
+
+    try:
+        return import_module("httpx2")
+    except ImportError:
+        return import_module("httpx")
 
 
 class ProxyAuthError(RuntimeError):
@@ -64,31 +85,32 @@ def _fail_fast(message: str) -> None:
     raise SystemExit(AUTH_FAILURE_EXIT_CODE)
 
 
-class _DatabricksTokenAuth(httpx.Auth):
-    """Injects a fresh Databricks OAuth bearer on every request.
+def _build_token_auth(workspace: str, profile: str | None):
+    """Build an httpx ``Auth`` that injects a fresh bearer on every request.
 
-    ``get_databricks_token`` returns a cached token and refreshes it when
-    expired, so calling it per request keeps auth current without the proxy
-    tracking token lifetimes itself."""
+    The base class comes from whichever httpx the SDK uses (see ``_httpx``), so
+    the returned auth is accepted by that SDK's ``AsyncClient``. Behaviour is
+    identical across flavours — ``Auth.auth_flow`` has the same generator
+    contract in httpx and httpx2."""
+    httpx = _httpx()
 
-    def __init__(self, workspace: str, profile: str | None, *, use_pat: bool) -> None:
-        self._workspace = workspace
-        self._profile = profile
-        self._use_pat = use_pat
+    class _DatabricksTokenAuth(httpx.Auth):
+        def auth_flow(self, request):
+            # get_databricks_token honors the DATABRICKS_BEARER short-circuit and
+            # PAT profiles internally; --use-pat is surfaced via the env ucode set.
+            # A RuntimeError here means auth is dead (expired refresh token,
+            # logged-out profile). Raising it from inside auth_flow would tear
+            # through the transport's task group and stall the process until the
+            # client times out, so translate it into a terminal ProxyAuthError the
+            # caller reports cleanly.
+            try:
+                token = get_databricks_token(workspace, profile)
+            except RuntimeError as exc:
+                raise ProxyAuthError(str(exc)) from exc
+            request.headers["Authorization"] = f"Bearer {token}"
+            yield request
 
-    def auth_flow(self, request: httpx.Request):
-        # get_databricks_token honors the DATABRICKS_BEARER short-circuit and PAT
-        # profiles internally; --use-pat is surfaced via the env ucode already set.
-        # A RuntimeError here means auth is dead (expired refresh token, logged-out
-        # profile). Raising it from inside httpx's auth_flow would tear through the
-        # transport's task group and stall the process until the client times out,
-        # so translate it into a terminal ProxyAuthError the caller reports cleanly.
-        try:
-            token = get_databricks_token(self._workspace, self._profile)
-        except RuntimeError as exc:
-            raise ProxyAuthError(str(exc)) from exc
-        request.headers["Authorization"] = f"Bearer {token}"
-        yield request
+    return _DatabricksTokenAuth()
 
 
 async def _pump(
@@ -105,13 +127,22 @@ async def _pump(
 
 
 async def _run(url: str, workspace: str, profile: str | None, use_pat: bool) -> None:
-    auth = _DatabricksTokenAuth(workspace, profile, use_pat=use_pat)
-    async with streamablehttp_client(url, auth=auth) as (http_read, http_write, _get_session_id):
-        async with stdio_server() as (stdio_read, stdio_write):
-            # Bidirectional bridge: client stdin -> Databricks, Databricks -> client stdout.
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(_pump, stdio_read, http_write)
-                tg.start_soon(_pump, http_read, stdio_write)
+    httpx = _httpx()
+    auth = _build_token_auth(workspace, profile)
+    # 2.x-native shape: hand the transport a pre-built AsyncClient carrying our
+    # per-request auth. Works on mcp 1.28+ and 2.x; `streamable_http_client`
+    # yields a (read, write) pair in both.
+    async with httpx.AsyncClient(auth=auth) as http_client:
+        async with streamable_http_client(url, http_client=http_client) as streams:
+            # mcp 1.x yields (read, write, get_session_id); mcp 2.x drops the
+            # trailing callback and yields (read, write). Take the first two
+            # positionally so both arities work — we don't use get_session_id.
+            http_read, http_write = streams[0], streams[1]
+            async with stdio_server() as (stdio_read, stdio_write):
+                # Bidirectional bridge: client stdin -> Databricks, Databricks -> client stdout.
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(_pump, stdio_read, http_write)
+                    tg.start_soon(_pump, http_read, stdio_write)
 
 
 def _preflight_token(workspace: str, profile: str | None) -> None:
