@@ -140,8 +140,8 @@ class TestSseRepair:
         assert b"finish_reason" in body
         assert b'"id":null' not in body
 
-    def test_truncated_content_stream_gets_finish_and_done(self):
-        stream = b'data: {"id":"c3","choices":[{"delta":{"content":"ok"}}]}\n\n'
+    def test_transport_truncated_stream_is_not_turned_into_success(self):
+        stream = b'data: {"id":"c3","choices":[{"delta":{"content":"partial"}}]}\n\n'
         upstream, gateway, gateway_thread = _gateway(stream, truncate=True)
         base, proxy, proxy_thread = _proxy(upstream)
         try:
@@ -149,8 +149,25 @@ class TestSseRepair:
         finally:
             _stop(proxy, proxy_thread)
             _stop(gateway, gateway_thread)
-        assert b"finish_reason" in body
-        assert body.rstrip().endswith(b"[DONE]")
+        assert body == stream
+        assert b"finish_reason" not in body
+        assert b"[DONE]" not in body
+
+    def test_multiline_finish_event_is_not_repaired_twice(self):
+        stream = (
+            b'data: {"id":"c4","choices":[{"delta":{},\n'
+            b'data: "index":0,"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        upstream, gateway, gateway_thread = _gateway(stream)
+        base, proxy, proxy_thread = _proxy(upstream)
+        try:
+            _, _, body = _post(base)
+        finally:
+            _stop(proxy, proxy_thread)
+            _stop(gateway, gateway_thread)
+        assert body == stream
+        assert body.count(b"finish_reason") == 1
 
     def test_any_choice_finish_reason_suppresses_injection(self):
         stream = (

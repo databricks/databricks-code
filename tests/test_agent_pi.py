@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
@@ -805,6 +806,72 @@ class TestMlflowProxyLifecycle:
             f"{WS}/ai-gateway/mlflow/v1"
         )
         assert restored["providers"]["databricks-mlflow"]["apiKey"] == "existing-token"
+
+    def test_refresh_keeps_live_proxy_url(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "models.json"
+        settings_path = tmp_path / "settings.json"
+        monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_PATH", settings_path)
+        monkeypatch.setattr(pi, "PI_BACKUP_PATH", tmp_path / "models.backup.json")
+        monkeypatch.setattr(pi, "PI_SETTINGS_BACKUP_PATH", tmp_path / "settings.backup.json")
+        state = {
+            "workspace": WS,
+            "oss_models": ["system.ai.inkling"],
+            "base_urls": {
+                "pi": {**_base_urls(), "oss": "http://127.0.0.1:54321/ai-gateway/mlflow/v1"}
+            },
+        }
+        with (
+            patch.object(pi, "get_databricks_token", return_value="refreshed-token"),
+            patch.object(pi, "save_state"),
+        ):
+            pi._refresh_token_once(state, force_refresh=True)
+        provider = json.loads(config_path.read_text())["providers"]["databricks-mlflow"]
+        assert provider["baseUrl"] == "http://127.0.0.1:54321/ai-gateway/mlflow/v1"
+        assert provider["apiKey"] == "refreshed-token"
+
+    def test_restore_waits_for_inflight_refresh_and_writes_direct_last(self, monkeypatch):
+        state = {
+            "workspace": WS,
+            "oss_models": ["system.ai.inkling"],
+            "base_urls": {
+                "pi": {**_base_urls(), "oss": "http://127.0.0.1:54321/ai-gateway/mlflow/v1"}
+            },
+        }
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+        restore_done = threading.Event()
+        write_order: list[str] = []
+
+        def fake_write(current, model, token=None, *, force_refresh=False):
+            write_order.append(str(token))
+            if token == "refresh-token":
+                refresh_started.set()
+                assert release_refresh.wait(timeout=2)
+            return current, str(token)
+
+        monkeypatch.setattr(pi, "_write_tool_config_unlocked", fake_write)
+        refresher = threading.Thread(
+            target=pi.write_tool_config,
+            args=(state, "system.ai.inkling", "refresh-token"),
+        )
+        refresher.start()
+        assert refresh_started.wait(timeout=2)
+        restorer = threading.Thread(
+            target=lambda: (
+                pi._restore_direct_oss_config(state, "restore-token"),
+                restore_done.set(),
+            )
+        )
+        restorer.start()
+        assert not restore_done.wait(timeout=0.05)
+        release_refresh.set()
+        refresher.join(timeout=2)
+        restorer.join(timeout=2)
+        assert not refresher.is_alive()
+        assert not restorer.is_alive()
+        assert write_order == ["refresh-token", "restore-token"]
+        assert state["base_urls"]["pi"]["oss"] == f"{WS}/ai-gateway/mlflow/v1"
 
     def test_proxy_precedes_first_config_write_and_is_cleaned_on_normal_exit(self):
         proxy, proxy_thread, server = self._proxy_pair()

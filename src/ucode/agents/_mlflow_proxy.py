@@ -163,17 +163,46 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         saw_done = False
         saw_error = False
         last_id: str | None = None
+        event_data: list[bytes] = []
+
+        def inspect_event() -> None:
+            nonlocal saw_error, saw_finish, last_id
+            if not event_data:
+                return
+            payload = b"\n".join(event_data)
+            event_data.clear()
+            try:
+                event = json.loads(payload)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return
+            if not isinstance(event, dict):
+                return
+            if "error" in event:
+                saw_error = True
+            event_id = event.get("id")
+            if isinstance(event_id, str):
+                last_id = event_id
+            choices = event.get("choices")
+            if isinstance(choices, list) and any(
+                isinstance(choice, dict) and choice.get("finish_reason") is not None
+                for choice in choices
+            ):
+                saw_finish = True
+
         try:
             for raw_line in stream:
                 payload = _data_payload(raw_line)
                 event_line = raw_line.rstrip(b"\r\n")
-                if event_line.lower().startswith(b"event:"):
+                if not event_line:
+                    inspect_event()
+                elif event_line.lower().startswith(b"event:"):
                     event_name = event_line[6:]
                     if event_name.startswith(b" "):
                         event_name = event_name[1:]
                     if event_name.lower() == b"error":
                         saw_error = True
                 if payload == b"[DONE]":
+                    inspect_event()
                     if saw_data and not saw_finish and not saw_error:
                         self._write(b"data: " + _finish_chunk(last_id) + b"\n\n")
                         saw_finish = True
@@ -182,30 +211,23 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     continue
                 if payload is not None and payload:
                     saw_data = True
-                    try:
-                        event = json.loads(payload)
-                        if isinstance(event, dict):
-                            if "error" in event:
-                                saw_error = True
-                            event_id = event.get("id")
-                            if isinstance(event_id, str):
-                                last_id = event_id
-                            choices = event.get("choices")
-                            if isinstance(choices, list) and any(
-                                isinstance(choice, dict) and choice.get("finish_reason") is not None
-                                for choice in choices
-                            ):
-                                saw_finish = True
-                    except (UnicodeDecodeError, json.JSONDecodeError):
-                        pass
+                    event_data.append(payload)
                 self._write(raw_line)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, OSError, IncompleteRead):
+            # Never turn a transport-failed partial stream into a successful
+            # synthetic completion. EOF without a transport exception remains
+            # repairable below because affected gateways can end cleanly after
+            # their final data event.
             return
-        except (OSError, IncompleteRead):
-            # A dropped upstream after data is treated as a truncated stream;
-            # the repair below gives Pi a structurally valid terminator.
-            pass
 
+        # ``HTTPResponse`` line iteration can end without raising even when a
+        # declared Content-Length was not satisfied. A positive remainder is
+        # still a transport truncation, not a clean finish-reason omission.
+        remaining = getattr(stream, "length", None)
+        if isinstance(remaining, int) and remaining > 0:
+            return
+
+        inspect_event()
         if saw_data and not saw_error:
             try:
                 if not saw_finish:

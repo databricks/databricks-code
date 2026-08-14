@@ -76,6 +76,7 @@ PI_CONFIG_PATH = PI_CONFIG_DIR / "models.json"
 PI_SETTINGS_PATH = PI_CONFIG_DIR / "settings.json"
 PI_BACKUP_PATH = APP_DIR / "pi-models.backup.json"
 PI_SETTINGS_BACKUP_PATH = APP_DIR / "pi-settings.backup.json"
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 SPEC: ToolSpec = {
     "binary": "pi",
@@ -324,6 +325,17 @@ def write_tool_config(
     *,
     force_refresh: bool = False,
 ) -> tuple[dict, str]:
+    with _CONFIG_WRITE_LOCK:
+        return _write_tool_config_unlocked(state, model, token, force_refresh=force_refresh)
+
+
+def _write_tool_config_unlocked(
+    state: dict,
+    model: str,
+    token: str | None = None,
+    *,
+    force_refresh: bool = False,
+) -> tuple[dict, str]:
     backup_existing_file(PI_CONFIG_PATH, PI_BACKUP_PATH)
     if token is None:
         token = get_databricks_token(
@@ -496,7 +508,12 @@ def _start_oss_proxy(
 
 
 def _restore_direct_oss_config(state: dict, token: str | None) -> None:
-    """Replace the session-only proxy URL before its listener is released."""
+    """Replace the session-only proxy URL after any in-flight config write."""
+    with _CONFIG_WRITE_LOCK:
+        _restore_direct_oss_config_unlocked(state, token)
+
+
+def _restore_direct_oss_config_unlocked(state: dict, token: str | None) -> None:
     pi_urls = state.setdefault("base_urls", {}).setdefault(
         "pi", build_pi_base_urls(state["workspace"])
     )
