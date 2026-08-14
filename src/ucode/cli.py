@@ -1384,9 +1384,6 @@ def _fetch_budget_recommendation(state: dict, managed: dict | None) -> dict | No
     Enforcement is server-side, so a failed read only costs the recommendation: the config's own
     ``default_model`` still applies and the launch proceeds.
     """
-    # No managed config (feature off, --skip-managed-config, or none published) means no budget to
-    # read. --dry-run resolves the agent from the last saved config alone, so it must not reach the
-    # control plane — mirroring the managed-config read, which is likewise skipped under --dry-run.
     if managed is None or is_dry_run():
         return None
     reason: str | None = None
