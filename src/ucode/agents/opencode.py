@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import threading
+from typing import cast
 
 from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
@@ -83,17 +84,67 @@ def _resolve_model_selector(model: str, opencode_models: dict[str, list[str]]) -
     return model
 
 
-def _oss_model_overlay(model: str, ua_header: dict[str, str]) -> dict:
-    """Per-model overlay for an OSS model entry.
+_OSS_SAFE_LIMITS = {"context": 128_000, "output": 8_192}
 
-    All OSS models carry the User-Agent header; models with known token limits
-    also pin `limit` (context + output) so OpenCode clamps `max_tokens` to a
-    value the gateway accepts. OpenCode's schema requires both fields together,
-    so the limits table always supplies both."""
+
+def _positive_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _oss_specs_by_id(raw_specs: object) -> dict[str, dict[str, object]]:
+    if not isinstance(raw_specs, list):
+        return {}
+    specs: dict[str, dict[str, object]] = {}
+    for raw_spec in raw_specs:
+        if not isinstance(raw_spec, dict):
+            continue
+        typed_spec = cast(dict[str, object], raw_spec)
+        model_id = typed_spec.get("id")
+        reasoning = typed_spec.get("reasoning")
+        context = typed_spec.get("context_window")
+        output = typed_spec.get("max_tokens")
+        valid_limits = all(
+            value is None or _positive_int(value) is not None for value in (context, output)
+        )
+        if (
+            isinstance(model_id, str)
+            and model_id
+            and isinstance(reasoning, bool)
+            and "context_window" in typed_spec
+            and "max_tokens" in typed_spec
+            and valid_limits
+            and model_id not in specs
+        ):
+            specs[model_id] = typed_spec
+    return specs
+
+
+def _oss_model_overlay(
+    model: str, ua_header: dict[str, str], spec: dict[str, object] | None = None
+) -> dict:
+    """Per-model OSS overlay from discovered or static capabilities.
+
+    OpenCode requires context and output limits together. Every discovered spec
+    therefore receives a complete conservative pair. Missing specs retain
+    static GLM/Kimi metadata, and unknown no-spec models remain uncapped.
+    """
     overlay: dict = {"headers": ua_header}
-    limits = model_token_limits(model)
-    if limits is not None:
-        overlay["limit"] = limits
+    static_limits = model_token_limits(model)
+    context = _positive_int(spec.get("context_window")) if isinstance(spec, dict) else None
+    output = _positive_int(spec.get("max_tokens")) if isinstance(spec, dict) else None
+    if isinstance(spec, dict):
+        overlay["limit"] = {
+            "context": context
+            or (static_limits.get("context") if static_limits else _OSS_SAFE_LIMITS["context"]),
+            "output": output
+            or (static_limits.get("output") if static_limits else _OSS_SAFE_LIMITS["output"]),
+        }
+    elif static_limits is not None:
+        overlay["limit"] = static_limits
+
+    reasoning = spec.get("reasoning") if isinstance(spec, dict) else None
+    if isinstance(reasoning, bool):
+        overlay["reasoning"] = reasoning
     return overlay
 
 
@@ -111,6 +162,7 @@ def render_overlay(
     token: str,
     opencode_base_urls: dict[str, str],
     opencode_models: dict[str, list[str]],
+    oss_specs: list[dict] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for opencode.json."""
     auth_headers = {"Authorization": f"Bearer {token}"}
@@ -177,6 +229,7 @@ def render_overlay(
         }
         keys.append(["provider", "databricks-openai"])
     if oss_models:
+        specs_by_id = _oss_specs_by_id(oss_specs)
         providers["databricks-oss"] = {
             "npm": "@ai-sdk/openai",
             "options": {
@@ -184,7 +237,7 @@ def render_overlay(
                 "apiKey": token,
                 "headers": auth_headers,
             },
-            "models": {m: _oss_model_overlay(m, ua_header) for m in oss_models},
+            "models": {m: _oss_model_overlay(m, ua_header, specs_by_id.get(m)) for m in oss_models},
         }
         keys.append(["provider", "databricks-oss"])
 
@@ -214,6 +267,7 @@ def write_tool_config(
         token,
         opencode_base_urls,
         state.get("opencode_models") or {},
+        state.get("oss_model_specs") or [],
     )
     existing = read_json_safe(OPENCODE_CONFIG_PATH)
     providers = existing.get("provider")

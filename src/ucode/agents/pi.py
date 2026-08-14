@@ -24,13 +24,9 @@ Per-provider `compat` flags work around fields the gateway translators reject:
   off-state makes Pi send `reasoning: {effort: "none"}`, which `gpt-5`,
   `gpt-5-mini`, `gpt-5-nano` and `gpt-5-5-pro` reject with a 400.
 
-The `databricks-mlflow` provider carries the validated OSS coding models
-(GLM and Kimi) discovered upstream. Per model it sets
-`contextWindow`/`maxTokens` from `databricks.model_token_limits` and
-`reasoning` from `databricks.model_is_reasoning` (so Pi renders the gateway's
-streamed reasoning_content as thinking). Inkling is intentionally not offered
-until the gateway emits a terminal `finish_reason` on natural completion
-(issue #215).
+The `databricks-mlflow` provider carries validated MLflow chat-completions
+models discovered upstream. Per-model reasoning and token metadata comes from
+the persisted gateway capability specs, with conservative static fallback.
 
 The bearer token is baked into the file and refreshed by a background thread
 while the session runs (same pattern as OpenCode/Copilot).
@@ -42,6 +38,7 @@ import os
 import signal
 import subprocess
 import threading
+from typing import cast
 
 from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
@@ -56,8 +53,8 @@ from ucode.databricks import (
     ANTHROPIC_FAMILIES,
     TOKEN_REFRESH_INTERVAL_SECONDS,
     build_pi_base_urls,
-    claude_model_capabilities,
     classify_model_family,
+    claude_model_capabilities,
     get_databricks_token,
     gpt_model_token_limits,
     model_is_reasoning,
@@ -141,21 +138,71 @@ def _pi_claude_model_entry(model_id: str) -> dict:
     return entry
 
 
-def _pi_oss_model_entry(model_id: str) -> dict:
-    """Build a Pi mlflow model entry enriched from the shared limits/reasoning
-    tables: `reasoning:true` for reasoning models (Pi renders their streamed
-    reasoning_content as thinking), and `contextWindow`/`maxTokens` from
-    `model_token_limits`. Fields are omitted when unknown so Pi keeps its
-    default."""
+_OSS_SAFE_LIMITS = {"context": 128_000, "output": 8_192}
+
+
+def _positive_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _oss_specs_by_id(raw_specs: object) -> dict[str, dict[str, object]]:
+    if not isinstance(raw_specs, list):
+        return {}
+    specs: dict[str, dict[str, object]] = {}
+    for raw_spec in raw_specs:
+        if not isinstance(raw_spec, dict):
+            continue
+        typed_spec = cast(dict[str, object], raw_spec)
+        model_id = typed_spec.get("id")
+        reasoning = typed_spec.get("reasoning")
+        context = typed_spec.get("context_window")
+        output = typed_spec.get("max_tokens")
+        valid_limits = all(
+            value is None or _positive_int(value) is not None for value in (context, output)
+        )
+        if (
+            isinstance(model_id, str)
+            and model_id
+            and isinstance(reasoning, bool)
+            and "context_window" in typed_spec
+            and "max_tokens" in typed_spec
+            and valid_limits
+            and model_id not in specs
+        ):
+            specs[model_id] = typed_spec
+    return specs
+
+
+def _pi_oss_model_entry(model_id: str, spec: dict[str, object] | None = None) -> dict:
+    """Build a Pi MLflow model entry from discovered or static capabilities.
+
+    A valid discovered boolean overrides static reasoning. Any discovered spec
+    receives a complete conservative limit pair, so missing capability fields
+    cannot leave a validated model effectively uncapped. Missing specs retain
+    the existing static GLM/Kimi behavior, while unknown models remain bare.
+    """
     entry: dict = {"id": model_id}
-    if model_is_reasoning(model_id):
+    static_limits = model_token_limits(model_id)
+    static_reasoning = model_is_reasoning(model_id)
+
+    reasoning = spec.get("reasoning") if isinstance(spec, dict) else None
+    if not isinstance(reasoning, bool):
+        reasoning = static_reasoning
+    if reasoning:
         entry["reasoning"] = True
-    limits = model_token_limits(model_id)
-    if limits:
-        if limits.get("context"):
-            entry["contextWindow"] = limits["context"]
-        if limits.get("output"):
-            entry["maxTokens"] = limits["output"]
+
+    context = _positive_int(spec.get("context_window")) if isinstance(spec, dict) else None
+    output = _positive_int(spec.get("max_tokens")) if isinstance(spec, dict) else None
+    if isinstance(spec, dict):
+        entry["contextWindow"] = context or (
+            static_limits.get("context") if static_limits else _OSS_SAFE_LIMITS["context"]
+        )
+        entry["maxTokens"] = output or (
+            static_limits.get("output") if static_limits else _OSS_SAFE_LIMITS["output"]
+        )
+    elif static_limits:
+        entry["contextWindow"] = static_limits["context"]
+        entry["maxTokens"] = static_limits["output"]
     return entry
 
 
@@ -196,6 +243,7 @@ def render_overlay(
     codex_models: list[str],
     gemini_models: list[str],
     oss_models: list[str],
+    oss_specs: list[dict] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Pi's private agent config."""
     providers: dict = {}
@@ -240,6 +288,7 @@ def render_overlay(
         }
         keys.append(["providers", "databricks-gemini"])
     if oss_models:
+        specs_by_id = _oss_specs_by_id(oss_specs)
         providers["databricks-mlflow"] = {
             "baseUrl": pi_base_urls["oss"],
             "api": "openai-completions",
@@ -249,7 +298,7 @@ def render_overlay(
             # and per-tool `strict`. Pi omits both when these are false.
             "compat": {"supportsStore": False, "supportsStrictMode": False},
             "headers": ua_headers,
-            "models": [_pi_oss_model_entry(m) for m in oss_models],
+            "models": [_pi_oss_model_entry(m, specs_by_id.get(m)) for m in oss_models],
         }
         keys.append(["providers", "databricks-mlflow"])
     overlay: dict = {
@@ -289,6 +338,7 @@ def write_tool_config(
         codex_models,
         gemini_models,
         state.get("oss_models") or [],
+        state.get("oss_model_specs") or [],
     )
     existing = read_json_safe(PI_CONFIG_PATH)
     providers = existing.get("providers")

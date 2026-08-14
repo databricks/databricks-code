@@ -28,6 +28,7 @@ def _empty() -> dict:
         "codex_models": [],
         "gemini_models": [],
         "oss_models": [],
+        "oss_specs": [],
     }
 
 
@@ -42,6 +43,7 @@ def _overlay(model: str, token: str = "tok", **kwargs):
         bundle["codex_models"],
         bundle["gemini_models"],
         bundle["oss_models"],
+        bundle["oss_specs"],
     )
 
 
@@ -215,6 +217,80 @@ class TestRenderOverlayOssEnrichment:
     def test_unknown_oss_model_bare(self):
         # No limits/reasoning table entry -> only id, client keeps defaults.
         overlay, _ = _overlay("system.ai.mystery-7b", oss_models=["system.ai.mystery-7b"])
+        assert overlay["providers"]["databricks-mlflow"]["models"][0] == {
+            "id": "system.ai.mystery-7b"
+        }
+
+    def test_dynamic_full_spec_overrides_static_metadata(self):
+        specs = [
+            {
+                "id": "system.ai.glm-5-2",
+                "reasoning": False,
+                "context_window": 256_000,
+                "max_tokens": 12_345,
+            }
+        ]
+        overlay, _ = _overlay(
+            "system.ai.glm-5-2", oss_models=["system.ai.glm-5-2"], oss_specs=specs
+        )
+        entry = overlay["providers"]["databricks-mlflow"]["models"][0]
+        assert entry == {
+            "id": "system.ai.glm-5-2",
+            "contextWindow": 256_000,
+            "maxTokens": 12_345,
+        }
+
+    def test_dynamic_reasoning_true_is_applied_with_safe_unknown_limits(self):
+        specs = [
+            {
+                "id": "system.ai.inkling",
+                "reasoning": True,
+                "context_window": None,
+                "max_tokens": None,
+            }
+        ]
+        overlay, _ = _overlay(
+            "system.ai.inkling", oss_models=["system.ai.inkling"], oss_specs=specs
+        )
+        assert overlay["providers"]["databricks-mlflow"]["models"][0] == {
+            "id": "system.ai.inkling",
+            "reasoning": True,
+            "contextWindow": 128_000,
+            "maxTokens": 8_192,
+        }
+
+    def test_partial_dynamic_limits_are_completed_conservatively(self):
+        specs = [
+            {
+                "id": "system.ai.inkling",
+                "reasoning": True,
+                "context_window": None,
+                "max_tokens": 65_536,
+            }
+        ]
+        overlay, _ = _overlay(
+            "system.ai.inkling", oss_models=["system.ai.inkling"], oss_specs=specs
+        )
+        entry = overlay["providers"]["databricks-mlflow"]["models"][0]
+        assert entry["contextWindow"] == 128_000
+        assert entry["maxTokens"] == 65_536
+
+    def test_malformed_spec_is_ignored_safely(self):
+        specs = [
+            None,
+            {"id": 12, "reasoning": True},
+            {
+                "id": "system.ai.mystery-7b",
+                "reasoning": "yes",
+                "context_window": -1,
+                "max_tokens": True,
+            },
+        ]
+        overlay, _ = _overlay(
+            "system.ai.mystery-7b",
+            oss_models=["system.ai.mystery-7b"],
+            oss_specs=specs,
+        )
         assert overlay["providers"]["databricks-mlflow"]["models"][0] == {
             "id": "system.ai.mystery-7b"
         }
@@ -514,6 +590,29 @@ class TestWriteToolConfig:
         written = json.loads(config_file.read_text())
         assert written["model"] == "databricks-claude/claude-sonnet"
         assert written["providers"]["databricks-claude"]["apiKey"] == "tok"
+
+    def test_state_oss_specs_reach_written_model_entry(self, tmp_path, monkeypatch):
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(
+            claude_models={},
+            oss_models=["system.ai.inkling"],
+            oss_model_specs=[
+                {
+                    "id": "system.ai.inkling",
+                    "reasoning": True,
+                    "context_window": 256_000,
+                    "max_tokens": 65_536,
+                }
+            ],
+        )
+
+        with patch("ucode.agents.pi.save_state"):
+            pi_mod.write_tool_config(state, "system.ai.inkling", token="tok")
+
+        entry = json.loads(config_file.read_text())["providers"]["databricks-mlflow"]["models"][0]
+        assert entry["reasoning"] is True
+        assert entry["contextWindow"] == 256_000
+        assert entry["maxTokens"] == 65_536
 
     def test_settings_pins_default_provider_and_model(self, tmp_path, monkeypatch):
         # Without this, Pi's `findInitialModel` can fall through to a built-in

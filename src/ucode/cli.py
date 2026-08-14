@@ -42,7 +42,7 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
-    discover_oss_models,
+    discover_oss_model_specs,
     ensure_ai_gateway,
     ensure_databricks_auth,
     ensure_pat_bearer,
@@ -568,6 +568,7 @@ def configure_shared_state(
     gemini_models = []
     codex_models = []
     oss_models = []
+    oss_specs: list[dict] = []
     opencode_models: dict[str, list[str]] = {}
     web_search_model: str | None = None
     if skip_model_discovery:
@@ -610,8 +611,22 @@ def configure_shared_state(
                     codex_models, codex_reason = discover_codex_models(workspace, token)
             if want_oss:
                 oss_models, oss_reason = ms_oss, ms_reason
-                if not oss_models:
-                    oss_models, oss_reason = discover_oss_models(workspace, token)
+                if oss_models:
+                    oss_specs, specs_reason = discover_oss_model_specs(workspace, token, oss_models)
+                    # Keep IDs and specs aligned. Broad OSS families are admitted
+                    # only by live capability validation; if that refresh fails,
+                    # offering the stale IDs without safe metadata would regress
+                    # them to uncapped client defaults. Static GLM/Kimi fallback
+                    # specs are still returned by discover_oss_model_specs.
+                    oss_models = [spec["id"] for spec in oss_specs]
+                    if not oss_specs and specs_reason:
+                        oss_reason = specs_reason
+                else:
+                    # The endpoint fallback returns ids and capabilities from
+                    # the same validated listing, avoiding a second request
+                    # whose transient failure could leave broad models uncapped.
+                    oss_specs, oss_reason = discover_oss_model_specs(workspace, token)
+                    oss_models = [spec["id"] for spec in oss_specs]
         if claude_models:
             opencode_models["anthropic"] = list(claude_models.values())
         if gemini_models:
@@ -636,6 +651,7 @@ def configure_shared_state(
             state["codex_models"] = codex_models
         if want_oss:
             state["oss_models"] = oss_models
+            state["oss_model_specs"] = oss_specs
         if fetch_all or "opencode" in tools:
             state["opencode_models"] = opencode_models
     save_state(state)

@@ -1423,7 +1423,13 @@ class TestDiscoverOssModels:
         models, reason = db_mod.discover_oss_models(WS, "token")
 
         assert reason is None
-        assert models == ["databricks-glm-5-2", "databricks-kimi-k2-7-code"]
+        assert models == [
+            "databricks-gemma-3-12b",
+            "databricks-glm-5-2",
+            "databricks-inkling",
+            "databricks-kimi-k2-7-code",
+            "databricks-qwen35-122b-a10b",
+        ]
 
     def test_excludes_claude_and_gemini_sharing_the_mlflow_dialect(self, monkeypatch):
         # On some workspaces every foundation model advertises the mlflow chat
@@ -1452,7 +1458,199 @@ class TestDiscoverOssModels:
 
         assert models == []
         assert reason is not None
-        assert "no OSS" in reason
+        assert "OSS" in reason
+
+
+class TestDiscoverOssModelSpecs:
+    def test_parses_reasoning_context_and_known_output_cap(self, monkeypatch):
+        payload = {
+            "endpoints": [
+                {
+                    "name": "databricks-inkling",
+                    "capabilities": {"openai_reasoning": True},
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": ["mlflow/v1/chat/completions"],
+                                    "description": "Supports a context window of 1.5M tokens.",
+                                }
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert reason is None
+        assert specs == [
+            {
+                "id": "databricks-inkling",
+                "reasoning": True,
+                "context_window": 1_500_000,
+                "max_tokens": 65_536,
+            }
+        ]
+
+    def test_excludes_endpoint_with_native_api_and_malformed_entries(self, monkeypatch):
+        payload = {
+            "endpoints": [
+                None,
+                {"name": "broken", "config": {"served_entities": "bad"}},
+                {
+                    "name": "databricks-qwen35-122b-a10b",
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": [
+                                        "mlflow/v1/chat/completions",
+                                        "openai/v1/responses",
+                                    ],
+                                }
+                            }
+                        ]
+                    },
+                },
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert specs == []
+        assert reason is not None
+
+    def test_v2_and_mlflow_type_must_belong_to_same_entity(self, monkeypatch):
+        payload = {
+            "endpoints": [
+                {
+                    "name": "databricks-inkling",
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": [],
+                                }
+                            },
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": False,
+                                    "api_types": ["mlflow/v1/chat/completions"],
+                                }
+                            },
+                        ]
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert specs == []
+        assert reason is not None
+
+    def test_duplicate_endpoint_ids_are_deduplicated(self, monkeypatch):
+        payload = _mlflow_chat_payload(["databricks-inkling", "databricks-inkling"])
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert reason is None
+        assert [spec["id"] for spec in specs] == ["databricks-inkling"]
+
+    def test_uc_ids_receive_matching_endpoint_capabilities(self, monkeypatch):
+        payload = {
+            "endpoints": [
+                {
+                    "name": "databricks-qwen35-122b-a10b",
+                    "capabilities": {"openai_reasoning": True},
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": ["mlflow/v1/chat/completions"],
+                                    "description": "context length of 128K tokens",
+                                }
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token", ["system.ai.qwen35-122b-a10b"])
+
+        assert reason is None
+        assert specs == [
+            {
+                "id": "system.ai.qwen35-122b-a10b",
+                "reasoning": True,
+                "context_window": 128_000,
+                "max_tokens": 25_000,
+            }
+        ]
+
+    def test_unavailable_metadata_keeps_static_glm_kimi_fallback(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token: (None, "HTTP 503 unavailable")
+        )
+
+        specs, reason = db_mod.discover_oss_model_specs(
+            WS,
+            "token",
+            ["system.ai.glm-5-2", "system.ai.kimi-k2-7-code", "system.ai.inkling"],
+        )
+
+        assert reason is None
+        assert [spec["id"] for spec in specs] == [
+            "system.ai.glm-5-2",
+            "system.ai.kimi-k2-7-code",
+        ]
+
+    @pytest.mark.parametrize("description", ["", "context length of nope", "context window of 0K"])
+    def test_malformed_context_description_degrades_to_none(self, monkeypatch, description):
+        payload = _mlflow_chat_payload(["databricks-inkling"])
+        payload["endpoints"][0]["config"]["served_entities"][0]["foundation_model"][
+            "description"
+        ] = description
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, _ = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert specs[0]["context_window"] is None
+
+
+class TestDiscoverModelServicesDynamicOss:
+    def test_uc_first_broad_model_requires_matching_endpoint_validation(self, monkeypatch):
+        model_services = {
+            "model_services": [
+                _model_service("system.ai.qwen35-122b-a10b"),
+                _model_service("system.ai.inkling"),
+            ]
+        }
+        foundation_models = _mlflow_chat_payload(["databricks-qwen35-122b-a10b"])
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        _, _, _, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        assert oss == ["system.ai.qwen35-122b-a10b"]
 
 
 class TestResolvePatToken:

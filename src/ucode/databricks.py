@@ -1403,14 +1403,20 @@ _MODEL_SERVICE_REQUIRED_PREFIX = "system.ai."
 # is the only server-side narrowing that works.
 _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 
-# OSS families validated as coding models in ucode, matched by name substring.
-# Keep this as an explicit product allowlist rather than exposing every model on
-# the chat-completions route. Inkling remains excluded until gateway issue #215
-# is fixed; other families require coding-harness validation before inclusion.
+# OSS families with statically validated coding-agent behavior. They remain the
+# safe fallback when the workspace's foundation-model capability listing is
+# unavailable. Other model families are offered only after the listing confirms
+# that they are served exclusively through MLflow chat completions.
 _OSS_MODEL_FAMILIES = ("kimi-", "glm-")
 
-# Non-chat services must never be offered to a chat agent if a future supported
-# family also uses one of these substrings.
+# Native routes take precedence over the generic MLflow chat-completions route.
+# A foundation model advertising any of these must not be duplicated as OSS.
+_NATIVE_PROVIDER_API_TYPES = frozenset(
+    {"anthropic/v1/messages", "openai/v1/responses", "gemini/v1/generateContent"}
+)
+
+# Non-chat services must never be offered to a chat agent, even if malformed
+# metadata happens to advertise a chat API type.
 _OSS_NON_CHAT_SUBSTRINGS = ("embedding", "embed", "rerank")
 
 
@@ -1496,6 +1502,202 @@ def model_token_limits(model_id: str) -> dict[str, int] | None:
     if _is_oss_chat_model(model_id):
         return dict(_OSS_FALLBACK_LIMITS)
     return None
+
+
+# The foundation-model API exposes context windows only in free-text
+# descriptions (for example "context length of 1M tokens"). Keep parsing
+# deliberately narrow: unrecognized or invalid text simply yields no override.
+_CONTEXT_LENGTH_RE = re.compile(r"context (?:length|window) of ([\d.,]+)\s*([MK])", re.IGNORECASE)
+
+
+def _parse_context_window(description: str) -> int | None:
+    if not isinstance(description, str):
+        return None
+    match = _CONTEXT_LENGTH_RE.search(description)
+    if not match:
+        return None
+    try:
+        value = float(match.group(1).replace(",", ""))
+        multiplier = 1_000_000 if match.group(2).upper() == "M" else 1_000
+        tokens = int(value * multiplier)
+    except (OverflowError, ValueError):
+        return None
+    return tokens if tokens > 0 else None
+
+
+# Per-model output ceilings enforced by the MLflow gateway. There is no
+# structured metadata field for these values; they were established by probing
+# oversized requests. Keys omit route prefixes so the same entry applies to
+# both `databricks-*` endpoint ids and `system.ai.*` model-service ids.
+_OSS_MAX_OUTPUT_TOKENS: dict[str, int] = {
+    "glm-5-2": 65_536,
+    "inkling": 65_536,
+    "kimi-k2-7-code": 65_536,
+    "gpt-oss-120b": 25_000,
+    "gpt-oss-20b": 25_000,
+    "qwen35-122b-a10b": 25_000,
+    "qwen3-next-80b-a3b-instruct": 10_000,
+    "llama-4-maverick": 8_192,
+    "meta-llama-3-1-8b-instruct": 8_192,
+    "meta-llama-3-3-70b-instruct": 8_192,
+    "gemma-3-12b": 8_192,
+}
+
+
+def _canonical_oss_model_id(model_id: str) -> str:
+    """Normalize endpoint/model-service ids for capability matching."""
+    tail = model_id.rsplit("/", 1)[-1].strip().lower()
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    if tail.startswith("databricks-"):
+        tail = tail[len("databricks-") :]
+    return tail
+
+
+def _static_oss_spec(model_id: str) -> dict | None:
+    """Capability fallback for the statically validated GLM/Kimi families."""
+    if not _is_oss_chat_model(model_id.lower()):
+        return None
+    limits = model_token_limits(model_id) or {}
+    return {
+        "id": model_id,
+        "reasoning": model_is_reasoning(model_id.lower()),
+        "context_window": limits.get("context"),
+        "max_tokens": limits.get("output"),
+    }
+
+
+def _oss_specs_from_foundation_models(payload: object) -> list[dict]:
+    """Parse validated chat-completions-only model specs from a listing."""
+    if not isinstance(payload, dict):
+        return []
+    payload_dict = cast(dict[str, object], payload)
+    raw_endpoints = payload_dict.get("endpoints")
+    if not isinstance(raw_endpoints, list):
+        return []
+
+    specs: list[dict] = []
+    for endpoint in raw_endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        endpoint_dict = cast(dict[str, object], endpoint)
+        name = endpoint_dict.get("name")
+        config = endpoint_dict.get("config")
+        if not isinstance(name, str) or not name.strip() or not isinstance(config, dict):
+            continue
+        name = name.strip()
+        lowered_name = _canonical_oss_model_id(name)
+        is_native_family = (
+            lowered_name.startswith("claude-")
+            or lowered_name.startswith("gemini-")
+            or re.match(r"^gpt-\d(?:-|$)", lowered_name) is not None
+        )
+        if is_native_family or any(bad in lowered_name for bad in _OSS_NON_CHAT_SUBSTRINGS):
+            continue
+        config_dict = cast(dict[str, object], config)
+        entities = config_dict.get("served_entities")
+        if not isinstance(entities, list):
+            continue
+
+        api_types: set[str] = set()
+        description = ""
+        has_v2_entity = False
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            entity_dict = cast(dict[str, object], entity)
+            foundation_model = entity_dict.get("foundation_model")
+            if not isinstance(foundation_model, dict):
+                continue
+            foundation_model_dict = cast(dict[str, object], foundation_model)
+            if foundation_model_dict.get("ai_gateway_v2_supported") is not True:
+                continue
+            has_v2_entity = True
+            raw_api_types = foundation_model_dict.get("api_types")
+            if isinstance(raw_api_types, list):
+                api_types.update(value for value in raw_api_types if isinstance(value, str))
+            raw_description = foundation_model_dict.get("description")
+            if not description and isinstance(raw_description, str):
+                description = raw_description
+
+        if not has_v2_entity or "mlflow/v1/chat/completions" not in api_types:
+            continue
+        if api_types & _NATIVE_PROVIDER_API_TYPES:
+            continue
+        capabilities = endpoint_dict.get("capabilities")
+        capabilities_dict = (
+            cast(dict[str, object], capabilities) if isinstance(capabilities, dict) else {}
+        )
+        reasoning = capabilities_dict.get("openai_reasoning") is True
+        canonical_id = _canonical_oss_model_id(name)
+        context_window = _parse_context_window(description)
+        max_tokens = _OSS_MAX_OUTPUT_TOKENS.get(canonical_id)
+        static_fallback = _static_oss_spec(name)
+        if static_fallback is not None:
+            # Missing/partial metadata must not regress the statically verified
+            # GLM/Kimi capabilities already used by existing installations.
+            reasoning = reasoning or static_fallback["reasoning"]
+            context_window = context_window or static_fallback["context_window"]
+            max_tokens = max_tokens or static_fallback["max_tokens"]
+        specs.append(
+            {
+                "id": name,
+                "reasoning": reasoning,
+                "context_window": context_window,
+                "max_tokens": max_tokens,
+            }
+        )
+    # Foundation listings can repeat a served endpoint. Emit one stable spec
+    # per canonical model so downstream model lists/configs stay deduplicated.
+    deduped: dict[str, dict] = {}
+    for spec in sorted(specs, key=lambda item: item["id"]):
+        deduped.setdefault(_canonical_oss_model_id(spec["id"]), spec)
+    return list(deduped.values())
+
+
+def discover_oss_model_specs(
+    workspace: str,
+    token: str,
+    model_ids: list[str] | None = None,
+) -> tuple[list[dict], str | None]:
+    """Discover validated MLflow chat-completions models and capabilities.
+
+    With ``model_ids`` (the UC-first path), endpoint capabilities are projected
+    back onto those exact ids using their normalized model name. Statically
+    validated GLM/Kimi ids remain available when capability discovery fails or
+    omits them. Without ``model_ids`` (the serving-endpoint fallback), only
+    models validated by the live API metadata are returned.
+    """
+    hostname = workspace_hostname(workspace)
+    payload, reason = _http_get_json(
+        f"https://{hostname}/api/2.0/serving-endpoints:foundation-models", token
+    )
+    discovered = _oss_specs_from_foundation_models(payload)
+
+    if model_ids is None:
+        if discovered:
+            return discovered, None
+        if payload is None:
+            return [], reason
+        return [], "no validated chat-completions-only OSS endpoints"
+
+    discovered_by_id = {_canonical_oss_model_id(spec["id"]): spec for spec in discovered}
+    specs: list[dict] = []
+    for model_id in model_ids:
+        if not isinstance(model_id, str) or not model_id.strip():
+            continue
+        dynamic = discovered_by_id.get(_canonical_oss_model_id(model_id))
+        if dynamic is not None:
+            specs.append({**dynamic, "id": model_id})
+            continue
+        fallback = _static_oss_spec(model_id)
+        if fallback is not None:
+            specs.append(fallback)
+    if specs:
+        return specs, None
+    if payload is None:
+        return [], reason
+    return [], "requested model ids matched no validated OSS endpoint"
 
 
 # Pi treats every custom model without explicit metadata as 128k context / 4k
@@ -1916,7 +2118,11 @@ def discover_model_services(
     )
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
 
-    oss_models = [m for m in ids if _is_oss_chat_model(m)]
+    # Project the live endpoint capability listing onto the UC ids. This
+    # broadens discovery beyond the static GLM/Kimi fallback only when the
+    # corresponding endpoint is validated as MLflow chat-completions-only.
+    oss_specs, _ = discover_oss_model_specs(workspace, token, ids)
+    oss_models = [spec["id"] for spec in oss_specs]
 
     if not (claude_models or codex_models or gemini_models or oss_models):
         sample = ", ".join(ids[:5])
@@ -3078,31 +3284,15 @@ def discover_codex_models(workspace: str, token: str) -> tuple[list[str], str | 
 
 
 def discover_oss_models(workspace: str, token: str) -> tuple[list[str], str | None]:
-    """Discover OSS chat models served as AI Gateway foundation-model endpoints.
+    """Discover validated chat-completions-only serving endpoints.
 
-    Fallback for workspaces that don't register OSS foundation models as
-    `system.ai.*` UC model-services (see `discover_model_services`): those
-    workspaces expose the same models as regular `databricks-*` serving
-    endpoints instead. Lists every endpoint advertising the
-    `mlflow/v1/chat/completions` dialect, then keeps only the OSS chat families
-    (`_is_oss_chat_model`) — on some workspaces the Claude/Gemini endpoints also
-    advertise that dialect, so the family filter is what separates the OSS
-    cohort from them. Mirrors the AI-Gateway fallback the other families use
-    when the UC model-services listing is empty.
+    This is the fallback for workspaces without UC model-services. Unlike the
+    static family fallback used for UC ids, every endpoint returned here has
+    live metadata confirming AI Gateway v2 MLflow chat completions and no
+    competing native Anthropic, Responses, or Gemini route.
     """
-    endpoints, reason = discover_endpoints_with_api_type(
-        workspace, token, "mlflow/v1/chat/completions"
-    )
-    if not endpoints:
-        return [], reason
-    oss = [e for e in endpoints if _is_oss_chat_model(e)]
-    if oss:
-        return oss, None
-    sample = ", ".join(endpoints[:5])
-    return [], (
-        "foundation-models exposing `mlflow/v1/chat/completions` matched no OSS "
-        f"chat family (got: {sample})"
-    )
+    specs, reason = discover_oss_model_specs(workspace, token)
+    return [spec["id"] for spec in specs], reason
 
 
 def fetch_gemini_models(workspace: str, token: str) -> list[str]:

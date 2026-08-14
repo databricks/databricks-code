@@ -12,7 +12,7 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
-    discover_oss_models,
+    discover_oss_model_specs,
     get_databricks_token,
 )
 from ucode.ui import normalize_workspace_url
@@ -71,8 +71,11 @@ def e2e_state(e2e_workspace, e2e_token):
         gemini_models, _ = discover_gemini_models(e2e_workspace, e2e_token)
     if not codex_models:
         codex_models, _ = discover_codex_models(e2e_workspace, e2e_token)
-    if not oss_models:
-        oss_models, _ = discover_oss_models(e2e_workspace, e2e_token)
+    if oss_models:
+        oss_model_specs, _ = discover_oss_model_specs(e2e_workspace, e2e_token, oss_models)
+    else:
+        oss_model_specs, _ = discover_oss_model_specs(e2e_workspace, e2e_token)
+    oss_models = [spec["id"] for spec in oss_model_specs]
 
     # E2E mirrors configure's default (Fable is premium and opt-in).
     claude_models.pop("fable", None)
@@ -93,6 +96,7 @@ def e2e_state(e2e_workspace, e2e_token):
         "gemini_models": gemini_models,
         "codex_models": codex_models,
         "oss_models": oss_models,
+        "oss_model_specs": oss_model_specs,
         "opencode_models": opencode_models,
         "base_urls": build_shared_base_urls(e2e_workspace),
         "managed_configs": {},

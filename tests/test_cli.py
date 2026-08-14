@@ -1934,7 +1934,22 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
-        monkeypatch.setattr(cli_mod, "discover_oss_models", lambda w, t: ([], None))
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: (
+                [
+                    {
+                        "id": model_id,
+                        "reasoning": True,
+                        "context_window": 128_000,
+                        "max_tokens": 8_192,
+                    }
+                    for model_id in (model_ids or [])
+                ],
+                None,
+            ),
+        )
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
         return cli_mod, logins, ensures, saved
 
@@ -2024,6 +2039,62 @@ class TestConfigureSharedStateUsePat:
         assert state["codex_models"] == ["system.ai.gpt-5"]
         assert legacy_called == []
         assert "uc_enabled" not in state
+
+    def test_uc_oss_ids_persist_matching_capability_specs(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [], [], ["system.ai.qwen35-122b-a10b"], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: (
+                [
+                    {
+                        "id": "system.ai.qwen35-122b-a10b",
+                        "reasoning": True,
+                        "context_window": 128_000,
+                        "max_tokens": 25_000,
+                    }
+                ],
+                None,
+            ),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert state["oss_models"] == ["system.ai.qwen35-122b-a10b"]
+        assert state["oss_model_specs"] == [
+            {
+                "id": "system.ai.qwen35-122b-a10b",
+                "reasoning": True,
+                "context_window": 128_000,
+                "max_tokens": 25_000,
+            }
+        ]
+        assert state["opencode_models"]["oss"] == ["system.ai.qwen35-122b-a10b"]
+
+    def test_uc_dynamic_oss_ids_are_dropped_when_spec_refresh_fails(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [], [], ["system.ai.inkling"], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: ([], "HTTP 503 unavailable"),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert state["oss_models"] == []
+        assert state["oss_model_specs"] == []
+        assert "oss" not in state["opencode_models"]
+        assert state["_discovery_reasons"]["oss"] == "HTTP 503 unavailable"
 
     def _stub_with_fable(self, monkeypatch):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
@@ -2160,8 +2231,19 @@ class TestConfigureSharedStateUsePat:
         )
         monkeypatch.setattr(
             cli_mod,
-            "discover_oss_models",
-            lambda w, t: (calls.append("oss") or ["databricks-glm-5-2"], None),
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: (
+                calls.append("oss")
+                or [
+                    {
+                        "id": "databricks-glm-5-2",
+                        "reasoning": True,
+                        "context_window": 128_000,
+                        "max_tokens": 8_192,
+                    }
+                ],
+                None,
+            ),
         )
 
         state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
@@ -2173,6 +2255,14 @@ class TestConfigureSharedStateUsePat:
         }
         assert state["codex_models"] == ["databricks-gpt-5-6-sol"]
         assert state["oss_models"] == ["databricks-glm-5-2"]
+        assert state["oss_model_specs"] == [
+            {
+                "id": "databricks-glm-5-2",
+                "reasoning": True,
+                "context_window": 128_000,
+                "max_tokens": 8_192,
+            }
+        ]
         assert state["opencode_models"] == {
             "anthropic": [
                 "databricks-claude-opus-4-8",
@@ -2255,7 +2345,11 @@ class TestConfigureSharedStateMcpCleanup:
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
-        monkeypatch.setattr(cli_mod, "discover_oss_models", lambda w, t: ([], None))
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: ([], None),
+        )
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
 
     def test_purges_residue_when_workspace_changes(self, monkeypatch):

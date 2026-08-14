@@ -117,6 +117,93 @@ class TestRenderOverlay:
         overlay, _ = opencode.render_overlay("system.ai.mystery-7b", "tok", _base_urls(), models)
         entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.mystery-7b"]
         assert "limit" not in entry
+        assert "reasoning" not in entry
+
+    def test_dynamic_full_spec_sets_reasoning_and_limits(self):
+        models = {"oss": ["system.ai.qwen35-122b-a10b"]}
+        specs = [
+            {
+                "id": "system.ai.qwen35-122b-a10b",
+                "reasoning": True,
+                "context_window": 262_144,
+                "max_tokens": 25_000,
+            }
+        ]
+        overlay, _ = opencode.render_overlay(
+            "system.ai.qwen35-122b-a10b", "tok", _base_urls(), models, specs
+        )
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.qwen35-122b-a10b"]
+        assert entry["reasoning"] is True
+        assert entry["limit"] == {"context": 262_144, "output": 25_000}
+
+    def test_dynamic_reasoning_false_is_respected(self):
+        models = {"oss": ["system.ai.glm-5-2"]}
+        specs = [
+            {
+                "id": "system.ai.glm-5-2",
+                "reasoning": False,
+                "context_window": None,
+                "max_tokens": None,
+            }
+        ]
+        overlay, _ = opencode.render_overlay(
+            "system.ai.glm-5-2", "tok", _base_urls(), models, specs
+        )
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.glm-5-2"]
+        assert entry["reasoning"] is False
+        assert entry["limit"] == {"context": 1_000_000, "output": 65_536}
+
+    def test_unknown_dynamic_spec_gets_safe_complete_limit_pair(self):
+        models = {"oss": ["system.ai.deepseek-v3"]}
+        specs = [
+            {
+                "id": "system.ai.deepseek-v3",
+                "reasoning": False,
+                "context_window": None,
+                "max_tokens": None,
+            }
+        ]
+        overlay, _ = opencode.render_overlay(
+            "system.ai.deepseek-v3", "tok", _base_urls(), models, specs
+        )
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.deepseek-v3"]
+        assert entry["reasoning"] is False
+        assert entry["limit"] == {"context": 128_000, "output": 8_192}
+
+    def test_partial_dynamic_limit_is_completed_as_valid_pair(self):
+        models = {"oss": ["system.ai.inkling"]}
+        specs = [
+            {
+                "id": "system.ai.inkling",
+                "reasoning": True,
+                "context_window": None,
+                "max_tokens": 65_536,
+            }
+        ]
+        overlay, _ = opencode.render_overlay(
+            "system.ai.inkling", "tok", _base_urls(), models, specs
+        )
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.inkling"]
+        assert entry["limit"] == {"context": 128_000, "output": 65_536}
+
+    def test_malformed_dynamic_spec_is_ignored_safely(self):
+        models = {"oss": ["system.ai.mystery-7b"]}
+        specs = [
+            None,
+            {"id": 12, "reasoning": True},
+            {
+                "id": "system.ai.mystery-7b",
+                "reasoning": "true",
+                "context_window": 0,
+                "max_tokens": True,
+            },
+        ]
+        overlay, _ = opencode.render_overlay(
+            "system.ai.mystery-7b", "tok", _base_urls(), models, specs
+        )
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.mystery-7b"]
+        assert "reasoning" not in entry
+        assert "limit" not in entry
 
     def test_token_in_api_key(self):
         models = {"anthropic": ["claude-sonnet"]}
@@ -539,3 +626,33 @@ class TestWriteToolConfigStaleProviderCleanup:
 
         written = json.loads(config_file.read_text())
         assert written["model"] == "databricks-anthropic/claude-sonnet"
+
+    def test_state_oss_specs_reach_written_model_entry(self, tmp_path, monkeypatch):
+        import ucode.agents.opencode as oc_mod
+
+        config_file = tmp_path / "opencode.json"
+        monkeypatch.setattr(oc_mod, "OPENCODE_CONFIG_PATH", config_file)
+        monkeypatch.setattr(oc_mod, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-backup.json")
+        state = {
+            "workspace": WS,
+            "base_urls": {"opencode": _base_urls()},
+            "opencode_models": {"oss": ["system.ai.inkling"]},
+            "oss_model_specs": [
+                {
+                    "id": "system.ai.inkling",
+                    "reasoning": True,
+                    "context_window": 256_000,
+                    "max_tokens": 65_536,
+                }
+            ],
+            "managed_configs": {},
+        }
+
+        with patch("ucode.agents.opencode.save_state"):
+            oc_mod.write_tool_config(state, "system.ai.inkling", token="tok")
+
+        entry = json.loads(config_file.read_text())["provider"]["databricks-oss"]["models"][
+            "system.ai.inkling"
+        ]
+        assert entry["reasoning"] is True
+        assert entry["limit"] == {"context": 256_000, "output": 65_536}
