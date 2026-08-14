@@ -1740,6 +1740,47 @@ def fetch_model_recommendation(workspace: str, token: str) -> tuple[dict, str | 
     return payload, None
 
 
+# The gateway's per-model price catalog (USD per million tokens), sourced from the same Zippy data
+# the server uses to bill external-model spend. We read it to estimate per-model cost from token
+# counts, since no API returns per-model dollars directly.
+_EXTERNAL_PROVIDER_MODELS_API_PATH = "/api/ai-gateway/v2/external-provider-models"
+_EXTERNAL_PROVIDER_MODELS_PAGE_SIZE = 1000
+_EXTERNAL_PROVIDER_MODELS_MAX_PAGES = 20
+
+
+def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict], str | None]:
+    """List external-provider models and their `base_pricing` (USD per million tokens) via the gateway.
+
+    Returns ``(models, reason)`` with each model the raw API entry; ``reason`` is non-None on failure
+    (callers omit cost rather than fail).
+    """
+    hostname = workspace_hostname(workspace)
+    base_url = f"https://{hostname}{_EXTERNAL_PROVIDER_MODELS_API_PATH}"
+    models: list[dict] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(_EXTERNAL_PROVIDER_MODELS_MAX_PAGES):
+        params: dict[str, str] = {"page_size": str(_EXTERNAL_PROVIDER_MODELS_PAGE_SIZE)}
+        if page_token:
+            params["page_token"] = page_token
+        payload, reason = _http_get_json(f"{base_url}?{urlencode(params)}", token, timeout=30)
+        if payload is None:
+            # Return what we have if a later page blips; only the first-page failure is fatal.
+            return (models, None) if models else ([], reason or "unknown error")
+        if not isinstance(payload, dict):
+            return [], "external-provider-models returned an unexpected response shape"
+        for entry in payload.get("models") or []:
+            if isinstance(entry, dict) and entry.get("model_name"):
+                models.append(entry)
+        page_token = payload.get("next_page_token") or None
+        if not page_token or page_token in seen_tokens:
+            break
+        seen_tokens.add(page_token)
+    if not models:
+        return [], "external-provider-models listing returned no models"
+    return models, None
+
+
 # Every field ucode's manifest can set, as `update_mask` paths for a PATCH. The server rejects a
 # missing or empty mask, and rejects paths outside its own mutable set — this is that set minus the
 # fields ucode doesn't author: `budget_id` (deprecated in favour of `budget_policy.budget_id`, and
