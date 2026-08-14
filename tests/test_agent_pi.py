@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from contextlib import nullcontext
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from ucode.agents import pi
 
@@ -714,6 +716,210 @@ class TestManagedModels:
             {"pi_models": ["system.ai.kimi-k2-7-code", "system.ai.claude-opus-4-8"]}
         )
         assert families == ({"opus": "system.ai.claude-opus-4-8"}, [], [])
+
+
+class TestMlflowProxyLifecycle:
+    def test_not_started_without_oss_models(self):
+        state = {"workspace": WS, "oss_models": [], "base_urls": {"pi": _base_urls()}}
+        with patch.object(pi._mlflow_proxy, "start") as start:
+            assert pi._start_oss_proxy(state) is None
+        start.assert_not_called()
+
+    def test_stale_loopback_url_is_replaced_and_real_workspace_is_upstream(self):
+        server = MagicMock()
+        state = {
+            "workspace": WS,
+            "oss_models": ["system.ai.inkling"],
+            "base_urls": {
+                "pi": {**_base_urls(), "oss": "http://127.0.0.1:54321/ai-gateway/mlflow/v1"}
+            },
+        }
+        with patch.object(
+            pi._mlflow_proxy,
+            "start",
+            return_value=(server, "http://127.0.0.1:60000"),
+        ) as start:
+            running = pi._start_oss_proxy(state)
+        assert running is not None
+        start.assert_called_once_with(WS)
+        assert state["base_urls"]["pi"]["oss"] == ("http://127.0.0.1:60000/ai-gateway/mlflow/v1")
+
+    def test_loopback_workspace_is_not_recursively_proxied(self):
+        state = {
+            "workspace": "http://127.0.0.1:9999",
+            "oss_models": ["system.ai.inkling"],
+        }
+        with patch.object(pi._mlflow_proxy, "start") as start:
+            assert pi._start_oss_proxy(state) is None
+        start.assert_not_called()
+
+    @staticmethod
+    def _proxy_pair():
+        proxy_thread = MagicMock()
+        server = MagicMock()
+        return (proxy_thread, server), proxy_thread, server
+
+    def test_restore_rewrites_persistent_config_to_direct_gateway(self):
+        state = {
+            "workspace": WS,
+            "oss_models": ["system.ai.inkling"],
+            "base_urls": {
+                "pi": {**_base_urls(), "oss": "http://127.0.0.1:54321/ai-gateway/mlflow/v1"}
+            },
+        }
+        with patch.object(pi, "write_tool_config") as write:
+            pi._restore_direct_oss_config(state, "tok")
+        assert state["base_urls"]["pi"]["oss"] == f"{WS}/ai-gateway/mlflow/v1"
+        write.assert_called_once_with(state, "system.ai.inkling", token="tok")
+
+    def test_restore_without_token_clears_state_and_existing_config_url(
+        self, tmp_path, monkeypatch
+    ):
+        config_path = tmp_path / "models.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "providers": {
+                        "databricks-mlflow": {
+                            "baseUrl": "http://127.0.0.1:54321/ai-gateway/mlflow/v1",
+                            "apiKey": "existing-token",
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
+        state = {
+            "workspace": WS,
+            "oss_models": ["system.ai.inkling"],
+            "base_urls": {
+                "pi": {**_base_urls(), "oss": "http://127.0.0.1:54321/ai-gateway/mlflow/v1"}
+            },
+        }
+        with patch.object(pi, "write_tool_config") as write:
+            pi._restore_direct_oss_config(state, None)
+        assert state["base_urls"]["pi"]["oss"] == f"{WS}/ai-gateway/mlflow/v1"
+        write.assert_not_called()
+        restored = json.loads(config_path.read_text())
+        assert restored["providers"]["databricks-mlflow"]["baseUrl"] == (
+            f"{WS}/ai-gateway/mlflow/v1"
+        )
+        assert restored["providers"]["databricks-mlflow"]["apiKey"] == "existing-token"
+
+    def test_proxy_precedes_first_config_write_and_is_cleaned_on_normal_exit(self):
+        proxy, proxy_thread, server = self._proxy_pair()
+        state = {"workspace": WS, "oss_models": ["system.ai.inkling"]}
+        order = []
+
+        def start(current):
+            current.setdefault("base_urls", {}).setdefault("pi", {})["oss"] = "http://live"
+            order.append("proxy")
+            return proxy
+
+        def refresh(current, *, force_refresh=False):
+            assert current["base_urls"]["pi"]["oss"] == "http://live"
+            order.append("config")
+            return "tok"
+
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        with (
+            patch.object(pi, "_start_oss_proxy", side_effect=start),
+            patch.object(pi, "_refresh_token_once", side_effect=refresh),
+            patch.object(pi, "_refresh_forever", return_value=None),
+            patch.object(pi, "_restore_direct_oss_config") as restore,
+            patch.object(pi.subprocess, "Popen", return_value=proc),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            pi.launch(state, [])
+        assert exit_info.value.code == 0
+        assert order[:2] == ["proxy", "config"]
+        restore.assert_called_once_with(state, "tok")
+        server.shutdown.assert_called_once()
+        server.server_close.assert_called_once()
+        proxy_thread.join.assert_called_once_with(timeout=1)
+
+    def test_interrupt_forwards_sigint_and_cleans_proxy(self):
+        proxy, _, server = self._proxy_pair()
+        proc = MagicMock()
+        proc.wait.side_effect = [KeyboardInterrupt, 130]
+        state = {"workspace": WS, "oss_models": ["system.ai.inkling"]}
+        with (
+            patch.object(pi, "_start_oss_proxy", return_value=proxy),
+            patch.object(pi, "_refresh_token_once", return_value="tok"),
+            patch.object(pi, "_refresh_forever", return_value=None),
+            patch.object(pi, "_restore_direct_oss_config") as restore,
+            patch.object(pi.subprocess, "Popen", return_value=proc),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            pi.launch(state, [])
+        assert exit_info.value.code == 130
+        proc.send_signal.assert_called_once_with(pi.signal.SIGINT)
+        restore.assert_called_once_with(state, "tok")
+        server.shutdown.assert_called_once()
+        server.server_close.assert_called_once()
+
+    @pytest.mark.parametrize("failure_stage", ["config", "popen"])
+    def test_setup_failure_still_cleans_proxy(self, failure_stage):
+        proxy, _, server = self._proxy_pair()
+        state = {"workspace": WS, "oss_models": ["system.ai.inkling"]}
+        refresh = MagicMock(return_value="tok")
+        popen = MagicMock(return_value=MagicMock())
+        if failure_stage == "config":
+            refresh.side_effect = RuntimeError("token failed")
+        else:
+            popen.side_effect = OSError("binary missing")
+        with (
+            patch.object(pi, "_start_oss_proxy", return_value=proxy),
+            patch.object(pi, "_refresh_token_once", refresh),
+            patch.object(pi, "_refresh_forever", return_value=None),
+            patch.object(pi, "_restore_direct_oss_config") as restore,
+            patch.object(pi.subprocess, "Popen", popen),
+            pytest.raises((RuntimeError, OSError)) as exc_info,
+        ):
+            pi.launch(state, [])
+        expected = "token failed" if failure_stage == "config" else "binary missing"
+        assert str(exc_info.value) == expected
+        expected_token = None if failure_stage == "config" else "tok"
+        restore.assert_called_once_with(state, expected_token)
+        server.shutdown.assert_called_once()
+        server.server_close.assert_called_once()
+
+    def test_setup_failure_remains_primary_when_restore_also_fails(self):
+        proxy, _, server = self._proxy_pair()
+        state = {"workspace": WS, "oss_models": ["system.ai.inkling"]}
+        with (
+            patch.object(pi, "_start_oss_proxy", return_value=proxy),
+            patch.object(pi, "_refresh_token_once", return_value="tok"),
+            patch.object(pi, "_refresh_forever", return_value=None),
+            patch.object(
+                pi, "_restore_direct_oss_config", side_effect=RuntimeError("restore failed")
+            ),
+            patch.object(pi, "print_warning") as warning,
+            patch.object(pi.subprocess, "Popen", side_effect=OSError("binary missing")),
+            pytest.raises(OSError, match="binary missing"),
+        ):
+            pi.launch(state, [])
+        warning.assert_called_once()
+        server.shutdown.assert_called_once()
+        server.server_close.assert_called_once()
+
+    def test_restore_failure_does_not_skip_proxy_shutdown(self):
+        proxy, _, server = self._proxy_pair()
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        state = {"workspace": WS, "oss_models": ["system.ai.inkling"]}
+        with (
+            patch.object(pi, "_start_oss_proxy", return_value=proxy),
+            patch.object(pi, "_refresh_token_once", return_value="tok"),
+            patch.object(pi, "_refresh_forever", return_value=None),
+            patch.object(pi, "_restore_direct_oss_config", side_effect=OSError("restore failed")),
+            patch.object(pi.subprocess, "Popen", return_value=proc),
+            pytest.raises(OSError, match="restore failed"),
+        ):
+            pi.launch(state, [])
+        server.shutdown.assert_called_once()
+        server.server_close.assert_called_once()
 
 
 class TestManagedDefaultModel:

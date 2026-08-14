@@ -27,6 +27,8 @@ Per-provider `compat` flags work around fields the gateway translators reject:
 The `databricks-mlflow` provider carries validated MLflow chat-completions
 models discovered upstream. Per-model reasoning and token metadata comes from
 the persisted gateway capability specs, with conservative static fallback.
+At launch this provider alone is routed through a loopback repair proxy because
+some models (notably Inkling) omit the terminal `finish_reason` Pi requires.
 
 The bearer token is baked into the file and refreshed by a background thread
 while the session runs (same pattern as OpenCode/Copilot).
@@ -34,13 +36,16 @@ while the session runs (same pattern as OpenCode/Copilot).
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import signal
 import subprocess
 import threading
 from typing import cast
+from urllib.parse import urlparse
 
 from ucode.agent_updates import available_npm_package_update
+from ucode.agents import _mlflow_proxy
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -63,6 +68,7 @@ from ucode.databricks import (
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
+from ucode.ui import print_warning
 
 PI_UCODE_HOME = APP_DIR / "pi-home"
 PI_CONFIG_DIR = PI_UCODE_HOME / ".pi" / "agent"
@@ -443,27 +449,122 @@ def build_runtime_env(token: str) -> dict[str, str]:
     return env
 
 
-def launch(state: dict, tool_args: list[str]) -> None:
-    token = _refresh_token_once(state)
-    env = build_runtime_env(token)
-
-    stop_event = threading.Event()
-    refresher = threading.Thread(
-        target=_refresh_forever,
-        args=(state, stop_event),
-        daemon=True,
-    )
-    refresher.start()
-
-    proc = subprocess.Popen([SPEC["binary"], *tool_args], env=env)
+def _is_loopback_origin(origin: str) -> bool:
+    hostname = urlparse(origin).hostname
+    if not hostname:
+        return True
+    if hostname.lower() == "localhost":
+        return True
     try:
-        returncode = proc.wait()
-    except KeyboardInterrupt:
-        proc.send_signal(signal.SIGINT)
-        returncode = proc.wait()
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _start_oss_proxy(
+    state: dict,
+) -> tuple[threading.Thread, _mlflow_proxy.ThreadingHTTPServer] | None:
+    """Start Pi's MLflow repair proxy and rewrite only the in-memory base URL.
+
+    The upstream is always derived from ``workspace`` rather than an existing
+    base URL, so a stale loopback port from an old config can never become the
+    next proxy's upstream.
+    """
+    if not (state.get("oss_models") or []):
+        return None
+    direct_oss_url = build_pi_base_urls(state["workspace"])["oss"]
+    origin = direct_oss_url.split("/ai-gateway/", 1)[0]
+    if _is_loopback_origin(origin):
+        print_warning("MLflow stream repair proxy skipped for a loopback workspace URL.")
+        return None
+    started = _mlflow_proxy.start(origin)
+    if started is None:
+        return None
+    server, proxy_origin = started
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    try:
+        thread.start()
+    except RuntimeError:
+        server.server_close()
+        print_warning("MLflow stream repair proxy could not start; using the direct gateway URL.")
+        return None
+    pi_urls = state.setdefault("base_urls", {}).setdefault(
+        "pi", build_pi_base_urls(state["workspace"])
+    )
+    pi_urls["oss"] = f"{proxy_origin}/ai-gateway/mlflow/v1"
+    return thread, server
+
+
+def _restore_direct_oss_config(state: dict, token: str | None) -> None:
+    """Replace the session-only proxy URL before its listener is released."""
+    pi_urls = state.setdefault("base_urls", {}).setdefault(
+        "pi", build_pi_base_urls(state["workspace"])
+    )
+    pi_urls["oss"] = build_pi_base_urls(state["workspace"])["oss"]
+    model = default_model(state)
+    if model and token is not None:
+        write_tool_config(state, model, token=token)
+        return
+
+    # Token acquisition can fail before the normal config rewrite returns a
+    # token. Repair an existing generated provider in place without changing
+    # its credential, so a stale loopback port is never left behind.
+    existing = read_json_safe(PI_CONFIG_PATH)
+    providers = existing.get("providers")
+    mlflow = providers.get("databricks-mlflow") if isinstance(providers, dict) else None
+    if isinstance(mlflow, dict):
+        mlflow["baseUrl"] = pi_urls["oss"]
+        write_json_file(PI_CONFIG_PATH, existing)
+
+
+def launch(state: dict, tool_args: list[str]) -> None:
+    proxy: tuple[threading.Thread, _mlflow_proxy.ThreadingHTTPServer] | None = None
+    stop_event = threading.Event()
+    refresher: threading.Thread | None = None
+    proc: subprocess.Popen | None = None
+    token: str | None = None
+    primary_error: BaseException | None = None
+    try:
+        # The proxy must be live and its URL in state before the first config
+        # write; refreshes then keep writing the same live loopback endpoint.
+        proxy = _start_oss_proxy(state)
+        token = _refresh_token_once(state)
+        env = build_runtime_env(token)
+
+        refresher = threading.Thread(
+            target=_refresh_forever,
+            args=(state, stop_event),
+            daemon=True,
+        )
+        refresher.start()
+
+        proc = subprocess.Popen([SPEC["binary"], *tool_args], env=env)
+        try:
+            returncode = proc.wait()
+        except KeyboardInterrupt:
+            proc.send_signal(signal.SIGINT)
+            returncode = proc.wait()
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         stop_event.set()
-        refresher.join(timeout=1)
+        if refresher is not None:
+            refresher.join(timeout=1)
+        if proxy is not None:
+            proxy_thread, server = proxy
+            restore_error: Exception | None = None
+            try:
+                _restore_direct_oss_config(state, token)
+            except Exception as exc:
+                restore_error = exc
+                print_warning(f"Pi MLflow direct configuration could not be restored ({exc}).")
+            finally:
+                server.shutdown()
+                server.server_close()
+                proxy_thread.join(timeout=1)
+            if restore_error is not None and primary_error is None:
+                raise restore_error
 
     raise SystemExit(returncode)
 
