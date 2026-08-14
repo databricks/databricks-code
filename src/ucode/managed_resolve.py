@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from typing import cast
 
+from ucode.agents import GLOBAL_SETTINGS_AGENTS
 from ucode.databricks import ANTHROPIC_FAMILIES, classify_model_family
 from ucode.state import MANAGED_OVERLAY_KEY
 
@@ -186,8 +187,6 @@ def managed_use_as_global_settings(managed: dict, tool: str) -> bool:
     other agent — a hand-written ``--from-file`` config can't turn it on for an agent that has no
     managed settings path.
     """
-    from ucode.agents import GLOBAL_SETTINGS_AGENTS
-
     if tool not in GLOBAL_SETTINGS_AGENTS:
         return False
     return bool(_agent_entry(managed, tool).get("use_as_global_settings"))

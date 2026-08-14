@@ -1691,7 +1691,7 @@ def _launch_tool(
             # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
             if model and tool != "claude":
                 resolved_model = model
-            # Claude Code's enterprise managed-settings scope (e.g. an Isaac/dbexec install)
+            # Claude Code's enterprise managed-settings scope (e.g. a dbexec install)
             # outranks the --settings file ucode writes AND can't be excluded with --setting-sources,
             # so a model pinned there silently wins over `--model`. Warn so a launch that ignores the
             # requested model looks like the misconfiguration it is, not a ucode bug.

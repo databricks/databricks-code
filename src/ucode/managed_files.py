@@ -8,12 +8,11 @@ the gateway config apply outside ``ucode <agent>``:
   ``/Library/Application Support/ClaudeCode/managed-settings.json`` (macOS)
 - Codex: ``/etc/codex/managed_config.toml`` (Linux + macOS)
 
-The write mirrors isaac's approach (``devtools/ai/llm_lib/core/config.py`` in universe): a **drift
-check** reads the world-readable file WITHOUT sudo and does nothing when it already matches, so the
-common no-op launch never prompts for a password; only a real change shells out to ``sudo`` (temp
-file → ``sudo cp``), clearing and restoring the immutable flag (``chattr``/``chflags``) that a fleet
-golden image may have set. Writing needs root, so the first write (or one after the config changes)
-prompts for the developer's sudo password — the same tradeoff isaac makes.
+The write is guarded by a **drift check**: it reads the world-readable file WITHOUT sudo and does
+nothing when it already matches, so the common no-op launch never prompts for a password; only a
+real change shells out to ``sudo`` (temp file → ``sudo cp``), clearing and restoring the immutable
+flag (``chattr``/``chflags``) that a fleet golden image may have set. Writing needs root, so the
+first write (or one after the config changes) prompts for the developer's sudo password.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from pathlib import Path
 from ucode.config_io import is_dry_run
 from ucode.ui import console, print_err, print_warning
 
-# Absolute path so a stripped PATH (desktop/GUI launchers) still finds it; matches isaac.
+# Absolute path so a stripped PATH (desktop/GUI launchers) still finds it.
 _SUDO = "/usr/bin/sudo"
 
 
@@ -82,8 +81,8 @@ def _sudo_replace(path: Path, desired_text: str) -> None:
     """Replace ``path`` with ``desired_text`` via sudo (temp file → ``sudo cp``), handling immutability.
 
     Writes the payload to a user-owned temp file first (no sudo), then copies it into place with
-    ``sudo`` and makes it world-readable — the same sequence isaac uses so the file it lays down is
-    readable by the agent binary regardless of who launched it.
+    ``sudo`` and makes it world-readable so the file it lays down is readable by the agent binary
+    regardless of who launched it.
     """
     subprocess.run([_SUDO, "mkdir", "-p", str(path.parent)], check=True)
     with tempfile.NamedTemporaryFile(
@@ -113,7 +112,7 @@ def _clear_immutable(path: Path) -> bool:
 
     macOS: preserve JAMF's system-immutable ``schg`` across the update — inspect, unlock only when
     set, and report that it must be restored. Linux: best-effort ``chattr -i`` (not every filesystem
-    supports it), never restored — matching isaac.
+    supports it), never restored.
     """
     try:
         # `path.exists()` stats the file; under a root-locked parent dir (e.g. a 750 /etc/codex we

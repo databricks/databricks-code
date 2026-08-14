@@ -587,9 +587,9 @@ def _write_managed_settings(
     Runs only under use_as_global_settings. The managed file is root-owned and the highest-precedence
     scope, so it applies whether or not `ucode` launches `claude`. The same compose (merge overlay +
     prune stale keys) that produced the private file is applied to the existing managed file, so any
-    real IT-authored keys already there survive. The write goes through the isaac-style sudo path
-    (drift-suppressed, so no password prompt when unchanged). Returns the descriptor for revert
-    tracking, or None when nothing was written.
+    real IT-authored keys already there survive. The write goes through the sudo path in
+    `managed_files` (drift-suppressed, so no password prompt when unchanged). Returns the descriptor
+    for revert tracking, or None when nothing was written.
 
     Relayed launches are skipped: they depend on a per-session loopback refresh proxy that only runs
     during `ucode claude`, so a bare `claude` could not reach the gateway anyway.

@@ -360,7 +360,8 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     # use_as_global_settings: also write the modern overlay to Codex's OS managed config
     # (/etc/codex/managed_config.toml), the highest-precedence scope a bare `codex` reads — so it
     # defaults to the gateway without `--profile ucode`. codex auth self-refreshes via
-    # `ucode auth-token`, so the file keeps working. The write goes through the isaac-style sudo path.
+    # `ucode auth-token`, so the file keeps working. The write goes through the sudo path in
+    # `managed_files`.
     managed_descriptors = None
     if state.get("write_managed_config"):
         managed_descriptors = _write_managed_config(
@@ -394,8 +395,8 @@ def _write_managed_config(
 ) -> list[dict] | None:
     """Merge the modern overlay into Codex's OS managed_config.toml, preserving any other keys there.
 
-    Written via the isaac-style sudo path (drift-suppressed). Returns the descriptor for revert
-    tracking, or None when nothing was written.
+    Written via the sudo path in `managed_files` (drift-suppressed). Returns the descriptor for
+    revert tracking, or None when nothing was written.
     """
     path = _managed_config_path()
     if path is None:
