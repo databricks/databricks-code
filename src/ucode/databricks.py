@@ -1424,6 +1424,10 @@ def _model_service_id(service: dict) -> str | None:
 _MODEL_SERVICES_PAGE_SIZE = 100
 _MODEL_SERVICES_PAGE_RETRIES = 4
 
+# Substrings that mark a failure reason (`HTTP <code> <phrase>: <body>`) as a 404 / NOT_FOUND:
+# the HTTP status line and the Databricks `error_code` carried in the response body.
+_NOT_FOUND_REASON_MARKERS = ("http 404", "not_found")
+
 
 def _get_model_services_page(
     url: str, token: str, *, retries: int = _MODEL_SERVICES_PAGE_RETRIES
@@ -1547,7 +1551,7 @@ def _is_not_found_reason(reason: str | None) -> bool:
     if not reason:
         return False
     lowered = reason.lower()
-    return "http 404" in lowered or "not_found" in lowered
+    return any(marker in lowered for marker in _NOT_FOUND_REASON_MARKERS)
 
 
 def model_service_exists(
