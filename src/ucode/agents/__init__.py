@@ -19,6 +19,7 @@ import subprocess
 from ucode.config_io import ToolSpec
 from ucode.databricks import (
     BEDROCK_PROVIDER_TYPES,
+    ensure_databricks_cli_version,
     get_databricks_token,
     install_ai_tools,
     install_databricks_cli,
@@ -80,11 +81,23 @@ AITOOLS_AGENT_TOKENS = {
     "pi": "pi",
 }
 
+AITOOLS_AGENT_MIN_CLI_VERSIONS = {
+    "gemini": (1, 12, 0),
+    "pi": (1, 12, 0),
+}
+
 
 def install_ai_tools_for_agents(tools: list[str], state: dict) -> None:
     """Install Databricks AI Tools for the coding agents that support them."""
     if state.get("databricks_ai_tools_enabled", True) is False:
         return
+    required_versions = [
+        AITOOLS_AGENT_MIN_CLI_VERSIONS[tool]
+        for tool in tools
+        if tool in AITOOLS_AGENT_MIN_CLI_VERSIONS
+    ]
+    if required_versions:
+        ensure_databricks_cli_version(max(required_versions))
     agents = [AITOOLS_AGENT_TOKENS[tool] for tool in tools if tool in AITOOLS_AGENT_TOKENS]
     install_ai_tools(agents, state.get("profile"))
 

@@ -51,8 +51,8 @@ WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
 AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
-# v1.12.0 adds AI Tools support for every coding agent supported by ucode.
-MIN_DATABRICKS_CLI_VERSION = (1, 12, 0)
+# v1.0.0 is the first release with `databricks aitools`.
+MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 
 
@@ -679,7 +679,9 @@ def _run_databricks_cli_installer(brew_subcommand: str = "install") -> None:
         raise RuntimeError("Failed to install/upgrade Databricks CLI automatically.") from exc
 
 
-def ensure_databricks_cli_version() -> None:
+def ensure_databricks_cli_version(
+    minimum_version: tuple[int, int, int] = MIN_DATABRICKS_CLI_VERSION,
+) -> None:
     try:
         result = run(
             ["databricks", "--version"],
@@ -698,14 +700,14 @@ def ensure_databricks_cli_version() -> None:
         raise RuntimeError(
             f"Could not parse Databricks CLI version from `databricks --version` output: {output!r}"
         )
-    if version < MIN_DATABRICKS_CLI_VERSION:
+    if version < minimum_version:
         current = ".".join(str(n) for n in version)
-        required = ".".join(str(n) for n in MIN_DATABRICKS_CLI_VERSION)
+        required = ".".join(str(n) for n in minimum_version)
         print_warning(
             f"Databricks CLI v{current} is too old (need v{required} or newer). Upgrading..."
         )
         _run_databricks_cli_installer(brew_subcommand="upgrade")
-        ensure_databricks_cli_version()
+        ensure_databricks_cli_version(minimum_version)
 
 
 def install_databricks_cli() -> None:
