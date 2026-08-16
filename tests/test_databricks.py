@@ -1995,10 +1995,19 @@ class TestEnsureDatabricksCliVersion:
         monkeypatch.setattr("os.environ", env)
         ensure_databricks_cli_version()
 
-    def test_auto_upgrades_when_version_too_old(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        ("installed", "minimum_version"),
+        [
+            ("0.299.2", None),
+            ("1.11.0", (1, 12, 0)),
+        ],
+    )
+    def test_auto_upgrades_when_version_too_old(
+        self, tmp_path, monkeypatch, installed, minimum_version
+    ):
         import ucode.databricks as db_mod
 
-        env = self._fake_databricks(tmp_path, "Databricks CLI v0.299.2")
+        env = self._fake_databricks(tmp_path, f"Databricks CLI v{installed}")
         monkeypatch.setattr("os.environ", env)
         upgraded = []
         monkeypatch.setattr(
@@ -2013,10 +2022,13 @@ class TestEnsureDatabricksCliVersion:
         def once(*a, **kw):
             call_count[0] += 1
             if call_count[0] == 1:
-                original()
+                original(*a, **kw)
 
         monkeypatch.setattr(db_mod, "ensure_databricks_cli_version", once)
-        once()
+        if minimum_version is None:
+            once()
+        else:
+            once(minimum_version)
         assert upgraded == ["upgrade"]
 
     def test_raises_when_version_unparseable(self, tmp_path, monkeypatch):

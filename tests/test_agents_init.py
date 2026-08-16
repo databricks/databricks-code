@@ -66,16 +66,33 @@ class TestInstallAiToolsForAgents:
         captured = {}
         monkeypatch.setattr(
             agents_mod,
+            "ensure_databricks_cli_version",
+            lambda minimum: captured.update(minimum_cli_version=minimum),
+        )
+        monkeypatch.setattr(
+            agents_mod,
             "install_ai_tools",
             lambda agents, profile: captured.update(agents=agents, profile=profile),
         )
         return captured
 
-    def test_maps_supported_tools_and_drops_others(self, monkeypatch):
+    def test_maps_supported_tools(self, monkeypatch):
         captured = self._capture(monkeypatch)
-        # gemini and pi aren't supported by `databricks aitools`, so they drop.
-        install_ai_tools_for_agents(["claude", "codex", "gemini", "pi"], {"profile": "prof"})
-        assert captured == {"agents": ["claude-code", "codex"], "profile": "prof"}
+        install_ai_tools_for_agents(
+            ["claude", "codex", "gemini", "opencode", "copilot", "pi"],
+            {"profile": "prof"},
+        )
+        assert captured == {
+            "agents": ["claude-code", "codex", "gemini-cli", "opencode", "copilot", "pi"],
+            "minimum_cli_version": (1, 12, 0),
+            "profile": "prof",
+        }
+
+    @pytest.mark.parametrize("tool", ["gemini", "pi"])
+    def test_requires_new_cli_for_extended_agents(self, monkeypatch, tool):
+        captured = self._capture(monkeypatch)
+        install_ai_tools_for_agents([tool], {"profile": "prof"})
+        assert captured["minimum_cli_version"] == (1, 12, 0)
 
     def test_installed_by_default(self, monkeypatch):
         # Opt-out: absent flag means install.
