@@ -71,6 +71,16 @@ TOOL_ALIASES = {
 DEFAULT_TOOL = "codex"
 BUNDLE_VERSION = 1
 
+# Agents that can mirror ucode's managed config into the tool's NATIVE default config file, so a
+# bare `claude` / `codex` (not just `ucode <agent>`) picks up the gateway settings. This is gated by
+# the admin's `use_as_global_settings` choice in `ucode setup`. Only agents whose gateway auth
+# self-refreshes qualify: claude's `apiKeyHelper` and codex's `ucode auth-token` command both re-mint
+# tokens on their own, so the native file keeps working indefinitely. The other agents bake a
+# short-lived bearer token with no bare-launch refresher (opencode/pi/gemini) or expose no native
+# config file at all (copilot is env-var only), so they're excluded — and `ucode setup` doesn't even
+# ask them the machine-wide question.
+GLOBAL_SETTINGS_AGENTS = frozenset({"claude", "codex"})
+
 # ucode tool -> `databricks aitools` agent id.
 AITOOLS_AGENT_TOKENS = {
     "claude": "claude-code",

@@ -51,7 +51,7 @@ WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
 AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
-# v1.0.0 is the first release with `databricks aitools`.
+# v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 
@@ -428,13 +428,37 @@ def _has_per_user_block(entry: dict) -> bool:
     return False
 
 
+def _per_user_block_threshold(entry: dict) -> Decimal | None:
+    """The dollar amount a per-user hard block trips at, or None when there isn't one.
+
+    Reads ``quantity_threshold`` off the same per-user ``BLOCK_USAGE`` alert that
+    :func:`_has_per_user_block` gates on (``quantity_type`` is ``LIST_PRICE_DOLLARS_USD`` and
+    ``time_period`` is ``MONTH``, so it's a per-user monthly dollar cap). Budget tiers are picked as
+    percentages of this, so surfacing it lets the admin see the dollars a percentage stands for. A
+    block alert without a parseable threshold yields None — the wizard just omits the dollar hint.
+    """
+    for alert in entry.get("alert_configurations") or []:
+        if not isinstance(alert, dict) or alert.get("scope_type") != _PER_USER_ALERT_SCOPE:
+            continue
+        blocks = any(
+            isinstance(action, dict) and action.get("action_type") == _BLOCK_ACTION_TYPE
+            for action in alert.get("action_configurations") or []
+        )
+        if blocks:
+            return _parse_decimal(alert.get("quantity_threshold"))
+    return None
+
+
 def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str | None]:
     """List the AI Gateway budgets that apply to this workspace.
 
-    Returns ``(budgets, reason)`` where each budget is ``{"id", "display_name", "has_per_user_block"}``.
-    ``reason`` is None on success, otherwise it explains why the list is empty. ucode never creates
-    budgets — an admin picks an existing one to attach a spend-routing policy to. ``has_per_user_block``
-    lets the picker hide budgets that can't enforce spend routing (see ``_has_per_user_block``).
+    Returns ``(budgets, reason)`` where each budget is
+    ``{"id", "display_name", "has_per_user_block", "per_user_threshold"}``. ``reason`` is None on
+    success, otherwise it explains why the list is empty. ucode never creates budgets — an admin picks
+    an existing one to attach a spend-routing policy to. ``has_per_user_block`` lets the picker hide
+    budgets that can't enforce spend routing (see ``_has_per_user_block``); ``per_user_threshold`` is
+    the per-user monthly dollar cap (a ``Decimal``, or None when it can't be read) so the tier prompt
+    can show what a tier percentage works out to in dollars.
     """
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}{_WORKSPACE_BUDGETS_API_PATH}"
@@ -459,6 +483,7 @@ def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str 
                 "id": budget_id,
                 "display_name": display_name if isinstance(display_name, str) else "",
                 "has_per_user_block": _has_per_user_block(entry),
+                "per_user_threshold": _per_user_block_threshold(entry),
             }
         )
     if not budgets:
@@ -817,6 +842,11 @@ def list_profile_entries() -> list[dict]:
     """Return raw profile dicts ({"name", "host", "auth_type", ...}) from
     `databricks auth profiles`.
 
+    Each non-PAT profile is returned individually — duplicate hosts (multiple
+    profiles pointing at the same workspace) appear as separate entries so the
+    workspace picker can offer each profile by name. Order matches the CLI's
+    own ordering.
+
     Returns ``[]`` on any failure (CLI missing, timeout, non-zero exit, JSON
     decode error). When ``UCODE_DEBUG=1`` each dropout path logs *why* the
     result was empty so a silently-disappearing workspace picker is
@@ -848,8 +878,7 @@ def get_databricks_profiles() -> list[tuple[str, str]]:
     """Return [(host_url, profile_name), ...] from Databricks CLI profiles."""
     profiles = list_profile_entries()
 
-    # dict dedupes by host (first non-PAT profile wins).
-    out: dict[str, str] = {}
+    out: list[tuple[str, str]] = []
     pat = 0
     for p in profiles:
         host = (p.get("host") or "").rstrip("/")
@@ -859,13 +888,13 @@ def get_databricks_profiles() -> list[tuple[str, str]]:
         if p.get("auth_type") == "pat":
             pat += 1
             continue
-        out.setdefault(host, name)
+        out.append((host, name))
 
     _debug(
         "get_databricks_profiles",
         f"returned={len(out)} total={len(profiles)} pat={pat}",
     )
-    return list(out.items())
+    return out
 
 
 def find_profile_name_for_host(workspace: str) -> str | None:

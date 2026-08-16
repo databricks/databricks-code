@@ -31,6 +31,7 @@ from ucode.databricks import (
     discover_sql_warehouses,
     ensure_databricks_cli_version,
     ensure_pat_bearer,
+    get_databricks_profiles,
     get_databricks_token,
     install_ai_tools,
     list_databricks_apps,
@@ -1569,6 +1570,63 @@ class TestGetDatabricksToken:
         assert f"databricks auth login --host {WS} --profile example-profile" in message
 
 
+class TestGetDatabricksProfiles:
+    def _patched_run(self, monkeypatch, payload: dict, returncode: int = 0) -> None:
+        def fake_run(args, **kwargs):
+            return subprocess.CompletedProcess(args, returncode, stdout=json.dumps(payload))
+
+        monkeypatch.setattr(db_mod, "run", fake_run)
+
+    def test_keeps_duplicate_hosts_as_separate_entries(self, monkeypatch):
+        self._patched_run(
+            monkeypatch,
+            {
+                "profiles": [
+                    {"host": WS, "name": "first", "auth_type": "databricks-cli"},
+                    {"host": WS, "name": "second", "auth_type": "databricks-cli"},
+                    {
+                        "host": "https://other.databricks.com",
+                        "name": "third",
+                        "auth_type": "databricks-cli",
+                    },
+                ]
+            },
+        )
+        profiles = get_databricks_profiles()
+        assert profiles == [
+            (WS, "first"),
+            (WS, "second"),
+            ("https://other.databricks.com", "third"),
+        ]
+
+    def test_skips_pat_profiles(self, monkeypatch):
+        self._patched_run(
+            monkeypatch,
+            {
+                "profiles": [
+                    {"host": WS, "name": "oauth", "auth_type": "databricks-cli"},
+                    {"host": WS, "name": "tokenized", "auth_type": "pat"},
+                ]
+            },
+        )
+        assert get_databricks_profiles() == [(WS, "oauth")]
+
+    def test_strips_trailing_slash_on_host(self, monkeypatch):
+        self._patched_run(
+            monkeypatch,
+            {
+                "profiles": [
+                    {"host": f"{WS}/", "name": "p", "auth_type": "databricks-cli"},
+                ]
+            },
+        )
+        assert get_databricks_profiles() == [(WS, "p")]
+
+    def test_returns_empty_on_non_zero_exit(self, monkeypatch):
+        self._patched_run(monkeypatch, {"profiles": []}, returncode=1)
+        assert get_databricks_profiles() == []
+
+
 class TestListDatabricksConnections:
     def test_lists_paginated_connections_with_workspace_env(self, monkeypatch):
         calls: list[dict] = []
@@ -2823,6 +2881,68 @@ class TestListWorkspaceBudgets:
         )
         budgets, _ = list_workspace_budgets("https://ws", "token")
         assert budgets[0]["has_per_user_block"] is False
+
+    def test_extracts_per_user_block_threshold(self, monkeypatch):
+        # The per-user hard block's `quantity_threshold` is the monthly dollar cap; it's read off the
+        # same alert `has_per_user_block` gates on so the tier prompt can show it. A per-user alert
+        # without a block action (email only) contributes no threshold.
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "capped",
+                        "display_name": "capped",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "quantity_threshold": "500.00",
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
+                    },
+                    {
+                        "budget_configuration_id": "email_only",
+                        "display_name": "email only",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "quantity_threshold": "500.00",
+                                "action_configurations": [{"action_type": self.EMAIL}],
+                            }
+                        ],
+                    },
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        by_id = {b["id"]: b for b in budgets}
+        assert by_id["capped"]["per_user_threshold"] == Decimal("500.00")
+        assert by_id["email_only"]["per_user_threshold"] is None
+
+    def test_missing_threshold_is_none_but_block_still_flagged(self, monkeypatch):
+        # A hard block with no (or unparseable) `quantity_threshold` still enforces routing, so the
+        # budget stays offerable — the tier prompt just omits the dollar hint.
+        self._stub(
+            monkeypatch,
+            {
+                "workspace_ai_gateway_budgets": [
+                    {
+                        "budget_configuration_id": "b",
+                        "display_name": "x",
+                        "alert_configurations": [
+                            {
+                                "scope_type": self.PER_USER,
+                                "action_configurations": [{"action_type": self.BLOCK}],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        budgets, _ = list_workspace_budgets("https://ws", "token")
+        assert budgets[0]["has_per_user_block"] is True
+        assert budgets[0]["per_user_threshold"] is None
 
 
 class TestDiscoverSqlWarehouses:

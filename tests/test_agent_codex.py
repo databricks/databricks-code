@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -529,6 +530,18 @@ class TestCodexDefaultModel:
 
         assert codex.default_model({"codex_models": models}) == "system.ai.gpt-5-5"
 
+    def test_default_model_falls_back_to_first_when_no_versioned_gpt(self):
+        # gpt-oss-* models are in the codex bucket from UC model-services and
+        # expose the responses API, so they're routable even though _parse_gpt
+        # returns None for them (no semantic version to rank).
+        models = ["system.ai.gpt-oss-120b", "system.ai.gpt-oss-20b"]
+        assert codex.default_model({"codex_models": models}) == "system.ai.gpt-oss-120b"
+
+    def test_default_model_prefers_versioned_gpt_over_oss(self):
+        # When both versioned and OSS models are present, the versioned one wins.
+        models = ["system.ai.gpt-oss-120b", "system.ai.gpt-5"]
+        assert codex.default_model({"codex_models": models}) == "system.ai.gpt-5"
+
 
 class TestCodexValidateCmd:
     def test_starts_with_binary(self):
@@ -652,3 +665,56 @@ class TestCodexLaunch:
             codex.launch({"workspace": WS}, [])
         assert exc.value.code == 0
         assert fallbacks == []
+
+
+class TestCodexManagedConfig:
+    """use_as_global_settings: also write Codex's OS managed_config.toml (via sudo, mocked)."""
+
+    def _patch(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        managed_path = tmp_path / "etc-codex" / "managed_config.toml"
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "codex-ucode-config.backup.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+        # Deterministic managed path + a mocked sudo writer that writes straight to disk, so the test
+        # can read the TOML back and NO real sudo/`/etc` write ever happens.
+        monkeypatch.setattr(codex, "_managed_config_path", lambda: managed_path)
+
+        def fake_write_managed(path, text, *, display):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(text, encoding="utf-8")
+            return "written"
+
+        monkeypatch.setattr(codex, "write_managed_file", fake_write_managed)
+        return config_path, managed_path
+
+    def test_writes_managed_config_when_flagged(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
+        codex.write_tool_config(state)
+
+        doc = read_toml_safe(managed_path)
+        assert doc["model_provider"] == "ucode-databricks"
+        assert doc["model"] == "gpt-5"
+        assert "ucode-databricks" in doc["model_providers"]
+
+    def test_managed_config_preserves_other_keys(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        managed_path.parent.mkdir(parents=True, exist_ok=True)
+        managed_path.write_text(
+            'model = "my-own"\napproval_policy = "on-request"\n', encoding="utf-8"
+        )
+        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
+        codex.write_tool_config(state)
+
+        doc = read_toml_safe(managed_path)
+        # ucode pins its own model, but other keys already in the managed file survive.
+        assert doc["approval_policy"] == "on-request"
+        assert doc["model"] == "gpt-5"
+
+    def test_no_managed_write_by_default(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        state = {"workspace": WS, "codex_models": ["gpt-5"]}
+        codex.write_tool_config(state)
+        assert not managed_path.exists()

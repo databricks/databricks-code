@@ -237,6 +237,7 @@ def clear_state() -> None:
 
 
 def mark_tool_managed(state: dict, tool: str, managed_keys: list) -> dict:
+    """Record which config keys ucode manages for ``tool``."""
     managed_configs = dict(state.get("managed_configs") or {})
     managed_configs[tool] = {"keys": list(managed_keys)}
     state["managed_configs"] = managed_configs

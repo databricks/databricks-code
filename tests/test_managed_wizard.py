@@ -8,6 +8,7 @@ managed-config types, the admin gate, and the per-agent model-config shapes.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
@@ -1421,6 +1422,54 @@ class TestBudgetPolicy:
             }
         ]
 
+    def test_shows_per_user_threshold_and_tier_dollars(self):
+        # The admin picks tiers as percentages, so surface the budget's per-user monthly cap and what
+        # each percentage works out to in dollars — otherwise a percentage is a number in a vacuum.
+        budgets = [
+            {
+                "id": BUDGET_ID,
+                "display_name": "eng",
+                "has_per_user_block": True,
+                "per_user_threshold": Decimal("500.00"),
+            }
+        ]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
+            ),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+            patch.object(wizard, "print_note") as note,
+        ):
+            wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        notes = " ".join(str(call.args[0]) for call in note.call_args_list)
+        assert "$500" in notes  # the per-user monthly cap
+        assert "$400" in notes  # 80% of $500
+
+    def test_missing_threshold_skips_the_dollar_hints(self):
+        # A budget whose threshold couldn't be read still works; the prompt just omits the dollars.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
+            ),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+            patch.object(wizard, "print_note") as note,
+        ):
+            policy = wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        notes = " ".join(str(call.args[0]) for call in note.call_args_list)
+        assert "$" not in notes
+        assert policy is not None and policy["tiers"][0]["spending_percentage"] == 0.8
+
     def test_offers_only_the_models_the_agent_was_configured_with(self):
         # Pi's catalog spans every family, so offering the workspace catalog would present four
         # models it was never given — and a tier naming one of them silently misroutes developers.
@@ -1638,6 +1687,25 @@ class TestSummary:
         out = capsys.readouterr().out
         assert "system.ai.gemini-3-flash" in out
         assert "models:" not in out
+
+    def test_scope_label_only_for_global_capable_agents(self, capsys):
+        # claude/codex can use global settings, so they carry the scope; gemini can't, so it doesn't.
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {"default_model": "system.ai.claude-opus-4-8"},
+                    "use_as_global_settings": True,
+                },
+                "gemini": {"model_config": {"default_model": "system.ai.gemini-3-flash"}},
+            },
+        }
+        wizard._render_summary(WORKSPACE, manifest)
+        out = capsys.readouterr().out
+        assert "global settings" in out
+        # The gemini line names its model but carries no global-settings/ucode-only scope.
+        gemini_line = next(line for line in out.splitlines() if "gemini-3-flash" in line)
+        assert "ucode-only" not in gemini_line and "global settings" not in gemini_line
 
 
 class TestSetupFromFile:

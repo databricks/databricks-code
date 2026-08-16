@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+import tomlkit
+
 from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
     APP_DIR,
@@ -24,6 +26,7 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
+from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
@@ -354,22 +357,79 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         enabled=smart_routing_enabled(state) and provider is None,
     )
     write_toml_file(CODEX_CONFIG_PATH, doc)
+    # use_as_global_settings: also write the modern overlay to Codex's OS managed config
+    # (/etc/codex/managed_config.toml), the highest-precedence scope a bare `codex` reads — so it
+    # defaults to the gateway without `--profile ucode`. codex auth self-refreshes via
+    # `ucode auth-token`, so the file keeps working. The write goes through the sudo path in
+    # `managed_files`.
+    if state.get("write_managed_config"):
+        _write_managed_config(
+            workspace, chosen_model, databricks_profile, bool(state.get("use_pat")), provider
+        )
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
     return state
 
 
+def _is_gpt_family(model: str) -> bool:
+    """Return True if this id is in the GPT family (versioned or OSS variants)."""
+    tail = model.split("/")[-1]
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    return tail.startswith("gpt-")
+
+
+def _managed_config_path() -> Path | None:
+    """OS-level Codex managed config file, or None on unsupported platforms.
+
+    Linux and macOS use ``/etc/codex/managed_config.toml`` (root-owned, highest precedence). See
+    https://learn.chatgpt.com/docs/enterprise/managed-configuration. Codex also supports a
+    ``~/.codex/managed_config.toml`` on Windows, but ucode's write path is sudo/Unix-only
+    (see :func:`managed_files.managed_files_supported`), so Windows returns None here too.
+    """
+    if current_os() in (OS.LINUX, OS.MACOS):
+        return Path("/etc/codex/managed_config.toml")
+    return None
+
+
+def _write_managed_config(
+    workspace: str,
+    model: str | None,
+    databricks_profile: str | None,
+    use_pat: bool,
+    provider: str | None,
+) -> None:
+    """Merge the modern overlay into Codex's OS managed_config.toml, preserving any other keys there.
+
+    Written via the sudo path in `managed_files` (drift-suppressed).
+    """
+    path = _managed_config_path()
+    if path is None:
+        print_warning_err(
+            "Machine-wide Codex settings aren't supported on this platform; skipped the managed "
+            "config write."
+        )
+        return
+    overlay = render_overlay(
+        workspace, model, databricks_profile, use_pat=use_pat, provider=provider
+    )
+    doc = read_toml_safe(path)
+    deep_merge_dict(doc, overlay)
+    if provider:
+        # deep_merge can't drop keys; clear a `model` a prior non-provider run pinned.
+        doc.pop("model", None)
+    write_managed_file(path, tomlkit.dumps(doc), display="Codex")
+
+
 def default_model(state: dict) -> str | None:
-    """Pick the newest GPT model when multiple are available.
+    """Pick the best available codex model.
 
-    A managed config's ``codex_default_model`` takes priority. The discovery list
-    is alphabetically sorted, which can put "databricks-gpt-5" ahead of
-    "databricks-gpt-5-5". Prefer the highest semantic version instead.
-
-    Only GPT-parseable ids are considered. Codex routes the chosen ``model``
-    through the gateway as-is, so a non-GPT entry (e.g. ``moonshotai/kimi-k2.5``)
-    would be rejected with a Unity Catalog endpoint-name error. When no
-    candidate parses as GPT we return None rather than pinning an unroutable id.
+    A managed config's ``codex_default_model`` takes priority. Among versioned
+    GPT ids (e.g. ``system.ai.gpt-5``, ``system.ai.gpt-5-6-luna``) the highest
+    semantic version wins. When no versioned GPT is present but other codex-family
+    ids are available (e.g. ``system.ai.gpt-oss-120b``), the first of those is
+    used — UC model-services only places ids in the codex bucket when they expose
+    the responses API, so any id there is routable.
     """
     if isinstance(state.get("codex_default_model"), str):
         return state.get("codex_default_model")
@@ -377,15 +437,21 @@ def default_model(state: dict) -> str | None:
     parsed: list[tuple[str, tuple[int, int | None, int | None, str]]] = [
         (mid, gpt) for mid in codex_models if (gpt := _parse_gpt(mid)) is not None
     ]
-    if not parsed:
-        return None
+    if parsed:
 
-    def _gpt_version_key(entry: tuple[str, tuple[int, int | None, int | None, str]]):
-        major, minor, patch, suffix = entry[1]
-        base_bonus = 1 if not suffix else 0
-        return (major, minor or 0, patch or 0, base_bonus)
+        def _gpt_version_key(entry: tuple[str, tuple[int, int | None, int | None, str]]):
+            major, minor, patch, suffix = entry[1]
+            base_bonus = 1 if not suffix else 0
+            return (major, minor or 0, patch or 0, base_bonus)
 
-    return max(parsed, key=_gpt_version_key)[0]
+        return max(parsed, key=_gpt_version_key)[0]
+
+    # No versioned GPT found. Fall back to the first GPT-family id (gpt-*
+    # after stripping the system.ai. prefix). gpt-oss-* models are confirmed
+    # routable through the responses API; non-GPT ids (e.g. moonshotai/kimi-k2.5)
+    # would be rejected by the gateway, so they stay excluded.
+    gpt_family = [m for m in codex_models if _is_gpt_family(m)]
+    return gpt_family[0] if gpt_family else None
 
 
 # codex rejects the global --profile on subcommands that don't accept it
