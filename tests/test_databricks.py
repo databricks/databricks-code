@@ -1812,13 +1812,11 @@ class TestListDatabricksApps:
 
 
 class TestEnsureAiGateway:
-    def test_v3_only_workspace_succeeds(self, monkeypatch):
+    def test_v3_only_workspace_succeeds_without_v2_probe(self, monkeypatch):
         calls: list[str] = []
 
         def fake_get(url, token):
             calls.append(url)
-            if "/api/ai-gateway/v2/endpoints" in url:
-                return None, "HTTP 404: Not Found"
             return {"model_services": []}, None
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
@@ -1826,57 +1824,61 @@ class TestEnsureAiGateway:
         db_mod.ensure_ai_gateway(WS, "fake-token")
 
         assert calls == [
-            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
-            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"
         ]
 
-    def test_v2_only_workspace_succeeds_without_v3_probe(self, monkeypatch):
+    def test_v2_only_workspace_succeeds_after_v3_probe(self, monkeypatch):
         calls: list[str] = []
 
         def fake_get(url, token):
             calls.append(url)
+            if "/api/2.1/unity-catalog/model-services" in url:
+                return None, "HTTP 404: Not Found"
             return {"endpoints": []}, None
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
         db_mod.ensure_ai_gateway(WS, "fake-token")
 
-        assert calls == [f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1"]
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
+        ]
 
-    def test_v2_forbidden_still_succeeds_when_v3_is_available(self, monkeypatch):
+    def test_v3_forbidden_still_succeeds_when_v2_is_available(self, monkeypatch):
         calls: list[str] = []
 
         def fake_get(url, token):
             calls.append(url)
-            if "/api/ai-gateway/v2/endpoints" in url:
+            if "/api/2.1/unity-catalog/model-services" in url:
                 return None, "HTTP 403: Forbidden"
-            return {"model_services": []}, None
+            return {"endpoints": []}, None
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
         db_mod.ensure_ai_gateway(WS, "fake-token")
 
         assert calls == [
-            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
             f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
         ]
 
     def test_neither_gateway_available_raises(self, monkeypatch):
-        reasons = iter(["HTTP 404: V2 missing", "HTTP 404: V3 missing"])
+        reasons = iter(["HTTP 404: V3 missing", "HTTP 404: V2 missing"])
         monkeypatch.setattr(
             db_mod,
             "_http_get_json",
             lambda url, token: (None, next(reasons)),
         )
 
-        with pytest.raises(RuntimeError, match="neither V2") as excinfo:
+        with pytest.raises(RuntimeError, match="neither V3") as excinfo:
             db_mod.ensure_ai_gateway(WS, "fake-token")
 
         message = str(excinfo.value)
         assert "HTTP 404: V2 missing" in message
         assert "HTTP 404: V3 missing" in message
 
-    def test_v2_auth_failure_does_not_probe_v3(self, monkeypatch):
+    def test_v3_auth_failure_does_not_probe_v2(self, monkeypatch):
         calls: list[str] = []
 
         def fake_get(url, token):
@@ -1888,7 +1890,25 @@ class TestEnsureAiGateway:
         with pytest.raises(RuntimeError, match="rejected"):
             db_mod.ensure_ai_gateway(WS, "fake-token")
 
-        assert calls == [f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1"]
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"
+        ]
+
+    def test_v3_forbidden_and_v2_unavailable_reports_permission_error(self, monkeypatch):
+        reasons = iter(["HTTP 403: Missing Unity Catalog grants", "HTTP 404: V2 missing"])
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: (None, next(reasons)),
+        )
+
+        with pytest.raises(RuntimeError, match="permission") as excinfo:
+            db_mod.ensure_ai_gateway(WS, "fake-token")
+
+        message = str(excinfo.value)
+        assert "USE SCHEMA" in message
+        assert "rejected the access token" not in message
+        assert "not enabled" not in message
 
 
 class TestEnsureAiGatewayV2:

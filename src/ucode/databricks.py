@@ -2875,25 +2875,39 @@ def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
     )
 
 
+def _raise_ai_gateway_permission_failure(
+    workspace: str, v3_reason: str | None, v2_reason: str | None
+) -> NoReturn:
+    raise RuntimeError(
+        f"Databricks AI Gateway access could not be verified on {workspace} because a probe "
+        f"was forbidden: V3 ({v3_reason or 'unknown error'}); "
+        f"V2 ({v2_reason or 'unknown error'}). The V3 probe requires permission to list "
+        "Unity Catalog model services. Verify USE CATALOG on `system`, USE SCHEMA on "
+        "`system.ai`, and the caller's workspace permissions."
+    )
+
+
 def ensure_ai_gateway(workspace: str, token: str) -> None:
     """Pass if either AI Gateway V2 or V3 is available."""
+    v3_ok, v3_reason = _probe_ai_gateway_v3(workspace, token)
+    if v3_ok:
+        return
+    if v3_reason and _looks_like_definitive_auth_failure(v3_reason):
+        _raise_ai_gateway_auth_failure(workspace, v3_reason)
+
     v2_ok, v2_reason = _probe_ai_gateway_v2(workspace, token)
     if v2_ok:
         return
     if v2_reason and _looks_like_definitive_auth_failure(v2_reason):
         _raise_ai_gateway_auth_failure(workspace, v2_reason)
-
-    v3_ok, v3_reason = _probe_ai_gateway_v3(workspace, token)
-    if v3_ok:
-        return
-    if v3_reason and _looks_like_auth_failure(v3_reason):
-        _raise_ai_gateway_auth_failure(workspace, v3_reason)
-    if v2_reason and _looks_like_auth_failure(v2_reason):
-        _raise_ai_gateway_auth_failure(workspace, v2_reason)
+    if any(
+        reason and _looks_like_permission_failure(reason) for reason in (v3_reason, v2_reason)
+    ):
+        _raise_ai_gateway_permission_failure(workspace, v3_reason, v2_reason)
 
     raise RuntimeError(
-        "Databricks AI Gateway is not enabled on this workspace: neither V2 "
-        f"({v2_reason or 'unknown error'}) nor V3 ({v3_reason or 'unknown error'}) is available. "
+        "Databricks AI Gateway is not enabled on this workspace: neither V3 "
+        f"({v3_reason or 'unknown error'}) nor V2 ({v2_reason or 'unknown error'}) is available. "
         f"See {AI_GATEWAY_V2_DOCS_URL}"
     )
 
@@ -2950,6 +2964,10 @@ def _looks_like_definitive_auth_failure(reason: str) -> bool:
     if "HTTP 401" in reason:
         return True
     return "HTTP 400" in reason and "invalid token" in reason.lower()
+
+
+def _looks_like_permission_failure(reason: str) -> bool:
+    return "HTTP 403" in reason
 
 
 CODING_AGENT_RECOMMEND_MODEL_PATH = "/api/ai-gateway/v2/coding-agent-configs:recommendModel"
