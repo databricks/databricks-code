@@ -18,6 +18,7 @@ from ucode.agents import (
     configure_tool,
     ensure_bootstrap_dependencies,
     ensure_provider_state,
+    install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
     provider_permission_error,
@@ -769,6 +770,7 @@ def configure_workspace_command(
         )
         state = states[0]
         state = configure_single_tool(tool, state)
+        install_databricks_ai_tools_for_agents([tool], state)
         spec = TOOL_SPECS[tool]
         console.print(
             Panel(

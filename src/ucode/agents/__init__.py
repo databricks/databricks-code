@@ -89,7 +89,7 @@ AITOOLS_AGENT_TOKENS = {
 }
 
 
-def install_ai_tools_for_agents(tools: list[str], state: dict) -> None:
+def install_databricks_ai_tools_for_agents(tools: list[str], state: dict) -> None:
     """Install Databricks AI Tools for the coding agents that support them
     (gemini/pi have no ``aitools`` support and are dropped)."""
     if state.get("databricks_ai_tools_enabled", True) is False:
@@ -429,7 +429,6 @@ def configure_single_tool(tool: str, state: dict) -> dict:
     available_tools = list(set((state.get("available_tools") or []) + [tool]))
     state["available_tools"] = available_tools
     save_state(state)
-    install_ai_tools_for_agents([tool], state)
     return state
 
 
@@ -462,7 +461,7 @@ def configure_selected_tools(state: dict, tools: list[str]) -> dict:
     existing = state.get("available_tools") or []
     state["available_tools"] = sorted(set(existing) | set(tools))
     save_state(state)
-    install_ai_tools_for_agents(tools, state)
+    install_databricks_ai_tools_for_agents(tools, state)
     return state
 
 
