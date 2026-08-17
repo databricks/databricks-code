@@ -2880,7 +2880,7 @@ def ensure_ai_gateway(workspace: str, token: str) -> None:
     v2_ok, v2_reason = _probe_ai_gateway_v2(workspace, token)
     if v2_ok:
         return
-    if v2_reason and _looks_like_auth_failure(v2_reason):
+    if v2_reason and _looks_like_definitive_auth_failure(v2_reason):
         _raise_ai_gateway_auth_failure(workspace, v2_reason)
 
     v3_ok, v3_reason = _probe_ai_gateway_v3(workspace, token)
@@ -2888,6 +2888,8 @@ def ensure_ai_gateway(workspace: str, token: str) -> None:
         return
     if v3_reason and _looks_like_auth_failure(v3_reason):
         _raise_ai_gateway_auth_failure(workspace, v3_reason)
+    if v2_reason and _looks_like_auth_failure(v2_reason):
+        _raise_ai_gateway_auth_failure(workspace, v2_reason)
 
     raise RuntimeError(
         "Databricks AI Gateway is not enabled on this workspace: neither V2 "
@@ -2937,6 +2939,17 @@ def _looks_like_auth_failure(reason: str) -> bool:
     if "HTTP 400" in reason and "invalid token" in reason.lower():
         return True
     return False
+
+
+def _looks_like_definitive_auth_failure(reason: str) -> bool:
+    """True when retrying another workspace API cannot rescue this token.
+
+    A 403 can be endpoint-specific authorization, so the version-agnostic
+    preflight must still try V3 before surfacing it as an auth failure.
+    """
+    if "HTTP 401" in reason:
+        return True
+    return "HTTP 400" in reason and "invalid token" in reason.lower()
 
 
 CODING_AGENT_RECOMMEND_MODEL_PATH = "/api/ai-gateway/v2/coding-agent-configs:recommendModel"

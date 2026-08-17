@@ -1843,6 +1843,24 @@ class TestEnsureAiGateway:
 
         assert calls == [f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1"]
 
+    def test_v2_forbidden_still_succeeds_when_v3_is_available(self, monkeypatch):
+        calls: list[str] = []
+
+        def fake_get(url, token):
+            calls.append(url)
+            if "/api/ai-gateway/v2/endpoints" in url:
+                return None, "HTTP 403: Forbidden"
+            return {"model_services": []}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        db_mod.ensure_ai_gateway(WS, "fake-token")
+
+        assert calls == [
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+        ]
+
     def test_neither_gateway_available_raises(self, monkeypatch):
         reasons = iter(["HTTP 404: V2 missing", "HTTP 404: V3 missing"])
         monkeypatch.setattr(
