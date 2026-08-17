@@ -1910,6 +1910,21 @@ class TestEnsureAiGateway:
         assert "rejected the access token" not in message
         assert "not enabled" not in message
 
+    def test_v2_forbidden_and_v3_unavailable_reports_permission_error(self, monkeypatch):
+        reasons = iter(["HTTP 404: V3 missing", "HTTP 403: V2 forbidden"])
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: (None, next(reasons)),
+        )
+
+        with pytest.raises(RuntimeError, match="workspace permissions") as excinfo:
+            db_mod.ensure_ai_gateway(WS, "fake-token")
+
+        message = str(excinfo.value)
+        assert "V2 access could not be verified" in message
+        assert "USE SCHEMA" not in message
+
 
 class TestEnsureAiGatewayV2:
     """Test ensure_ai_gateway_v2 without real network calls.

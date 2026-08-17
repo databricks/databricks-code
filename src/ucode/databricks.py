@@ -2875,15 +2875,24 @@ def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
     )
 
 
-def _raise_ai_gateway_permission_failure(
-    workspace: str, v3_reason: str | None, v2_reason: str | None
+def _raise_ai_gateway_v3_permission_failure(
+    workspace: str, v3_reason: str, v2_reason: str | None
 ) -> NoReturn:
     raise RuntimeError(
-        f"Databricks AI Gateway access could not be verified on {workspace} because a probe "
-        f"was forbidden: V3 ({v3_reason or 'unknown error'}); "
-        f"V2 ({v2_reason or 'unknown error'}). The V3 probe requires permission to list "
-        "Unity Catalog model services. Verify USE CATALOG on `system`, USE SCHEMA on "
-        "`system.ai`, and the caller's workspace permissions."
+        f"Databricks AI Gateway V3 access could not be verified on {workspace} ({v3_reason}). "
+        f"The V2 fallback also failed ({v2_reason or 'unknown error'}). The V3 probe requires "
+        "permission to list Unity Catalog model services. Verify USE CATALOG on `system` and "
+        "USE SCHEMA on `system.ai`."
+    )
+
+
+def _raise_ai_gateway_v2_permission_failure(
+    workspace: str, v2_reason: str, v3_reason: str | None
+) -> NoReturn:
+    raise RuntimeError(
+        f"Databricks AI Gateway V2 access could not be verified on {workspace} ({v2_reason}). "
+        f"The V3 probe also failed ({v3_reason or 'unknown error'}). Verify the caller's "
+        "workspace permissions for the AI Gateway V2 endpoints listing."
     )
 
 
@@ -2900,10 +2909,10 @@ def ensure_ai_gateway(workspace: str, token: str) -> None:
         return
     if v2_reason and _looks_like_definitive_auth_failure(v2_reason):
         _raise_ai_gateway_auth_failure(workspace, v2_reason)
-    if any(
-        reason and _looks_like_permission_failure(reason) for reason in (v3_reason, v2_reason)
-    ):
-        _raise_ai_gateway_permission_failure(workspace, v3_reason, v2_reason)
+    if v3_reason and _looks_like_permission_failure(v3_reason):
+        _raise_ai_gateway_v3_permission_failure(workspace, v3_reason, v2_reason)
+    if v2_reason and _looks_like_permission_failure(v2_reason):
+        _raise_ai_gateway_v2_permission_failure(workspace, v2_reason, v3_reason)
 
     raise RuntimeError(
         "Databricks AI Gateway is not enabled on this workspace: neither V3 "
