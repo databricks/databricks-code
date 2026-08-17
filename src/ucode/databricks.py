@@ -2921,49 +2921,6 @@ def ensure_ai_gateway(workspace: str, token: str) -> None:
     )
 
 
-def ensure_ai_gateway_v2(workspace: str, token: str) -> None:
-    """Probe AI Gateway v2 and raise if unavailable.
-
-    Uses the dedicated v2 listing endpoint `GET /api/ai-gateway/v2/endpoints`:
-    a 200 response (even with an empty list) means v2 is wired up on this
-    workspace — a "no endpoints provisioned" case will surface naturally in
-    downstream discovery. Failure branches:
-
-    - 401 / 403 / 400 with `Invalid Token`: the token is bad for *this*
-      workspace.
-    - 404: AI Gateway V2 is not enabled on this workspace — point at the docs.
-    - other (5xx, network errors): surface the reason verbatim.
-    """
-    ok, reason = _probe_ai_gateway_v2(workspace, token)
-    if ok:
-        return
-    reason_str = reason or "unknown error"
-    if _looks_like_auth_failure(reason_str):
-        _raise_ai_gateway_auth_failure(workspace, reason_str)
-    if "HTTP 404" in reason_str:
-        raise RuntimeError(
-            "Databricks Unity AI Gateway is not enabled on this workspace "
-            f"({reason_str}). See {AI_GATEWAY_V2_DOCS_URL}"
-        )
-    raise RuntimeError(
-        "Databricks Unity AI Gateway probe failed on this workspace "
-        f"({reason_str}). See {AI_GATEWAY_V2_DOCS_URL}"
-    )
-
-
-def _looks_like_auth_failure(reason: str) -> bool:
-    """True when the gateway response signals the token is not accepted.
-
-    Covers 401/403 directly and the gateway's 400 + `Invalid Token` body
-    (which happens when the bearer is valid but issued for a different
-    workspace)."""
-    if "HTTP 401" in reason or "HTTP 403" in reason:
-        return True
-    if "HTTP 400" in reason and "invalid token" in reason.lower():
-        return True
-    return False
-
-
 def _looks_like_definitive_auth_failure(reason: str) -> bool:
     """True when retrying another workspace API cannot rescue this token.
 

@@ -12,7 +12,6 @@ import pytest
 
 import ucode.databricks as db_mod
 from ucode.databricks import (
-    AI_GATEWAY_V2_DOCS_URL,
     CODING_AGENT_RECOMMEND_MODEL_PATH,
     _format_subprocess_result,
     _parse_databricks_cli_version,
@@ -1926,128 +1925,9 @@ class TestEnsureAiGateway:
         assert "USE SCHEMA" not in message
 
 
-class TestEnsureAiGatewayV2:
-    """Test ensure_ai_gateway_v2 without real network calls.
-
-    The probe is `GET /api/ai-gateway/v2/endpoints`: a successful JSON
-    response means v2 is wired up (even if `endpoints` is empty), while
-    404/401/403/network errors all raise a RuntimeError with the docs URL.
-    """
-
-    @staticmethod
-    def _mock_json_response(body: str):
-        from unittest.mock import MagicMock
-
-        mock_resp = MagicMock()
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = body.encode("utf-8")
-        return mock_resp
-
-    @staticmethod
-    def _http_error(code: int, msg: str, body: str = ""):
-        import io
-        from unittest.mock import MagicMock
-        from urllib.error import HTTPError
-
-        fp = io.BytesIO(body.encode("utf-8")) if body else None
-        return HTTPError(url="", code=code, msg=msg, hdrs=MagicMock(), fp=fp)
-
-    def test_raises_on_404(self):
-        from unittest.mock import patch
-
-        exc = self._http_error(404, "Not Found")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
-
-            with pytest.raises(RuntimeError, match=AI_GATEWAY_V2_DOCS_URL) as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            assert "not enabled" in str(excinfo.value)
-
-    def test_raises_on_401_with_auth_hint(self):
-        from unittest.mock import patch
-
-        exc = self._http_error(401, "Unauthorized")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
-
-            with pytest.raises(RuntimeError, match="401") as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            message = str(excinfo.value)
-            assert "rejected" in message.lower()
-            assert "databricks auth login" in message
-
-    def test_raises_on_400_invalid_token_with_auth_hint(self):
-        """400 + body `Invalid Token` is the misleading-error case from issue #84."""
-        from unittest.mock import patch
-
-        exc = self._http_error(400, "Bad Request", body="Invalid Token")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
-
-            with pytest.raises(RuntimeError) as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            message = str(excinfo.value)
-            # The bug we are fixing: must NOT collapse to the generic
-            # "v2 not available" message — must call out the auth failure
-            # and point at re-login.
-            assert "Invalid Token" in message
-            assert "rejected" in message.lower()
-            assert "databricks auth login" in message
-
-    def test_400_without_invalid_token_falls_through_to_generic(self):
-        """A 400 that is *not* an auth failure should still surface the body."""
-        from unittest.mock import patch
-
-        exc = self._http_error(400, "Bad Request", body="some other detail")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
-
-            with pytest.raises(RuntimeError, match=AI_GATEWAY_V2_DOCS_URL) as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            assert "some other detail" in str(excinfo.value)
-
-    def test_raises_on_url_error(self):
-        from unittest.mock import patch
-        from urllib.error import URLError
-
-        with patch(
-            "ucode.databricks.urllib_request.urlopen",
-            side_effect=URLError("connection refused"),
-        ):
-            from ucode.databricks import ensure_ai_gateway_v2
-
-            with pytest.raises(RuntimeError, match=AI_GATEWAY_V2_DOCS_URL):
-                ensure_ai_gateway_v2(WS, "fake-token")
-
-    def test_succeeds_with_endpoints_list(self):
-        from unittest.mock import patch
-
-        with patch(
-            "ucode.databricks.urllib_request.urlopen",
-            return_value=self._mock_json_response('{"endpoints": [{"name": "foo"}]}'),
-        ):
-            from ucode.databricks import ensure_ai_gateway_v2
-
-            ensure_ai_gateway_v2(WS, "fake-token")  # should not raise
-
-    def test_succeeds_with_empty_endpoints_list(self):
-        from unittest.mock import patch
-
-        # A 200 with no endpoints still means v2 is wired up on this workspace —
-        # downstream discovery will surface "no models" with a clearer reason.
-        with patch(
-            "ucode.databricks.urllib_request.urlopen",
-            return_value=self._mock_json_response('{"endpoints": []}'),
-        ):
-            from ucode.databricks import ensure_ai_gateway_v2
-
-            ensure_ai_gateway_v2(WS, "fake-token")  # should not raise
-
-
 class TestHttpGetJsonReason:
     """The `reason` string returned by `_http_get_json` must include the response body
-    so callers (e.g. ensure_ai_gateway_v2) can route on it. Before issue #84's fix
+    so callers (e.g. ensure_ai_gateway) can route on it. Before issue #84's fix
     the body was logged only when UCODE_DEBUG=1 and dropped from the bubbled error."""
 
     @staticmethod
