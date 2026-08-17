@@ -41,7 +41,7 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
-    ensure_ai_gateway_v2,
+    ensure_ai_gateway,
     ensure_databricks_auth,
     ensure_pat_bearer,
     find_profile_name_for_host,
@@ -543,7 +543,7 @@ def configure_shared_state(
             state["profile"] = profile
     with spinner("Verifying Unity AI Gateway..."):
         token = get_databricks_token(workspace, profile)
-        ensure_ai_gateway_v2(workspace, token)
+        ensure_ai_gateway(workspace, token)
     print_success("Unity AI Gateway detected")
 
     want_claude = (

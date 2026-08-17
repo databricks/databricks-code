@@ -1,5 +1,5 @@
 """Databricks workspace integration: CLI auth, token retrieval, model
-discovery, AI Gateway v2 enforcement, SQL warehouse discovery, URL builders."""
+discovery, AI Gateway checks, SQL warehouse discovery, URL builders."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from concurrent.futures import (
 )
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal, NamedTuple, cast, overload
+from typing import Literal, NamedTuple, NoReturn, cast, overload
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import quote, urlencode, urlparse
@@ -2852,6 +2852,50 @@ def fetch_codex_models(workspace: str, token: str) -> list[str]:
     return models
 
 
+def _probe_ai_gateway_v2(workspace: str, token: str) -> tuple[bool, str | None]:
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}/api/ai-gateway/v2/endpoints?page_size=1"
+    payload, reason = _http_get_json(url, token)
+    return payload is not None, reason
+
+
+def _probe_ai_gateway_v3(workspace: str, token: str) -> tuple[bool, str | None]:
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}/api/2.1/unity-catalog/model-services?page_size=1"
+    payload, reason = _http_get_json(url, token)
+    return payload is not None, reason
+
+
+def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
+    raise RuntimeError(
+        f"Databricks rejected the access token for {workspace} ({reason}). "
+        f"Try:\n"
+        f"  databricks auth logout --host {workspace}\n"
+        f"  databricks auth login --host {workspace}"
+    )
+
+
+def ensure_ai_gateway(workspace: str, token: str) -> None:
+    """Pass if either AI Gateway V2 or V3 is available."""
+    v2_ok, v2_reason = _probe_ai_gateway_v2(workspace, token)
+    if v2_ok:
+        return
+    if v2_reason and _looks_like_auth_failure(v2_reason):
+        _raise_ai_gateway_auth_failure(workspace, v2_reason)
+
+    v3_ok, v3_reason = _probe_ai_gateway_v3(workspace, token)
+    if v3_ok:
+        return
+    if v3_reason and _looks_like_auth_failure(v3_reason):
+        _raise_ai_gateway_auth_failure(workspace, v3_reason)
+
+    raise RuntimeError(
+        "Databricks AI Gateway is not enabled on this workspace: neither V2 "
+        f"({v2_reason or 'unknown error'}) nor V3 ({v3_reason or 'unknown error'}) is available. "
+        f"See {AI_GATEWAY_V2_DOCS_URL}"
+    )
+
+
 def ensure_ai_gateway_v2(workspace: str, token: str) -> None:
     """Probe AI Gateway v2 and raise if unavailable.
 
@@ -2865,19 +2909,12 @@ def ensure_ai_gateway_v2(workspace: str, token: str) -> None:
     - 404: AI Gateway V2 is not enabled on this workspace — point at the docs.
     - other (5xx, network errors): surface the reason verbatim.
     """
-    hostname = workspace_hostname(workspace)
-    url = f"https://{hostname}/api/ai-gateway/v2/endpoints?page_size=1"
-    payload, reason = _http_get_json(url, token)
-    if payload is not None:
+    ok, reason = _probe_ai_gateway_v2(workspace, token)
+    if ok:
         return
     reason_str = reason or "unknown error"
     if _looks_like_auth_failure(reason_str):
-        raise RuntimeError(
-            f"Databricks rejected the access token for {workspace} ({reason_str}). "
-            f"Try:\n"
-            f"  databricks auth logout --host {workspace}\n"
-            f"  databricks auth login --host {workspace}"
-        )
+        _raise_ai_gateway_auth_failure(workspace, reason_str)
     if "HTTP 404" in reason_str:
         raise RuntimeError(
             "Databricks Unity AI Gateway is not enabled on this workspace "
