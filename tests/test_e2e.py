@@ -748,7 +748,7 @@ class TestGeminiFreshInstall:
 
 
 class TestOpencodeLaunch:
-    """Run opencode against every available opencode model (anthropic + gemini)."""
+    """Run opencode against every available model across all four providers."""
 
     # Models that hang opencode well past 180s on the staging gateway with
     # no stderr beyond the initial `> build · <model>` line, while every
@@ -936,6 +936,8 @@ class TestPiLaunch:
             out.append(("codex", model))
         for model in e2e_state.get("gemini_models") or []:
             out.append(("gemini", model))
+        for model in e2e_state.get("oss_models") or []:
+            out.append(("oss", model))
         return out
 
     def test_launch_pi_per_model(self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token):
@@ -953,10 +955,14 @@ class TestPiLaunch:
         pi_home = tmp_path / "pi-home"
         pi_dir = pi_home / ".pi" / "agent"
         config_path = pi_dir / "models.json"
+        settings_path = pi_dir / "settings.json"
         backup_path = tmp_path / "pi-models.backup.json"
+        settings_backup_path = tmp_path / "pi-settings.backup.json"
         monkeypatch.setattr(pi, "PI_UCODE_HOME", pi_home)
         monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_PATH", settings_path)
         monkeypatch.setattr(pi, "PI_BACKUP_PATH", backup_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_BACKUP_PATH", settings_backup_path)
 
         failures = []
         for family, model in models:

@@ -130,9 +130,9 @@ from ucode.usage import usage as usage_report
 
 _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
     "claude": ("claude", "opencode", "copilot", "pi"),
-    "codex": ("codex", "copilot", "pi"),
+    "codex": ("codex", "opencode", "copilot", "pi"),
     "gemini": ("gemini", "opencode", "pi"),
-    "oss": ("opencode",),
+    "oss": ("opencode", "pi"),
 }
 
 
@@ -550,8 +550,10 @@ def configure_shared_state(
         fetch_all or "claude" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools
     )
     want_gemini = fetch_all or "gemini" in tools or "opencode" in tools or "pi" in tools
-    want_codex = fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools
-    want_oss = fetch_all or "opencode" in tools
+    want_codex = (
+        fetch_all or "codex" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools
+    )
+    want_oss = fetch_all or "opencode" in tools or "pi" in tools
 
     claude_reason: str | None = None
     gemini_reason: str | None = None
@@ -605,6 +607,8 @@ def configure_shared_state(
                 oss_models, oss_reason = ms_oss, ms_reason
         if claude_models:
             opencode_models["anthropic"] = list(claude_models.values())
+        if codex_models:
+            opencode_models["openai"] = codex_models
         if gemini_models:
             opencode_models["gemini"] = gemini_models
         if oss_models:

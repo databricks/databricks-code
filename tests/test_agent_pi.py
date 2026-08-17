@@ -17,6 +17,7 @@ def _base_urls() -> dict[str, str]:
         "claude": f"{WS}/ai-gateway/anthropic",
         "openai": f"{WS}/ai-gateway/codex/v1",
         "gemini": f"{WS}/ai-gateway/gemini/v1beta",
+        "oss": f"{WS}/ai-gateway/mlflow/v1",
     }
 
 
@@ -26,6 +27,7 @@ def _empty() -> dict:
         "claude_models": {},
         "codex_models": [],
         "gemini_models": [],
+        "oss_models": [],
     }
 
 
@@ -39,6 +41,7 @@ def _overlay(model: str, token: str = "tok", **kwargs):
         bundle["claude_models"],
         bundle["codex_models"],
         bundle["gemini_models"],
+        bundle["oss_models"],
     )
 
 
@@ -81,22 +84,30 @@ class TestRenderOverlayProviders:
         assert provider["api"] == "google-generative-ai"
         assert provider["baseUrl"] == f"{WS}/ai-gateway/gemini/v1beta"
 
-    def test_all_three_providers_when_all_present(self):
+    def test_oss_provider_uses_openai_responses(self):
+        overlay, _ = _overlay("system.ai.kimi-k2-7-code", oss_models=["system.ai.kimi-k2-7-code"])
+        provider = overlay["providers"]["databricks-oss"]
+        assert provider["api"] == "openai-responses"
+        assert provider["baseUrl"] == f"{WS}/ai-gateway/mlflow/v1"
+
+    def test_all_four_providers_when_all_present(self):
         overlay, _ = _overlay(
             "claude-sonnet",
             claude_models={"sonnet": "claude-sonnet"},
             codex_models=["gpt-5"],
             gemini_models=["gemini-2"],
+            oss_models=["system.ai.kimi-k2-7-code"],
         )
         assert set(overlay["providers"].keys()) == {
             "databricks-claude",
             "databricks-openai",
             "databricks-gemini",
+            "databricks-oss",
         }
 
 
 class TestRenderOverlayUserAgent:
-    def test_user_agent_set_on_all_three_providers(self, monkeypatch):
+    def test_user_agent_set_on_all_four_providers(self, monkeypatch):
         monkeypatch.setattr(pi, "ucode_version", lambda: "0.1.0")
         monkeypatch.setattr(pi, "agent_version", lambda binary: "0.74.0")
         overlay, _ = _overlay(
@@ -104,9 +115,15 @@ class TestRenderOverlayUserAgent:
             claude_models={"sonnet": "claude-sonnet"},
             codex_models=["gpt-5"],
             gemini_models=["gemini-2"],
+            oss_models=["system.ai.kimi-k2-7-code"],
         )
         expected = "ucode/0.1.0 pi/0.74.0"
-        for name in ("databricks-claude", "databricks-openai", "databricks-gemini"):
+        for name in (
+            "databricks-claude",
+            "databricks-openai",
+            "databricks-gemini",
+            "databricks-oss",
+        ):
             assert overlay["providers"][name]["headers"]["User-Agent"] == expected
 
 
@@ -119,15 +136,17 @@ class TestRenderOverlayCompatFlags:
         compat = overlay["providers"]["databricks-claude"]["compat"]
         assert compat["supportsEagerToolInputStreaming"] is False
 
-    def test_openai_and_gemini_have_no_compat_flags(self):
+    def test_openai_gemini_and_oss_have_no_compat_flags(self):
         # Their gateway routes accept pi's request shape as-is.
         overlay, _ = _overlay(
             "gpt-5",
             codex_models=["gpt-5"],
             gemini_models=["gemini-2"],
+            oss_models=["system.ai.kimi-k2-7-code"],
         )
         assert "compat" not in overlay["providers"]["databricks-openai"]
         assert "compat" not in overlay["providers"]["databricks-gemini"]
+        assert "compat" not in overlay["providers"]["databricks-oss"]
 
 
 class TestRenderOverlayAuthAndModels:
@@ -143,8 +162,14 @@ class TestRenderOverlayAuthAndModels:
             claude_models={"sonnet": "claude-sonnet"},
             codex_models=["gpt-5"],
             gemini_models=["gemini-2"],
+            oss_models=["system.ai.kimi-k2-7-code"],
         )
-        for name in ("databricks-claude", "databricks-openai", "databricks-gemini"):
+        for name in (
+            "databricks-claude",
+            "databricks-openai",
+            "databricks-gemini",
+            "databricks-oss",
+        ):
             assert overlay["providers"][name]["authHeader"] is True
 
     def test_claude_models_listed(self):
@@ -163,6 +188,17 @@ class TestRenderOverlayAuthAndModels:
         ids = {m["id"] for m in overlay["providers"]["databricks-gemini"]["models"]}
         assert ids == {"gemini-2", "gemini-2-pro"}
 
+    def test_oss_models_listed_with_known_limits(self):
+        overlay, _ = _overlay(
+            "system.ai.glm-5-2",
+            oss_models=["system.ai.kimi-k2-7-code", "system.ai.glm-5-2"],
+        )
+        entries = {m["id"]: m for m in overlay["providers"]["databricks-oss"]["models"]}
+        assert set(entries) == {"system.ai.kimi-k2-7-code", "system.ai.glm-5-2"}
+        assert entries["system.ai.glm-5-2"]["contextWindow"] == 200_000
+        assert entries["system.ai.glm-5-2"]["maxTokens"] == 25_000
+        assert "maxTokens" not in entries["system.ai.kimi-k2-7-code"]
+
 
 class TestRenderOverlayManagedKeys:
     def test_managed_keys_include_model(self):
@@ -175,8 +211,14 @@ class TestRenderOverlayManagedKeys:
             claude_models={"sonnet": "claude-sonnet"},
             codex_models=["gpt-5"],
             gemini_models=["gemini-2"],
+            oss_models=["system.ai.kimi-k2-7-code"],
         )
-        for name in ("databricks-claude", "databricks-openai", "databricks-gemini"):
+        for name in (
+            "databricks-claude",
+            "databricks-openai",
+            "databricks-gemini",
+            "databricks-oss",
+        ):
             assert ["providers", name] in keys
 
 
@@ -192,6 +234,10 @@ class TestRenderOverlayModelSelector:
     def test_prefixes_gemini_model(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
         assert overlay["model"] == "databricks-gemini/gemini-2"
+
+    def test_prefixes_oss_model(self):
+        overlay, _ = _overlay("system.ai.kimi-k2-7-code", oss_models=["system.ai.kimi-k2-7-code"])
+        assert overlay["model"] == "databricks-oss/system.ai.kimi-k2-7-code"
 
     def test_preserves_already_prefixed_model(self):
         overlay, _ = _overlay(
@@ -228,10 +274,22 @@ class TestPiDefaultModel:
         state = {"claude_models": {}, "codex_models": [], "gemini_models": ["gemini-2"]}
         assert pi.default_model(state) == "gemini-2"
 
+    def test_falls_back_to_oss(self):
+        state = {
+            "claude_models": {},
+            "codex_models": [],
+            "gemini_models": [],
+            "oss_models": ["system.ai.kimi-k2-7-code"],
+        }
+        assert pi.default_model(state) == "system.ai.kimi-k2-7-code"
+
     def test_returns_none_when_empty(self):
         assert pi.default_model({}) is None
         assert (
-            pi.default_model({"claude_models": {}, "codex_models": [], "gemini_models": []}) is None
+            pi.default_model(
+                {"claude_models": {}, "codex_models": [], "gemini_models": [], "oss_models": []}
+            )
+            is None
         )
 
 
@@ -283,6 +341,7 @@ class TestWriteToolConfig:
             "claude_models": {"sonnet": "claude-sonnet"},
             "codex_models": [],
             "gemini_models": [],
+            "oss_models": [],
             "managed_configs": {},
         }
         state.update(overrides)
@@ -296,6 +355,7 @@ class TestWriteToolConfig:
                 "databricks-claude": {"old": True},
                 "databricks-openai": {"old": True},
                 "databricks-gemini": {"old": True},
+                "databricks-oss": {"old": True},
                 "user-provider": {"keep": True},
             }
         }
@@ -311,12 +371,11 @@ class TestWriteToolConfig:
         providers = written.get("providers", {})
         assert providers.get("databricks-claude") != {"old": True}
         assert "old" not in providers.get("databricks-claude", {})
+        assert "databricks-oss" not in providers
         assert providers.get("user-provider") == {"keep": True}
 
     def test_legacy_providers_removed_on_upgrade(self, tmp_path, monkeypatch):
-        """Earlier ucode versions wrote `databricks-anthropic`, `databricks-codex`,
-        and `databricks-oss` providers. They must be stripped on the next write
-        so users don't end up with stale entries pointing at routes that 400."""
+        """Old provider names are stripped on the next write."""
         pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
 
         config_file.write_text(
@@ -325,7 +384,6 @@ class TestWriteToolConfig:
                     "providers": {
                         "databricks-anthropic": {"api": "anthropic-messages"},
                         "databricks-codex": {"api": "openai-responses"},
-                        "databricks-oss": {"api": "openai-completions"},
                     }
                 }
             ),
@@ -339,7 +397,7 @@ class TestWriteToolConfig:
             pi_mod.write_tool_config(self._state(), "claude-sonnet", token="tok")
 
         written_providers = json.loads(config_file.read_text()).get("providers", {})
-        for legacy in ("databricks-anthropic", "databricks-codex", "databricks-oss"):
+        for legacy in ("databricks-anthropic", "databricks-codex"):
             assert legacy not in written_providers
         assert "databricks-claude" in written_providers
 
@@ -435,27 +493,32 @@ class TestManagedModels:
                 "system.ai.claude-opus-4-8",
                 "system.ai.gpt-5",
                 "system.ai.gemini-3-flash",
+                "system.ai.kimi-k2-7-code",
             ]
         }
         assert pi._managed_model_families(state) == (
             {"opus": "system.ai.claude-opus-4-8"},
             ["system.ai.gpt-5"],
             ["system.ai.gemini-3-flash"],
+            ["system.ai.kimi-k2-7-code"],
         )
 
     def test_no_split_without_managed_models(self):
         assert pi._managed_model_families({"claude_models": {"opus": "x"}}) is None
 
     def test_none_when_no_managed_model_is_servable(self):
-        # Pi has no OSS provider, so an oss-only list yields no families. Returning an all-empty
-        # tuple would be truthy and suppress the fallback, writing a config with zero providers.
-        assert pi._managed_model_families({"pi_models": ["system.ai.kimi-k2-7-code"]}) is None
+        assert pi._managed_model_families({"pi_models": ["unknown-model"]}) is None
 
-    def test_partially_servable_list_still_splits(self):
+    def test_oss_models_are_servable(self):
         families = pi._managed_model_families(
             {"pi_models": ["system.ai.kimi-k2-7-code", "system.ai.claude-opus-4-8"]}
         )
-        assert families == ({"opus": "system.ai.claude-opus-4-8"}, [], [])
+        assert families == (
+            {"opus": "system.ai.claude-opus-4-8"},
+            [],
+            [],
+            ["system.ai.kimi-k2-7-code"],
+        )
 
 
 class TestManagedDefaultModel:

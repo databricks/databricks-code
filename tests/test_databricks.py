@@ -24,6 +24,7 @@ from ucode.databricks import (
     build_auth_token_argv,
     build_databricks_cli_env,
     build_opencode_base_urls,
+    build_pi_base_urls,
     build_shared_base_urls,
     build_skills_mcp_url,
     build_tool_base_url,
@@ -121,9 +122,19 @@ class TestBuildToolBaseUrl:
 
 
 class TestBuildOpencodeBaseUrls:
-    def test_returns_anthropic_gemini_and_oss(self):
+    def test_returns_all_supported_model_families(self):
         urls = build_opencode_base_urls(WS)
         assert urls["anthropic"] == f"{WS}/ai-gateway/anthropic/v1"
+        assert urls["openai"] == f"{WS}/ai-gateway/codex/v1"
+        assert urls["gemini"] == f"{WS}/ai-gateway/gemini/v1beta"
+        assert urls["oss"] == f"{WS}/ai-gateway/mlflow/v1"
+
+
+class TestBuildPiBaseUrls:
+    def test_returns_all_supported_model_families(self):
+        urls = build_pi_base_urls(WS)
+        assert urls["claude"] == f"{WS}/ai-gateway/anthropic"
+        assert urls["openai"] == f"{WS}/ai-gateway/codex/v1"
         assert urls["gemini"] == f"{WS}/ai-gateway/gemini/v1beta"
         assert urls["oss"] == f"{WS}/ai-gateway/mlflow/v1"
 
@@ -222,6 +233,7 @@ class TestDiscoverModelServices:
                 _model_service("system.ai.claude-opus-4-8"),
                 _model_service("system.ai.claude-sonnet-4-6"),
                 _model_service("system.ai.gpt-5"),
+                _model_service("system.ai.gpt-oss-120b"),
                 _model_service("system.ai.gemini-2-5-flash"),
                 _model_service("system.ai.gemini-3-5-flash"),
                 _model_service("system.ai.kimi-k2-7-code"),
@@ -242,6 +254,8 @@ class TestDiscoverModelServices:
             "opus": "system.ai.claude-opus-4-8",
             "sonnet": "system.ai.claude-sonnet-4-6",
         }
+        # gpt-oss is not Responses-compatible with Pi/OpenCode and must not
+        # leak into the Codex bucket just because its name contains `gpt-`.
         assert codex == ["system.ai.gpt-5"]
         # Gemini ordered newest-first via the shared sort key.
         assert gemini[0] == "system.ai.gemini-3-5-flash"
@@ -249,11 +263,12 @@ class TestDiscoverModelServices:
         assert oss == ["system.ai.glm-5-2", "system.ai.kimi-k2-7-code"]
 
     def test_oss_allowlist_drops_unsupported_families(self, monkeypatch):
-        # Only kimi/glm are allowlisted; other families are dropped.
+        # Only kimi/glm are allowlisted; other families, including gpt-oss, are dropped.
         payload = {
             "model_services": [
                 _model_service("system.ai.glm-5-2"),
                 _model_service("system.ai.kimi-k2-7-code"),
+                _model_service("system.ai.gpt-oss-20b"),
                 _model_service("system.ai.qwen-3-coder"),
                 _model_service("system.ai.deepseek-v3"),
                 _model_service("system.ai.gte-large-embed"),
@@ -1152,7 +1167,11 @@ class TestDiscoverGeminiModels:
                         ]
                     },
                 }
-                for name in ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
+                for name in [
+                    "databricks-gpt-5-2-codex",
+                    "databricks-gpt-4-1",
+                    "databricks-gpt-oss-120b",
+                ]
             ]
         }
         monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))

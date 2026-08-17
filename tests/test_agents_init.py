@@ -189,6 +189,9 @@ class TestCheckGatewayEndpoint:
     def test_pi_available_with_gemini(self):
         assert check_gateway_endpoint({"gemini_models": ["gemini-2"]}, "pi") is True
 
+    def test_pi_available_with_oss(self):
+        assert check_gateway_endpoint({"oss_models": ["system.ai.kimi-k2-7-code"]}, "pi") is True
+
     def test_pi_unavailable_when_no_models(self):
         assert check_gateway_endpoint({}, "pi") is False
 
@@ -231,6 +234,15 @@ class TestDefaultModelForTool:
         state = {"opencode_models": {"gemini": ["gemini-2"]}}
         assert default_model_for_tool("opencode", state) == "gemini-2"
 
+    def test_opencode_falls_back_to_openai_before_gemini(self):
+        state = {
+            "opencode_models": {
+                "openai": ["system.ai.gpt-5"],
+                "gemini": ["gemini-2"],
+            }
+        }
+        assert default_model_for_tool("opencode", state) == "system.ai.gpt-5"
+
     def test_pi_prefers_claude_opus(self):
         state = {"claude_models": {"opus": "o4", "sonnet": "s4"}, "codex_models": ["c"]}
         assert default_model_for_tool("pi", state) == "o4"
@@ -242,6 +254,15 @@ class TestDefaultModelForTool:
     def test_pi_falls_back_to_gemini(self):
         state = {"claude_models": {}, "codex_models": [], "gemini_models": ["gemini-2"]}
         assert default_model_for_tool("pi", state) == "gemini-2"
+
+    def test_pi_falls_back_to_oss(self):
+        state = {
+            "claude_models": {},
+            "codex_models": [],
+            "gemini_models": [],
+            "oss_models": ["system.ai.kimi-k2-7-code"],
+        }
+        assert default_model_for_tool("pi", state) == "system.ai.kimi-k2-7-code"
 
     def test_pi_returns_none_when_no_models(self):
         assert default_model_for_tool("pi", {}) is None

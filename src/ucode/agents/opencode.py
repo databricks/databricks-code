@@ -40,6 +40,7 @@ SPEC: ToolSpec = {
 
 PROVIDER_KEYS: list[list[str]] = [
     ["provider", "databricks-anthropic"],
+    ["provider", "databricks-openai"],
     ["provider", "databricks-google"],
     ["provider", "databricks-oss"],
 ]
@@ -51,12 +52,23 @@ def is_update_available() -> tuple[str, str] | None:
 
 def _resolve_model_selector(model: str, opencode_models: dict[str, list[str]]) -> str:
     """Return an OpenCode model selector in provider/model form when possible."""
-    if model.startswith(("databricks-anthropic/", "databricks-google/", "databricks-oss/")):
+    if model.startswith(
+        (
+            "databricks-anthropic/",
+            "databricks-openai/",
+            "databricks-google/",
+            "databricks-oss/",
+        )
+    ):
         return model
 
     anthropic_models = opencode_models.get("anthropic") or []
     if model in anthropic_models:
         return f"databricks-anthropic/{model}"
+
+    openai_models = opencode_models.get("openai") or []
+    if model in openai_models:
+        return f"databricks-openai/{model}"
 
     gemini_models = opencode_models.get("gemini") or []
     if model in gemini_models:
@@ -100,6 +112,7 @@ def render_overlay(
     }
 
     anthropic_models = opencode_models.get("anthropic") or []
+    openai_models = opencode_models.get("openai") or []
     gemini_models = opencode_models.get("gemini") or []
     oss_models = opencode_models.get("oss") or []
 
@@ -125,6 +138,17 @@ def render_overlay(
             "models": dict.fromkeys(anthropic_models, anthropic_model_overlay),
         }
         keys.append(["provider", "databricks-anthropic"])
+    if openai_models:
+        providers["databricks-openai"] = {
+            "npm": "@ai-sdk/openai",
+            "options": {
+                "baseURL": opencode_base_urls["openai"],
+                "apiKey": token,
+                "headers": auth_headers,
+            },
+            "models": {m: {"headers": ua_header} for m in openai_models},
+        }
+        keys.append(["provider", "databricks-openai"])
     if gemini_models:
         providers["databricks-google"] = {
             "npm": "@ai-sdk/google",
@@ -234,6 +258,9 @@ def default_model(state: dict) -> str | None:
     anthropic = opencode_models.get("anthropic") or []
     if anthropic:
         return anthropic[0]
+    openai = opencode_models.get("openai") or []
+    if openai:
+        return openai[0]
     gemini = opencode_models.get("gemini") or []
     if gemini:
         return gemini[0]

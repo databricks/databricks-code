@@ -8,6 +8,7 @@ import pytest
 
 from ucode.databricks import (
     build_shared_base_urls,
+    discover_model_services,
     fetch_ai_gateway_claude_models,
     fetch_codex_models,
     fetch_gemini_models,
@@ -63,18 +64,24 @@ def e2e_state(e2e_workspace, e2e_token):
     claude_models = fetch_ai_gateway_claude_models(e2e_workspace, e2e_token)
     gemini_models = fetch_gemini_models(e2e_workspace, e2e_token)
     codex_models = fetch_codex_models(e2e_workspace, e2e_token)
+    _, _, _, oss_models, _ = discover_model_services(e2e_workspace, e2e_token)
 
     opencode_models: dict = {}
     if claude_models:
         opencode_models["anthropic"] = list(claude_models.values())
+    if codex_models:
+        opencode_models["openai"] = codex_models
     if gemini_models:
         opencode_models["gemini"] = gemini_models
+    if oss_models:
+        opencode_models["oss"] = oss_models
 
     return {
         "workspace": e2e_workspace,
         "claude_models": claude_models,
         "gemini_models": gemini_models,
         "codex_models": codex_models,
+        "oss_models": oss_models,
         "opencode_models": opencode_models,
         "base_urls": build_shared_base_urls(e2e_workspace),
         "managed_configs": {},

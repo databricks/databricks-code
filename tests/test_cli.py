@@ -2253,6 +2253,70 @@ class TestConfigureSharedStateMcpCleanup:
         assert purge_calls == []
 
 
+class TestConfigureSharedStateAlignedModelFamilies:
+    WS = "https://workspace.databricks.com"
+
+    @staticmethod
+    def _stub(monkeypatch):
+        import ucode.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "load_state", lambda: {})
+        monkeypatch.setattr(cli_mod, "save_state", lambda state: None)
+        monkeypatch.setattr(cli_mod, "normalize_workspace_url", lambda workspace: workspace)
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda workspace, profile=None: None)
+        monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda workspace: None)
+        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda workspace, profile: "token")
+        monkeypatch.setattr(cli_mod, "ensure_ai_gateway_v2", lambda workspace, token: None)
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda workspace, token: (
+                {"sonnet": "system.ai.claude-sonnet-4-6"},
+                ["system.ai.gpt-5"],
+                ["system.ai.gemini-2-5-pro"],
+                ["system.ai.kimi-k2-7-code"],
+                None,
+            ),
+        )
+        monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda workspace: {})
+        return cli_mod
+
+    def test_opencode_discovers_openai_alongside_existing_families(self, monkeypatch):
+        cli_mod = self._stub(monkeypatch)
+
+        state = cli_mod.configure_shared_state(self.WS, tools=["opencode"])
+
+        assert state["opencode_models"] == {
+            "anthropic": ["system.ai.claude-sonnet-4-6"],
+            "openai": ["system.ai.gpt-5"],
+            "gemini": ["system.ai.gemini-2-5-pro"],
+            "oss": ["system.ai.kimi-k2-7-code"],
+        }
+
+    def test_pi_discovers_oss_alongside_existing_families(self, monkeypatch):
+        cli_mod = self._stub(monkeypatch)
+
+        state = cli_mod.configure_shared_state(self.WS, tools=["pi"])
+
+        assert state["claude_models"] == {"sonnet": "system.ai.claude-sonnet-4-6"}
+        assert state["codex_models"] == ["system.ai.gpt-5"]
+        assert state["gemini_models"] == ["system.ai.gemini-2-5-pro"]
+        assert state["oss_models"] == ["system.ai.kimi-k2-7-code"]
+
+    def test_diagnostics_list_new_family_consumers(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        notes: list[str] = []
+        monkeypatch.setattr(cli_mod, "print_note", notes.append)
+
+        cli_mod._print_discovery_diagnostics(
+            {"_discovery_reasons": {"codex": "missing", "oss": "missing"}}
+        )
+
+        assert "needed for: codex, opencode, copilot, pi" in notes[0]
+        assert "needed for: opencode, pi" in notes[1]
+
+
 class TestConfigureSharedStateSkipDiscovery:
     """With skip_model_discovery (provider mode), the heavy family discovery is
     skipped; only a single web-search model is fetched, and existing model lists
