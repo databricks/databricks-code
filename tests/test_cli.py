@@ -2183,7 +2183,9 @@ class TestConfigureSkipValidate:
         monkeypatch.setattr(cli_mod, "configure_single_tool", lambda t, s: s)
         installed: list = []
         monkeypatch.setattr(
-            cli_mod, "install_ai_tools_for_agents", lambda tools, s: installed.append(tools)
+            cli_mod,
+            "install_databricks_ai_tools_for_agents",
+            lambda tools, s: installed.append(tools),
         )
         validated: list = []
         monkeypatch.setattr(cli_mod, "validate_tool", lambda t: validated.append(t) or (True, ""))

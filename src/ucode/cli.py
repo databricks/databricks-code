@@ -18,7 +18,7 @@ from ucode.agents import (
     configure_tool,
     ensure_bootstrap_dependencies,
     ensure_provider_state,
-    install_ai_tools_for_agents,
+    install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
     provider_permission_error,
@@ -773,7 +773,7 @@ def configure_workspace_command(
         # Install Databricks AI Tools here (a `ucode configure`-only step), not in
         # configure_single_tool — the launch path auto-configures through that and
         # must never install skills.
-        install_ai_tools_for_agents([tool], state)
+        install_databricks_ai_tools_for_agents([tool], state)
         spec = TOOL_SPECS[tool]
         console.print(
             Panel(
