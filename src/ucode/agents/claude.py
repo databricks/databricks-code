@@ -302,6 +302,11 @@ def render_overlay(
         "ENABLE_TOOL_SEARCH": "1",
         "CLAUDE_CODE_USE_GATEWAY": "1",
     }
+    # Native /model discovery: picker lists every gateway Messages-API endpoint,
+    # not just the family aliases. Skipped under a provider (its routing header
+    # would send a discovered gateway id to a provider that can't resolve it).
+    if not provider:
+        env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     # Intentionally NOT setting ANTHROPIC_MODEL by default. Setting it produces a
     # duplicate catalog row in Claude Code's /model picker (e.g. "Opus 4.8 (1M
     # context) ✓") on top of the family-alias row from ANTHROPIC_DEFAULT_OPUS_MODEL.

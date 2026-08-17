@@ -127,6 +127,17 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert overlay["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
+    def test_enables_gateway_model_discovery(self):
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+
+    def test_gateway_model_discovery_skipped_under_provider(self):
+        # A Model Provider Service routes every request to the external provider,
+        # so a discovered gateway endpoint id would reach a provider that can't
+        # resolve it — discovery must be off in that mode.
+        overlay, _ = claude.render_overlay(WS, "s4", provider="main.x.claude-svc")
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
+
     def test_sets_api_key_helper(self):
         overlay, _ = claude.render_overlay(WS, "s4")
         assert "apiKeyHelper" in overlay
