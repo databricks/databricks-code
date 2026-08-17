@@ -2181,6 +2181,10 @@ class TestConfigureSkipValidate:
         state = {**MINIMAL_STATE, "workspace": "https://first.com"}
         monkeypatch.setattr(cli_mod, "configure_shared_state", lambda *a, **k: state)
         monkeypatch.setattr(cli_mod, "configure_single_tool", lambda t, s: s)
+        installed: list = []
+        monkeypatch.setattr(
+            cli_mod, "install_ai_tools_for_agents", lambda tools, s: installed.append(tools)
+        )
         validated: list = []
         monkeypatch.setattr(cli_mod, "validate_tool", lambda t: validated.append(t) or (True, ""))
 
@@ -2192,6 +2196,9 @@ class TestConfigureSkipValidate:
 
         assert result == 0
         assert validated == []
+        # `ucode configure` (single-agent) still installs AI Tools — it's the
+        # configure path, unlike launch which auto-configures without installing.
+        assert installed == [["claude"]]
 
 
 class TestConfigureSharedStateMcpCleanup:
