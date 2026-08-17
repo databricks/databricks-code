@@ -770,9 +770,6 @@ def configure_workspace_command(
         )
         state = states[0]
         state = configure_single_tool(tool, state)
-        # Install Databricks AI Tools here (a `ucode configure`-only step), not in
-        # configure_single_tool — the launch path auto-configures through that and
-        # must never install skills.
         install_databricks_ai_tools_for_agents([tool], state)
         spec = TOOL_SPECS[tool]
         console.print(

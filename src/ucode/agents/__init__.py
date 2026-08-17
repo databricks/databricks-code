@@ -413,11 +413,7 @@ def _availability_failure_detail(tool: str, state: dict) -> str:
 
 
 def configure_single_tool(tool: str, state: dict) -> dict:
-    """Check availability, configure, and persist state for one tool only.
-
-    Does NOT install Databricks AI Tools — that is a `ucode configure`-only step
-    (see `install_databricks_ai_tools_for_agents` callers). The launch path auto-configures
-    through here, and launching must never install skills."""
+    """Check availability, configure, and persist state for one tool only."""
     provider = get_provider_service(state, tool)
     # A Model Provider Service routes through the same gateway and pins no
     # Databricks model, so the per-tool model availability check doesn't apply.
