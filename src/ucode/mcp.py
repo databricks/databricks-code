@@ -1739,15 +1739,43 @@ def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[
     return workspace, profile, clients
 
 
+def _union_missing(base: list[dict], selected: list[dict]) -> list[dict]:
+    """Return ``selected`` followed by every ``base`` server whose name isn't
+    already in it. Used by ``ucode mcp add`` so registering new servers never
+    removes ones that are already configured (append semantics)."""
+    have = _servers_by_name(selected)
+    extra = [s for s in base if (_server_name(s) or "") not in have]
+    return [*selected, *extra]
+
+
+def add_mcp_command(
+    location: str | None = None,
+    services: set[str] | None = None,
+) -> int:
+    """`ucode mcp add`: register Databricks MCP servers WITHOUT removing any that
+    are already configured.
+
+    Uses the same discovery and options as `configure mcp` — the interactive
+    picker, or the non-interactive `--location`/`--services` paths — but is purely
+    additive: unlike `configure mcp`, it never removes servers outside the
+    selection."""
+    return configure_mcp_command(location=location, services=services, append=True)
+
+
 def configure_mcp_command(
     location: str | None = None,
     services: set[str] | None = None,
     *,
     exclude_sources: set[str] | None = None,
+    append: bool = False,
 ) -> int:
     """Interactive MCP picker. ``exclude_sources`` hides search sources the caller can't use —
     `ucode setup` passes ``{"apps"}`` because a managed config can't carry an app's off-workspace
-    host, so an app picked here would be silently dropped from the published config."""
+    host, so an app picked here would be silently dropped from the published config.
+
+    ``append`` (used by `ucode mcp add`) makes the command purely additive: the
+    final server list is unioned with the already-configured servers, so nothing
+    outside the current selection is removed."""
     if services is not None and location is None:
         # `--services` works standalone with full names (`system.ai.github`): the
         # `<catalog>.<schema>` to configure is derived from them. Bare short names
@@ -1766,13 +1794,19 @@ def configure_mcp_command(
             )
         location = next(iter(schemas))
     state = load_state()
-    workspace, profile, clients = setup_mcp_clients(state, "MCP Servers")
+    workspace, profile, clients = setup_mcp_clients(
+        state, "Add MCP Servers" if append else "MCP Servers"
+    )
 
     original_mcp_servers_for_location: list[dict] = list(state.get("mcp_servers") or [])
     if location is not None:
         working_mcp_servers = _resolve_location_mcp_servers(
             workspace, profile, clients, location, original_mcp_servers_for_location, services
         )
+        if append:
+            working_mcp_servers = _union_missing(
+                original_mcp_servers_for_location, working_mcp_servers
+            )
         changed = apply_mcp_server_changes(
             original_mcp_servers_for_location,
             working_mcp_servers,
@@ -1866,6 +1900,9 @@ def configure_mcp_command(
         )
         working_names.add(entry_name)
 
+    if append:
+        working_mcp_servers = _union_missing(original_mcp_servers, working_mcp_servers)
+
     changed = apply_mcp_server_changes(
         original_mcp_servers,
         working_mcp_servers,
@@ -1878,7 +1915,8 @@ def configure_mcp_command(
         state["mcp_servers"] = working_mcp_servers
         save_state(state)
         added = sorted(working_names - set(original_by_name))
-        removed = sorted(set(original_by_name) - working_names)
+        # `add` never removes; the union above re-keeps unselected servers.
+        removed = [] if append else sorted(set(original_by_name) - working_names)
         print_success(_mcp_change_summary(added, removed, clients))
     elif not selections and not original_mcp_servers:
         # User submitted the picker without toggling anything --> make it clear nothing was selected

@@ -1806,6 +1806,92 @@ class TestConfigureMcpFromLocation:
         ]
 
 
+class TestAddMcpCommand:
+    """`ucode mcp add` (append) registers new servers without removing existing ones."""
+
+    def test_keeps_servers_outside_location(self, monkeypatch):
+        """Unlike `configure mcp --location`, `mcp add --location` preserves any
+        server outside the location instead of removing it."""
+        saved_states: list[dict] = []
+        configured: list[tuple[str, str, str]] = []
+        removed: list[tuple[str, str]] = []
+        outside_entry = {
+            "name": "databricks-sql",
+            "url": f"{WS}/api/2.0/mcp/sql",
+            "auth": "proxy",
+            "clients": ["claude"],
+        }
+        _stub_location_base(
+            monkeypatch,
+            {**CLAUDE_STATE, "mcp_servers": [outside_entry]},
+        )
+        monkeypatch.setattr(
+            mcp,
+            "list_mcp_services",
+            lambda workspace, token, parent: (["system.ai.github"], None),
+        )
+        monkeypatch.setattr(
+            mcp,
+            "configure_client_mcp_server",
+            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
+        )
+        monkeypatch.setattr(
+            mcp,
+            "remove_client_mcp_server",
+            lambda client, name: removed.append((client, name)) or [],
+        )
+        monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
+
+        assert mcp.add_mcp_command(location="system.ai") == 0
+
+        # Nothing is removed; the new service is added and the outside one kept.
+        assert removed == []
+        assert [c[1] for c in configured] == ["system-ai-github"]
+        assert saved_states[-1]["mcp_servers"] == [
+            {
+                "name": "system-ai-github",
+                "url": f"{WS}/ai-gateway/mcp-services/system.ai.github",
+                "auth": "proxy",
+                "clients": ["claude"],
+            },
+            outside_entry,
+        ]
+
+    def test_services_subset_keeps_others_in_location(self, monkeypatch):
+        """`mcp add --services` registers the named subset while leaving other
+        already-registered services in the same schema untouched."""
+        saved_states: list[dict] = []
+        removed: list[tuple[str, str]] = []
+        existing = {
+            "name": "system-ai-slack",
+            "url": f"{WS}/ai-gateway/mcp-services/system.ai.slack",
+            "auth": "proxy",
+            "clients": ["claude"],
+        }
+        _stub_location_base(
+            monkeypatch,
+            {**CLAUDE_STATE, "mcp_servers": [existing]},
+        )
+        monkeypatch.setattr(
+            mcp,
+            "list_mcp_services",
+            lambda workspace, token, parent: (["system.ai.github", "system.ai.slack"], None),
+        )
+        monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a, **kw: [])
+        monkeypatch.setattr(
+            mcp,
+            "remove_client_mcp_server",
+            lambda client, name: removed.append((client, name)) or [],
+        )
+        monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
+
+        assert mcp.add_mcp_command(location="system.ai", services={"github"}) == 0
+
+        assert removed == []
+        names = [s["name"] for s in saved_states[-1]["mcp_servers"]]
+        assert names == ["system-ai-github", "system-ai-slack"]
+
+
 class TestConfigureMcpServicesSubset:
     """`--location <schema> --services a,b,...` configures exactly the named subset."""
 
