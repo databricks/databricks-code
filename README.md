@@ -160,7 +160,9 @@ ucode mcp add
 ```
 
 `ucode mcp add` takes the same `--location` and `--services` options as `ucode configure mcp`;
-the only difference is that it never removes servers outside the selection.
+the only difference is that it never removes servers outside the selection. In the interactive
+picker, servers you already have configured are shown as `(already configured)` and can't be
+toggled off — you only pick new ones to add.
 
 ### Skills (optional)
 

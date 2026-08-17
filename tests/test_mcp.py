@@ -369,6 +369,23 @@ class TestMcpPicker:
         assert choices_by_title["Connection: github-mcp"].checked is True
         assert choices_by_title["Databricks SQL"].checked is False
 
+    def test_additive_picker_shows_configured_servers_as_disabled(self):
+        """In `ucode mcp add` mode an already-configured server can't be removed, so
+        it's shown as a non-toggleable note rather than a pre-checked box."""
+        choices = mcp.build_mcp_picker_choices(
+            ["github-mcp"],
+            [],
+            [],
+            [{"name": "github-mcp", "url": f"{WS}/api/2.0/mcp/external/github-mcp"}],
+            additive=True,
+        )
+        choices_by_title = {choice.title: choice for choice in choices}
+        configured = choices_by_title["Connection: github-mcp"]
+        assert configured.disabled == "already configured"
+        assert configured.checked is False
+        # A not-yet-configured server stays an addable, toggleable choice.
+        assert choices_by_title["Databricks SQL"].disabled is None
+
     def test_picker_keeps_databricks_sql_when_nothing_discovered(self):
         choices = mcp.build_mcp_picker_choices([], [], [], [])
         assert [choice.title for choice in choices] == ["Databricks SQL"]
@@ -1890,6 +1907,15 @@ class TestAddMcpCommand:
         assert removed == []
         names = [s["name"] for s in saved_states[-1]["mcp_servers"]]
         assert names == ["system-ai-github", "system-ai-slack"]
+
+    def test_empty_services_is_a_noop(self, monkeypatch):
+        """`mcp add --services ""` has nothing to add, so it's a no-op that never
+        reaches configuration (and doesn't need --location the way a subset does)."""
+        called: list[bool] = []
+        monkeypatch.setattr(mcp, "load_state", lambda: called.append(True) or {})
+
+        assert mcp.add_mcp_command(services=set()) == 0
+        assert called == []
 
 
 class TestConfigureMcpServicesSubset:

@@ -1074,9 +1074,10 @@ def mcp_add(
         str | None,
         typer.Option(
             "--services",
-            help="Register exactly this comma-separated subset of MCP services. Full names like "
-            "`system.ai.github` work on their own; bare short names like `github` need --location "
-            "to locate them. Omit --services to register the whole --location schema.",
+            help="Register this comma-separated subset of MCP services (additively). Full names "
+            "like `system.ai.github` work on their own; bare short names like `github` need "
+            "--location to locate them. Omit --services to register the whole --location schema; "
+            'an empty `--services ""` adds nothing (no-op).',
         ),
     ] = None,
 ) -> None:
