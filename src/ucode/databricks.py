@@ -1,5 +1,5 @@
 """Databricks workspace integration: CLI auth, token retrieval, model
-discovery, AI Gateway v2 enforcement, SQL warehouse discovery, URL builders."""
+discovery, AI Gateway checks, SQL warehouse discovery, URL builders."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from concurrent.futures import (
 )
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal, NamedTuple, cast, overload
+from typing import Literal, NamedTuple, NoReturn, cast, overload
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import quote, urlencode, urlparse
@@ -2885,54 +2885,88 @@ def fetch_codex_models(workspace: str, token: str) -> list[str]:
     return models
 
 
-def ensure_ai_gateway_v2(workspace: str, token: str) -> None:
-    """Probe AI Gateway v2 and raise if unavailable.
-
-    Uses the dedicated v2 listing endpoint `GET /api/ai-gateway/v2/endpoints`:
-    a 200 response (even with an empty list) means v2 is wired up on this
-    workspace — a "no endpoints provisioned" case will surface naturally in
-    downstream discovery. Failure branches:
-
-    - 401 / 403 / 400 with `Invalid Token`: the token is bad for *this*
-      workspace.
-    - 404: AI Gateway V2 is not enabled on this workspace — point at the docs.
-    - other (5xx, network errors): surface the reason verbatim.
-    """
+def _probe_ai_gateway_v2(workspace: str, token: str) -> tuple[bool, str | None]:
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}/api/ai-gateway/v2/endpoints?page_size=1"
     payload, reason = _http_get_json(url, token)
-    if payload is not None:
-        return
-    reason_str = reason or "unknown error"
-    if _looks_like_auth_failure(reason_str):
-        raise RuntimeError(
-            f"Databricks rejected the access token for {workspace} ({reason_str}). "
-            f"Try:\n"
-            f"  databricks auth logout --host {workspace}\n"
-            f"  databricks auth login --host {workspace}"
-        )
-    if "HTTP 404" in reason_str:
-        raise RuntimeError(
-            "Databricks Unity AI Gateway is not enabled on this workspace "
-            f"({reason_str}). See {AI_GATEWAY_V2_DOCS_URL}"
-        )
+    return payload is not None, reason
+
+
+def _probe_ai_gateway_v3(workspace: str, token: str) -> tuple[bool, str | None]:
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}/api/2.1/unity-catalog/model-services?page_size=1"
+    payload, reason = _http_get_json(url, token)
+    return payload is not None, reason
+
+
+def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
     raise RuntimeError(
-        "Databricks Unity AI Gateway probe failed on this workspace "
-        f"({reason_str}). See {AI_GATEWAY_V2_DOCS_URL}"
+        f"Databricks rejected the access token for {workspace} ({reason}). "
+        f"Try:\n"
+        f"  databricks auth logout --host {workspace}\n"
+        f"  databricks auth login --host {workspace}"
     )
 
 
-def _looks_like_auth_failure(reason: str) -> bool:
-    """True when the gateway response signals the token is not accepted.
+def _raise_ai_gateway_v3_permission_failure(
+    workspace: str, v3_reason: str, v2_reason: str | None
+) -> NoReturn:
+    raise RuntimeError(
+        f"Databricks AI Gateway V3 access could not be verified on {workspace} ({v3_reason}). "
+        f"The V2 fallback also failed ({v2_reason or 'unknown error'}). The V3 probe requires "
+        "permission to list Unity Catalog model services. Verify USE CATALOG on `system` and "
+        "USE SCHEMA on `system.ai`."
+    )
 
-    Covers 401/403 directly and the gateway's 400 + `Invalid Token` body
-    (which happens when the bearer is valid but issued for a different
-    workspace)."""
-    if "HTTP 401" in reason or "HTTP 403" in reason:
+
+def _raise_ai_gateway_v2_permission_failure(
+    workspace: str, v2_reason: str, v3_reason: str | None
+) -> NoReturn:
+    raise RuntimeError(
+        f"Databricks AI Gateway V2 access could not be verified on {workspace} ({v2_reason}). "
+        f"The V3 probe also failed ({v3_reason or 'unknown error'}). Verify the caller's "
+        "workspace permissions for the AI Gateway V2 endpoints listing."
+    )
+
+
+def ensure_ai_gateway(workspace: str, token: str) -> None:
+    """Pass if either AI Gateway V2 or V3 is available."""
+    v3_ok, v3_reason = _probe_ai_gateway_v3(workspace, token)
+    if v3_ok:
+        return
+    if v3_reason and _looks_like_definitive_auth_failure(v3_reason):
+        _raise_ai_gateway_auth_failure(workspace, v3_reason)
+
+    v2_ok, v2_reason = _probe_ai_gateway_v2(workspace, token)
+    if v2_ok:
+        return
+    if v2_reason and _looks_like_definitive_auth_failure(v2_reason):
+        _raise_ai_gateway_auth_failure(workspace, v2_reason)
+    if v3_reason and _looks_like_permission_failure(v3_reason):
+        _raise_ai_gateway_v3_permission_failure(workspace, v3_reason, v2_reason)
+    if v2_reason and _looks_like_permission_failure(v2_reason):
+        _raise_ai_gateway_v2_permission_failure(workspace, v2_reason, v3_reason)
+
+    raise RuntimeError(
+        "Databricks AI Gateway is not enabled on this workspace: neither V3 "
+        f"({v3_reason or 'unknown error'}) nor V2 ({v2_reason or 'unknown error'}) is available. "
+        f"See {AI_GATEWAY_V2_DOCS_URL}"
+    )
+
+
+def _looks_like_definitive_auth_failure(reason: str) -> bool:
+    """True when retrying another workspace API cannot rescue this token.
+
+    A 403 can be endpoint-specific authorization, so the version-agnostic
+    preflight must still try V3 before surfacing it as an auth failure.
+    """
+    if "HTTP 401" in reason:
         return True
-    if "HTTP 400" in reason and "invalid token" in reason.lower():
-        return True
-    return False
+    return "HTTP 400" in reason and "invalid token" in reason.lower()
+
+
+def _looks_like_permission_failure(reason: str) -> bool:
+    return "HTTP 403" in reason
 
 
 CODING_AGENT_RECOMMEND_MODEL_PATH = "/api/ai-gateway/v2/coding-agent-configs:recommendModel"

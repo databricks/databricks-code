@@ -12,7 +12,6 @@ import pytest
 
 import ucode.databricks as db_mod
 from ucode.databricks import (
-    AI_GATEWAY_V2_DOCS_URL,
     CODING_AGENT_RECOMMEND_MODEL_PATH,
     _format_subprocess_result,
     _parse_databricks_cli_version,
@@ -43,6 +42,7 @@ from ucode.databricks import (
 )
 
 WS = "https://example.databricks.com"
+WS_HOST = "example.databricks.com"
 
 
 class _FakeResponse:
@@ -1831,128 +1831,120 @@ class TestListDatabricksApps:
             list_databricks_apps(WS)
 
 
-class TestEnsureAiGatewayV2:
-    """Test ensure_ai_gateway_v2 without real network calls.
+class TestEnsureAiGateway:
+    def test_v3_only_workspace_succeeds_without_v2_probe(self, monkeypatch):
+        calls: list[str] = []
 
-    The probe is `GET /api/ai-gateway/v2/endpoints`: a successful JSON
-    response means v2 is wired up (even if `endpoints` is empty), while
-    404/401/403/network errors all raise a RuntimeError with the docs URL.
-    """
+        def fake_get(url, token):
+            calls.append(url)
+            return {"model_services": []}, None
 
-    @staticmethod
-    def _mock_json_response(body: str):
-        from unittest.mock import MagicMock
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        mock_resp = MagicMock()
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_resp.read.return_value = body.encode("utf-8")
-        return mock_resp
+        db_mod.ensure_ai_gateway(WS, "fake-token")
 
-    @staticmethod
-    def _http_error(code: int, msg: str, body: str = ""):
-        import io
-        from unittest.mock import MagicMock
-        from urllib.error import HTTPError
+        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"]
 
-        fp = io.BytesIO(body.encode("utf-8")) if body else None
-        return HTTPError(url="", code=code, msg=msg, hdrs=MagicMock(), fp=fp)
+    def test_v2_only_workspace_succeeds_after_v3_probe(self, monkeypatch):
+        calls: list[str] = []
 
-    def test_raises_on_404(self):
-        from unittest.mock import patch
+        def fake_get(url, token):
+            calls.append(url)
+            if "/api/2.1/unity-catalog/model-services" in url:
+                return None, "HTTP 404: Not Found"
+            return {"endpoints": []}, None
 
-        exc = self._http_error(404, "Not Found")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-            with pytest.raises(RuntimeError, match=AI_GATEWAY_V2_DOCS_URL) as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            assert "not enabled" in str(excinfo.value)
+        db_mod.ensure_ai_gateway(WS, "fake-token")
 
-    def test_raises_on_401_with_auth_hint(self):
-        from unittest.mock import patch
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
+        ]
 
-        exc = self._http_error(401, "Unauthorized")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
+    def test_v3_forbidden_still_succeeds_when_v2_is_available(self, monkeypatch):
+        calls: list[str] = []
 
-            with pytest.raises(RuntimeError, match="401") as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            message = str(excinfo.value)
-            assert "rejected" in message.lower()
-            assert "databricks auth login" in message
+        def fake_get(url, token):
+            calls.append(url)
+            if "/api/2.1/unity-catalog/model-services" in url:
+                return None, "HTTP 403: Forbidden"
+            return {"endpoints": []}, None
 
-    def test_raises_on_400_invalid_token_with_auth_hint(self):
-        """400 + body `Invalid Token` is the misleading-error case from issue #84."""
-        from unittest.mock import patch
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        exc = self._http_error(400, "Bad Request", body="Invalid Token")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
+        db_mod.ensure_ai_gateway(WS, "fake-token")
 
-            with pytest.raises(RuntimeError) as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            message = str(excinfo.value)
-            # The bug we are fixing: must NOT collapse to the generic
-            # "v2 not available" message — must call out the auth failure
-            # and point at re-login.
-            assert "Invalid Token" in message
-            assert "rejected" in message.lower()
-            assert "databricks auth login" in message
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
+        ]
 
-    def test_400_without_invalid_token_falls_through_to_generic(self):
-        """A 400 that is *not* an auth failure should still surface the body."""
-        from unittest.mock import patch
+    def test_neither_gateway_available_raises(self, monkeypatch):
+        reasons = iter(["HTTP 404: V3 missing", "HTTP 404: V2 missing"])
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: (None, next(reasons)),
+        )
 
-        exc = self._http_error(400, "Bad Request", body="some other detail")
-        with patch("ucode.databricks.urllib_request.urlopen", side_effect=exc):
-            from ucode.databricks import ensure_ai_gateway_v2
+        with pytest.raises(RuntimeError, match="neither V3") as excinfo:
+            db_mod.ensure_ai_gateway(WS, "fake-token")
 
-            with pytest.raises(RuntimeError, match=AI_GATEWAY_V2_DOCS_URL) as excinfo:
-                ensure_ai_gateway_v2(WS, "fake-token")
-            assert "some other detail" in str(excinfo.value)
+        message = str(excinfo.value)
+        assert "HTTP 404: V2 missing" in message
+        assert "HTTP 404: V3 missing" in message
 
-    def test_raises_on_url_error(self):
-        from unittest.mock import patch
-        from urllib.error import URLError
+    def test_v3_auth_failure_does_not_probe_v2(self, monkeypatch):
+        calls: list[str] = []
 
-        with patch(
-            "ucode.databricks.urllib_request.urlopen",
-            side_effect=URLError("connection refused"),
-        ):
-            from ucode.databricks import ensure_ai_gateway_v2
+        def fake_get(url, token):
+            calls.append(url)
+            return None, "HTTP 401: Unauthorized"
 
-            with pytest.raises(RuntimeError, match=AI_GATEWAY_V2_DOCS_URL):
-                ensure_ai_gateway_v2(WS, "fake-token")
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-    def test_succeeds_with_endpoints_list(self):
-        from unittest.mock import patch
+        with pytest.raises(RuntimeError, match="rejected"):
+            db_mod.ensure_ai_gateway(WS, "fake-token")
 
-        with patch(
-            "ucode.databricks.urllib_request.urlopen",
-            return_value=self._mock_json_response('{"endpoints": [{"name": "foo"}]}'),
-        ):
-            from ucode.databricks import ensure_ai_gateway_v2
+        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"]
 
-            ensure_ai_gateway_v2(WS, "fake-token")  # should not raise
+    def test_v3_forbidden_and_v2_unavailable_reports_permission_error(self, monkeypatch):
+        reasons = iter(["HTTP 403: Missing Unity Catalog grants", "HTTP 404: V2 missing"])
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: (None, next(reasons)),
+        )
 
-    def test_succeeds_with_empty_endpoints_list(self):
-        from unittest.mock import patch
+        with pytest.raises(RuntimeError, match="permission") as excinfo:
+            db_mod.ensure_ai_gateway(WS, "fake-token")
 
-        # A 200 with no endpoints still means v2 is wired up on this workspace —
-        # downstream discovery will surface "no models" with a clearer reason.
-        with patch(
-            "ucode.databricks.urllib_request.urlopen",
-            return_value=self._mock_json_response('{"endpoints": []}'),
-        ):
-            from ucode.databricks import ensure_ai_gateway_v2
+        message = str(excinfo.value)
+        assert "USE SCHEMA" in message
+        assert "rejected the access token" not in message
+        assert "not enabled" not in message
 
-            ensure_ai_gateway_v2(WS, "fake-token")  # should not raise
+    def test_v2_forbidden_and_v3_unavailable_reports_permission_error(self, monkeypatch):
+        reasons = iter(["HTTP 404: V3 missing", "HTTP 403: V2 forbidden"])
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: (None, next(reasons)),
+        )
+
+        with pytest.raises(RuntimeError, match="workspace permissions") as excinfo:
+            db_mod.ensure_ai_gateway(WS, "fake-token")
+
+        message = str(excinfo.value)
+        assert "V2 access could not be verified" in message
+        assert "USE SCHEMA" not in message
 
 
 class TestHttpGetJsonReason:
     """The `reason` string returned by `_http_get_json` must include the response body
-    so callers (e.g. ensure_ai_gateway_v2) can route on it. Before issue #84's fix
+    so callers (e.g. ensure_ai_gateway) can route on it. Before issue #84's fix
     the body was logged only when UCODE_DEBUG=1 and dropped from the bubbled error."""
 
     @staticmethod

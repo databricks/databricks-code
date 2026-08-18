@@ -42,7 +42,7 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
-    ensure_ai_gateway_v2,
+    ensure_ai_gateway,
     ensure_databricks_auth,
     ensure_pat_bearer,
     find_profile_name_for_host,
@@ -99,6 +99,7 @@ from ucode.mcp import (
     configure_mcp_command,
     configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
+    remove_mcp_command,
     revert_mcp_configs,
 )
 from ucode.skills_download import (
@@ -554,7 +555,7 @@ def configure_shared_state(
             state["profile"] = profile
     with spinner("Verifying Unity AI Gateway..."):
         token = get_databricks_token(workspace, profile)
-        ensure_ai_gateway_v2(workspace, token)
+        ensure_ai_gateway(workspace, token)
     print_success("Unity AI Gateway detected")
 
     want_claude = (
@@ -1100,6 +1101,23 @@ def mcp_add(
     selected = None if services is None else {s.strip() for s in services.split(",") if s.strip()}
     try:
         add_mcp_command(location=location, services=selected)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+
+
+@mcp_app.command("remove")
+def mcp_remove() -> None:
+    """Remove configured Databricks MCP servers from your coding tools.
+
+    Interactive: shows the servers you currently have configured and unregisters the
+    ones you select. Needs no Databricks login.
+    """
+    try:
+        remove_mcp_command()
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

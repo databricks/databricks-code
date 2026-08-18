@@ -164,6 +164,17 @@ the only difference is that it never removes servers outside the selection. In t
 picker, servers you already have configured are shown as `(already configured)` and can't be
 toggled off — you only pick new ones to add.
 
+#### Remove configured servers
+
+To unregister servers you've already configured, use `ucode mcp remove`:
+
+```bash
+ucode mcp remove
+```
+
+It shows the servers you currently have configured — each with the coding tools it's registered
+on — and removes the ones you select from those tools. It needs no Databricks login.
+
 ### Skills (optional)
 
 Configure Unity Catalog Skills for your coding tools with `ucode configure skills`:
@@ -281,6 +292,7 @@ their next ucode run.
 | `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
 | `ucode mcp add --location system.ai` | Register a schema's MCP servers, keeping any already configured (additive; never removes) |
 | `ucode mcp add --services system.ai.slack` | Register specific MCP server(s) without removing existing ones |
+| `ucode mcp remove` | Interactively unregister configured MCP servers from your coding tools |
 | `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
 | `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
