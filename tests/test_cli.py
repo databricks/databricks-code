@@ -2181,6 +2181,12 @@ class TestConfigureSkipValidate:
         state = {**MINIMAL_STATE, "workspace": "https://first.com"}
         monkeypatch.setattr(cli_mod, "configure_shared_state", lambda *a, **k: state)
         monkeypatch.setattr(cli_mod, "configure_single_tool", lambda t, s: s)
+        installed: list = []
+        monkeypatch.setattr(
+            cli_mod,
+            "install_databricks_ai_tools_for_agents",
+            lambda tools, s: installed.append(tools),
+        )
         validated: list = []
         monkeypatch.setattr(cli_mod, "validate_tool", lambda t: validated.append(t) or (True, ""))
 
@@ -2192,6 +2198,9 @@ class TestConfigureSkipValidate:
 
         assert result == 0
         assert validated == []
+        # `ucode configure` (single-agent) still installs AI Tools — it's the
+        # configure path, unlike launch which auto-configures without installing.
+        assert installed == [["claude"]]
 
 
 class TestConfigureSharedStateMcpCleanup:
@@ -3038,3 +3047,42 @@ class TestBudgetRecommendationAtLaunch:
         result, calls, _ = self._launch(monkeypatch, managed=None)
         assert result.exit_code == 0, result.output
         assert calls == []
+
+
+class TestMcpProxyCmdForwardsUsePat:
+    """`ucode mcp-proxy` forwards the PAT choice to `serve`, which owns the
+    actual PAT resolution. Behavior of that resolution lives in test_mcp_proxy."""
+
+    def _invoke(self, monkeypatch, *, flag, state):
+        captured: dict = {}
+        monkeypatch.setattr("ucode.cli.load_state", lambda: state)
+        monkeypatch.setattr(
+            "ucode.mcp_proxy.serve",
+            lambda *a, **kw: captured.update(args=a, kwargs=kw),
+        )
+        args = ["mcp-proxy", "--url", "https://x/mcp", "--host", "https://x"]
+        if flag:
+            args.append("--use-pat")
+        result = runner.invoke(app, args)
+        return result, captured
+
+    def test_flag_forwards_use_pat_true(self, monkeypatch):
+        result, captured = self._invoke(
+            monkeypatch, flag=True, state={"workspace": "https://x", "profile": "p"}
+        )
+        assert result.exit_code == 0, result.output
+        assert captured["kwargs"]["use_pat"] is True
+
+    def test_saved_use_pat_state_forwards_true(self, monkeypatch):
+        # A workspace configured with --use-pat persists use_pat=True; the proxy
+        # honors it without the flag being repeated.
+        result, captured = self._invoke(
+            monkeypatch, flag=False, state={"workspace": "https://x", "use_pat": True}
+        )
+        assert result.exit_code == 0, result.output
+        assert captured["kwargs"]["use_pat"] is True
+
+    def test_no_flag_and_no_state_forwards_false(self, monkeypatch):
+        result, captured = self._invoke(monkeypatch, flag=False, state={"workspace": "https://x"})
+        assert result.exit_code == 0, result.output
+        assert captured["kwargs"]["use_pat"] is False

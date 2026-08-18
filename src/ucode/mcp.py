@@ -880,15 +880,27 @@ def build_mcp_picker_choices(
     available_mcp_service_names: list[str] | None = None,
     available_vector_search_servers: list[dict] | None = None,
     available_uc_functions_servers: list[dict] | None = None,
+    additive: bool = False,
 ) -> list[questionary.Choice | questionary.Separator]:
     original_by_name = _servers_by_name(original_servers)
     known_names = set(original_by_name)
+
+    def known_choice(name: str, title: str | None = None) -> questionary.Choice:
+        # `ucode mcp add` (additive) never removes an already-configured server, so
+        # show it as a non-toggleable note rather than a pre-checked box whose
+        # unchecking would be silently ignored. `configure mcp` (replace) keeps it a
+        # pre-checked toggle so unchecking removes it.
+        if additive:
+            return questionary.Choice(
+                title=title or name, value=name, disabled="already configured"
+            )
+        return _server_choice(name, True, title)
 
     choices: list[questionary.Choice | questionary.Separator] = []
     displayed_names: set[str] = set()
 
     if "databricks-sql" in known_names:
-        choices.append(_server_choice("databricks-sql", True, "Databricks SQL"))
+        choices.append(known_choice("databricks-sql", "Databricks SQL"))
     else:
         choices.append(_add_choice(SQL_MCP_VALUE, "Databricks SQL"))
     displayed_names.add("databricks-sql")
@@ -900,7 +912,7 @@ def build_mcp_picker_choices(
         registered_as = name.replace(".", "-")
         display_title = f"MCP: {name}"
         if registered_as in known_names:
-            choices.append(_server_choice(registered_as, True, display_title))
+            choices.append(known_choice(registered_as, display_title))
         else:
             choices.append(_add_choice(f"{MCP_SERVICE_SELECTION_PREFIX}{name}", display_title))
         displayed_names.add(registered_as)
@@ -908,7 +920,7 @@ def build_mcp_picker_choices(
     for name in available_external_names:
         display_title = f"Connection: {name}"
         if name in known_names:
-            choices.append(_server_choice(name, True, display_title))
+            choices.append(known_choice(name, display_title))
         else:
             choices.append(_add_choice(f"{EXTERNAL_MCP_SELECTION_PREFIX}{name}", display_title))
         displayed_names.add(name)
@@ -920,7 +932,7 @@ def build_mcp_picker_choices(
             continue
         display_title = f"Genie: {title}" if isinstance(title, str) and title else name
         if name in known_names:
-            choices.append(_server_choice(name, True, display_title))
+            choices.append(known_choice(name, display_title))
         else:
             choices.append(
                 _add_choice(
@@ -937,7 +949,7 @@ def build_mcp_picker_choices(
             continue
         display_title = f"App: {title}" if isinstance(title, str) and title else name
         if name in known_names:
-            choices.append(_server_choice(name, True, display_title))
+            choices.append(known_choice(name, display_title))
         else:
             choices.append(
                 _add_choice(
@@ -955,7 +967,7 @@ def build_mcp_picker_choices(
             continue
         display_title = f"Vector Search: {catalog}.{schema}"
         if name in known_names:
-            choices.append(_server_choice(name, True, display_title))
+            choices.append(known_choice(name, display_title))
         else:
             choices.append(
                 _add_choice(
@@ -973,7 +985,7 @@ def build_mcp_picker_choices(
             continue
         display_title = f"UC Functions: {catalog}.{schema}"
         if name in known_names:
-            choices.append(_server_choice(name, True, display_title))
+            choices.append(known_choice(name, display_title))
         else:
             choices.append(
                 _add_choice(
@@ -984,7 +996,7 @@ def build_mcp_picker_choices(
         displayed_names.add(name)
 
     for name in sorted(known_names - displayed_names):
-        choices.append(_server_choice(name, True))
+        choices.append(known_choice(name))
     return choices
 
 
@@ -997,10 +1009,14 @@ def prompt_for_mcp_server_choices(
     available_vector_search_servers: list[dict] | None = None,
     available_uc_functions_servers: list[dict] | None = None,
     allow_back: bool = False,
+    additive: bool = False,
 ) -> list[str] | None | _Back:
     """Show the MCP server picker. Returns the list of selected values, `None`
     if cancelled (Ctrl-C), or `_BACK` if `allow_back` and the user pressed Left
-    to return to the previous wizard step."""
+    to return to the previous wizard step.
+
+    ``additive`` (``ucode mcp add``) shows already-configured servers as
+    non-toggleable notes instead of pre-checked, removable boxes."""
     instruction = "(space to toggle, ctrl-a all, enter to save, type to filter)"
     if allow_back:
         instruction = "(space to toggle, ctrl-a all, ← back, enter to save, type to filter)"
@@ -1014,6 +1030,7 @@ def prompt_for_mcp_server_choices(
             available_mcp_service_names,
             available_vector_search_servers,
             available_uc_functions_servers,
+            additive=additive,
         ),
         style=_picker_style(),
         instruction=instruction,
@@ -1739,15 +1756,49 @@ def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[
     return workspace, profile, clients
 
 
+def _union_missing(base: list[dict], selected: list[dict]) -> list[dict]:
+    """Return ``selected`` followed by every ``base`` server whose name isn't
+    already in it. Used by ``ucode mcp add`` so registering new servers never
+    removes ones that are already configured (append semantics)."""
+    have = _servers_by_name(selected)
+    extra = [s for s in base if (_server_name(s) or "") not in have]
+    return [*selected, *extra]
+
+
+def add_mcp_command(
+    location: str | None = None,
+    services: set[str] | None = None,
+) -> int:
+    """`ucode mcp add`: register Databricks MCP servers WITHOUT removing any that
+    are already configured.
+
+    Uses the same discovery and options as `configure mcp` — the interactive
+    picker, or the non-interactive `--location`/`--services` paths — but is purely
+    additive: unlike `configure mcp`, it never removes servers outside the
+    selection."""
+    if services is not None and not services:
+        # An empty `--services` selects nothing. For `configure mcp` that means
+        # "remove all"; for the additive `add` there is simply nothing to register,
+        # so it's a no-op (and doesn't need --location the way a real subset does).
+        print_note("No MCP services given to add (empty --services); nothing to do.")
+        return 0
+    return configure_mcp_command(location=location, services=services, append=True)
+
+
 def configure_mcp_command(
     location: str | None = None,
     services: set[str] | None = None,
     *,
     exclude_sources: set[str] | None = None,
+    append: bool = False,
 ) -> int:
     """Interactive MCP picker. ``exclude_sources`` hides search sources the caller can't use —
     `ucode setup` passes ``{"apps"}`` because a managed config can't carry an app's off-workspace
-    host, so an app picked here would be silently dropped from the published config."""
+    host, so an app picked here would be silently dropped from the published config.
+
+    ``append`` (used by `ucode mcp add`) makes the command purely additive: the
+    final server list is unioned with the already-configured servers, so nothing
+    outside the current selection is removed."""
     if services is not None and location is None:
         # `--services` works standalone with full names (`system.ai.github`): the
         # `<catalog>.<schema>` to configure is derived from them. Bare short names
@@ -1766,13 +1817,19 @@ def configure_mcp_command(
             )
         location = next(iter(schemas))
     state = load_state()
-    workspace, profile, clients = setup_mcp_clients(state, "MCP Servers")
+    workspace, profile, clients = setup_mcp_clients(
+        state, "Add MCP Servers" if append else "MCP Servers"
+    )
 
     original_mcp_servers_for_location: list[dict] = list(state.get("mcp_servers") or [])
     if location is not None:
         working_mcp_servers = _resolve_location_mcp_servers(
             workspace, profile, clients, location, original_mcp_servers_for_location, services
         )
+        if append:
+            working_mcp_servers = _union_missing(
+                original_mcp_servers_for_location, working_mcp_servers
+            )
         changed = apply_mcp_server_changes(
             original_mcp_servers_for_location,
             working_mcp_servers,
@@ -1817,6 +1874,7 @@ def configure_mcp_command(
             discovered["vector_search"],
             discovered["uc_functions"],
             allow_back=True,
+            additive=append,
         )
         if selections is None:
             return 0
@@ -1866,6 +1924,9 @@ def configure_mcp_command(
         )
         working_names.add(entry_name)
 
+    if append:
+        working_mcp_servers = _union_missing(original_mcp_servers, working_mcp_servers)
+
     changed = apply_mcp_server_changes(
         original_mcp_servers,
         working_mcp_servers,
@@ -1878,7 +1939,8 @@ def configure_mcp_command(
         state["mcp_servers"] = working_mcp_servers
         save_state(state)
         added = sorted(working_names - set(original_by_name))
-        removed = sorted(set(original_by_name) - working_names)
+        # `add` never removes; the union above re-keeps unselected servers.
+        removed = [] if append else sorted(set(original_by_name) - working_names)
         print_success(_mcp_change_summary(added, removed, clients))
     elif not selections and not original_mcp_servers:
         # User submitted the picker without toggling anything --> make it clear nothing was selected

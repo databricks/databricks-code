@@ -18,6 +18,7 @@ from ucode.agents import (
     configure_tool,
     ensure_bootstrap_dependencies,
     ensure_provider_state,
+    install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
     provider_permission_error,
@@ -92,6 +93,7 @@ from ucode.managed_wizard import (
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
+    add_mcp_command,
     apply_managed_mcp_servers,
     apply_managed_skills,
     configure_mcp_command,
@@ -778,6 +780,7 @@ def configure_workspace_command(
         )
         state = states[0]
         state = configure_single_tool(tool, state)
+        install_databricks_ai_tools_for_agents([tool], state)
         spec = TOOL_SPECS[tool]
         console.print(
             Panel(
@@ -1067,6 +1070,44 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+@mcp_app.command("add")
+def mcp_add(
+    location: Annotated[
+        str | None,
+        typer.Option(
+            "--location",
+            help="Non-interactive: register the MCP services in the given Unity Catalog "
+            "`<catalog>.<schema>` (e.g. `system.ai`) and exit without showing the picker. "
+            "Servers already configured outside this location are kept.",
+        ),
+    ] = None,
+    services: Annotated[
+        str | None,
+        typer.Option(
+            "--services",
+            help="Register this comma-separated subset of MCP services (additively). Full names "
+            "like `system.ai.github` work on their own; bare short names like `github` need "
+            "--location to locate them. Omit --services to register the whole --location schema; "
+            'an empty `--services ""` adds nothing (no-op).',
+        ),
+    ] = None,
+) -> None:
+    """Add Databricks MCP servers to installed coding tools.
+
+    Like `ucode configure mcp`, but purely additive: it never removes MCP servers
+    that are already configured, only registers new ones.
+    """
+    selected = None if services is None else {s.strip() for s in services.split(",") if s.strip()}
+    try:
+        add_mcp_command(location=location, services=selected)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+
+
 @mcp_app.command("web-search")
 def mcp_web_search_cmd() -> None:
     """Run the web_search MCP server over stdio. Invoked as a subprocess by Claude Code."""
@@ -1091,15 +1132,21 @@ def mcp_proxy_cmd(
         str | None, typer.Option("--profile", help="Databricks CLI profile.")
     ] = None,
     use_pat: Annotated[
-        bool, typer.Option("--use-pat", help="Use the profile's static PAT instead of OAuth.")
+        bool,
+        typer.Option(
+            "--use-pat",
+            help="Authenticate with the profile's static personal access token (from "
+            "~/.databrickscfg) instead of OAuth. Set automatically for workspaces configured "
+            "with `ucode configure --profiles <name> --use-pat`.",
+        ),
     ] = False,
 ) -> None:
     """Bridge a coding agent's stdio MCP transport to a Databricks MCP endpoint.
 
     Each configured client spawns this as a local stdio MCP server (see
     `ucode configure mcp`); it forwards messages to ``--url`` and injects a
-    freshly-minted OAuth bearer on every upstream request, so the token never
-    expires mid-session. Not meant for interactive use — the agent manages this
+    freshly-minted token on every upstream request, so it never expires
+    mid-session. Not meant for interactive use — the agent manages this
     process's lifecycle."""
     from ucode.mcp_proxy import serve
 
