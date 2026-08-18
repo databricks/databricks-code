@@ -553,6 +553,50 @@ class TestStatus:
         assert "https://example.databricks.com/ai-gateway/anthropic" not in result.output
         assert "https://example.databricks.com/ai-gateway/gemini" not in result.output
 
+    def test_status_shows_managed_config_box_when_present_and_enabled(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        managed = {
+            "enabled_agents": {"claude": {}, "codex": {}},
+            "mcp_servers": [{"name": "github-mcp", "type": "external"}],
+            "skills": {"names": ["debug-ci"]},
+        }
+        with (
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.load_managed_state", return_value=managed),
+        ):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "Workspace-managed config" in result.output
+        assert "Enabled agents:" in result.output
+        assert "github-mcp" in result.output
+        assert "debug-ci" in result.output
+
+    def test_status_hides_managed_config_box_when_feature_disabled(self, monkeypatch):
+        monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
+        managed = {"enabled_agents": {"claude": {}}}
+        with (
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.load_managed_state", return_value=managed) as load_managed,
+        ):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "Workspace-managed config" not in result.output
+        # Feature off: the managed cache is never consulted.
+        load_managed.assert_not_called()
+
+    def test_status_hides_managed_config_box_when_none_present(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        with (
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.load_managed_state", return_value=None),
+        ):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "Workspace-managed config" not in result.output
+
 
 class TestConfigureSkillsCommand:
     def test_mcp_flag_dispatches_location_set(self):
@@ -2800,6 +2844,36 @@ class TestBareUcode:
         result, launched = self._run(monkeypatch, managed=managed)
         assert result.exit_code == 0, result.output
         assert launched[0][0] == "opencode"
+
+    def test_launch_banner_is_abridged_not_the_full_box(self, monkeypatch):
+        managed = {
+            "default_agent": "claude",
+            "enabled_agents": {"claude": {"model_config": {"default_model": "system.ai.opus"}}},
+            "mcp_servers": [{"name": "system.ai.slack", "type": "mcp-service"}],
+            "skills": {"names": ["main.default.my_skill"]},
+        }
+        result, _ = self._run(monkeypatch, managed=managed)
+        assert result.exit_code == 0, result.output
+        # One-line banner: the agent it launches, and the model.
+        assert "launching Claude Code as the default agent" in result.output
+        assert "system.ai.opus" in result.output
+        # The full box's per-config enumeration is left to `ucode status`.
+        assert "Enabled agents:" not in result.output
+        assert "system.ai.slack" not in result.output
+        assert "main.default.my_skill" not in result.output
+
+    def test_launch_banner_omits_default_agent_when_a_tier_overrides(self, monkeypatch):
+        # A budget tier can launch a different agent than the config's default; the banner must not
+        # then call it "the default agent" (the tier note in _launch_tool explains the swap).
+        managed = {"default_agent": "claude", "enabled_agents": {"claude": {}, "opencode": {}}}
+        monkeypatch.setattr(
+            "ucode.cli._fetch_budget_recommendation", lambda state, m: {"agent": "opencode"}
+        )
+        result, launched = self._run(monkeypatch, managed=managed)
+        assert result.exit_code == 0, result.output
+        assert launched[0][0] == "opencode"
+        assert "launching OpenCode" in result.output
+        assert "as the default agent" not in result.output
 
     def test_admin_without_a_config_is_pointed_at_setup(self, monkeypatch):
         result, launched = self._run(monkeypatch, managed=None, is_admin=True)

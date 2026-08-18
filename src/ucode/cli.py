@@ -175,13 +175,23 @@ def _policy_summary_lines(managed: dict) -> list[str]:
     return lines
 
 
-def _print_managed_summary(managed: dict, state: dict, tool: str | None) -> None:
+def _print_managed_summary(
+    managed: dict, state: dict, tool: str | None, *, abridged: bool = False
+) -> None:
     """Show which of the admin's settings are in force.
 
     With ``tool`` set (launch path) the per-agent Agent/Provider/Model lines are included;
     with ``tool=None`` (e.g. ``ucode configure`` under a managed config) they are skipped
     since no single agent has been chosen yet.
+
+    ``abridged`` prints only what changes launch-to-launch — the agent and model this run will use,
+    and the policy in force — with a pointer to ``ucode status`` for the rest. Bare ``ucode`` runs
+    every session, so re-enumerating the workspace's full MCP/skills/tier list each time is noise;
+    the full box stays for ``status`` and ``configure``, where the reader asked to see it.
     """
+    if abridged:
+        _print_managed_summary_abridged(managed, state, tool)
+        return
     lines = [f"[bold]Workspace:[/bold] [cyan]{state.get('workspace', '?')}[/cyan]"]
     if tool is not None:
         lines.append(f"[bold]Agent:[/bold] [green]{TOOL_SPECS[tool]['display']}[/green]")
@@ -217,6 +227,27 @@ def _print_managed_summary(managed: dict, state: dict, tool: str | None) -> None
     lines.extend(_policy_summary_lines(managed))
     console.print(
         Panel("\n".join(lines), title="Workspace-managed config", style="green", expand=False)
+    )
+
+
+def _print_managed_summary_abridged(managed: dict, state: dict, tool: str | None) -> None:
+    """One-line launch banner: which agent (and model) this managed run is launching.
+
+    Bare ``ucode`` runs every session, so the full box's MCP/skills/policy enumeration is noise
+    each time; ``ucode status`` still shows all of it. See ``_print_managed_summary``'s ``abridged``
+    note. ``tool`` is always set on the launch path, but is guarded for callers that pass None."""
+    if tool is None:
+        print_note("Using managed config.")
+        return
+    agent = TOOL_SPECS[tool]["display"]
+    model = managed_default_model(managed, tool)
+    model_suffix = f" with [magenta]{model}[/magenta]" if model else ""
+    # "as the default agent" only when this really is the config's default: a budget tier can
+    # override the default and launch a different agent, and the tier note in `_launch_tool` already
+    # explains that case — so claiming "default" here would contradict it.
+    role = " as the default agent" if tool == managed.get("default_agent") else ""
+    console.print(
+        f"[dim]•[/dim] Using managed config — launching [green]{agent}[/green]{role}{model_suffix}"
     )
 
 
@@ -925,6 +956,16 @@ def status() -> int:
     profile = state.get("profile")
     if profile:
         print_kv("CLI profile", profile)
+
+    # When the workspace publishes a managed config and this run has the feature switched on, that
+    # admin-authored config is what launches actually apply — so surface the whole setup as one box
+    # here too, rather than leaving a developer to infer it from the per-agent rows below. Read from
+    # the local cache (no network): status is a quick, offline-safe glance, and the cache is what the
+    # last launch persisted for this workspace.
+    if workspace and managed_agent_config_enabled():
+        managed = load_managed_state(workspace)
+        if managed:
+            _print_managed_summary(managed, state, None)
 
     print_heading("Coding Agents")
     for tool, spec in TOOL_SPECS.items():
@@ -2008,7 +2049,7 @@ def _launch_managed_default(
             "Your workspace's managed config names no agent to launch. Ask an admin to set a "
             "default agent, or run `ucode <agent>` directly."
         )
-    _print_managed_summary(managed, state, tool)
+    _print_managed_summary(managed, state, tool, abridged=True)
     _launch_tool(
         tool,
         ctx,
