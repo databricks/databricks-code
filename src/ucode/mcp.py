@@ -1712,11 +1712,21 @@ def prompt_for_mcp_search_sources(exclude_sources: set[str] | None = None) -> se
     return {str(value) for value in selection}
 
 
-def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[str]]:
+def setup_mcp_clients(
+    state: dict,
+    section: str,
+    *,
+    require_auth: bool = True,
+    action_note: str = "Configuring for",
+) -> tuple[str, str | None, list[str]]:
     """Validate the workspace, resolve configured MCP clients, and prepare auth.
 
     Returns ``(workspace, profile, clients)`` and prints the section header, the
-    "Configuring for" note, and a warning per configured-but-uninstalled client.
+    ``action_note`` line, and a warning per configured-but-uninstalled client.
+
+    ``require_auth`` forces a Databricks login (needed to register a server); the
+    removal path passes ``False`` since unregistering a server is purely local and
+    should work even when the workspace token has expired.
     """
     workspace = state.get("workspace")
     if not workspace:
@@ -1742,12 +1752,13 @@ def setup_mcp_clients(state: dict, section: str) -> tuple[str, str | None, list[
     ]
 
     profile = state.get("profile")
-    apply_pat_environment(state)
-    ensure_databricks_auth(workspace, profile)
+    if require_auth:
+        apply_pat_environment(state)
+        ensure_databricks_auth(workspace, profile)
 
     print_section(section)
     client_names = ", ".join(str(MCP_CLIENTS[client]["display"]) for client in clients)
-    print_note(f"Configuring for: {client_names}")
+    print_note(f"{action_note}: {client_names}")
     for client in missing_clients:
         print_warning(
             f"{MCP_CLIENTS[client]['display']} is configured in ucode but not installed; "
@@ -1964,6 +1975,75 @@ def _mcp_change_summary(added: list[str], removed: list[str], clients: list[str]
     noun = "MCP server" if total == 1 else "MCP servers"
     summary = ", ".join(parts).capitalize()
     return f"{summary} {noun} across {client_names}" if client_names else f"{summary} {noun}"
+
+
+def _prompt_for_mcp_removal(servers: list[dict]) -> list[str] | None:
+    """Checklist of already-configured MCP servers to remove. Each item shows the
+    registered name and the tools it's currently on. Returns the selected server
+    names, ``None`` if cancelled (Ctrl-C), or ``[]`` if nothing was checked."""
+    choices: list[questionary.Choice | questionary.Separator] = []
+    for server in servers:
+        name = _server_name(server)
+        if not name:
+            continue
+        on_clients = [str(MCP_CLIENTS[c]["display"]) for c in _mcp_server_clients(server)]
+        title = f"{name} ({', '.join(on_clients)})" if on_clients else name
+        choices.append(questionary.Choice(title=title, value=name, checked=False))
+    if not choices:
+        return []
+    selection = _scrolling_checkbox(
+        "Remove MCP:",
+        choices=choices,
+        style=_picker_style(),
+        instruction="(space to toggle, ctrl-a all, enter to remove, type to filter)",
+    ).ask()
+    if selection is None:
+        return None
+    return [str(value) for value in selection]
+
+
+def remove_mcp_command() -> int:
+    """`ucode mcp remove`: interactively unregister configured MCP servers.
+
+    Shows the servers currently configured (skills connections excluded — they're
+    owned by `configure skills`) and removes the ones you select from every coding
+    tool they're registered on. It never adds or reconfigures anything, and needs no
+    Databricks auth."""
+    state = load_state()
+    workspace, profile, clients = setup_mcp_clients(
+        state, "Remove MCP Servers", require_auth=False, action_note="Removing from"
+    )
+
+    original_mcp_servers = list(state.get("mcp_servers") or [])
+    removable = [s for s in original_mcp_servers if s.get("kind") != SKILLS_MCP_KIND]
+    if not removable:
+        print_note("No MCP servers are configured to remove.")
+        return 0
+
+    selection = _prompt_for_mcp_removal(removable)
+    if selection is None:
+        return 0
+    if not selection:
+        print_note("No MCP servers selected.")
+        return 0
+    remove_names = set(selection)
+
+    working_mcp_servers = [
+        s for s in original_mcp_servers if (_server_name(s) or "") not in remove_names
+    ]
+    changed = apply_mcp_server_changes(
+        original_mcp_servers,
+        working_mcp_servers,
+        clients,
+        workspace,
+        profile,
+        use_pat=bool(state.get("use_pat")),
+    )
+    if changed or original_mcp_servers != working_mcp_servers:
+        state["mcp_servers"] = working_mcp_servers
+        save_state(state)
+        print_success(_mcp_change_summary([], sorted(remove_names), clients))
+    return 0
 
 
 def _merge_clients(prior: list[str] | None, new: list[str]) -> list[str]:

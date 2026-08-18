@@ -386,6 +386,33 @@ class TestMcpPicker:
         # A not-yet-configured server stays an addable, toggleable choice.
         assert choices_by_title["Databricks SQL"].disabled is None
 
+    def test_removal_picker_lists_configured_servers_with_their_clients(self, monkeypatch):
+        checkbox_calls: list[dict] = []
+
+        class FakePrompt:
+            def ask(self):
+                return ["system-ai-github"]
+
+        def fake_checkbox(*args, **kwargs):
+            checkbox_calls.append(kwargs)
+            return FakePrompt()
+
+        monkeypatch.setattr(mcp, "_scrolling_checkbox", fake_checkbox)
+
+        result = mcp._prompt_for_mcp_removal(
+            [
+                {"name": "system-ai-github", "url": f"{WS}/x", "clients": ["claude", "codex"]},
+                {"name": "", "url": f"{WS}/y", "clients": ["claude"]},  # unnamed: skipped
+            ]
+        )
+
+        assert result == ["system-ai-github"]
+        choices = checkbox_calls[0]["choices"]
+        # The unnamed server is skipped; the named one shows the tools it's on.
+        assert [c.title for c in choices] == ["system-ai-github (Claude Code, Codex)"]
+        assert [c.value for c in choices] == ["system-ai-github"]
+        assert all(c.checked is False for c in choices)
+
     def test_picker_keeps_databricks_sql_when_nothing_discovered(self):
         choices = mcp.build_mcp_picker_choices([], [], [], [])
         assert [choice.title for choice in choices] == ["Databricks SQL"]
@@ -1918,6 +1945,87 @@ class TestAddMcpCommand:
 
         assert mcp.add_mcp_command(services=set()) == 0
         assert called == []
+
+
+class TestRemoveMcpCommand:
+    """`ucode mcp remove` interactively unregisters configured MCP servers."""
+
+    GITHUB = {
+        "name": "system-ai-github",
+        "url": f"{WS}/ai-gateway/mcp-services/system.ai.github",
+        "auth": "proxy",
+        "clients": ["claude"],
+    }
+    SQL = {
+        "name": "databricks-sql",
+        "url": f"{WS}/api/2.0/mcp/sql",
+        "auth": "proxy",
+        "clients": ["claude"],
+    }
+
+    def test_removes_only_selected_servers(self, monkeypatch):
+        saved_states: list[dict] = []
+        removed: list[tuple[str, str]] = []
+        _stub_location_base(
+            monkeypatch,
+            {**CLAUDE_STATE, "mcp_servers": [self.GITHUB, self.SQL]},
+        )
+        monkeypatch.setattr(mcp, "_prompt_for_mcp_removal", lambda servers: ["system-ai-github"])
+        monkeypatch.setattr(
+            mcp,
+            "remove_client_mcp_server",
+            lambda client, name: removed.append((client, name)) or [],
+        )
+        monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
+
+        assert mcp.remove_mcp_command() == 0
+
+        assert removed == [("claude", "system-ai-github")]
+        assert [s["name"] for s in saved_states[-1]["mcp_servers"]] == ["databricks-sql"]
+
+    def test_cancel_makes_no_changes(self, monkeypatch):
+        saved_states: list[dict] = []
+        _stub_location_base(monkeypatch, {**CLAUDE_STATE, "mcp_servers": [self.SQL]})
+        monkeypatch.setattr(mcp, "_prompt_for_mcp_removal", lambda servers: None)
+        monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state))
+
+        assert mcp.remove_mcp_command() == 0
+        assert saved_states == []
+
+    def test_skills_connection_is_not_offered(self, monkeypatch):
+        offered: dict[str, list[str]] = {}
+        skills = {
+            "name": mcp.SKILLS_MCP_SERVER_NAME,
+            "kind": mcp.SKILLS_MCP_KIND,
+            "url": f"{WS}/ai-gateway/skills/?schema=main.default",
+            "auth": "env:OAUTH_TOKEN",
+            "clients": ["claude"],
+        }
+        _stub_location_base(
+            monkeypatch,
+            {**CLAUDE_STATE, "mcp_servers": [skills, self.GITHUB]},
+        )
+
+        def fake_prompt(servers):
+            offered["names"] = [s["name"] for s in servers]
+            return []
+
+        monkeypatch.setattr(mcp, "_prompt_for_mcp_removal", fake_prompt)
+
+        assert mcp.remove_mcp_command() == 0
+        # The skills connection is owned by `configure skills`, so it's never a
+        # removal candidate; only the real MCP server is offered.
+        assert offered["names"] == ["system-ai-github"]
+
+    def test_no_configured_servers_skips_the_picker(self, monkeypatch):
+        prompted: list[bool] = []
+        _stub_location_base(monkeypatch, {**CLAUDE_STATE, "mcp_servers": []})
+        monkeypatch.setattr(
+            mcp, "_prompt_for_mcp_removal", lambda servers: prompted.append(True) or []
+        )
+
+        assert mcp.remove_mcp_command() == 0
+        assert prompted == []
 
 
 class TestConfigureMcpServicesSubset:

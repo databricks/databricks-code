@@ -91,6 +91,7 @@ from ucode.mcp import (
     configure_mcp_command,
     configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
+    remove_mcp_command,
     revert_mcp_configs,
 )
 from ucode.skills_download import (
@@ -1089,6 +1090,24 @@ def mcp_add(
     selected = None if services is None else {s.strip() for s in services.split(",") if s.strip()}
     try:
         add_mcp_command(location=location, services=selected)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+
+
+@mcp_app.command("remove")
+def mcp_remove() -> None:
+    """Remove configured Databricks MCP servers from your coding tools.
+
+    Interactive: shows the servers you currently have configured and unregisters the
+    ones you select. Skills connections (managed by `ucode configure skills`) are not
+    shown. Needs no Databricks login.
+    """
+    try:
+        remove_mcp_command()
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
