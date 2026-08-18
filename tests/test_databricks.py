@@ -1523,6 +1523,27 @@ class TestGetDatabricksToken:
         token = get_databricks_token(WS)
         assert token == "refreshed-token"
 
+    def test_retries_on_cache_lock_contention(self, tmp_path, monkeypatch):
+        # Concurrent `databricks auth token` calls racing on the shared token
+        # cache fail with "cache update: exit status 45". That's transient (the
+        # credential is fine), so we must retry — not treat it as a dead session.
+        call_count = tmp_path / "calls"
+        call_count.write_text("0")
+        env = self._fake_databricks(
+            tmp_path,
+            f"count=$(cat {call_count})\n"
+            f"echo $((count + 1)) > {call_count}\n"
+            'if [ "$count" -lt 2 ]; then\n'
+            '  echo "Error: forced token refresh: cache update: exit status 45" >&2\n'
+            "  exit 1\n"
+            "else\n"
+            '  echo \'{"access_token": "won-the-lock", "token_type": "Bearer"}\'\n'
+            "fi",
+        )
+        monkeypatch.setattr("os.environ", env)
+        token = get_databricks_token(WS)
+        assert token == "won-the-lock"
+
     def test_raises_when_reauth_also_fails(self, tmp_path, monkeypatch):
         env = self._fake_databricks(
             tmp_path,

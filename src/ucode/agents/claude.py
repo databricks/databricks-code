@@ -986,7 +986,7 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     if not isinstance(port, int):
         raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
 
-    server, cache = start_proxy(workspace, state.get("profile"), port)
+    server, cache, client = start_proxy(workspace, state.get("profile"), port)
     # start_proxy falls back to an OS-assigned port when the cached one is taken
     # (stale proxy from a killed session). Reconcile settings + state to whatever
     # it actually bound, so Claude Code connects to the live port.
@@ -1006,6 +1006,7 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     finally:
         cache.stop()
         server.shutdown()
+        client.close()
     raise SystemExit(returncode)
 
 
