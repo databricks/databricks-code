@@ -1103,8 +1103,7 @@ def mcp_remove() -> None:
     """Remove configured Databricks MCP servers from your coding tools.
 
     Interactive: shows the servers you currently have configured and unregisters the
-    ones you select. Skills connections (managed by `ucode configure skills`) are not
-    shown. Needs no Databricks login.
+    ones you select. Needs no Databricks login.
     """
     try:
         remove_mcp_command()

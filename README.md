@@ -173,8 +173,7 @@ ucode mcp remove
 ```
 
 It shows the servers you currently have configured — each with the coding tools it's registered
-on — and removes the ones you select from those tools. Skills connections (managed by
-`ucode configure skills`) aren't shown, and it needs no Databricks login.
+on — and removes the ones you select from those tools. It needs no Databricks login.
 
 ### Skills (optional)
 
