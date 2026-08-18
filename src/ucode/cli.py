@@ -18,6 +18,7 @@ from ucode.agents import (
     configure_tool,
     ensure_bootstrap_dependencies,
     ensure_provider_state,
+    install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
     provider_permission_error,
@@ -84,6 +85,7 @@ from ucode.managed_wizard import apply_command, setup_command, show_command
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
+    add_mcp_command,
     apply_managed_mcp_servers,
     apply_managed_skills,
     configure_mcp_command,
@@ -769,6 +771,7 @@ def configure_workspace_command(
         )
         state = states[0]
         state = configure_single_tool(tool, state)
+        install_databricks_ai_tools_for_agents([tool], state)
         spec = TOOL_SPECS[tool]
         console.print(
             Panel(
@@ -1054,6 +1057,44 @@ def _version_callback(value: bool) -> None:
 
         print(ucode_version())
         raise typer.Exit()
+
+
+@mcp_app.command("add")
+def mcp_add(
+    location: Annotated[
+        str | None,
+        typer.Option(
+            "--location",
+            help="Non-interactive: register the MCP services in the given Unity Catalog "
+            "`<catalog>.<schema>` (e.g. `system.ai`) and exit without showing the picker. "
+            "Servers already configured outside this location are kept.",
+        ),
+    ] = None,
+    services: Annotated[
+        str | None,
+        typer.Option(
+            "--services",
+            help="Register this comma-separated subset of MCP services (additively). Full names "
+            "like `system.ai.github` work on their own; bare short names like `github` need "
+            "--location to locate them. Omit --services to register the whole --location schema; "
+            'an empty `--services ""` adds nothing (no-op).',
+        ),
+    ] = None,
+) -> None:
+    """Add Databricks MCP servers to installed coding tools.
+
+    Like `ucode configure mcp`, but purely additive: it never removes MCP servers
+    that are already configured, only registers new ones.
+    """
+    selected = None if services is None else {s.strip() for s in services.split(",") if s.strip()}
+    try:
+        add_mcp_command(location=location, services=selected)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
 
 
 @mcp_app.command("web-search")

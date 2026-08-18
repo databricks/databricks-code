@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import os
 import platform
+import random
 import re
 import shlex
 import shutil
@@ -54,6 +55,13 @@ AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
+# Substrings the Databricks CLI emits when it loses the token-cache write lock
+# to a concurrent `databricks auth token` (e.g. another ucode helper process or
+# MLflow tracing refreshing the shared ~/.databricks/token-cache.json at the same
+# instant). These are transient — the credential is fine, only the local write
+# raced — so we retry rather than treat them as an expired session.
+_TOKEN_CACHE_LOCK_MARKERS = ("cache update", "exit status 45")
+_TOKEN_FETCH_MAX_ATTEMPTS = 4
 
 
 def _debug_enabled() -> bool:
@@ -1066,7 +1074,8 @@ def get_databricks_token(
         + f" profile={profile or '<none>'}",
     )
 
-    def _fetch() -> str:
+    def _fetch() -> tuple[str, str]:
+        """Return (access_token, stderr). token is '' on any failure."""
         try:
             result = run(
                 cmd,
@@ -1078,12 +1087,32 @@ def get_databricks_token(
             )
             _debug("auth token", _format_subprocess_result(result))
             if result.returncode == 0:
-                return json.loads(result.stdout or "{}").get("access_token", "")
+                return json.loads(result.stdout or "{}").get("access_token", ""), ""
+            return "", result.stderr or ""
         except (subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
             _debug("auth token", f"exception: {type(exc).__name__}: {exc}")
+            return "", str(exc)
+
+    def _fetch_with_lock_retry() -> str:
+        """Mint a token, retrying transient token-cache lock contention.
+
+        Concurrent `databricks auth token` calls racing on the shared cache fail
+        fast with a lock error (see ``_TOKEN_CACHE_LOCK_MARKERS``). The lock is
+        held only for the brief cache write, so a short jittered backoff almost
+        always wins the next attempt. A non-lock failure returns '' immediately
+        so the caller can fall through to the re-auth path."""
+        for attempt in range(_TOKEN_FETCH_MAX_ATTEMPTS):
+            token, stderr = _fetch()
+            if token:
+                return token
+            if not any(marker in stderr.lower() for marker in _TOKEN_CACHE_LOCK_MARKERS):
+                return ""
+            _debug("auth token", f"cache-lock contention (attempt {attempt + 1}); retrying")
+            if attempt < _TOKEN_FETCH_MAX_ATTEMPTS - 1:
+                time.sleep(random.uniform(0.05, 0.1 * (2**attempt)))
         return ""
 
-    token = _fetch()
+    token = _fetch_with_lock_retry()
     if not token:
         # Session may have expired — attempt non-interactive re-auth and retry once.
         _debug("auth token", "empty on first fetch; attempting auth login --no-browser")
@@ -1106,7 +1135,7 @@ def get_databricks_token(
             _debug("auth login", _format_subprocess_result(reauth))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             _debug("auth login", f"exception: {type(exc).__name__}: {exc}")
-        token = _fetch()
+        token = _fetch_with_lock_retry()
 
     if not token:
         profile_name = profile or find_profile_name_for_host(workspace)
