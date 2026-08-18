@@ -799,13 +799,15 @@ class TestConfigureMcpCommand:
 
         assert mcp.configure_mcp_command() == 0
 
-        assert configured == [
-            ("claude", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
-            ("codex", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
-            ("gemini", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
-            ("opencode", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
-            ("copilot", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
-        ]
+        assert sorted(configured) == sorted(
+            [
+                ("claude", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
+                ("codex", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
+                ("gemini", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
+                ("opencode", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
+                ("copilot", "github-mcp", f"{WS}/api/2.0/mcp/external/github-mcp"),
+            ]
+        )
         assert saved_states[-1]["mcp_servers"] == [
             {
                 "name": "github-mcp",

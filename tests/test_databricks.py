@@ -1843,9 +1843,7 @@ class TestEnsureAiGateway:
 
         db_mod.ensure_ai_gateway(WS, "fake-token")
 
-        assert calls == [
-            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"
-        ]
+        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"]
 
     def test_v2_only_workspace_succeeds_after_v3_probe(self, monkeypatch):
         calls: list[str] = []
@@ -1910,9 +1908,7 @@ class TestEnsureAiGateway:
         with pytest.raises(RuntimeError, match="rejected"):
             db_mod.ensure_ai_gateway(WS, "fake-token")
 
-        assert calls == [
-            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"
-        ]
+        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"]
 
     def test_v3_forbidden_and_v2_unavailable_reports_permission_error(self, monkeypatch):
         reasons = iter(["HTTP 403: Missing Unity Catalog grants", "HTTP 404: V2 missing"])
