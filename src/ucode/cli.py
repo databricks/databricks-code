@@ -232,9 +232,11 @@ def _resolve_workspace_then_maybe_reject(
     locally would be overridden at launch anyway: show the admin's config and point the developer
     at `ucode`.
 
-    Returns the resolved entries to configure when there is no managed config so the caller reuses
-    them instead of prompting again. Without the feature enabled it returns ``workspace_entries``
-    unchanged and prompts nothing.
+    When there is no managed config the developer's own ``configure`` always proceeds — an admin
+    just sees an FYI that they could publish one with ``ucode setup`` (never a prompt, never a
+    diversion). Returns the resolved entries to configure so the caller reuses them instead of
+    prompting again. Without the feature enabled it returns ``workspace_entries`` unchanged and
+    prompts nothing.
     """
     if not managed_agent_config_enabled():
         return workspace_entries
@@ -257,13 +259,13 @@ def _resolve_workspace_then_maybe_reject(
 
 
 def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
-    """When a workspace admin runs ``configure`` on a workspace with no managed config, offer to
-    bail out so they can publish one with ``ucode setup`` instead.
+    """When a workspace admin runs ``configure`` on a workspace with no managed config, drop an FYI
+    that they could publish one with ``ucode setup`` — without interrupting the configure flow.
 
-    Admins are the ones who'd want a managed config; a plain developer just gets the normal
-    configure flow. If they accept, exit cleanly (assuming they'll run `ucode setup`); if they
-    decline, fall through to configure their own local settings. The check is best-effort: any
-    failure to determine admin status (auth or SCIM unreachable) silently skips the prompt.
+    Admins are the ones who'd want a managed config, so the note is only shown to them; a plain
+    developer sees nothing. This never prompts and never diverts the command: the developer's own
+    ``configure`` always runs to completion, with the note printed alongside it. The check is
+    best-effort: any failure to determine admin status (auth or SCIM unreachable) silently skips it.
     """
     try:
         token = get_databricks_token(workspace, profile)
@@ -274,23 +276,10 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
     if not is_admin:
         return
     print_note(
-        "✨ New: as a workspace admin you can publish a managed config with `ucode setup` — set the "
-        "agents and models once (then MCP servers and skills with `ucode setup mcps` / `skills`), and "
-        "every developer picks them up automatically."
+        "✨ New: run `ucode setup` to publish a managed config to a workspace — set agents, models, mcps "
+        "and skills once, and every developer inherits them when running `ucode`. This scales "
+        "delivery of coding agents to all developers without each one setting up ucode themselves."
     )
-    if prompt_yes_no("Set one up now with `ucode setup`?"):
-        # Launch the setup flow in place rather than telling them to re-run a command. Reuse the
-        # workspace/profile we already resolved and authenticated against so setup doesn't prompt
-        # for them again.
-        try:
-            code = setup_command(workspace=workspace, profile=profile)
-        except RuntimeError as exc:
-            print_err(str(exc))
-            raise typer.Exit(1) from None
-        except KeyboardInterrupt:
-            print_err("Interrupted.")
-            raise typer.Exit(130) from None
-        raise typer.Exit(code or 0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:

@@ -2590,84 +2590,53 @@ class TestConfigureDeprecation:
         entries = self._resolve([("https://w", None)])
         assert entries == [("https://w", None)]
 
-    def test_admin_who_declines_proceeds_with_configure(self, monkeypatch):
-        # An admin on a config-less workspace is offered `ucode setup`; declining continues the
-        # normal configure flow and returns the resolved workspace.
+    def test_admin_sees_fyi_note_and_is_not_hijacked(self, monkeypatch):
+        # An admin on a config-less workspace gets an FYI that they could publish one with
+        # `ucode setup`, but the command is never diverted: no prompt, no in-place setup launch —
+        # the normal configure flow runs to completion and returns the resolved workspace.
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
         monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
-        monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: False)
+        monkeypatch.setattr(
+            "ucode.cli.prompt_yes_no",
+            lambda prompt: pytest.fail("configure must not prompt to launch setup"),
+        )
+        monkeypatch.setattr(
+            "ucode.cli.setup_command",
+            lambda **kwargs: pytest.fail("configure must not launch setup in place"),
+        )
+        notes: list[str] = []
+        monkeypatch.setattr("ucode.cli.print_note", lambda msg: notes.append(msg))
         entries = self._resolve([("https://w", None)])
         assert entries == [("https://w", None)]
+        assert any("ucode setup" in note for note in notes)
 
-    def test_admin_who_accepts_launches_setup_in_place(self, monkeypatch):
-        # Accepting the offer runs `setup_command` right there — reusing the workspace/profile we
-        # already resolved so setup doesn't re-prompt for them — then exits with its code.
-        import typer
-
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
-        monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: True)
-        calls = {}
-        monkeypatch.setattr(
-            "ucode.cli.setup_command",
-            lambda **kwargs: calls.update(kwargs) or 0,
-        )
-        with pytest.raises(typer.Exit) as exc:
-            self._resolve([("https://w", None)])
-        assert exc.value.exit_code == 0
-        assert calls == {"workspace": "https://w", "profile": None}
-
-    def test_admin_who_accepts_propagates_setup_failure(self, monkeypatch):
-        # A RuntimeError from setup (e.g. discovery failed) surfaces as a non-zero exit, not a stack
-        # trace bubbling out of configure.
-        import typer
-
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
-        monkeypatch.setattr("ucode.cli.prompt_yes_no", lambda prompt: True)
-        monkeypatch.setattr(
-            "ucode.cli.setup_command",
-            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("no agents")),
-        )
-        with pytest.raises(typer.Exit) as exc:
-            self._resolve([("https://w", None)])
-        assert exc.value.exit_code == 1
-
-    def test_non_admin_is_never_prompted_for_setup(self, monkeypatch):
+    def test_non_admin_sees_no_setup_note(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
         monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: False)
-        monkeypatch.setattr(
-            "ucode.cli.prompt_yes_no",
-            lambda prompt: pytest.fail("non-admins must not be prompted for setup"),
-        )
+        notes: list[str] = []
+        monkeypatch.setattr("ucode.cli.print_note", lambda msg: notes.append(msg))
         entries = self._resolve([("https://w", None)])
         assert entries == [("https://w", None)]
+        assert notes == []
 
-    def test_admin_check_failure_skips_the_setup_prompt(self, monkeypatch):
-        # `is_workspace_admin` returns None when the check itself fails; treat as "don't prompt".
+    def test_admin_check_failure_shows_no_setup_note(self, monkeypatch):
+        # `is_workspace_admin` returns None when the check itself fails; treat as "not an admin".
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
         monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: None)
-        monkeypatch.setattr(
-            "ucode.cli.prompt_yes_no",
-            lambda prompt: pytest.fail("must not prompt when admin status is unknown"),
-        )
+        notes: list[str] = []
+        monkeypatch.setattr("ucode.cli.print_note", lambda msg: notes.append(msg))
         entries = self._resolve([("https://w", None)])
         assert entries == [("https://w", None)]
+        assert notes == []
 
     def test_configure_command_exits_zero_without_erroring(self, monkeypatch):
         # `typer.Exit(0)` subclasses RuntimeError, so the command's own RuntimeError handler must
