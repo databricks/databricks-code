@@ -473,7 +473,7 @@ def _prompt_claude_models(state: dict) -> dict:
         family_models = candidates.get(family)
         if not family_models:
             continue
-        rows = [(model, model) for model in family_models[:_MODEL_PICKER_LIMIT]] + [
+        rows = [(model, model) for model in family_models] + [
             (_CUSTOM_MODEL, _CUSTOM_MODEL_LABEL),
             (_SKIP_FAMILY, f"(skip {family})"),
         ]
@@ -721,18 +721,17 @@ def _require_text(prompt: str) -> str:
         print_err("Please enter a model id.")
 
 
-# Discovered model lists run long (a dozen-plus ids on a real workspace), so each hosted-model picker
-# shows only the most relevant few and offers an explicit "type your own" row. Typing a model covers
-# both a discovered id past the shown few and a custom model service outside `system.ai` that
+# Discovered model lists run long (a dozen-plus ids on a real workspace), so every hosted-model
+# picker is searchable and scrolls (see `prompt_for_selection`); all discovered ids are offered, and
+# an explicit "type your own" row still covers a custom model service outside `system.ai` that
 # discovery never lists at all.
-_MODEL_PICKER_LIMIT = 5
 _CUSTOM_MODEL = "__custom_model__"
 _CUSTOM_MODEL_LABEL = "✎ Enter a custom model…"
 
 
 def _custom_option_rows(options: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """The first few model rows plus a 'type your own' row, for a hosted-model picker."""
-    return list(options[:_MODEL_PICKER_LIMIT]) + [(_CUSTOM_MODEL, _CUSTOM_MODEL_LABEL)]
+    """All discovered model rows plus a 'type your own' row, for a hosted-model picker."""
+    return list(options) + [(_CUSTOM_MODEL, _CUSTOM_MODEL_LABEL)]
 
 
 def _short_reason(reason: str | None) -> str:
@@ -792,7 +791,7 @@ def _prompt_custom_model(state: dict) -> str:
 def _select_hosted_model(
     prompt: str, options: list[str], state: dict, custom_sink: list[str]
 ) -> str:
-    """Single-select over the top few ``options`` plus a custom-entry row.
+    """Single-select over all discovered ``options`` plus a custom-entry row.
 
     Records any custom id in ``custom_sink`` so the caller can mark it in
     ``model_config.custom_models``, which keeps validation from rejecting a model discovery didn't
@@ -809,7 +808,7 @@ def _select_hosted_model(
 def _select_hosted_models_multi(
     prompt: str, options: list[str], state: dict, custom_sink: list[str]
 ) -> list[str]:
-    """Multi-select over the top few ``options`` plus a custom-entry row; requires one pick.
+    """Multi-select over all discovered ``options`` plus a custom-entry row; requires one pick.
 
     Selecting the custom row prompts for custom model ids — as many as the admin wants, since a
     multi-select agent (opencode, pi) can carry a whole list — and folds them into the picks. Records

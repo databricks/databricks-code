@@ -484,3 +484,43 @@ class TestFormatMeter:
     def test_width_is_constant(self):
         for fraction in (0.0, 0.13, 0.5, 0.99, 1.0):
             assert len(format_meter(fraction)) == 32
+
+
+class TestChoiceViewportCap:
+    """`_cap_choice_viewport` pins long picker lists to a fixed scrolling window."""
+
+    @staticmethod
+    def _choice_window_height(question):
+        from prompt_toolkit.layout.containers import Window
+        from questionary.prompts.common import InquirerControl
+
+        for window in question.application.layout.find_all_windows():
+            if isinstance(window, Window) and isinstance(window.content, InquirerControl):
+                return window.height
+        raise AssertionError("no InquirerControl window found")
+
+    def test_short_list_keeps_natural_height(self):
+        # At or below the threshold everything fits, so the window is left unbounded (height=None)
+        # rather than padded to a fixed size.
+        n = ui_mod._SCROLL_HINT_THRESHOLD
+        question = questionary.select("p", choices=[f"m{i}" for i in range(n)])
+        ui_mod._cap_choice_viewport(question, n)
+        assert self._choice_window_height(question) is None
+
+    def test_long_list_is_capped_to_the_threshold(self):
+        n = ui_mod._SCROLL_HINT_THRESHOLD + 15
+        question = questionary.select("p", choices=[f"m{i}" for i in range(n)])
+        ui_mod._cap_choice_viewport(question, n)
+        height = self._choice_window_height(question)
+        assert height.max == ui_mod._SCROLL_HINT_THRESHOLD
+        assert height.preferred == ui_mod._SCROLL_HINT_THRESHOLD
+
+    def test_checkbox_list_is_capped_too(self):
+        n = ui_mod._SCROLL_HINT_THRESHOLD + 15
+        question = questionary.checkbox("p", choices=[f"m{i}" for i in range(n)])
+        ui_mod._cap_choice_viewport(question, n)
+        assert self._choice_window_height(question).max == ui_mod._SCROLL_HINT_THRESHOLD
+
+    def test_missing_application_is_a_no_op(self):
+        # Best-effort: a question shape without an application must not raise.
+        ui_mod._cap_choice_viewport(object(), ui_mod._SCROLL_HINT_THRESHOLD + 5)

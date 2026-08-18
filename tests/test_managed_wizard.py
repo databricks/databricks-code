@@ -1103,9 +1103,10 @@ class TestCustomModelEntry:
         assert config["default_model"] == "main.aarushi.maybe"
         assert warn.called
 
-    def test_picker_shows_only_the_top_few_plus_custom(self):
-        # A long list is truncated so the custom row is reachable without scrolling past everything.
-        state = {**STATE, "codex_models": [f"system.ai.gpt-5-{i}" for i in range(10)]}
+    def test_picker_offers_all_models_plus_custom(self):
+        # Every discovered model is offered (the searchable picker scrolls), with the custom row last.
+        models = [f"system.ai.gpt-5-{i}" for i in range(10)]
+        state = {**STATE, "codex_models": list(models)}
         offered: list[list[str]] = []
 
         def fake_sel(prompt, options, **kwargs):
@@ -1116,7 +1117,8 @@ class TestCustomModelEntry:
             wizard._prompt_models_for_agent("codex", state, None)
         rows = offered[0]
         assert rows[-1] == wizard._CUSTOM_MODEL
-        assert len(rows) == wizard._MODEL_PICKER_LIMIT + 1  # top few + the custom row
+        # All 10 discovered ids are offered — no truncation to the old top-few cap.
+        assert set(models) <= set(rows[:-1])
 
     def test_claude_family_custom_model_slots_and_validates(self):
         # A custom id chosen for a family lands in that slot, is marked custom, and survives
