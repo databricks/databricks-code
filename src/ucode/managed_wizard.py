@@ -912,7 +912,8 @@ def _prompt_budget_policy(
         print_warning_panel(
             "No AI Gateway budgets are visible for this workspace, so there is nothing to attach a "
             "policy to. Create a budget in the Databricks console first, then re-run "
-            "`ucode setup spend-tiers`."
+            "`ucode setup spend-tiers`. Currently, only AI Gateway budgets with hard blocks are "
+            "eligible to be associated with Tiered Spend Policies."
         )
         return None
 

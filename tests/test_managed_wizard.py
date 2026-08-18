@@ -1374,7 +1374,9 @@ class TestBudgetPolicy:
             patch.object(wizard, "print_note") as note,
         ):
             assert wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE) is None
-        assert warn_box.called
+        warning = warn_box.call_args.args[0]
+        assert "only AI Gateway budgets with hard blocks" in warning
+        assert "eligible to be associated with Tiered Spend Policies" in warning
         assert not note.called  # the BUDGET_POLICY_BLURB note is skipped
 
     def test_no_per_user_block_budgets_warns_and_yields_none(self):
