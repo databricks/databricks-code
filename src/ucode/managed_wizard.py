@@ -6,7 +6,7 @@ at ``~/.ucode/managed-state.json`` (the one local managed-config file, owned by
 :mod:`ucode.managed_config`).
 
 Authoring is split across commands so an admin can change one part without walking the whole flow:
-``ucode setup`` picks the agents and models, and ``ucode setup mcp`` / ``skills`` / ``budget-policy``
+``ucode setup`` picks the agents and models, and ``ucode setup mcps`` / ``skills`` / ``spend-tiers``
 each edit their own section of the same manifest. ``ucode setup`` carries the other sections forward
 untouched (:func:`_carry_forward_sections`), and ``ucode setup help`` prints the whole sequence.
 
@@ -91,9 +91,9 @@ GLOBAL_SETTINGS_FILES = {
 }
 
 BUDGET_POLICY_BLURB = (
-    "As the workspace spends more of a budget, a policy automatically switches everyone's default "
-    "agent and model to a cheaper one — for example Claude Code / Opus normally, Claude Code / "
-    "Sonnet once spend passes 80%, OpenCode / Kimi past 100%.\n\n"
+    "As the workspace spends more of a budget, a tiered spend policy automatically switches "
+    "everyone's default agent and model to a cheaper one — for example Claude Code / Opus normally, "
+    "Claude Code / Sonnet once spend passes 80%, OpenCode / Kimi past 100%.\n\n"
     "It only moves the default. Developers can still pick any model they have access to, and the "
     "budget's own hard block is what actually caps spend."
 )
@@ -897,10 +897,10 @@ def _prompt_budget_policy(
     model it wasn't given, which neither this validation nor the server's would reject: the tier would
     activate and hand the developer a model their agent doesn't have.
 
-    Asks no "set up a budget policy?" gate — running `ucode setup budget-policy` is the answer to that
-    question, the same way `ucode configure <thing>` needs no confirmation.
+    Asks no "set up a tiered spend policy?" gate — running `ucode setup spend-tiers` is the answer to
+    that question, the same way `ucode configure <thing>` needs no confirmation.
     """
-    print_section("Budget policy")
+    print_section("Tiered Spend Policy")
 
     # Check for attachable budgets before anything else: budgets are created in the Databricks
     # console, so if there are none (or none that can enforce routing) there is nothing to do here.
@@ -912,7 +912,7 @@ def _prompt_budget_policy(
         print_warning_panel(
             "No AI Gateway budgets are visible for this workspace, so there is nothing to attach a "
             "policy to. Create a budget in the Databricks console first, then re-run "
-            "`ucode setup budget-policy`."
+            "`ucode setup spend-tiers`."
         )
         return None
 
@@ -926,13 +926,13 @@ def _prompt_budget_policy(
             "None of this workspace's AI Gateway budgets have a per-user threshold with a usage "
             "block configured, which spend routing enforces. Add a per-user alert threshold with a "
             "block action to a budget in the Databricks console, then re-run "
-            "`ucode setup budget-policy`."
+            "`ucode setup spend-tiers`."
         )
         return None
 
     # Budgets exist — now explain what a policy does, before asking the admin to pick one. Boxed so
     # the concept is read as a unit rather than skimmed as one more bullet.
-    print_panel("What is a budget policy?", [BUDGET_POLICY_BLURB])
+    print_panel("What is a Tiered Spend Policy?", [BUDGET_POLICY_BLURB])
     print_note(
         "Showing only budgets with a per-user hard block configured, which spend routing enforces."
     )
@@ -983,7 +983,7 @@ def _prompt_budget_policy(
         # Percentage first, in its own retry loop so a duplicate here re-asks only the percentage.
         while True:
             fraction = prompt_for_percentage(
-                f"Tier {index}: switch once spend passes what % of the budget?"
+                f"Tier {index}: switch once spend passes what % of the budget? Ex: 50%"
             )
             if fraction in seen_percentages:
                 print_err("That percentage is already used by another tier; pick a different one.")
@@ -1122,7 +1122,7 @@ def _render_summary(workspace: str, manifest: dict) -> None:
             percent = float(tier.get("spending_percentage", 0)) * 100
             lines.append(kv_line(f"  at {percent:g}%", f"{display} / {tier.get('default_model')}"))
     else:
-        lines.append(kv_line("Budget policy", "none"))
+        lines.append(kv_line("Tiered Spend Policy", "none"))
 
     print_panel("Configuration summary", lines)
 
@@ -1375,11 +1375,11 @@ def setup_from_file(path: str) -> int:
 # The sections that have their own `ucode setup <thing>` command, in the order the checklist lists
 # them: the command, the label the summary uses, and how to tell whether the manifest has one.
 SETUP_SECTIONS: list[tuple[str, str, Callable[[dict], bool]]] = [
-    ("ucode setup mcp", "MCP servers", lambda m: bool(m.get("mcp_servers"))),
+    ("ucode setup mcps", "MCP servers", lambda m: bool(m.get("mcp_servers"))),
     ("ucode setup skills", "Skills", lambda m: bool((m.get("skills") or {}).get("names"))),
     (
-        "ucode setup budget-policy",
-        "Budget policy",
+        "ucode setup spend-tiers",
+        "Tiered Spend Policy",
         lambda m: isinstance(m.get("budget_policy"), dict),
     ),
 ]
@@ -1458,12 +1458,32 @@ def _print_next_steps(manifest: dict) -> None:
     )
 
 
+def _offer_apply() -> None:
+    """Offer to publish the saved draft right away, so an admin can apply changes incrementally.
+
+    Each `ucode setup` command only writes a local draft. Without this an admin has to remember to run
+    `ucode apply` separately, and a `ucode setup` re-run in the meantime is easy to mistake for having
+    lost the change. Answering yes runs `apply_command`, which shows the diff against the published
+    config as it publishes; declining leaves the draft for a later `ucode apply`. Skipped under
+    --dry-run, where nothing was saved to publish.
+    """
+    if config_io.is_dry_run():
+        return
+    console.print()
+    if not prompt_yes_no_default(
+        "Publish these changes to the workspace now? (runs `ucode apply`)", default=False
+    ):
+        print_note("Draft saved. Run `ucode apply` when you're ready to publish.")
+        return
+    apply_command(yes=True)
+
+
 # The sections `ucode setup` carries forward instead of prompting for, and how to rebuild each one.
 CARRIED_SECTIONS: list[tuple[str, str, str]] = [
-    ("mcp_servers", "MCP servers", "ucode setup mcp"),
+    ("mcp_servers", "MCP servers", "ucode setup mcps"),
     ("skills", "Skills", "ucode setup skills"),
     ("tracing_table", "Tracing table", "ucode setup --from-file"),
-    ("budget_policy", "Budget policy", "ucode setup budget-policy"),
+    ("budget_policy", "Tiered Spend Policy", "ucode setup spend-tiers"),
 ]
 
 
@@ -1512,8 +1532,8 @@ def setup_command(
 ) -> int:
     """Author the agents and models half of the workspace's managed coding config interactively.
 
-    Agents and per-agent models only. MCP servers, skills, and the budget policy each have their own
-    command (`ucode setup mcp` / `skills` / `budget-policy`), so an admin changing one of them doesn't
+    Agents and per-agent models only. MCP servers, skills, and the tiered spend policy each have their
+    own command (`ucode setup mcps` / `skills` / `spend-tiers`), so an admin changing one of them doesn't
     have to walk the whole flow again — and this command carries whatever they already authored
     forward untouched rather than clearing it (:func:`_carry_forward_sections`).
 
@@ -1641,6 +1661,7 @@ def setup_command(
     console.print()
     print_success("Saved to ~/.ucode/managed-state.json")
     _print_next_steps(manifest)
+    _offer_apply()
     return 0
 
 
@@ -1708,11 +1729,12 @@ def _save_section_update(workspace: str, manifest: dict) -> int:
     console.print()
     print_success("Saved to ~/.ucode/managed-state.json")
     _print_next_steps(manifest)
+    _offer_apply()
     return 0
 
 
 def setup_mcp_command() -> int:
-    """Author the managed config's MCP servers (`ucode setup mcp`)."""
+    """Author the managed config's MCP servers (`ucode setup mcps`)."""
     workspace, _, _ = _resolve_admin_workspace()
     manifest = _manifest_for_edit(workspace)
 
@@ -1720,17 +1742,24 @@ def setup_mcp_command() -> int:
     print_note("Developers get these MCP servers registered automatically when they run ucode.")
     from ucode.mcp import configure_mcp_command
 
-    # Snapshot the managed-shaped servers before the picker so a cancelled or no-op run leaves the
-    # section exactly as it was: the picker returns 0 on Esc, and re-reading local state would
-    # otherwise let whatever is registered locally overwrite the manifest — including deleting the
-    # section when nothing is registered.
+    # Snapshot the managed-shaped servers before the picker so a cancelled run on an empty local
+    # state can't delete a section the manifest still has: the picker returns 0 on Esc, and re-reading
+    # local state would otherwise overwrite the manifest with nothing.
     before = _mcp_servers_from_state(load_state())
     # Managed configs can't carry a Databricks app (its host isn't reconstructable from the
     # workspace), so hide apps from the picker rather than let an admin pick one that is then
     # dropped from the published config.
     configure_mcp_command(exclude_sources={"apps"})
     after = _mcp_servers_from_state(load_state())
-    if after == before:
+
+    # `after == before` isn't enough to call this a no-op: an admin who ran `ucode configure mcp`
+    # first arrives with those servers already registered, so confirming the picker leaves local state
+    # unchanged even though the manifest doesn't carry them yet. Also sync when local state already
+    # holds servers the manifest is missing — but only when servers are actually registered, so an Esc
+    # on an empty local state still can't wipe a published section.
+    manifest_servers = manifest.get("mcp_servers") or []
+    carries_unsaved = bool(after) and after != manifest_servers
+    if after == before and not carries_unsaved:
         print_note("No changes to the MCP servers — the managed config is unchanged.")
         return 0
 
@@ -1783,7 +1812,7 @@ def setup_skills_command(locations: list[str] | None = None) -> int:
 
 
 def setup_budget_policy_command() -> int:
-    """Author the managed config's spend-routing budget policy (`ucode setup budget-policy`)."""
+    """Author the managed config's tiered spend policy (`ucode setup spend-tiers`)."""
     workspace, _, token = _resolve_admin_workspace()
     manifest = _manifest_for_edit(workspace)
 
@@ -1806,7 +1835,7 @@ def setup_budget_policy_command() -> int:
         workspace, token, manifest["enabled_agents"], load_state(), base_default=base_default
     )
     if not policy:
-        print_note("The managed config's budget policy is unchanged.")
+        print_note("The managed config's tiered spend policy is unchanged.")
         return 0
     manifest["budget_policy"] = policy
     return _save_section_update(workspace, manifest)

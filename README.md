@@ -208,9 +208,9 @@ section, then publish:
 
 ```bash
 ucode setup                 # agents and models (start here)
-ucode setup mcp             # managed MCP servers
+ucode setup mcps            # managed MCP servers
 ucode setup skills          # managed skills
-ucode setup budget-policy   # spend-based routing
+ucode setup spend-tiers     # spend-based routing
 ucode apply                 # publish it to the workspace
 ```
 
@@ -221,15 +221,16 @@ Claude Code is asked one model per family (opus/sonnet/haiku/fable), since it se
 alias; any family can be skipped.
 
 The optional sections each edit their own part of the same config, so you can add an MCP server or
-change a budget tier later without walking the whole flow. `ucode setup skills --location
-main.default,other.schema` skips the prompt. `ucode setup budget-policy` sets a spend-based policy
-that switches the default agent and model as the workspace burns through a budget. Answering these
-also runs the matching `ucode configure` step, which does configure this machine.
+change a spend tier later without walking the whole flow. `ucode setup skills --location
+main.default,other.schema` skips the prompt. `ucode setup spend-tiers` sets a tiered spend policy
+that switches the default agent and model as the workspace burns through a budget. Each section
+command also offers to publish right away, so you can apply changes incrementally; answering the
+section prompts also runs the matching `ucode configure` step, which does configure this machine.
 
 Everything is written to `~/.ucode/managed-state.json` — the one local managed-config file — which
 `ucode apply` publishes. Re-running `ucode setup` keeps the MCP servers, skills, tracing table, and
-budget policy already authored, rather than clearing them; to drop one, edit the file and reload it
-with `ucode setup --from-file`.
+tiered spend policy already authored, rather than clearing them; to drop one, edit the file and reload
+it with `ucode setup --from-file`.
 
 ```bash
 # Review the manifest and the exact payload `ucode apply` would publish.
@@ -285,9 +286,9 @@ their next ucode run.
 | `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
 | `ucode setup` | Author the managed config's agents and models (workspace admins only) |
-| `ucode setup mcp` | Add or change the managed config's MCP servers |
+| `ucode setup mcps` | Add or change the managed config's MCP servers |
 | `ucode setup skills [--location a.b,c.d]` | Add or change the managed config's skills |
-| `ucode setup budget-policy` | Set the managed config's spend-based routing policy |
+| `ucode setup spend-tiers` | Set the managed config's tiered spend routing policy |
 | `ucode setup help` | Walk through the whole setup sequence, marking what's already configured |
 | `ucode setup show` | Print the authored config and the payload `ucode apply` would publish |
 | `ucode setup --from-file <file>` | Load a hand-written managed config instead of running the prompts |

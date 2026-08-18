@@ -147,7 +147,7 @@ _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
 
 
 def _policy_summary_lines(managed: dict) -> list[str]:
-    """Rich-markup lines describing the admin's budget policy, or empty when it sets none."""
+    """Rich-markup lines describing the admin's tiered spend policy, or empty when it sets none."""
     policy = managed.get("budget_policy")
     if not isinstance(policy, dict):
         return []
@@ -274,7 +274,7 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
         return
     print_note(
         "✨ New: as a workspace admin you can publish a managed config with `ucode setup` — set the "
-        "agents and models once (then MCP servers and skills with `ucode setup mcp` / `skills`), and "
+        "agents and models once (then MCP servers and skills with `ucode setup mcps` / `skills`), and "
         "every developer picks them up automatically."
     )
     if prompt_yes_no("Set one up now with `ucode setup`?"):
@@ -2674,7 +2674,7 @@ def setup(
 ) -> None:
     """Choose the agents and models for your workspace's managed config (admins only).
 
-    MCP servers, skills, and the budget policy have their own commands — see `ucode setup help`.
+    MCP servers, skills, and the tiered spend policy have their own commands — see `ucode setup help`.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -2693,7 +2693,7 @@ def setup(
         raise typer.Exit(code)
 
 
-@setup_app.command("mcp")
+@setup_app.command("mcps")
 def setup_mcp_cmd() -> None:
     """Choose the MCP servers the managed config gives developers (admins only)."""
     # Same `typer.Exit`/RuntimeError ordering trap as the `setup` callback above.
@@ -2737,7 +2737,7 @@ def setup_skills_cmd(
         raise typer.Exit(code)
 
 
-@setup_app.command("budget-policy")
+@setup_app.command("spend-tiers")
 def setup_budget_policy_cmd() -> None:
     """Route developers to cheaper agents as the workspace spends its budget (admins only)."""
     try:

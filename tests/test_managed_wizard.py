@@ -1354,7 +1354,7 @@ CLAUDE_ONLY = {"claude": {"model_config": {"default_model": "system.ai.claude-op
 
 class TestBudgetPolicy:
     def test_no_up_front_gate(self):
-        # Running `ucode setup budget-policy` is the consent, so the flow asks no "set up a policy?"
+        # Running `ucode setup spend-tiers` is the consent, so the flow asks no "set up a policy?"
         # question — it goes straight to listing budgets. (The only yes/no it asks is "add another
         # tier?", after a tier is built.)
         with (
@@ -2072,9 +2072,9 @@ class TestNextSteps:
         manifest = {**AGENTS_ONLY, "skills": {"names": ["main.default"]}}
         wizard._print_next_steps(manifest)
         out = capsys.readouterr().out
-        assert "ucode setup mcp" in out
+        assert "ucode setup mcps" in out
         assert "ucode setup skills" in out
-        assert "ucode setup budget-policy" in out
+        assert "ucode setup spend-tiers" in out
         assert "ucode apply" in out
 
     def test_dry_run_says_nothing_was_saved(self, capsys, monkeypatch):
@@ -2086,7 +2086,7 @@ class TestNextSteps:
 
 
 class TestSectionCommands:
-    """The `ucode setup mcp` / `skills` / `budget-policy` section commands."""
+    """The `ucode setup mcps` / `skills` / `spend-tiers` section commands."""
 
     @staticmethod
     def _admin(**overrides):
@@ -2096,6 +2096,9 @@ class TestSectionCommands:
             "ensure_databricks_auth": lambda *a, **k: None,
             "get_databricks_token": lambda *a, **k: "tok",
             "is_workspace_admin": lambda *a, **k: True,
+            # Decline the end-of-section "publish now?" offer so a section run saves the draft without
+            # trying to apply; the apply path is exercised in TestApplyCommand.
+            "prompt_yes_no_default": lambda *a, **k: False,
         }
         defaults.update(overrides)
         return [patch.object(wizard, name, value) for name, value in defaults.items()]
@@ -2149,6 +2152,20 @@ class TestSectionCommands:
             code = self._run(wizard.setup_mcp_command)
         assert code == 0
         assert not save.called
+
+    def test_mcp_carries_forward_preregistered_servers(self):
+        # An admin who ran `ucode configure mcp` first arrives with those servers already registered,
+        # so the picker leaves local state unchanged (before == after). The manifest doesn't carry them
+        # yet, so `setup mcps` must still save them rather than report "no changes" and drop them.
+        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
+        servers = [{"name": "system.ai.github", "type": "mcp-service"}]
+        with (
+            patch("ucode.mcp.configure_mcp_command", return_value=0),
+            patch.object(wizard, "_mcp_servers_from_state", return_value=servers),
+        ):
+            code = self._run(wizard.setup_mcp_command)
+        assert code == 0
+        assert managed_config_mod.load_managed_state(WORKSPACE)["mcp_servers"] == servers
 
     def test_mcp_not_admin_raises(self):
         managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
@@ -2230,9 +2247,9 @@ class TestSetupHelp:
         out = capsys.readouterr().out
         for command in (
             "ucode setup",
-            "ucode setup mcp",
+            "ucode setup mcps",
             "ucode setup skills",
-            "ucode setup budget-policy",
+            "ucode setup spend-tiers",
             "ucode setup show",
             "ucode apply",
         ):
@@ -2633,9 +2650,9 @@ class TestCliWiring:
     @pytest.mark.parametrize(
         ("command", "target"),
         [
-            ("mcp", "setup_mcp_command"),
+            ("mcps", "setup_mcp_command"),
             ("skills", "setup_skills_command"),
-            ("budget-policy", "setup_budget_policy_command"),
+            ("spend-tiers", "setup_budget_policy_command"),
         ],
     )
     def test_section_subcommands_are_registered_and_called(self, command, target):
@@ -2680,7 +2697,7 @@ class TestCliWiring:
                 "ucode.cli.setup_mcp_command", side_effect=RuntimeError("run `ucode setup` first")
             ),
         ):
-            result = runner.invoke(app, ["setup", "mcp"])
+            result = runner.invoke(app, ["setup", "mcps"])
         assert result.exit_code == 1
         assert "ucode setup" in _out(result)
 
@@ -2689,7 +2706,7 @@ class TestCliWiring:
             patch("ucode.cli.install_databricks_cli"),
             patch("ucode.cli.setup_budget_policy_command", side_effect=KeyboardInterrupt),
         ):
-            result = runner.invoke(app, ["setup", "budget-policy"])
+            result = runner.invoke(app, ["setup", "spend-tiers"])
         assert result.exit_code == 130
 
 
