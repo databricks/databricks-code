@@ -142,6 +142,28 @@ ucode configure --agents claude --mcp system.ai.slack
 `--mcp` also works without `--agents` for MCP-only clients (it configures just the workspace,
 then registers the servers); pass a comma-separated list to register several at once.
 
+#### Add servers without replacing existing ones
+
+`ucode configure mcp` **replaces** the registered MCP servers with your selection — anything
+outside a `--location`/`--services` scope (or left unchecked in the picker) is removed. To
+**add** servers while leaving everything already configured in place, use `ucode mcp add`:
+
+```bash
+# Register a whole schema's services, keeping any servers already configured.
+ucode mcp add --location system.ai
+
+# Register just a subset (same name rules as `configure mcp --services`).
+ucode mcp add --services system.ai.slack,system.ai.github
+
+# No arguments launches the same interactive picker, but never removes servers.
+ucode mcp add
+```
+
+`ucode mcp add` takes the same `--location` and `--services` options as `ucode configure mcp`;
+the only difference is that it never removes servers outside the selection. In the interactive
+picker, servers you already have configured are shown as `(already configured)` and can't be
+toggled off — you only pick new ones to add.
+
 ### Skills (optional)
 
 Configure Unity Catalog Skills for your coding tools with `ucode configure skills`:
@@ -243,6 +265,8 @@ pick the new config up on their next ucode run.
 | `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
 | `ucode configure --agents claude,codex,pi --skip-unavailable` | Configure the requested agents that are available; skip the rest with a warning |
 | `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
+| `ucode mcp add --location system.ai` | Register a schema's MCP servers, keeping any already configured (additive; never removes) |
+| `ucode mcp add --services system.ai.slack` | Register specific MCP server(s) without removing existing ones |
 | `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
 | `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
