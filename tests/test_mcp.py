@@ -1946,6 +1946,46 @@ class TestAddMcpCommand:
         assert mcp.add_mcp_command(services=set()) == 0
         assert called == []
 
+    def test_agents_scopes_registration_to_named_agent(self, monkeypatch):
+        """With two agents configured, `agents={"claude"}` registers the server for
+        claude only and records only claude on the saved entry."""
+        saved_states: list[dict] = []
+        configured: list[tuple[str, str]] = []
+        _stub_location_base(
+            monkeypatch,
+            {"workspace": WS, "available_tools": ["claude", "codex"], "mcp_servers": []},
+        )
+        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["claude", "codex"])
+        monkeypatch.setattr(
+            mcp, "list_mcp_services", lambda workspace, token, parent: (["system.ai.github"], None)
+        )
+        monkeypatch.setattr(
+            mcp,
+            "configure_client_mcp_server",
+            lambda client, name, url, *a, **kw: configured.append((client, name)) or [],
+        )
+        monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
+
+        assert mcp.add_mcp_command(location="system.ai", agents={"claude"}) == 0
+
+        assert configured == [("claude", "system-ai-github")]
+        assert saved_states[-1]["mcp_servers"][0]["clients"] == ["claude"]
+
+    def test_agents_not_configured_raises(self, monkeypatch):
+        """`--agents` naming an agent that isn't configured for MCP is a clear error
+        (the CLI sets agents up first, so this guards the library entry point)."""
+        _stub_location_base(monkeypatch, {**CLAUDE_STATE, "mcp_servers": []})
+        monkeypatch.setattr(
+            mcp, "list_mcp_services", lambda workspace, token, parent: (["system.ai.github"], None)
+        )
+        try:
+            mcp.add_mcp_command(location="system.ai", agents={"gemini"})
+        except RuntimeError as exc:
+            assert "gemini" in str(exc)
+            assert "not configured" in str(exc)
+        else:
+            raise AssertionError("expected RuntimeError for an unconfigured agent")
+
 
 class TestRemoveMcpCommand:
     """`ucode mcp remove` interactively unregisters configured MCP servers."""
@@ -2025,6 +2065,57 @@ class TestRemoveMcpCommand:
         )
 
         assert mcp.remove_mcp_command() == 0
+        assert prompted == []
+
+    def test_agents_scopes_removal_to_named_agent(self, monkeypatch):
+        """`--agents claude` unregisters the server from claude only; a server that
+        was also on codex is kept there with claude stripped from its clients."""
+        saved_states: list[dict] = []
+        removed: list[tuple[str, str]] = []
+        both = {
+            "name": "system-ai-github",
+            "url": f"{WS}/ai-gateway/mcp-services/system.ai.github",
+            "auth": "proxy",
+            "clients": ["claude", "codex"],
+        }
+        _stub_location_base(
+            monkeypatch,
+            {"workspace": WS, "available_tools": ["claude", "codex"], "mcp_servers": [both]},
+        )
+        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["claude", "codex"])
+        monkeypatch.setattr(mcp, "_prompt_for_mcp_removal", lambda servers: ["system-ai-github"])
+        monkeypatch.setattr(
+            mcp,
+            "remove_client_mcp_server",
+            lambda client, name: removed.append((client, name)) or [],
+        )
+        monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
+
+        assert mcp.remove_mcp_command(agents={"claude"}) == 0
+
+        # Only claude is unregistered; the state entry survives on codex.
+        assert removed == [("claude", "system-ai-github")]
+        assert saved_states[-1]["mcp_servers"] == [{**both, "clients": ["codex"]}]
+
+    def test_agents_only_offers_servers_on_that_agent(self, monkeypatch):
+        prompted: list[bool] = []
+        codex_only = {
+            "name": "system-ai-github",
+            "url": f"{WS}/ai-gateway/mcp-services/system.ai.github",
+            "auth": "proxy",
+            "clients": ["codex"],
+        }
+        _stub_location_base(
+            monkeypatch,
+            {"workspace": WS, "available_tools": ["claude", "codex"], "mcp_servers": [codex_only]},
+        )
+        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["claude", "codex"])
+        monkeypatch.setattr(
+            mcp, "_prompt_for_mcp_removal", lambda servers: prompted.append(True) or []
+        )
+
+        # Nothing is registered on claude, so `--agents claude` has nothing to offer.
+        assert mcp.remove_mcp_command(agents={"claude"}) == 0
         assert prompted == []
 
 

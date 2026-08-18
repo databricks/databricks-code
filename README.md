@@ -164,12 +164,29 @@ the only difference is that it never removes servers outside the selection. In t
 picker, servers you already have configured are shown as `(already configured)` and can't be
 toggled off — you only pick new ones to add.
 
+Pass `--agents` to target specific coding agents. Any named agent that isn't set up yet is
+configured first (workspace + models), so this doubles as one-command setup:
+
+```bash
+# Set up Claude Code (if needed) and register the server for it, in one command.
+ucode mcp add --agents claude --services system.ai.slack
+
+# Target several agents at once.
+ucode mcp add --agents claude,codex --location system.ai
+```
+
+Without `--agents`, the server is registered for every already-configured agent.
+
 #### Remove configured servers
 
 To unregister servers you've already configured, use `ucode mcp remove`:
 
 ```bash
 ucode mcp remove
+
+# Remove only from specific agents. A server registered on several agents is
+# unregistered from the named ones and kept on the rest.
+ucode mcp remove --agents codex
 ```
 
 It shows the servers you currently have configured — each with the coding tools it's registered
@@ -292,7 +309,9 @@ their next ucode run.
 | `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
 | `ucode mcp add --location system.ai` | Register a schema's MCP servers, keeping any already configured (additive; never removes) |
 | `ucode mcp add --services system.ai.slack` | Register specific MCP server(s) without removing existing ones |
+| `ucode mcp add --agents claude --services system.ai.slack` | Set up the agent(s) if needed and register the server for them |
 | `ucode mcp remove` | Interactively unregister configured MCP servers from your coding tools |
+| `ucode mcp remove --agents codex` | Unregister selected servers from specific agents only |
 | `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
 | `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |

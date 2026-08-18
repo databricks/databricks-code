@@ -1104,6 +1104,36 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+def _configure_agents_for_mcp(
+    requested: list[str], *, prompt_optional_updates: bool = True
+) -> set[str]:
+    """Ensure the named coding agents are set up (workspace + models) so a
+    subsequent `ucode mcp add` has them as targets, and return their canonical
+    names. Mirrors `ucode configure --agents`: model agents go through
+    configure_workspace_command (which installs binaries and configures models);
+    Cursor is MCP-only, so it just needs workspace state established and rides
+    along via MCP_ONLY_CLIENTS. Interactive — prompts for the workspace URL on
+    first run."""
+    wants_cursor = "cursor" in requested
+    model_agent_names = ",".join(a for a in requested if a != "cursor")
+    configured: set[str] = set()
+    if model_agent_names:
+        selected_tools = _parse_agents_option(model_agent_names)
+        configure_workspace_command(
+            selected_tools=selected_tools, prompt_optional_updates=prompt_optional_updates
+        )
+        configured.update(selected_tools)
+    if wants_cursor:
+        # Establish workspace state for a Cursor-only run; when model agents were
+        # configured above the workspace is already set, so Cursor just rides along.
+        if not model_agent_names:
+            _configure_shared_workspace_states(
+                [_prompt_for_configuration(None)], tools=[], force_login=True
+            )
+        configured.add("cursor")
+    return configured
+
+
 @mcp_app.command("add")
 def mcp_add(
     location: Annotated[
@@ -1125,15 +1155,32 @@ def mcp_add(
             'an empty `--services ""` adds nothing (no-op).',
         ),
     ] = None,
+    agents: Annotated[
+        str | None,
+        typer.Option(
+            "--agents",
+            help="Comma-separated coding agents to register the server(s) for (e.g. "
+            "claude,codex,cursor). Any that aren't configured yet are set up first "
+            "(workspace + models), so this works as a one-command setup. Without --agents, "
+            "the server is registered for every already-configured agent.",
+        ),
+    ] = None,
 ) -> None:
     """Add Databricks MCP servers to installed coding tools.
 
     Like `ucode configure mcp`, but purely additive: it never removes MCP servers
-    that are already configured, only registers new ones.
+    that are already configured, only registers new ones. Pass --agents to target
+    (and, if needed, set up) specific agents.
     """
     selected = None if services is None else {s.strip() for s in services.split(",") if s.strip()}
+    requested_agents = (
+        None
+        if agents is None
+        else ({a.strip().lower() for a in agents.split(",") if a.strip()} or None)
+    )
     try:
-        add_mcp_command(location=location, services=selected)
+        scope = _configure_agents_for_mcp(sorted(requested_agents)) if requested_agents else None
+        add_mcp_command(location=location, services=selected, agents=scope)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
@@ -1143,14 +1190,30 @@ def mcp_add(
 
 
 @mcp_app.command("remove")
-def mcp_remove() -> None:
+def mcp_remove(
+    agents: Annotated[
+        str | None,
+        typer.Option(
+            "--agents",
+            help="Comma-separated coding agents to remove the server(s) from (e.g. "
+            "claude,codex). A server registered on several agents is unregistered only "
+            "from the named ones and kept on the rest. Without --agents, a selected server "
+            "is removed from every agent it's on.",
+        ),
+    ] = None,
+) -> None:
     """Remove configured Databricks MCP servers from your coding tools.
 
     Interactive: shows the servers you currently have configured and unregisters the
     ones you select. Needs no Databricks login.
     """
+    requested_agents = (
+        None
+        if agents is None
+        else ({a.strip().lower() for a in agents.split(",") if a.strip()} or None)
+    )
     try:
-        remove_mcp_command()
+        remove_mcp_command(agents=requested_agents)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
