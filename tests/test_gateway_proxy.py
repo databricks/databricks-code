@@ -64,8 +64,10 @@ class _FakeResponse:
         self.status_code = status_code
         self.headers = headers
         self._chunks = chunks
+        self.chunk_sizes = []
 
     def iter_raw(self, chunk_size=None):
+        self.chunk_sizes.append(chunk_size)
         yield from self._chunks
 
 
@@ -158,6 +160,43 @@ class TestRelayResponseClientDisconnect:
         assert b"429" in blob
         assert b"Content-Type: application/json" in blob
         assert b"Transfer-Encoding" not in blob  # hop-by-hop, stripped
+        assert resp.chunk_sizes == [None]  # relay each upstream SSE/network chunk immediately
+
+    def test_diagnostics_identify_upstream_mid_stream_drop(self, monkeypatch, capsys):
+        monkeypatch.setenv(gateway_proxy._DIAGNOSTICS_ENV, "1")
+
+        class _Ok(io.RawIOBase):
+            def write(self, data):  # type: ignore[override]
+                return len(data)
+
+            def flush(self):
+                return None
+
+        def _chunks():
+            yield b"partial"
+            raise httpx.ReadError("upstream dropped")
+
+        handler = _relay_handler(_Ok())
+        handler._relay_response(
+            _FakeResponse(200, {}, _chunks()),
+            diagnostic_id="local-id",
+            started=time.monotonic(),
+        )
+
+        line = capsys.readouterr().err.strip()
+        assert line.startswith("[ucode-relay] ")
+        event = json.loads(line.removeprefix("[ucode-relay] "))
+        assert event["event"] == "upstream_stream_error"
+        assert event["request_id"] == "local-id"
+        assert event["error_type"] == "ReadError"
+        assert event["bytes"] == len(b"partial")
+        assert "upstream dropped" not in line
+
+    def test_diagnostics_are_silent_by_default(self, monkeypatch, capsys):
+        monkeypatch.delenv(gateway_proxy._DIAGNOSTICS_ENV, raising=False)
+        handler = _relay_handler(_Collect())
+        handler._relay_response(_FakeResponse(200, {}, [b"ok"]))
+        assert capsys.readouterr().err == ""
 
 
 class TestJwtExp:

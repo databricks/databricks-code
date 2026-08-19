@@ -20,9 +20,11 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
@@ -51,7 +53,6 @@ _HOP_BY_HOP = frozenset(
 # Request headers the proxy manages itself and must never forward on: hop-by-hop
 # plus the swap header (replaced with a freshly-minted value per request).
 _STRIP_ON_FORWARD = _HOP_BY_HOP | {_SWAP_HEADER.lower()}
-_STREAM_CHUNK = 8192
 # Per-operation upstream timeouts. `read` is generous because model turns stream
 # over a single response and Anthropic emits SSE pings, so inter-chunk gaps stay
 # small; `connect`/`pool` fail fast when the gateway is unreachable.
@@ -64,6 +65,25 @@ _REFRESH_BUFFER_S = 600
 _REFRESHER_POLL_S = 120
 # Assumed lifetime when a token carries no decodable `exp` (defensive fallback).
 _DEFAULT_TTL_S = 3600
+# Opt-in transport diagnostics for intermittent streaming failures. Events only
+# contain locally-generated request ids, timings, status codes, byte counts,
+# and exception class names — never headers, bodies, or credentials.
+_DIAGNOSTICS_ENV = "UCODE_RELAYED_PROXY_DIAGNOSTICS"
+_DIAGNOSTICS_TRUE = frozenset({"1", "true", "yes", "on"})
+
+
+def _diagnostics_enabled() -> bool:
+    return os.environ.get(_DIAGNOSTICS_ENV, "").strip().lower() in _DIAGNOSTICS_TRUE
+
+
+def _diagnostic_log(event: str, **fields: object) -> None:
+    if not _diagnostics_enabled():
+        return
+    payload = {"event": event, **fields}
+    sys.stderr.write(
+        f"[ucode-relay] {json.dumps(payload, sort_keys=True, separators=(',', ':'))}\n"
+    )
+    sys.stderr.flush()
 
 
 def _jwt_exp(token: str) -> float | None:
@@ -186,15 +206,30 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             pass
 
     def _handle(self) -> None:
+        diagnostic_id = uuid.uuid4().hex[:12]
+        started = time.monotonic()
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
         url = self.path.lstrip("/")
+        _diagnostic_log(
+            "request_start",
+            request_id=diagnostic_id,
+            method=self.command,
+            path=self.path.split("?", 1)[0],
+        )
         try:
             # First attempt with the current token.
             headers = _forwarded_request_headers(self, self.cache.token)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
+                _diagnostic_log(
+                    "upstream_headers",
+                    request_id=diagnostic_id,
+                    attempt=1,
+                    status=resp.status_code,
+                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                )
                 if resp.status_code not in (401, 403):
-                    self._relay_response(resp)
+                    self._relay_response(resp, diagnostic_id=diagnostic_id, started=started)
                     return
                 # Auth rejected. Drain the (small) error body so the pooled
                 # connection can be reused, then fall through to one retry.
@@ -211,41 +246,106 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 pass  # refresh failed; retry with the existing token and relay whatever comes
             headers = _forwarded_request_headers(self, self.cache.token)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
-                self._relay_response(resp)
+                _diagnostic_log(
+                    "upstream_headers",
+                    request_id=diagnostic_id,
+                    attempt=2,
+                    status=resp.status_code,
+                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                )
+                self._relay_response(resp, diagnostic_id=diagnostic_id, started=started)
         except (BrokenPipeError, ConnectionResetError):
             # Client closed before/while we relayed headers — routine on cancel.
+            _diagnostic_log(
+                "client_disconnect",
+                request_id=diagnostic_id,
+                phase="request",
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
             return
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             # Upstream failed before any bytes reached the client; a 502 is still
             # sendable. (An HTTP *status* like 429 is not an error here — httpx
             # only raises for transport failures — so real gateway errors are
             # relayed verbatim by `_relay_response`.)
+            _diagnostic_log(
+                "upstream_request_error",
+                request_id=diagnostic_id,
+                error_type=type(exc).__name__,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
             self._safe_send_error(502, "gateway proxy upstream error")
 
     # Streaming passthrough: forward chunks as they arrive so SSE token streaming
     # is not buffered (buffering would add full-response latency to first token).
     # `iter_raw` preserves any Content-Encoding verbatim (we relay that header),
     # so the proxy stays byte-transparent.
-    def _relay_response(self, resp: httpx.Response) -> None:
+    def _relay_response(
+        self,
+        resp: httpx.Response,
+        *,
+        diagnostic_id: str | None = None,
+        started: float | None = None,
+    ) -> None:
+        started = started if started is not None else time.monotonic()
+        chunks = 0
+        bytes_relayed = 0
+        first_byte_ms: int | None = None
         try:
             self.send_response(resp.status_code)
             for key, value in resp.headers.items():
                 if key.lower() not in _HOP_BY_HOP:
                     self.send_header(key, value)
             self.end_headers()
-            for chunk in resp.iter_raw(_STREAM_CHUNK):
+            # Do not pass a fixed chunk size here. httpx accumulates bytes until
+            # that size is reached, which can hide small SSE heartbeat frames
+            # from Claude Code for minutes during a slow artifact/tool call.
+            # With ``chunk_size=None`` (the default), raw upstream chunks are
+            # yielded as they arrive and pings keep the downstream connection
+            # alive even before the model produces a large content block.
+            for chunk in resp.iter_raw():
                 if chunk:
+                    if first_byte_ms is None:
+                        first_byte_ms = round((time.monotonic() - started) * 1000)
                     self.wfile.write(chunk)
                     self.wfile.flush()
+                    chunks += 1
+                    bytes_relayed += len(chunk)
+            _diagnostic_log(
+                "response_complete",
+                request_id=diagnostic_id,
+                status=resp.status_code,
+                chunks=chunks,
+                bytes=bytes_relayed,
+                first_byte_ms=first_byte_ms,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
         except (BrokenPipeError, ConnectionResetError):
             # Client (Claude Code) closed the connection mid-response — routine on
             # cancelled turns / SSE teardown. Nothing left to relay to, so stop
             # quietly rather than crashing the handler thread.
+            _diagnostic_log(
+                "client_disconnect",
+                request_id=diagnostic_id,
+                phase="response",
+                chunks=chunks,
+                bytes=bytes_relayed,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
             return
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             # Upstream dropped mid-stream. Headers (and status) may already be
             # sent, so we can't reliably signal a fresh error — stop and let the
             # client see a truncated stream rather than corrupt the framing.
+            _diagnostic_log(
+                "upstream_stream_error",
+                request_id=diagnostic_id,
+                error_type=type(exc).__name__,
+                status=resp.status_code,
+                chunks=chunks,
+                bytes=bytes_relayed,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
             return
 
     # Forward every method: this is a transparent pass-through, so routing any
