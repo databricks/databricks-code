@@ -28,6 +28,17 @@ runner = CliRunner()
 TOOLS = ["codex", "claude", "gemini", "opencode"]
 
 
+def test_oss_discovery_diagnostic_names_all_consumers(monkeypatch):
+    import ucode.cli as cli_mod
+
+    notes = []
+    monkeypatch.setattr(cli_mod, "print_note", notes.append)
+
+    cli_mod._print_discovery_diagnostics({"_discovery_reasons": {"oss": "not found"}})
+
+    assert notes[0] == "OSS models (needed for: opencode, pi): not found"
+
+
 @pytest.fixture(autouse=True)
 def no_state_writes():
     """Prevent any test from writing to the real state file on disk."""
@@ -1923,6 +1934,22 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: (
+                [
+                    {
+                        "id": model_id,
+                        "reasoning": True,
+                        "context_window": 128_000,
+                        "max_tokens": 8_192,
+                    }
+                    for model_id in (model_ids or [])
+                ],
+                None,
+            ),
+        )
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
         return cli_mod, logins, ensures, saved
 
@@ -2012,6 +2039,115 @@ class TestConfigureSharedStateUsePat:
         assert state["codex_models"] == ["system.ai.gpt-5"]
         assert legacy_called == []
         assert "uc_enabled" not in state
+
+    def test_active_listing_replaces_unlisted_gpt_in_state_and_overlays(self, monkeypatch):
+        from ucode.agents import opencode as opencode_mod
+        from ucode.agents import pi as pi_mod
+
+        unlisted = "system.ai.gpt-5"
+        active = "system.ai.gpt-5-6-luna"
+        cli_mod, _, _, saved = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": self.WS,
+                "profile": "DEFAULT",
+                "codex_models": [unlisted],
+                "opencode_models": {"openai": [unlisted]},
+            },
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [active], [], [], None),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        # The current model listing replaces stale persisted discovery state;
+        # unavailable models cannot survive into either agent's provider map.
+        assert state["codex_models"] == [active]
+        assert state["opencode_models"]["openai"] == [active]
+        assert saved[-1]["codex_models"] == [active]
+        assert saved[-1]["opencode_models"]["openai"] == [active]
+
+        pi_overlay, _ = pi_mod.render_overlay(
+            pi_mod.default_model(state),
+            "token",
+            {"openai": "https://example/codex"},
+            {},
+            state["codex_models"],
+            [],
+            [],
+            [],
+        )
+        pi_models = pi_overlay["providers"]["databricks-openai"]["models"]
+        assert [model["id"] for model in pi_models] == [active]
+
+        opencode_overlay, _ = opencode_mod.render_overlay(
+            opencode_mod.default_model(state),
+            "token",
+            {"openai": "https://example/codex"},
+            state["opencode_models"],
+        )
+        openai_models = opencode_overlay["provider"]["databricks-openai"]["models"]
+        assert list(openai_models) == [active]
+
+    def test_uc_oss_ids_persist_matching_capability_specs(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [], [], ["system.ai.qwen35-122b-a10b"], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: (
+                [
+                    {
+                        "id": "system.ai.qwen35-122b-a10b",
+                        "reasoning": True,
+                        "context_window": 128_000,
+                        "max_tokens": 25_000,
+                    }
+                ],
+                None,
+            ),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert state["oss_models"] == ["system.ai.qwen35-122b-a10b"]
+        assert state["oss_model_specs"] == [
+            {
+                "id": "system.ai.qwen35-122b-a10b",
+                "reasoning": True,
+                "context_window": 128_000,
+                "max_tokens": 25_000,
+            }
+        ]
+        assert state["opencode_models"]["oss"] == ["system.ai.qwen35-122b-a10b"]
+
+    def test_uc_dynamic_oss_ids_are_dropped_when_spec_refresh_fails(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [], [], ["system.ai.inkling"], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: ([], "HTTP 503 unavailable"),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert state["oss_models"] == []
+        assert state["oss_model_specs"] == []
+        assert "oss" not in state["opencode_models"]
+        assert state["_discovery_reasons"]["oss"] == "HTTP 503 unavailable"
 
     def _stub_with_fable(self, monkeypatch):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
@@ -2129,6 +2265,7 @@ class TestConfigureSharedStateUsePat:
     def test_falls_back_to_legacy_when_uc_empty(self, monkeypatch):
         # No UC model-services: each family falls back to the legacy listing.
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        calls: list[str] = []
         monkeypatch.setattr(
             cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], "no model services")
         )
@@ -2140,12 +2277,52 @@ class TestConfigureSharedStateUsePat:
                 None,
             ),
         )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_codex_models",
+            lambda w, t: (calls.append("codex") or ["databricks-gpt-5-6-sol"], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: (
+                calls.append("oss")
+                or [
+                    {
+                        "id": "databricks-glm-5-2",
+                        "reasoning": True,
+                        "context_window": 128_000,
+                        "max_tokens": 8_192,
+                    }
+                ],
+                None,
+            ),
+        )
 
         state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
 
+        assert calls == ["codex", "oss"]
         assert state["claude_models"] == {
             "opus": "databricks-claude-opus-4-8",
             "sonnet": "databricks-claude-sonnet-4-6",
+        }
+        assert state["codex_models"] == ["databricks-gpt-5-6-sol"]
+        assert state["oss_models"] == ["databricks-glm-5-2"]
+        assert state["oss_model_specs"] == [
+            {
+                "id": "databricks-glm-5-2",
+                "reasoning": True,
+                "context_window": 128_000,
+                "max_tokens": 8_192,
+            }
+        ]
+        assert state["opencode_models"] == {
+            "anthropic": [
+                "databricks-claude-opus-4-8",
+                "databricks-claude-sonnet-4-6",
+            ],
+            "openai": ["databricks-gpt-5-6-sol"],
+            "oss": ["databricks-glm-5-2"],
         }
 
 
@@ -2221,6 +2398,11 @@ class TestConfigureSharedStateMcpCleanup:
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: ([], None),
+        )
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
 
     def test_purges_residue_when_workspace_changes(self, monkeypatch):
