@@ -226,6 +226,7 @@ class TestDiscoverModelServices:
                 _model_service("system.ai.gemini-3-5-flash"),
                 _model_service("system.ai.kimi-k2-7-code"),
                 _model_service("system.ai.glm-5-2"),
+                _model_service("system.ai.deepseek-v4-pro"),
                 _model_service("system.ai.llama-4-maverick"),
             ]
         }
@@ -245,17 +246,21 @@ class TestDiscoverModelServices:
         assert codex == ["system.ai.gpt-5"]
         # Gemini ordered newest-first via the shared sort key.
         assert gemini[0] == "system.ai.gemini-3-5-flash"
-        # kimi and glm are the allowlisted OSS families; llama is not.
-        assert oss == ["system.ai.glm-5-2", "system.ai.kimi-k2-7-code"]
+        # DeepSeek, GLM, and Kimi are allowlisted OSS families; Llama is not.
+        assert oss == [
+            "system.ai.deepseek-v4-pro",
+            "system.ai.glm-5-2",
+            "system.ai.kimi-k2-7-code",
+        ]
 
     def test_oss_allowlist_drops_unsupported_families(self, monkeypatch):
-        # Only kimi/glm are allowlisted; other families are dropped.
+        # Only explicitly supported chat families are retained.
         payload = {
             "model_services": [
                 _model_service("system.ai.glm-5-2"),
                 _model_service("system.ai.kimi-k2-7-code"),
                 _model_service("system.ai.qwen-3-coder"),
-                _model_service("system.ai.deepseek-v3"),
+                _model_service("system.ai.deepseek-v4-pro"),
                 _model_service("system.ai.gte-large-embed"),
                 _model_service("system.ai.bge-reranker-v2"),
             ]
@@ -268,7 +273,11 @@ class TestDiscoverModelServices:
 
         assert reason is None
         assert (claude, codex, gemini) == ({}, [], [])
-        assert oss == ["system.ai.glm-5-2", "system.ai.kimi-k2-7-code"]
+        assert oss == [
+            "system.ai.deepseek-v4-pro",
+            "system.ai.glm-5-2",
+            "system.ai.kimi-k2-7-code",
+        ]
 
     def test_paginates_via_next_page_token(self, monkeypatch):
         pages = {
@@ -2276,6 +2285,7 @@ class TestClassifyModelFamily:
             ("system.ai.gemini-3-flash", "gemini"),
             ("system.ai.kimi-k2-7-code", "oss"),
             ("system.ai.glm-4-6", "oss"),
+            ("system.ai.deepseek-v4-pro", "oss"),
             ("something-unrecognized", None),
         ],
     )
