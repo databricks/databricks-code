@@ -24,6 +24,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, cast, overload
@@ -1402,9 +1403,23 @@ _MODEL_SERVICE_REQUIRED_PREFIX = "system.ai."
 # is the only server-side narrowing that works.
 _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 
-# Supported OSS chat families, matched by name substring. Add an entry to
-# support a new family.
+# OSS families validated as coding models in ucode, matched by name substring.
+# Keep this as an explicit product allowlist rather than exposing every model on
+# the chat-completions route. Inkling remains excluded until gateway issue #215
+# is fixed; other families require coding-harness validation before inclusion.
 _OSS_MODEL_FAMILIES = ("kimi-", "glm-")
+
+# Non-chat services must never be offered to a chat agent if a future supported
+# family also uses one of these substrings.
+_OSS_NON_CHAT_SUBSTRINGS = ("embedding", "embed", "rerank")
+
+
+def _is_oss_chat_model(model_id: str) -> bool:
+    """True if the id matches an OSS chat family and isn't a non-chat service."""
+    if any(bad in model_id for bad in _OSS_NON_CHAT_SUBSTRINGS):
+        return False
+    return any(family in model_id for family in _OSS_MODEL_FAMILIES)
+
 
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
@@ -1440,22 +1455,153 @@ def classify_model_family(model_id: str) -> str | None:
 # config dialect. Both fields are provided because agents like OpenCode require
 # context and output together. Keyed by family substring; add an entry to bound
 # a new model.
+#
+# Output caps probed from the gateway 2026-07-16 (it 400s with "max_tokens (N)
+# cannot exceed <cap>"); context windows from each model's docs/description
+# (conservative when unstated). If the gateway raises a cap or ships a new
+# model, update this table.
 _MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
-    # GLM-4.6: 200k context, but the gateway caps output well below the model's
-    # native 128k — pin 25k so requests aren't rejected.
+    # Keep the version-specific entry before the family fallback: GLM 5.2 has
+    # materially higher probed gateway limits than earlier/unknown variants.
+    "glm-5-2": {"context": 1_000_000, "output": 65_536},
     "glm": {"context": 200_000, "output": 25_000},
+    "kimi": {"context": 128_000, "output": 65_536},
 }
+
+# Conservative fallback for a future variant that matches a validated family
+# but has no specific entry. Pinning a low output ceiling risks truncation, not
+# a gateway 400, so it is the safe failure direction.
+_OSS_FALLBACK_LIMITS = {"context": 128_000, "output": 8_192}
+
+# Validated families that emit reasoning. Pi renders their streamed
+# reasoning_content as thinking when the model entry sets reasoning:true.
+_OSS_REASONING_FAMILIES = ("glm", "kimi")
+
+
+def model_is_reasoning(model_id: str) -> bool:
+    """True if the OSS model reports reasoning output (family-matched)."""
+    return any(family in model_id for family in _OSS_REASONING_FAMILIES)
 
 
 def model_token_limits(model_id: str) -> dict[str, int] | None:
     """Return ``{"context": ..., "output": ...}`` limits for ``model_id``, or None.
 
-    Matches by family substring (e.g. any ``*glm*`` id). None means the model
-    has no known limits and the agent should not pin any."""
+    Prefers a specific `_MODEL_TOKEN_LIMITS` family entry (e.g. any ``*glm*``
+    id). Any other OSS chat model falls back to a conservative floor so it is
+    never offered uncapped (which would 400). None only for non-OSS ids, where
+    the agent should not pin any limit."""
     for family, limits in _MODEL_TOKEN_LIMITS.items():
         if family in model_id:
             return dict(limits)
+    if _is_oss_chat_model(model_id):
+        return dict(_OSS_FALLBACK_LIMITS)
     return None
+
+
+# Pi treats every custom model without explicit metadata as 128k context / 4k
+# output. Gateway ids are custom ids (not Pi's built-ins), so preserve the
+# upstream windows explicitly. Entries are ordered most-specific first after
+# normalizing dotted OpenAI ids and hyphenated Databricks ids to one form.
+# GPT-5.6 Sol/Terra/Luna support the opt-in 1.05M window; 272k is merely Pi's
+# built-in short-context pricing default, not the model's hard context limit.
+_GPT_TOKEN_LIMITS: tuple[tuple[str, dict[str, int]], ...] = (
+    ("gpt-5-6-sol", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-6-terra", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-6-luna", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-5-pro", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-4-pro", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-5", {"context": 272_000, "output": 128_000}),
+    ("gpt-5-4-mini", {"context": 400_000, "output": 128_000}),
+    ("gpt-5-4-nano", {"context": 400_000, "output": 128_000}),
+    ("gpt-5-4", {"context": 272_000, "output": 128_000}),
+    ("gpt-5", {"context": 400_000, "output": 128_000}),
+    ("gpt-4-1", {"context": 1_047_576, "output": 32_768}),
+    ("gpt-4o", {"context": 128_000, "output": 16_384}),
+    ("gpt-4-turbo", {"context": 128_000, "output": 4_096}),
+    ("gpt-4", {"context": 8_192, "output": 8_192}),
+)
+_GPT_FALLBACK_LIMITS = {"context": 128_000, "output": 16_384}
+
+
+def _normalized_foundation_model_id(model_id: str) -> str:
+    """Strip route prefixes case-insensitively and normalize dotted versions."""
+    tail = model_id.split("/")[-1].lower()
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    if tail.startswith("databricks-"):
+        tail = tail[len("databricks-") :]
+    return tail.replace(".", "-")
+
+
+def gpt_model_token_limits(model_id: str) -> dict[str, int]:
+    """Return Pi metadata limits for a GPT (codex/openai) gateway model."""
+    tail = _normalized_foundation_model_id(model_id)
+    for family, limits in _GPT_TOKEN_LIMITS:
+        if tail == family or tail.startswith(f"{family}-"):
+            return dict(limits)
+    return dict(_GPT_FALLBACK_LIMITS)
+
+
+@dataclass(frozen=True)
+class ClaudeModelCapabilities:
+    context: int
+    output: int
+    supports_1m: bool = False
+    force_adaptive_thinking: bool = False
+
+
+_CLAUDE_FALLBACK_CAPABILITIES = ClaudeModelCapabilities(context=200_000, output=64_000)
+_CLAUDE_MODEL_RE = re.compile(r"^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?")
+
+
+def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
+    """Return the shared Claude capability policy for every agent.
+
+    Opus gained the opt-in 1M window in 4.6; Sonnet gained it in 4.5.
+    Sonnet's verified 1M tiers retain a conservative 64k output cap. Fable 5
+    is 1M by default (so it needs no ``[1m]`` suffix) with a 128k output cap.
+    Opus 4.5, Haiku, and unrecognized ids use the conservative 200k fallback.
+    """
+    tail = _normalized_foundation_model_id(model_id)
+    match = _CLAUDE_MODEL_RE.match(tail)
+    if not match:
+        return _CLAUDE_FALLBACK_CAPABILITIES
+    family, major_raw, minor_raw = match.groups()
+    version = (int(major_raw), int(minor_raw or 0))
+    if family == "opus" and version >= (4, 6):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=128_000,
+            supports_1m=True,
+            force_adaptive_thinking=True,
+        )
+    if family == "sonnet" and version >= (4, 6):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=64_000,
+            supports_1m=True,
+            force_adaptive_thinking=True,
+        )
+    if family == "sonnet" and version >= (4, 5):
+        return ClaudeModelCapabilities(context=1_000_000, output=64_000, supports_1m=True)
+    if family == "fable" and version >= (5, 0):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=128_000,
+            force_adaptive_thinking=True,
+        )
+    return _CLAUDE_FALLBACK_CAPABILITIES
+
+
+def claude_model_supports_1m(model_id: str) -> bool:
+    """Whether Claude Code should request the model's opt-in ``[1m]`` tier."""
+    return claude_model_capabilities(model_id).supports_1m
+
+
+def claude_model_token_limits(model_id: str) -> dict[str, int]:
+    """Return Pi metadata limits from the shared Claude capability policy."""
+    capabilities = claude_model_capabilities(model_id)
+    return {"context": capabilities.context, "output": capabilities.output}
 
 
 def _model_service_id(service: dict) -> str | None:
@@ -1737,10 +1883,16 @@ def discover_model_services(
     # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
     _prefer_opus_4_8(claude_models, ids)
 
-    codex_models = sorted([m for m in ids if "gpt-" in m], key=model_version_sort_key)
+    # `gpt-oss-*` also contains "gpt-" but is a chat-completions-only OSS model
+    # (served via /ai-gateway/mlflow/v1), NOT an openai-responses codex model —
+    # exclude it here so it isn't offered under the codex provider (which 400s).
+    codex_models = sorted(
+        [m for m in ids if "gpt-" in m and "gpt-oss" not in m],
+        key=model_version_sort_key,
+    )
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
 
-    oss_models = [m for m in ids if any(family in m for family in _OSS_MODEL_FAMILIES)]
+    oss_models = [m for m in ids if _is_oss_chat_model(m)]
 
     if not (claude_models or codex_models or gemini_models or oss_models):
         sample = ", ".join(ids[:5])
@@ -3203,6 +3355,7 @@ def build_pi_base_urls(workspace: str) -> dict[str, str]:
         "claude": build_tool_base_url("claude", workspace),
         "openai": build_tool_base_url("codex", workspace),
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
+        "oss": f"{workspace}/ai-gateway/mlflow/v1",
     }
 
 

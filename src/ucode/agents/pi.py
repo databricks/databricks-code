@@ -1,12 +1,13 @@
 """Pi coding agent: writes ~/.pi/agent/models.json with Databricks-backed providers.
 
-Pi (https://pi.dev) is a multi-provider coding agent. We register three
+Pi (https://pi.dev) is a multi-provider coding agent. We register four
 providers in its `models.json`, each speaking the API dialect best suited to
 that family's gateway path:
 
 - `databricks-claude`  (api: anthropic-messages)       → /ai-gateway/anthropic
 - `databricks-openai`  (api: openai-responses)         → /ai-gateway/codex/v1
 - `databricks-gemini`  (api: google-generative-ai)     → /ai-gateway/gemini/v1beta
+- `databricks-mlflow`  (api: openai-completions)       → /ai-gateway/mlflow/v1
 
 Per-provider `compat` flags work around fields the gateway translators reject:
 
@@ -15,11 +16,21 @@ Per-provider `compat` flags work around fields the gateway translators reject:
   pi uses for every request. With this flag pi omits the per-tool field and
   sends the legacy `anthropic-beta: fine-grained-tool-streaming-...` header
   instead, which the gateway accepts.
+- mlflow: `supportsStore: false` and `supportsStrictMode: false` — the MLflow
+  chat-completions gateway rejects OpenAI's `store` field and
+  `tools[].function.strict`.
+- openai: no `compat` flags needed, but the per-model `thinkingLevelMap`
+  matters — see `_pi_gpt_model_entry`. Declaring `reasoning: true` without an
+  off-state makes Pi send `reasoning: {effort: "none"}`, which `gpt-5`,
+  `gpt-5-mini`, `gpt-5-nano` and `gpt-5-5-pro` reject with a 400.
 
-OSS / Databricks-foundation models (Llama, Qwen, etc.) are not exposed via
-pi today — they live behind /ai-gateway/mlflow/v1 with per-model
-`max_tokens` caps that pi has no global way to honor without per-model
-config we don't currently maintain.
+The `databricks-mlflow` provider carries the validated OSS coding models
+(GLM and Kimi) discovered upstream. Per model it sets
+`contextWindow`/`maxTokens` from `databricks.model_token_limits` and
+`reasoning` from `databricks.model_is_reasoning` (so Pi renders the gateway's
+streamed reasoning_content as thinking). Inkling is intentionally not offered
+until the gateway emits a terminal `finish_reason` on natural completion
+(issue #215).
 
 The bearer token is baked into the file and refreshed by a background thread
 while the session runs (same pattern as OpenCode/Copilot).
@@ -46,7 +57,11 @@ from ucode.databricks import (
     TOKEN_REFRESH_INTERVAL_SECONDS,
     build_pi_base_urls,
     classify_model_family,
+    claude_model_capabilities,
     get_databricks_token,
+    gpt_model_token_limits,
+    model_is_reasoning,
+    model_token_limits,
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
@@ -70,6 +85,7 @@ PROVIDER_NAMES = (
     "databricks-claude",
     "databricks-openai",
     "databricks-gemini",
+    "databricks-mlflow",
 )
 
 PROVIDER_KEYS: list[list[str]] = [["providers", name] for name in PROVIDER_NAMES]
@@ -88,6 +104,7 @@ def _resolve_model_selector(
     claude_models: dict[str, str],
     codex_models: list[str],
     gemini_models: list[str],
+    oss_models: list[str],
 ) -> str:
     """Return a Pi model selector in `<provider>/<model>` form when possible."""
     for name in PROVIDER_NAMES:
@@ -99,7 +116,75 @@ def _resolve_model_selector(
         return f"databricks-openai/{model}"
     if model in gemini_models:
         return f"databricks-gemini/{model}"
+    if model in oss_models:
+        return f"databricks-mlflow/{model}"
     return model
+
+
+def _pi_claude_model_entry(model_id: str) -> dict:
+    """Build a Claude entry with explicit limits.
+
+    Databricks model ids do not match Pi's built-in Anthropic ids, so a bare
+    custom entry silently gets Pi's 128k context / 4k output defaults.
+    """
+    capabilities = claude_model_capabilities(model_id)
+    entry: dict = {
+        "id": model_id,
+        "reasoning": True,
+        "input": ["text", "image"],
+        "contextWindow": capabilities.context,
+        "maxTokens": capabilities.output,
+    }
+    if capabilities.force_adaptive_thinking:
+        entry["compat"] = {"forceAdaptiveThinking": True}
+    return entry
+
+
+def _pi_oss_model_entry(model_id: str) -> dict:
+    """Build a Pi mlflow model entry enriched from the shared limits/reasoning
+    tables: `reasoning:true` for reasoning models (Pi renders their streamed
+    reasoning_content as thinking), and `contextWindow`/`maxTokens` from
+    `model_token_limits`. Fields are omitted when unknown so Pi keeps its
+    default."""
+    entry: dict = {"id": model_id}
+    if model_is_reasoning(model_id):
+        entry["reasoning"] = True
+    limits = model_token_limits(model_id)
+    if limits:
+        if limits.get("context"):
+            entry["contextWindow"] = limits["context"]
+        if limits.get("output"):
+            entry["maxTokens"] = limits["output"]
+    return entry
+
+
+def _pi_gpt_model_entry(model_id: str) -> dict:
+    """Build a Pi openai (codex) model entry with `contextWindow`/`maxTokens`
+    from `databricks.gpt_model_token_limits`. GPT ids aren't in Pi's built-in
+    catalog, so without an explicit window Pi falls back to a small default and
+    truncates long sessions.
+
+    `thinkingLevelMap: {"off": None}` is required alongside `reasoning: True`.
+    When a model declares `reasoning` but no off-state, Pi's Responses builder
+    falls back to `reasoning: {effort: "none"}` for the thinking-off case
+    (`pi-ai/dist/api/openai-responses.js`, the `thinkingLevelMap?.off !== null`
+    branch). `"none"` is only valid on gpt-5.1+, so `gpt-5`, `gpt-5-mini`,
+    `gpt-5-nano` and `gpt-5-5-pro` reject every request with
+    `BAD_REQUEST: Unsupported value: 'none' is not supported with the 'gpt-5'
+    model`. An explicit `None` makes Pi omit `reasoning` entirely, which the
+    gateway accepts for all ids (verified against /ai-gateway/codex/v1).
+    """
+    limits = gpt_model_token_limits(model_id)
+    entry: dict = {
+        "id": model_id,
+        "contextWindow": limits["context"],
+        "maxTokens": limits["output"],
+    }
+    if "gpt-5" in model_id.lower().replace(".", "-"):
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {"off": None}
+    return entry
 
 
 def render_overlay(
@@ -109,6 +194,7 @@ def render_overlay(
     claude_models: dict[str, str],
     codex_models: list[str],
     gemini_models: list[str],
+    oss_models: list[str],
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for ~/.pi/agent/models.json."""
     providers: dict = {}
@@ -129,7 +215,7 @@ def render_overlay(
             # the legacy beta header instead when this is false.
             "compat": {"supportsEagerToolInputStreaming": False},
             "headers": ua_headers,
-            "models": [{"id": m} for m in claude_ids],
+            "models": [_pi_claude_model_entry(m) for m in claude_ids],
         }
         keys.append(["providers", "databricks-claude"])
     if codex_models:
@@ -139,7 +225,7 @@ def render_overlay(
             "apiKey": token,
             "authHeader": True,
             "headers": ua_headers,
-            "models": [{"id": m} for m in codex_models],
+            "models": [_pi_gpt_model_entry(m) for m in codex_models],
         }
         keys.append(["providers", "databricks-openai"])
     if gemini_models:
@@ -152,8 +238,23 @@ def render_overlay(
             "models": [{"id": m} for m in gemini_models],
         }
         keys.append(["providers", "databricks-gemini"])
+    if oss_models:
+        providers["databricks-mlflow"] = {
+            "baseUrl": pi_base_urls["oss"],
+            "api": "openai-completions",
+            "apiKey": token,
+            "authHeader": True,
+            # MLflow chat-completions gateway rejects OpenAI's `store` field
+            # and per-tool `strict`. Pi omits both when these are false.
+            "compat": {"supportsStore": False, "supportsStrictMode": False},
+            "headers": ua_headers,
+            "models": [_pi_oss_model_entry(m) for m in oss_models],
+        }
+        keys.append(["providers", "databricks-mlflow"])
     overlay: dict = {
-        "model": _resolve_model_selector(model, claude_models, codex_models, gemini_models),
+        "model": _resolve_model_selector(
+            model, claude_models, codex_models, gemini_models, oss_models
+        ),
     }
     if providers:
         overlay["providers"] = providers
@@ -186,6 +287,7 @@ def write_tool_config(
         claude_models,
         codex_models,
         gemini_models,
+        state.get("oss_models") or [],
     )
     existing = read_json_safe(PI_CONFIG_PATH)
     providers = existing.get("providers")
@@ -242,7 +344,7 @@ def _managed_model_families(state: dict) -> tuple[dict[str, str], list[str], lis
 
 
 def default_model(state: dict) -> str | None:
-    """Prefer Claude opus → sonnet → haiku; fall back to codex, gemini.
+    """Prefer Claude opus → sonnet → haiku; fall back to codex, Gemini, then OSS.
 
     A managed config's ``pi_default_model`` and ``pi_models`` both win outright: the former is
     the admin's chosen session start, the latter their allowlist. Workspace-wide discovery falls back.
@@ -260,7 +362,10 @@ def default_model(state: dict) -> str | None:
     if codex_models:
         return codex_models[0]
     gemini_models = state.get("gemini_models") or []
-    return gemini_models[0] if gemini_models else None
+    if gemini_models:
+        return gemini_models[0]
+    oss_models = state.get("oss_models") or []
+    return oss_models[0] if oss_models else None
 
 
 def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> str:
