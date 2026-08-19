@@ -198,19 +198,52 @@ def _model_service(model_id: str) -> dict:
 
 class TestModelTokenLimits:
     def test_glm_is_capped(self):
+        # Probed 2026-07-16: glm-5-2 accepts 1M context / 65536 output.
         assert db_mod.model_token_limits("system.ai.glm-5-2") == {
+            "context": 1_000_000,
+            "output": 65_536,
+        }
+
+    @pytest.mark.parametrize(
+        "model_id",
+        ["system.ai.glm-4-6-flash", "system.ai.glm-future"],
+    )
+    def test_other_glm_versions_keep_conservative_limits(self, model_id):
+        assert db_mod.model_token_limits(model_id) == {
             "context": 200_000,
             "output": 25_000,
         }
 
-    def test_glm_matches_any_version(self):
-        assert db_mod.model_token_limits("system.ai.glm-4-6-flash") == {
-            "context": 200_000,
-            "output": 25_000,
+    def test_kimi_is_capped(self):
+        assert db_mod.model_token_limits("system.ai.kimi-k2-7-code") == {
+            "context": 128_000,
+            "output": 65_536,
         }
 
-    def test_uncapped_model_returns_none(self):
-        assert db_mod.model_token_limits("system.ai.kimi-k2-7-code") is None
+    def test_unvalidated_families_return_none(self):
+        for model_id in (
+            "system.ai.inkling",
+            "system.ai.gpt-oss-120b",
+            "system.ai.llama-4-maverick",
+            "system.ai.qwen35-122b-a10b",
+            "system.ai.gemma-3-12b",
+            "system.ai.deepseek-v3",
+        ):
+            assert db_mod.model_token_limits(model_id) is None
+
+    def test_embedding_model_returns_none_not_fallback(self):
+        assert db_mod.model_token_limits("system.ai.qwen3-embedding-0-6b") is None
+
+
+class TestModelIsReasoning:
+    def test_reasoning_families(self):
+        assert db_mod.model_is_reasoning("system.ai.glm-5-2") is True
+        assert db_mod.model_is_reasoning("system.ai.kimi-k2-7-code") is True
+
+    def test_unvalidated_families_are_not_marked_reasoning(self):
+        assert db_mod.model_is_reasoning("system.ai.inkling") is False
+        assert db_mod.model_is_reasoning("system.ai.qwen35-122b-a10b") is False
+        assert db_mod.model_is_reasoning("system.ai.gpt-oss-120b") is False
 
 
 class TestDiscoverModelServices:
@@ -245,19 +278,20 @@ class TestDiscoverModelServices:
         assert codex == ["system.ai.gpt-5"]
         # Gemini ordered newest-first via the shared sort key.
         assert gemini[0] == "system.ai.gemini-3-5-flash"
-        # kimi and glm are the allowlisted OSS families; llama is not.
+        # Only coding-harness-validated OSS families are offered.
         assert oss == ["system.ai.glm-5-2", "system.ai.kimi-k2-7-code"]
 
-    def test_oss_allowlist_drops_unsupported_families(self, monkeypatch):
-        # Only kimi/glm are allowlisted; other families are dropped.
+    def test_oss_allowlist_drops_unvalidated_families(self, monkeypatch):
         payload = {
             "model_services": [
                 _model_service("system.ai.glm-5-2"),
                 _model_service("system.ai.kimi-k2-7-code"),
-                _model_service("system.ai.qwen-3-coder"),
+                _model_service("system.ai.qwen35-122b-a10b"),
+                _model_service("system.ai.inkling"),
+                _model_service("system.ai.llama-4-maverick"),
+                _model_service("system.ai.gemma-3-12b"),
                 _model_service("system.ai.deepseek-v3"),
-                _model_service("system.ai.gte-large-embed"),
-                _model_service("system.ai.bge-reranker-v2"),
+                _model_service("system.ai.qwen3-embedding-0-6b"),
             ]
         }
         monkeypatch.setattr(
@@ -269,6 +303,25 @@ class TestDiscoverModelServices:
         assert reason is None
         assert (claude, codex, gemini) == ({}, [], [])
         assert oss == ["system.ai.glm-5-2", "system.ai.kimi-k2-7-code"]
+
+    def test_gpt_oss_is_neither_selectable_oss_nor_codex(self, monkeypatch):
+        # Keep the independent codex exclusion: gpt-oss contains "gpt-" but
+        # cannot use the Responses API, even though it is not an offered model.
+        payload = {
+            "model_services": [
+                _model_service("system.ai.gpt-5"),
+                _model_service("system.ai.gpt-oss-120b"),
+            ]
+        }
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=10: (payload, None)
+        )
+
+        _, codex, _, oss, _ = db_mod.discover_model_services(WS, "token")
+
+        assert codex == ["system.ai.gpt-5"]
+        assert "system.ai.gpt-oss-120b" not in oss
+        assert "system.ai.gpt-oss-120b" not in codex
 
     def test_paginates_via_next_page_token(self, monkeypatch):
         pages = {
@@ -306,7 +359,8 @@ class TestDiscoverModelServices:
         assert reason == "HTTP 500 Server Error"
 
     def test_no_matching_families_reports_sample(self, monkeypatch):
-        payload = {"model_services": [_model_service("system.ai.llama-4-maverick")]}
+        # deepseek is outside every claude/gpt/gemini/oss family bucket.
+        payload = {"model_services": [_model_service("system.ai.deepseek-v3")]}
         monkeypatch.setattr(
             db_mod, "_http_get_json", lambda url, token, timeout=10: (payload, None)
         )
@@ -314,7 +368,7 @@ class TestDiscoverModelServices:
         claude, codex, gemini, oss, reason = db_mod.discover_model_services(WS, "token")
 
         assert (claude, codex, gemini, oss) == ({}, [], [], [])
-        assert reason is not None and "llama-4-maverick" in reason
+        assert reason is not None and "deepseek-v3" in reason
 
     def test_ignores_non_system_ai_schemas(self, monkeypatch):
         # The metastore listing returns services from every schema; only
