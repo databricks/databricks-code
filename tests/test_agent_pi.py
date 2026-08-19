@@ -17,6 +17,7 @@ def _base_urls() -> dict[str, str]:
         "claude": f"{WS}/ai-gateway/anthropic",
         "openai": f"{WS}/ai-gateway/codex/v1",
         "gemini": f"{WS}/ai-gateway/gemini/v1beta",
+        "oss": f"{WS}/ai-gateway/mlflow/v1",
     }
 
 
@@ -26,6 +27,7 @@ def _empty() -> dict:
         "claude_models": {},
         "codex_models": [],
         "gemini_models": [],
+        "oss_models": [],
     }
 
 
@@ -39,6 +41,7 @@ def _overlay(model: str, token: str = "tok", **kwargs):
         bundle["claude_models"],
         bundle["codex_models"],
         bundle["gemini_models"],
+        bundle["oss_models"],
     )
 
 
@@ -75,23 +78,117 @@ class TestRenderOverlayProviders:
         assert provider["api"] == "openai-responses"
         assert provider["baseUrl"] == f"{WS}/ai-gateway/codex/v1"
 
+    def test_gpt56_sol_model_entry_pins_1m_context(self):
+        # Gateway ids are custom to Pi, so explicit metadata is required to
+        # avoid its 128k custom-model default.
+        overlay, _ = _overlay("gpt-5-6-sol", codex_models=["gpt-5-6-sol"])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+        assert entry["id"] == "gpt-5-6-sol"
+        assert entry["contextWindow"] == 1_050_000
+        assert entry["maxTokens"] == 128_000
+        assert entry["reasoning"] is True
+        assert entry["input"] == ["text", "image"]
+
+    def test_gpt_model_entries_use_model_specific_windows(self):
+        overlay, _ = _overlay(
+            "system.ai.gpt-5-2",
+            codex_models=[
+                "system.ai.gpt-5-2",
+                "databricks-gpt-5-4-nano",
+                "databricks-gpt-5-6-sol",
+            ],
+        )
+        windows = {
+            m["id"]: m["contextWindow"] for m in overlay["providers"]["databricks-openai"]["models"]
+        }
+        assert windows == {
+            "system.ai.gpt-5-2": 400_000,
+            "databricks-gpt-5-4-nano": 400_000,
+            "databricks-gpt-5-6-sol": 1_050_000,
+        }
+
+    def test_claude_entries_pin_limits_and_capabilities(self):
+        overlay, _ = _overlay(
+            "databricks-claude-opus-4-8",
+            claude_models={
+                "opus": "databricks-claude-opus-4-8",
+                "sonnet": "system.ai.claude-sonnet-4-5",
+                "haiku": "databricks-claude-haiku-4-5",
+                "fable": "system.ai.claude-fable-5",
+            },
+        )
+        entries = {m["id"]: m for m in overlay["providers"]["databricks-claude"]["models"]}
+        opus = entries["databricks-claude-opus-4-8"]
+        assert opus["contextWindow"] == 1_000_000
+        assert opus["maxTokens"] == 128_000
+        assert opus["reasoning"] is True
+        assert opus["input"] == ["text", "image"]
+        assert opus["compat"] == {"forceAdaptiveThinking": True}
+        assert entries["system.ai.claude-sonnet-4-5"]["contextWindow"] == 1_000_000
+        assert entries["system.ai.claude-sonnet-4-5"]["maxTokens"] == 64_000
+        assert entries["databricks-claude-haiku-4-5"]["contextWindow"] == 200_000
+        fable = entries["system.ai.claude-fable-5"]
+        assert fable["contextWindow"] == 1_000_000
+        assert fable["maxTokens"] == 128_000
+        assert fable["compat"] == {"forceAdaptiveThinking": True}
+
     def test_gemini_provider_uses_google_generative_ai(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
         provider = overlay["providers"]["databricks-gemini"]
         assert provider["api"] == "google-generative-ai"
         assert provider["baseUrl"] == f"{WS}/ai-gateway/gemini/v1beta"
 
-    def test_all_three_providers_when_all_present(self):
+    def test_mlflow_provider_uses_openai_completions(self):
+        overlay, _ = _overlay("system.ai.glm-5-2", oss_models=["system.ai.glm-5-2"])
+        provider = overlay["providers"]["databricks-mlflow"]
+        assert provider["api"] == "openai-completions"
+        assert provider["baseUrl"] == f"{WS}/ai-gateway/mlflow/v1"
+        assert provider["compat"] == {"supportsStore": False, "supportsStrictMode": False}
+
+    def test_no_mlflow_provider_when_no_oss_models(self):
+        overlay, _ = _overlay("gpt-5", codex_models=["gpt-5"])
+        assert "databricks-mlflow" not in overlay.get("providers", {})
+
+    def test_all_four_providers_when_all_present(self):
         overlay, _ = _overlay(
             "claude-sonnet",
             claude_models={"sonnet": "claude-sonnet"},
             codex_models=["gpt-5"],
             gemini_models=["gemini-2"],
+            oss_models=["system.ai.glm-5-2"],
         )
         assert set(overlay["providers"].keys()) == {
             "databricks-claude",
             "databricks-openai",
             "databricks-gemini",
+            "databricks-mlflow",
+        }
+
+
+class TestRenderOverlayOssEnrichment:
+    """OSS mlflow model entries carry reasoning + contextWindow + maxTokens
+    from the shared databricks.model_token_limits / model_is_reasoning tables."""
+
+    def test_reasoning_model_enriched(self):
+        overlay, _ = _overlay("system.ai.glm-5-2", oss_models=["system.ai.glm-5-2"])
+        entry = overlay["providers"]["databricks-mlflow"]["models"][0]
+        assert entry["id"] == "system.ai.glm-5-2"
+        assert entry["reasoning"] is True
+        assert entry["contextWindow"] == 1_000_000
+        assert entry["maxTokens"] == 65_536
+
+    def test_unvalidated_model_has_no_inferred_metadata(self):
+        # Discovery does not offer this model; even if supplied directly, Pi
+        # must not infer capabilities for an unvalidated coding model.
+        overlay, _ = _overlay("system.ai.inkling", oss_models=["system.ai.inkling"])
+        entry = overlay["providers"]["databricks-mlflow"]["models"][0]
+        assert entry == {"id": "system.ai.inkling"}
+
+    def test_unknown_oss_model_bare(self):
+        # No limits/reasoning table entry -> only id, client keeps defaults.
+        overlay, _ = _overlay("system.ai.mystery-7b", oss_models=["system.ai.mystery-7b"])
+        assert overlay["providers"]["databricks-mlflow"]["models"][0] == {
+            "id": "system.ai.mystery-7b"
         }
 
 
@@ -193,6 +290,10 @@ class TestRenderOverlayModelSelector:
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
         assert overlay["model"] == "databricks-gemini/gemini-2"
 
+    def test_prefixes_oss_model(self):
+        overlay, _ = _overlay("system.ai.glm-5-2", oss_models=["system.ai.glm-5-2"])
+        assert overlay["model"] == "databricks-mlflow/system.ai.glm-5-2"
+
     def test_preserves_already_prefixed_model(self):
         overlay, _ = _overlay(
             "databricks-claude/claude-sonnet",
@@ -220,13 +321,41 @@ class TestPiDefaultModel:
         state = {"claude_models": {"haiku": "h4"}}
         assert pi.default_model(state) == "h4"
 
-    def test_falls_back_to_codex(self):
-        state = {"claude_models": {}, "codex_models": ["gpt-5"]}
-        assert pi.default_model(state) == "gpt-5"
+    def test_pins_first_discovered_codex_model_verbatim(self):
+        # Discovery order is meaningful (#282): Pi takes the first id as-is
+        # rather than re-sorting for the newest version.
+        state = {
+            "claude_models": {},
+            "codex_models": ["databricks-gpt-5", "system.ai.gpt-5-6-sol", "gpt-5-5"],
+        }
+        assert pi.default_model(state) == "databricks-gpt-5"
+
+    def test_falls_back_to_generic_responses_endpoint(self):
+        state = {"claude_models": {}, "codex_models": ["c1"]}
+        assert pi.default_model(state) == "c1"
+
+    def test_takes_codex_list_verbatim_regardless_of_id_shape(self):
+        # Keeping gpt-oss out of `codex_models` is discovery's job (capability
+        # bucketing); Pi's default does not second-guess the list it is given.
+        state = {
+            "claude_models": {},
+            "codex_models": ["gpt-oss-120b"],
+            "gemini_models": ["gemini-2"],
+        }
+        assert pi.default_model(state) == "gpt-oss-120b"
 
     def test_falls_back_to_gemini(self):
         state = {"claude_models": {}, "codex_models": [], "gemini_models": ["gemini-2"]}
         assert pi.default_model(state) == "gemini-2"
+
+    def test_falls_back_to_oss_last(self):
+        state = {
+            "claude_models": {},
+            "codex_models": [],
+            "gemini_models": [],
+            "oss_models": ["system.ai.glm-5-2"],
+        }
+        assert pi.default_model(state) == "system.ai.glm-5-2"
 
     def test_returns_none_when_empty(self):
         assert pi.default_model({}) is None
@@ -296,6 +425,7 @@ class TestWriteToolConfig:
                 "databricks-claude": {"old": True},
                 "databricks-openai": {"old": True},
                 "databricks-gemini": {"old": True},
+                "databricks-mlflow": {"old": True},
                 "user-provider": {"keep": True},
             }
         }
@@ -311,6 +441,7 @@ class TestWriteToolConfig:
         providers = written.get("providers", {})
         assert providers.get("databricks-claude") != {"old": True}
         assert "old" not in providers.get("databricks-claude", {})
+        assert "databricks-mlflow" not in providers
         assert providers.get("user-provider") == {"keep": True}
 
     def test_legacy_providers_removed_on_upgrade(self, tmp_path, monkeypatch):
