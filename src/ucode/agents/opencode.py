@@ -127,7 +127,10 @@ export const UcodeDatabricksAuth = async () => ({
 
 def _parse_version(value: str) -> tuple[int, int, int] | None:
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
-    return tuple(map(int, match.groups())) if match else None
+    if match is None:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
 
 
 def _minimum_version_message() -> str | None:

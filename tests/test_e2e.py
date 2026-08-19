@@ -907,9 +907,7 @@ class TestOpencodeLaunch:
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
         xdg = tmp_path / "opencode-xdg"
         monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
-        monkeypatch.setattr(
-            opencode, "OPENCODE_CONFIG_PATH", xdg / "opencode" / "opencode.json"
-        )
+        monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", xdg / "opencode" / "opencode.json")
         monkeypatch.setattr(
             opencode, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-config.backup.json"
         )
