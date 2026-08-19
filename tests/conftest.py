@@ -8,9 +8,11 @@ import pytest
 
 from ucode.databricks import (
     build_shared_base_urls,
-    fetch_ai_gateway_claude_models,
-    fetch_codex_models,
-    fetch_gemini_models,
+    discover_claude_models,
+    discover_codex_models,
+    discover_gemini_models,
+    discover_model_services,
+    discover_oss_model_specs,
     get_databricks_token,
 )
 from ucode.ui import normalize_workspace_url
@@ -59,22 +61,42 @@ def e2e_token(e2e_workspace):
 
 @pytest.fixture(scope="session")
 def e2e_state(e2e_workspace, e2e_token):
-    """Full state dict mirroring what configure_shared_state produces."""
-    claude_models = fetch_ai_gateway_claude_models(e2e_workspace, e2e_token)
-    gemini_models = fetch_gemini_models(e2e_workspace, e2e_token)
-    codex_models = fetch_codex_models(e2e_workspace, e2e_token)
+    """Full state dict mirroring configure's UC-first family discovery."""
+    claude_models, codex_models, gemini_models, oss_models, _ = discover_model_services(
+        e2e_workspace, e2e_token
+    )
+    if not claude_models:
+        claude_models, _ = discover_claude_models(e2e_workspace, e2e_token)
+    if not gemini_models:
+        gemini_models, _ = discover_gemini_models(e2e_workspace, e2e_token)
+    if not codex_models:
+        codex_models, _ = discover_codex_models(e2e_workspace, e2e_token)
+    if oss_models:
+        oss_model_specs, _ = discover_oss_model_specs(e2e_workspace, e2e_token, oss_models)
+    else:
+        oss_model_specs, _ = discover_oss_model_specs(e2e_workspace, e2e_token)
+    oss_models = [spec["id"] for spec in oss_model_specs]
+
+    # E2E mirrors configure's default (Fable is premium and opt-in).
+    claude_models.pop("fable", None)
 
     opencode_models: dict = {}
     if claude_models:
         opencode_models["anthropic"] = list(claude_models.values())
     if gemini_models:
         opencode_models["gemini"] = gemini_models
+    if codex_models:
+        opencode_models["openai"] = codex_models
+    if oss_models:
+        opencode_models["oss"] = oss_models
 
     return {
         "workspace": e2e_workspace,
         "claude_models": claude_models,
         "gemini_models": gemini_models,
         "codex_models": codex_models,
+        "oss_models": oss_models,
+        "oss_model_specs": oss_model_specs,
         "opencode_models": opencode_models,
         "base_urls": build_shared_base_urls(e2e_workspace),
         "managed_configs": {},

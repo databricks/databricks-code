@@ -1,12 +1,13 @@
-"""Pi coding agent: writes ~/.pi/agent/models.json with Databricks-backed providers.
+"""Pi coding agent: writes a ucode-private models.json with Databricks-backed providers.
 
-Pi (https://pi.dev) is a multi-provider coding agent. We register three
+Pi (https://pi.dev) is a multi-provider coding agent. We register four
 providers in its `models.json`, each speaking the API dialect best suited to
 that family's gateway path:
 
 - `databricks-claude`  (api: anthropic-messages)       → /ai-gateway/anthropic
 - `databricks-openai`  (api: openai-responses)         → /ai-gateway/codex/v1
 - `databricks-gemini`  (api: google-generative-ai)     → /ai-gateway/gemini/v1beta
+- `databricks-mlflow`  (api: openai-completions)       → /ai-gateway/mlflow/v1
 
 Per-provider `compat` flags work around fields the gateway translators reject:
 
@@ -15,11 +16,19 @@ Per-provider `compat` flags work around fields the gateway translators reject:
   pi uses for every request. With this flag pi omits the per-tool field and
   sends the legacy `anthropic-beta: fine-grained-tool-streaming-...` header
   instead, which the gateway accepts.
+- mlflow: `supportsStore: false` and `supportsStrictMode: false` — the MLflow
+  chat-completions gateway rejects OpenAI's `store` field and
+  `tools[].function.strict`.
+- openai: no `compat` flags needed, but the per-model `thinkingLevelMap`
+  matters — see `_pi_gpt_model_entry`. Declaring `reasoning: true` without an
+  off-state makes Pi send `reasoning: {effort: "none"}`, which `gpt-5`,
+  `gpt-5-mini`, `gpt-5-nano` and `gpt-5-5-pro` reject with a 400.
 
-OSS / Databricks-foundation models (Llama, Qwen, etc.) are not exposed via
-pi today — they live behind /ai-gateway/mlflow/v1 with per-model
-`max_tokens` caps that pi has no global way to honor without per-model
-config we don't currently maintain.
+The `databricks-mlflow` provider carries validated MLflow chat-completions
+models discovered upstream. Per-model reasoning and token metadata comes from
+the persisted gateway capability specs, with conservative static fallback.
+At launch this provider alone is routed through a loopback repair proxy because
+some models (notably Inkling) omit the terminal `finish_reason` Pi requires.
 
 The bearer token is baked into the file and refreshed by a background thread
 while the session runs (same pattern as OpenCode/Copilot).
@@ -27,12 +36,16 @@ while the session runs (same pattern as OpenCode/Copilot).
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import signal
 import subprocess
 import threading
+from typing import cast
+from urllib.parse import urlparse
 
 from ucode.agent_updates import available_npm_package_update
+from ucode.agents import _mlflow_proxy
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -46,10 +59,16 @@ from ucode.databricks import (
     TOKEN_REFRESH_INTERVAL_SECONDS,
     build_pi_base_urls,
     classify_model_family,
+    claude_model_capabilities,
     get_databricks_token,
+    gpt_model_token_limits,
+    model_is_reasoning,
+    model_token_limits,
+    preferred_gpt_model,
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
+from ucode.ui import print_warning
 
 PI_UCODE_HOME = APP_DIR / "pi-home"
 PI_CONFIG_DIR = PI_UCODE_HOME / ".pi" / "agent"
@@ -57,6 +76,7 @@ PI_CONFIG_PATH = PI_CONFIG_DIR / "models.json"
 PI_SETTINGS_PATH = PI_CONFIG_DIR / "settings.json"
 PI_BACKUP_PATH = APP_DIR / "pi-models.backup.json"
 PI_SETTINGS_BACKUP_PATH = APP_DIR / "pi-settings.backup.json"
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 SPEC: ToolSpec = {
     "binary": "pi",
@@ -70,6 +90,7 @@ PROVIDER_NAMES = (
     "databricks-claude",
     "databricks-openai",
     "databricks-gemini",
+    "databricks-mlflow",
 )
 
 PROVIDER_KEYS: list[list[str]] = [["providers", name] for name in PROVIDER_NAMES]
@@ -88,6 +109,7 @@ def _resolve_model_selector(
     claude_models: dict[str, str],
     codex_models: list[str],
     gemini_models: list[str],
+    oss_models: list[str],
 ) -> str:
     """Return a Pi model selector in `<provider>/<model>` form when possible."""
     for name in PROVIDER_NAMES:
@@ -99,7 +121,125 @@ def _resolve_model_selector(
         return f"databricks-openai/{model}"
     if model in gemini_models:
         return f"databricks-gemini/{model}"
+    if model in oss_models:
+        return f"databricks-mlflow/{model}"
     return model
+
+
+def _pi_claude_model_entry(model_id: str) -> dict:
+    """Build a Claude entry with explicit limits.
+
+    Databricks model ids do not match Pi's built-in Anthropic ids, so a bare
+    custom entry silently gets Pi's 128k context / 4k output defaults.
+    """
+    capabilities = claude_model_capabilities(model_id)
+    entry: dict = {
+        "id": model_id,
+        "reasoning": True,
+        "input": ["text", "image"],
+        "contextWindow": capabilities.context,
+        "maxTokens": capabilities.output,
+    }
+    if capabilities.force_adaptive_thinking:
+        entry["compat"] = {"forceAdaptiveThinking": True}
+    return entry
+
+
+_OSS_SAFE_LIMITS = {"context": 128_000, "output": 8_192}
+
+
+def _positive_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _oss_specs_by_id(raw_specs: object) -> dict[str, dict[str, object]]:
+    if not isinstance(raw_specs, list):
+        return {}
+    specs: dict[str, dict[str, object]] = {}
+    for raw_spec in raw_specs:
+        if not isinstance(raw_spec, dict):
+            continue
+        typed_spec = cast(dict[str, object], raw_spec)
+        model_id = typed_spec.get("id")
+        reasoning = typed_spec.get("reasoning")
+        context = typed_spec.get("context_window")
+        output = typed_spec.get("max_tokens")
+        valid_limits = all(
+            value is None or _positive_int(value) is not None for value in (context, output)
+        )
+        if (
+            isinstance(model_id, str)
+            and model_id
+            and isinstance(reasoning, bool)
+            and "context_window" in typed_spec
+            and "max_tokens" in typed_spec
+            and valid_limits
+            and model_id not in specs
+        ):
+            specs[model_id] = typed_spec
+    return specs
+
+
+def _pi_oss_model_entry(model_id: str, spec: dict[str, object] | None = None) -> dict:
+    """Build a Pi MLflow model entry from discovered or static capabilities.
+
+    A valid discovered boolean overrides static reasoning. Any discovered spec
+    receives a complete conservative limit pair, so missing capability fields
+    cannot leave a validated model effectively uncapped. Missing specs retain
+    the existing static GLM/Kimi behavior, while unknown models remain bare.
+    """
+    entry: dict = {"id": model_id}
+    static_limits = model_token_limits(model_id)
+    static_reasoning = model_is_reasoning(model_id)
+
+    reasoning = spec.get("reasoning") if isinstance(spec, dict) else None
+    if not isinstance(reasoning, bool):
+        reasoning = static_reasoning
+    if reasoning:
+        entry["reasoning"] = True
+
+    context = _positive_int(spec.get("context_window")) if isinstance(spec, dict) else None
+    output = _positive_int(spec.get("max_tokens")) if isinstance(spec, dict) else None
+    if isinstance(spec, dict):
+        entry["contextWindow"] = context or (
+            static_limits.get("context") if static_limits else _OSS_SAFE_LIMITS["context"]
+        )
+        entry["maxTokens"] = output or (
+            static_limits.get("output") if static_limits else _OSS_SAFE_LIMITS["output"]
+        )
+    elif static_limits:
+        entry["contextWindow"] = static_limits["context"]
+        entry["maxTokens"] = static_limits["output"]
+    return entry
+
+
+def _pi_gpt_model_entry(model_id: str) -> dict:
+    """Build a Pi openai (codex) model entry with `contextWindow`/`maxTokens`
+    from `databricks.gpt_model_token_limits`. GPT ids aren't in Pi's built-in
+    catalog, so without an explicit window Pi falls back to a small default and
+    truncates long sessions.
+
+    `thinkingLevelMap: {"off": None}` is required alongside `reasoning: True`.
+    When a model declares `reasoning` but no off-state, Pi's Responses builder
+    falls back to `reasoning: {effort: "none"}` for the thinking-off case
+    (`pi-ai/dist/api/openai-responses.js`, the `thinkingLevelMap?.off !== null`
+    branch). `"none"` is only valid on gpt-5.1+, so `gpt-5`, `gpt-5-mini`,
+    `gpt-5-nano` and `gpt-5-5-pro` reject every request with
+    `BAD_REQUEST: Unsupported value: 'none' is not supported with the 'gpt-5'
+    model`. An explicit `None` makes Pi omit `reasoning` entirely, which the
+    gateway accepts for all ids (verified against /ai-gateway/codex/v1).
+    """
+    limits = gpt_model_token_limits(model_id)
+    entry: dict = {
+        "id": model_id,
+        "contextWindow": limits["context"],
+        "maxTokens": limits["output"],
+    }
+    if "gpt-5" in model_id.lower().replace(".", "-"):
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        entry["thinkingLevelMap"] = {"off": None}
+    return entry
 
 
 def render_overlay(
@@ -109,8 +249,10 @@ def render_overlay(
     claude_models: dict[str, str],
     codex_models: list[str],
     gemini_models: list[str],
+    oss_models: list[str],
+    oss_specs: list[dict] | None = None,
 ) -> tuple[dict, list[list[str]]]:
-    """Return (overlay, managed_key_paths) for ~/.pi/agent/models.json."""
+    """Return (overlay, managed_key_paths) for Pi's private agent config."""
     providers: dict = {}
     keys: list[list[str]] = [["model"]]
     # Pi expands header values that match an env var name. Our UA contains
@@ -129,7 +271,7 @@ def render_overlay(
             # the legacy beta header instead when this is false.
             "compat": {"supportsEagerToolInputStreaming": False},
             "headers": ua_headers,
-            "models": [{"id": m} for m in claude_ids],
+            "models": [_pi_claude_model_entry(m) for m in claude_ids],
         }
         keys.append(["providers", "databricks-claude"])
     if codex_models:
@@ -139,7 +281,7 @@ def render_overlay(
             "apiKey": token,
             "authHeader": True,
             "headers": ua_headers,
-            "models": [{"id": m} for m in codex_models],
+            "models": [_pi_gpt_model_entry(m) for m in codex_models],
         }
         keys.append(["providers", "databricks-openai"])
     if gemini_models:
@@ -152,8 +294,24 @@ def render_overlay(
             "models": [{"id": m} for m in gemini_models],
         }
         keys.append(["providers", "databricks-gemini"])
+    if oss_models:
+        specs_by_id = _oss_specs_by_id(oss_specs)
+        providers["databricks-mlflow"] = {
+            "baseUrl": pi_base_urls["oss"],
+            "api": "openai-completions",
+            "apiKey": token,
+            "authHeader": True,
+            # MLflow chat-completions gateway rejects OpenAI's `store` field
+            # and per-tool `strict`. Pi omits both when these are false.
+            "compat": {"supportsStore": False, "supportsStrictMode": False},
+            "headers": ua_headers,
+            "models": [_pi_oss_model_entry(m, specs_by_id.get(m)) for m in oss_models],
+        }
+        keys.append(["providers", "databricks-mlflow"])
     overlay: dict = {
-        "model": _resolve_model_selector(model, claude_models, codex_models, gemini_models),
+        "model": _resolve_model_selector(
+            model, claude_models, codex_models, gemini_models, oss_models
+        ),
     }
     if providers:
         overlay["providers"] = providers
@@ -161,6 +319,17 @@ def render_overlay(
 
 
 def write_tool_config(
+    state: dict,
+    model: str,
+    token: str | None = None,
+    *,
+    force_refresh: bool = False,
+) -> tuple[dict, str]:
+    with _CONFIG_WRITE_LOCK:
+        return _write_tool_config_unlocked(state, model, token, force_refresh=force_refresh)
+
+
+def _write_tool_config_unlocked(
     state: dict,
     model: str,
     token: str | None = None,
@@ -186,6 +355,8 @@ def write_tool_config(
         claude_models,
         codex_models,
         gemini_models,
+        state.get("oss_models") or [],
+        state.get("oss_model_specs") or [],
     )
     existing = read_json_safe(PI_CONFIG_PATH)
     providers = existing.get("providers")
@@ -242,7 +413,8 @@ def _managed_model_families(state: dict) -> tuple[dict[str, str], list[str], lis
 
 
 def default_model(state: dict) -> str | None:
-    """Prefer Claude opus → sonnet → haiku; fall back to codex, gemini.
+    """Prefer a managed Pi default/allowlist, then Claude opus → sonnet → haiku;
+    fall back to codex, Gemini, then OSS.
 
     A managed config's ``pi_default_model`` and ``pi_models`` both win outright: the former is
     the admin's chosen session start, the latter their allowlist. Workspace-wide discovery falls back.
@@ -256,11 +428,14 @@ def default_model(state: dict) -> str | None:
     for family in ("opus", "sonnet", "haiku"):
         if claude_models.get(family):
             return claude_models[family]
-    codex_models = state.get("codex_models") or []
-    if codex_models:
-        return codex_models[0]
+    codex_model = preferred_gpt_model(state.get("codex_models") or [])
+    if codex_model:
+        return codex_model
     gemini_models = state.get("gemini_models") or []
-    return gemini_models[0] if gemini_models else None
+    if gemini_models:
+        return gemini_models[0]
+    oss_models = state.get("oss_models") or []
+    return oss_models[0] if oss_models else None
 
 
 def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> str:
@@ -282,31 +457,131 @@ def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
 def build_runtime_env(token: str) -> dict[str, str]:
     env = os.environ.copy()
     env["OAUTH_TOKEN"] = token
-    env["HOME"] = str(PI_UCODE_HOME)
+    env["PI_CODING_AGENT_DIR"] = str(PI_CONFIG_DIR)
     return env
 
 
-def launch(state: dict, tool_args: list[str]) -> None:
-    token = _refresh_token_once(state)
-    env = build_runtime_env(token)
-
-    stop_event = threading.Event()
-    refresher = threading.Thread(
-        target=_refresh_forever,
-        args=(state, stop_event),
-        daemon=True,
-    )
-    refresher.start()
-
-    proc = subprocess.Popen([SPEC["binary"], *tool_args], env=env)
+def _is_loopback_origin(origin: str) -> bool:
+    hostname = urlparse(origin).hostname
+    if not hostname:
+        return True
+    if hostname.lower() == "localhost":
+        return True
     try:
-        returncode = proc.wait()
-    except KeyboardInterrupt:
-        proc.send_signal(signal.SIGINT)
-        returncode = proc.wait()
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _start_oss_proxy(
+    state: dict,
+) -> tuple[threading.Thread, _mlflow_proxy.ThreadingHTTPServer] | None:
+    """Start Pi's MLflow repair proxy and rewrite only the in-memory base URL.
+
+    The upstream is always derived from ``workspace`` rather than an existing
+    base URL, so a stale loopback port from an old config can never become the
+    next proxy's upstream.
+    """
+    if not (state.get("oss_models") or []):
+        return None
+    direct_oss_url = build_pi_base_urls(state["workspace"])["oss"]
+    origin = direct_oss_url.split("/ai-gateway/", 1)[0]
+    if _is_loopback_origin(origin):
+        print_warning("MLflow stream repair proxy skipped for a loopback workspace URL.")
+        return None
+    started = _mlflow_proxy.start(origin)
+    if started is None:
+        return None
+    server, proxy_origin = started
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    try:
+        thread.start()
+    except RuntimeError:
+        server.server_close()
+        print_warning("MLflow stream repair proxy could not start; using the direct gateway URL.")
+        return None
+    pi_urls = state.setdefault("base_urls", {}).setdefault(
+        "pi", build_pi_base_urls(state["workspace"])
+    )
+    pi_urls["oss"] = f"{proxy_origin}/ai-gateway/mlflow/v1"
+    return thread, server
+
+
+def _restore_direct_oss_config(state: dict, token: str | None) -> None:
+    """Replace the session-only proxy URL after any in-flight config write."""
+    with _CONFIG_WRITE_LOCK:
+        _restore_direct_oss_config_unlocked(state, token)
+
+
+def _restore_direct_oss_config_unlocked(state: dict, token: str | None) -> None:
+    pi_urls = state.setdefault("base_urls", {}).setdefault(
+        "pi", build_pi_base_urls(state["workspace"])
+    )
+    pi_urls["oss"] = build_pi_base_urls(state["workspace"])["oss"]
+    model = default_model(state)
+    if model and token is not None:
+        write_tool_config(state, model, token=token)
+        return
+
+    # Token acquisition can fail before the normal config rewrite returns a
+    # token. Repair an existing generated provider in place without changing
+    # its credential, so a stale loopback port is never left behind.
+    existing = read_json_safe(PI_CONFIG_PATH)
+    providers = existing.get("providers")
+    mlflow = providers.get("databricks-mlflow") if isinstance(providers, dict) else None
+    if isinstance(mlflow, dict):
+        mlflow["baseUrl"] = pi_urls["oss"]
+        write_json_file(PI_CONFIG_PATH, existing)
+
+
+def launch(state: dict, tool_args: list[str]) -> None:
+    proxy: tuple[threading.Thread, _mlflow_proxy.ThreadingHTTPServer] | None = None
+    stop_event = threading.Event()
+    refresher: threading.Thread | None = None
+    proc: subprocess.Popen | None = None
+    token: str | None = None
+    primary_error: BaseException | None = None
+    try:
+        # The proxy must be live and its URL in state before the first config
+        # write; refreshes then keep writing the same live loopback endpoint.
+        proxy = _start_oss_proxy(state)
+        token = _refresh_token_once(state)
+        env = build_runtime_env(token)
+
+        refresher = threading.Thread(
+            target=_refresh_forever,
+            args=(state, stop_event),
+            daemon=True,
+        )
+        refresher.start()
+
+        proc = subprocess.Popen([SPEC["binary"], *tool_args], env=env)
+        try:
+            returncode = proc.wait()
+        except KeyboardInterrupt:
+            proc.send_signal(signal.SIGINT)
+            returncode = proc.wait()
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         stop_event.set()
-        refresher.join(timeout=1)
+        if refresher is not None:
+            refresher.join(timeout=1)
+        if proxy is not None:
+            proxy_thread, server = proxy
+            restore_error: Exception | None = None
+            try:
+                _restore_direct_oss_config(state, token)
+            except Exception as exc:
+                restore_error = exc
+                print_warning(f"Pi MLflow direct configuration could not be restored ({exc}).")
+            finally:
+                server.shutdown()
+                server.server_close()
+                proxy_thread.join(timeout=1)
+            if restore_error is not None and primary_error is None:
+                raise restore_error
 
     raise SystemExit(returncode)
 

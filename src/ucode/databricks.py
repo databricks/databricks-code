@@ -24,6 +24,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, cast, overload
@@ -1402,9 +1403,29 @@ _MODEL_SERVICE_REQUIRED_PREFIX = "system.ai."
 # is the only server-side narrowing that works.
 _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 
-# Supported OSS chat families, matched by name substring. Add an entry to
-# support a new family.
+# OSS families with statically validated coding-agent behavior. They remain the
+# safe fallback when the workspace's foundation-model capability listing is
+# unavailable. Other model families are offered only after the listing confirms
+# that they are served exclusively through MLflow chat completions.
 _OSS_MODEL_FAMILIES = ("kimi-", "glm-")
+
+# Native routes take precedence over the generic MLflow chat-completions route.
+# A foundation model advertising any of these must not be duplicated as OSS.
+_NATIVE_PROVIDER_API_TYPES = frozenset(
+    {"anthropic/v1/messages", "openai/v1/responses", "gemini/v1/generateContent"}
+)
+
+# Non-chat services must never be offered to a chat agent, even if malformed
+# metadata happens to advertise a chat API type.
+_OSS_NON_CHAT_SUBSTRINGS = ("embedding", "embed", "rerank")
+
+
+def _is_oss_chat_model(model_id: str) -> bool:
+    """True if the id matches an OSS chat family and isn't a non-chat service."""
+    if any(bad in model_id for bad in _OSS_NON_CHAT_SUBSTRINGS):
+        return False
+    return any(family in model_id for family in _OSS_MODEL_FAMILIES)
+
 
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
@@ -1440,22 +1461,373 @@ def classify_model_family(model_id: str) -> str | None:
 # config dialect. Both fields are provided because agents like OpenCode require
 # context and output together. Keyed by family substring; add an entry to bound
 # a new model.
+#
+# Output caps probed from the gateway 2026-07-16 (it 400s with "max_tokens (N)
+# cannot exceed <cap>"); context windows from each model's docs/description
+# (conservative when unstated). If the gateway raises a cap or ships a new
+# model, update this table.
 _MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
-    # GLM-4.6: 200k context, but the gateway caps output well below the model's
-    # native 128k — pin 25k so requests aren't rejected.
+    # Keep the version-specific entry before the family fallback: GLM 5.2 has
+    # materially higher probed gateway limits than earlier/unknown variants.
+    "glm-5-2": {"context": 1_000_000, "output": 65_536},
     "glm": {"context": 200_000, "output": 25_000},
+    "kimi": {"context": 128_000, "output": 65_536},
 }
+
+# Conservative fallback for a future variant that matches a validated family
+# but has no specific entry. Pinning a low output ceiling risks truncation, not
+# a gateway 400, so it is the safe failure direction.
+_OSS_FALLBACK_LIMITS = {"context": 128_000, "output": 8_192}
+
+# Validated families that emit reasoning. Pi renders their streamed
+# reasoning_content as thinking when the model entry sets reasoning:true.
+_OSS_REASONING_FAMILIES = ("glm", "kimi")
+
+
+def model_is_reasoning(model_id: str) -> bool:
+    """True if the OSS model reports reasoning output (family-matched)."""
+    return any(family in model_id for family in _OSS_REASONING_FAMILIES)
 
 
 def model_token_limits(model_id: str) -> dict[str, int] | None:
     """Return ``{"context": ..., "output": ...}`` limits for ``model_id``, or None.
 
-    Matches by family substring (e.g. any ``*glm*`` id). None means the model
-    has no known limits and the agent should not pin any."""
+    Prefers a specific `_MODEL_TOKEN_LIMITS` family entry (e.g. any ``*glm*``
+    id). Any other OSS chat model falls back to a conservative floor so it is
+    never offered uncapped (which would 400). None only for non-OSS ids, where
+    the agent should not pin any limit."""
     for family, limits in _MODEL_TOKEN_LIMITS.items():
         if family in model_id:
             return dict(limits)
+    if _is_oss_chat_model(model_id):
+        return dict(_OSS_FALLBACK_LIMITS)
     return None
+
+
+# The foundation-model API exposes context windows only in free-text
+# descriptions (for example "context length of 1M tokens"). Keep parsing
+# deliberately narrow: unrecognized or invalid text simply yields no override.
+_CONTEXT_LENGTH_RE = re.compile(r"context (?:length|window) of ([\d.,]+)\s*([MK])", re.IGNORECASE)
+
+
+def _parse_context_window(description: str) -> int | None:
+    if not isinstance(description, str):
+        return None
+    match = _CONTEXT_LENGTH_RE.search(description)
+    if not match:
+        return None
+    try:
+        value = float(match.group(1).replace(",", ""))
+        multiplier = 1_000_000 if match.group(2).upper() == "M" else 1_000
+        tokens = int(value * multiplier)
+    except (OverflowError, ValueError):
+        return None
+    return tokens if tokens > 0 else None
+
+
+# Per-model output ceilings enforced by the MLflow gateway. There is no
+# structured metadata field for these values; they were established by probing
+# oversized requests. Keys omit route prefixes so the same entry applies to
+# both `databricks-*` endpoint ids and `system.ai.*` model-service ids.
+_OSS_MAX_OUTPUT_TOKENS: dict[str, int] = {
+    "glm-5-2": 65_536,
+    "inkling": 65_536,
+    "kimi-k2-7-code": 65_536,
+    "gpt-oss-120b": 25_000,
+    "gpt-oss-20b": 25_000,
+    "qwen35-122b-a10b": 25_000,
+    "qwen3-next-80b-a3b-instruct": 10_000,
+    "llama-4-maverick": 8_192,
+    "meta-llama-3-1-8b-instruct": 8_192,
+    "meta-llama-3-3-70b-instruct": 8_192,
+    "gemma-3-12b": 8_192,
+}
+
+
+def _canonical_oss_model_id(model_id: str) -> str:
+    """Normalize endpoint/model-service ids for capability matching."""
+    tail = model_id.rsplit("/", 1)[-1].strip().lower()
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    if tail.startswith("databricks-"):
+        tail = tail[len("databricks-") :]
+    return tail
+
+
+def _static_oss_spec(model_id: str) -> dict | None:
+    """Capability fallback for the statically validated GLM/Kimi families."""
+    if not _is_oss_chat_model(model_id.lower()):
+        return None
+    limits = model_token_limits(model_id) or {}
+    return {
+        "id": model_id,
+        "reasoning": model_is_reasoning(model_id.lower()),
+        "context_window": limits.get("context"),
+        "max_tokens": limits.get("output"),
+    }
+
+
+def _oss_specs_from_foundation_models(payload: object) -> list[dict]:
+    """Parse validated chat-completions-only model specs from a listing."""
+    if not isinstance(payload, dict):
+        return []
+    payload_dict = cast(dict[str, object], payload)
+    raw_endpoints = payload_dict.get("endpoints")
+    if not isinstance(raw_endpoints, list):
+        return []
+
+    specs: list[dict] = []
+    for endpoint in raw_endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        endpoint_dict = cast(dict[str, object], endpoint)
+        name = endpoint_dict.get("name")
+        config = endpoint_dict.get("config")
+        if not isinstance(name, str) or not name.strip() or not isinstance(config, dict):
+            continue
+        name = name.strip()
+        lowered_name = _canonical_oss_model_id(name)
+        is_native_family = (
+            lowered_name.startswith("claude-")
+            or lowered_name.startswith("gemini-")
+            or re.match(r"^gpt-\d(?:-|$)", lowered_name) is not None
+        )
+        if is_native_family or any(bad in lowered_name for bad in _OSS_NON_CHAT_SUBSTRINGS):
+            continue
+        config_dict = cast(dict[str, object], config)
+        entities = config_dict.get("served_entities")
+        if not isinstance(entities, list):
+            continue
+
+        api_types: set[str] = set()
+        description = ""
+        has_v2_entity = False
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            entity_dict = cast(dict[str, object], entity)
+            foundation_model = entity_dict.get("foundation_model")
+            if not isinstance(foundation_model, dict):
+                continue
+            foundation_model_dict = cast(dict[str, object], foundation_model)
+            if foundation_model_dict.get("ai_gateway_v2_supported") is not True:
+                continue
+            has_v2_entity = True
+            raw_api_types = foundation_model_dict.get("api_types")
+            if isinstance(raw_api_types, list):
+                api_types.update(value for value in raw_api_types if isinstance(value, str))
+            raw_description = foundation_model_dict.get("description")
+            if not description and isinstance(raw_description, str):
+                description = raw_description
+
+        if not has_v2_entity or "mlflow/v1/chat/completions" not in api_types:
+            continue
+        if api_types & _NATIVE_PROVIDER_API_TYPES:
+            continue
+        capabilities = endpoint_dict.get("capabilities")
+        capabilities_dict = (
+            cast(dict[str, object], capabilities) if isinstance(capabilities, dict) else {}
+        )
+        reasoning = capabilities_dict.get("openai_reasoning") is True
+        canonical_id = _canonical_oss_model_id(name)
+        context_window = _parse_context_window(description)
+        max_tokens = _OSS_MAX_OUTPUT_TOKENS.get(canonical_id)
+        static_fallback = _static_oss_spec(name)
+        if static_fallback is not None:
+            # Missing/partial metadata must not regress the statically verified
+            # GLM/Kimi capabilities already used by existing installations.
+            reasoning = reasoning or static_fallback["reasoning"]
+            context_window = context_window or static_fallback["context_window"]
+            max_tokens = max_tokens or static_fallback["max_tokens"]
+        specs.append(
+            {
+                "id": name,
+                "reasoning": reasoning,
+                "context_window": context_window,
+                "max_tokens": max_tokens,
+            }
+        )
+    # Foundation listings can repeat a served endpoint. Emit one stable spec
+    # per canonical model so downstream model lists/configs stay deduplicated.
+    deduped: dict[str, dict] = {}
+    for spec in sorted(specs, key=lambda item: item["id"]):
+        deduped.setdefault(_canonical_oss_model_id(spec["id"]), spec)
+    return list(deduped.values())
+
+
+def discover_oss_model_specs(
+    workspace: str,
+    token: str,
+    model_ids: list[str] | None = None,
+) -> tuple[list[dict], str | None]:
+    """Discover validated MLflow chat-completions models and capabilities.
+
+    With ``model_ids`` (the UC-first path), endpoint capabilities are projected
+    back onto those exact ids using their normalized model name. Statically
+    validated GLM/Kimi ids remain available when capability discovery fails or
+    omits them. Without ``model_ids`` (the serving-endpoint fallback), only
+    models validated by the live API metadata are returned.
+    """
+    hostname = workspace_hostname(workspace)
+    payload, reason = _http_get_json(
+        f"https://{hostname}/api/2.0/serving-endpoints:foundation-models", token
+    )
+    discovered = _oss_specs_from_foundation_models(payload)
+
+    if model_ids is None:
+        if discovered:
+            return discovered, None
+        if payload is None:
+            return [], reason
+        return [], "no validated chat-completions-only OSS endpoints"
+
+    discovered_by_id = {_canonical_oss_model_id(spec["id"]): spec for spec in discovered}
+    specs: list[dict] = []
+    for model_id in model_ids:
+        if not isinstance(model_id, str) or not model_id.strip():
+            continue
+        dynamic = discovered_by_id.get(_canonical_oss_model_id(model_id))
+        if dynamic is not None:
+            specs.append({**dynamic, "id": model_id})
+            continue
+        fallback = _static_oss_spec(model_id)
+        if fallback is not None:
+            specs.append(fallback)
+    if specs:
+        return specs, None
+    if payload is None:
+        return [], reason
+    return [], "requested model ids matched no validated OSS endpoint"
+
+
+# Pi treats every custom model without explicit metadata as 128k context / 4k
+# output. Gateway ids are custom ids (not Pi's built-ins), so preserve the
+# upstream windows explicitly. Entries are ordered most-specific first after
+# normalizing dotted OpenAI ids and hyphenated Databricks ids to one form.
+# GPT-5.6 Sol/Terra/Luna support the opt-in 1.05M window; 272k is merely Pi's
+# built-in short-context pricing default, not the model's hard context limit.
+_GPT_TOKEN_LIMITS: tuple[tuple[str, dict[str, int]], ...] = (
+    ("gpt-5-6-sol", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-6-terra", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-6-luna", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-5-pro", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-4-pro", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-5", {"context": 272_000, "output": 128_000}),
+    ("gpt-5-4-mini", {"context": 400_000, "output": 128_000}),
+    ("gpt-5-4-nano", {"context": 400_000, "output": 128_000}),
+    ("gpt-5-4", {"context": 272_000, "output": 128_000}),
+    ("gpt-5", {"context": 400_000, "output": 128_000}),
+    ("gpt-4-1", {"context": 1_047_576, "output": 32_768}),
+    ("gpt-4o", {"context": 128_000, "output": 16_384}),
+    ("gpt-4-turbo", {"context": 128_000, "output": 4_096}),
+    ("gpt-4", {"context": 8_192, "output": 8_192}),
+)
+_GPT_FALLBACK_LIMITS = {"context": 128_000, "output": 16_384}
+
+
+def _normalized_foundation_model_id(model_id: str) -> str:
+    """Strip route prefixes case-insensitively and normalize dotted versions."""
+    tail = model_id.split("/")[-1].lower()
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    if tail.startswith("databricks-"):
+        tail = tail[len("databricks-") :]
+    return tail.replace(".", "-")
+
+
+def gpt_model_token_limits(model_id: str) -> dict[str, int]:
+    """Return Pi metadata limits for a GPT (codex/openai) gateway model."""
+    tail = _normalized_foundation_model_id(model_id)
+    for family, limits in _GPT_TOKEN_LIMITS:
+        if tail == family or tail.startswith(f"{family}-"):
+            return dict(limits)
+    return dict(_GPT_FALLBACK_LIMITS)
+
+
+def preferred_gpt_model(model_ids: list[str]) -> str | None:
+    """Prefer the newest numeric GPT id, then any other Responses endpoint.
+
+    ``gpt-oss`` is chat-completions-only and must never be selected for the
+    Responses route, even if stale state supplies it here.
+    """
+    eligible = [
+        model_id
+        for model_id in model_ids
+        if not _normalized_foundation_model_id(model_id).startswith("gpt-oss")
+    ]
+    numeric_gpt = [
+        model_id
+        for model_id in eligible
+        if re.match(r"^gpt-\d(?:-|$)", _normalized_foundation_model_id(model_id))
+    ]
+    if numeric_gpt:
+        return min(
+            numeric_gpt,
+            key=lambda model_id: model_version_sort_key(_normalized_foundation_model_id(model_id)),
+        )
+    return eligible[0] if eligible else None
+
+
+@dataclass(frozen=True)
+class ClaudeModelCapabilities:
+    context: int
+    output: int
+    supports_1m: bool = False
+    force_adaptive_thinking: bool = False
+
+
+_CLAUDE_FALLBACK_CAPABILITIES = ClaudeModelCapabilities(context=200_000, output=64_000)
+_CLAUDE_MODEL_RE = re.compile(r"^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?")
+
+
+def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
+    """Return the shared Claude capability policy for every agent.
+
+    Opus gained the opt-in 1M window in 4.6; Sonnet gained it in 4.5.
+    Sonnet's verified 1M tiers retain a conservative 64k output cap. Fable 5
+    is 1M by default (so it needs no ``[1m]`` suffix) with a 128k output cap.
+    Opus 4.5, Haiku, and unrecognized ids use the conservative 200k fallback.
+    """
+    tail = _normalized_foundation_model_id(model_id)
+    match = _CLAUDE_MODEL_RE.match(tail)
+    if not match:
+        return _CLAUDE_FALLBACK_CAPABILITIES
+    family, major_raw, minor_raw = match.groups()
+    version = (int(major_raw), int(minor_raw or 0))
+    if family == "opus" and version >= (4, 6):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=128_000,
+            supports_1m=True,
+            force_adaptive_thinking=True,
+        )
+    if family == "sonnet" and version >= (4, 6):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=64_000,
+            supports_1m=True,
+            force_adaptive_thinking=True,
+        )
+    if family == "sonnet" and version >= (4, 5):
+        return ClaudeModelCapabilities(context=1_000_000, output=64_000, supports_1m=True)
+    if family == "fable" and version >= (5, 0):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=128_000,
+            force_adaptive_thinking=True,
+        )
+    return _CLAUDE_FALLBACK_CAPABILITIES
+
+
+def claude_model_supports_1m(model_id: str) -> bool:
+    """Whether Claude Code should request the model's opt-in ``[1m]`` tier."""
+    return claude_model_capabilities(model_id).supports_1m
+
+
+def claude_model_token_limits(model_id: str) -> dict[str, int]:
+    """Return Pi metadata limits from the shared Claude capability policy."""
+    capabilities = claude_model_capabilities(model_id)
+    return {"context": capabilities.context, "output": capabilities.output}
 
 
 def _model_service_id(service: dict) -> str | None:
@@ -1737,10 +2109,20 @@ def discover_model_services(
     # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
     _prefer_opus_4_8(claude_models, ids)
 
-    codex_models = sorted([m for m in ids if "gpt-" in m], key=model_version_sort_key)
+    # `gpt-oss-*` also contains "gpt-" but is a chat-completions-only OSS model
+    # (served via /ai-gateway/mlflow/v1), NOT an openai-responses codex model —
+    # exclude it here so it isn't offered under the codex provider (which 400s).
+    codex_models = sorted(
+        [m for m in ids if "gpt-" in m and "gpt-oss" not in m],
+        key=model_version_sort_key,
+    )
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
 
-    oss_models = [m for m in ids if any(family in m for family in _OSS_MODEL_FAMILIES)]
+    # Project the live endpoint capability listing onto the UC ids. This
+    # broadens discovery beyond the static GLM/Kimi fallback only when the
+    # corresponding endpoint is validated as MLflow chat-completions-only.
+    oss_specs, _ = discover_oss_model_specs(workspace, token, ids)
+    oss_models = [spec["id"] for spec in oss_specs]
 
     if not (claude_models or codex_models or gemini_models or oss_models):
         sample = ", ".join(ids[:5])
@@ -2824,27 +3206,53 @@ def discover_endpoints_with_api_type(
         return [], reason
 
     data = cast(dict, payload) if isinstance(payload, dict) else {}
-    endpoints = data.get("endpoints", [])
+    raw_endpoints = data.get("endpoints", [])
+    endpoints = raw_endpoints if isinstance(raw_endpoints, list) else []
     out: list[str] = []
     saw_endpoint_without_v2 = False
+    saw_malformed = not isinstance(raw_endpoints, list)
     for ep in endpoints:
-        name = ep.get("name", "")
-        entities = ep.get("config", {}).get("served_entities", [])
+        if not isinstance(ep, dict):
+            saw_malformed = True
+            continue
+        name = ep.get("name")
+        config = ep.get("config")
+        if not isinstance(name, str) or not name or not isinstance(config, dict):
+            saw_malformed = True
+            continue
+        raw_entities = config.get("served_entities", [])
+        if not isinstance(raw_entities, list):
+            saw_malformed = True
+            continue
         api_types: set[str] = set()
         any_v2 = False
-        for se in entities:
-            fm = se.get("foundation_model", {})
+        for se in raw_entities:
+            if not isinstance(se, dict):
+                saw_malformed = True
+                continue
+            fm = se.get("foundation_model")
+            if not isinstance(fm, dict):
+                saw_malformed = True
+                continue
             if fm.get("ai_gateway_v2_supported") is True:
                 any_v2 = True
-                api_types.update(fm.get("api_types", []))
-        if not any_v2 and entities:
+                raw_api_types = fm.get("api_types", [])
+                if isinstance(raw_api_types, list):
+                    api_types.update(value for value in raw_api_types if isinstance(value, str))
+                else:
+                    saw_malformed = True
+        if not any_v2 and raw_entities:
             saw_endpoint_without_v2 = True
         if api_type in api_types:
             out.append(name)
     if out:
         return sorted(out, key=sort_key), None
     if not endpoints:
+        if saw_malformed:
+            return [], "foundation-models listing returned malformed `endpoints`"
         return [], "foundation-models listing returned no endpoints"
+    if saw_malformed:
+        return [], "foundation-models listing contained no valid matching endpoints"
     if saw_endpoint_without_v2:
         return [], (
             f"no endpoint exposes api_type `{api_type}` with "
@@ -2873,6 +3281,18 @@ def discover_codex_models(workspace: str, token: str) -> tuple[list[str], str | 
     return discover_endpoints_with_api_type(
         workspace, token, "openai/v1/responses", sort_key=model_version_sort_key
     )
+
+
+def discover_oss_models(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """Discover validated chat-completions-only serving endpoints.
+
+    This is the fallback for workspaces without UC model-services. Unlike the
+    static family fallback used for UC ids, every endpoint returned here has
+    live metadata confirming AI Gateway v2 MLflow chat completions and no
+    competing native Anthropic, Responses, or Gemini route.
+    """
+    specs, reason = discover_oss_model_specs(workspace, token)
+    return [spec["id"] for spec in specs], reason
 
 
 def fetch_gemini_models(workspace: str, token: str) -> list[str]:
@@ -3183,6 +3603,9 @@ def build_opencode_base_urls(workspace: str) -> dict[str, str]:
     return {
         "anthropic": build_tool_base_url("claude", workspace) + "/v1",
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
+        # @ai-sdk/openai appends "/responses" (or "/chat/completions") to baseURL,
+        # so stop just before that — matches the Pi adapter's build_pi_base_urls.
+        "openai": build_tool_base_url("codex", workspace),
         "oss": f"{workspace}/ai-gateway/mlflow/v1",
     }
 
@@ -3203,6 +3626,7 @@ def build_pi_base_urls(workspace: str) -> dict[str, str]:
         "claude": build_tool_base_url("claude", workspace),
         "openai": build_tool_base_url("codex", workspace),
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
+        "oss": f"{workspace}/ai-gateway/mlflow/v1",
     }
 
 
