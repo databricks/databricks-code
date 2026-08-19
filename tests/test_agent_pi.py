@@ -17,6 +17,7 @@ def _base_urls() -> dict[str, str]:
         "claude": f"{WS}/ai-gateway/anthropic",
         "openai": f"{WS}/ai-gateway/codex/v1",
         "gemini": f"{WS}/ai-gateway/gemini/v1beta",
+        "oss": f"{WS}/ai-gateway/mlflow/v1",
     }
 
 
@@ -26,6 +27,7 @@ def _empty() -> dict:
         "claude_models": {},
         "codex_models": [],
         "gemini_models": [],
+        "oss_models": [],
     }
 
 
@@ -39,6 +41,7 @@ def _overlay(model: str, token: str = "tok", **kwargs):
         bundle["claude_models"],
         bundle["codex_models"],
         bundle["gemini_models"],
+        bundle["oss_models"],
     )
 
 
@@ -75,23 +78,145 @@ class TestRenderOverlayProviders:
         assert provider["api"] == "openai-responses"
         assert provider["baseUrl"] == f"{WS}/ai-gateway/codex/v1"
 
+    def test_gpt56_sol_model_entry_pins_1m_context(self):
+        # Gateway ids are custom to Pi, so explicit metadata is required to
+        # avoid its 128k custom-model default.
+        overlay, _ = _overlay("gpt-5-6-sol", codex_models=["gpt-5-6-sol"])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+        assert entry["id"] == "gpt-5-6-sol"
+        assert entry["contextWindow"] == 1_050_000
+        assert entry["maxTokens"] == 128_000
+        assert entry["reasoning"] is True
+        assert entry["input"] == ["text", "image"]
+
+    def test_gpt_entries_pin_off_thinking_level_to_none(self):
+        # `reasoning: True` without an off-state makes Pi send
+        # `reasoning: {effort: "none"}`, which gpt-5 / -mini / -nano / -5-5-pro
+        # reject with a 400. `{"off": None}` makes Pi omit `reasoning`.
+        overlay, _ = _overlay(
+            "system.ai.gpt-5",
+            codex_models=[
+                "system.ai.gpt-5",
+                "system.ai.gpt-5-mini",
+                "system.ai.gpt-5-nano",
+                "system.ai.gpt-5-5-pro",
+                "system.ai.gpt-5-6-luna",
+            ],
+        )
+        entries = overlay["providers"]["databricks-openai"]["models"]
+        assert entries, "expected gpt entries"
+        for entry in entries:
+            assert entry["reasoning"] is True
+            assert entry["thinkingLevelMap"] == {"off": None}, entry["id"]
+
+    def test_non_gpt_codex_entry_has_no_thinking_level_map(self):
+        # Only the gpt-5 family declares `reasoning`, so only it needs the
+        # off-state override.
+        overlay, _ = _overlay("gpt-oss-120b", codex_models=["gpt-oss-120b"])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+        assert "reasoning" not in entry
+        assert "thinkingLevelMap" not in entry
+
+    def test_gpt_model_entries_use_model_specific_windows(self):
+        overlay, _ = _overlay(
+            "system.ai.gpt-5-2",
+            codex_models=[
+                "system.ai.gpt-5-2",
+                "databricks-gpt-5-4-nano",
+                "databricks-gpt-5-6-sol",
+            ],
+        )
+        windows = {
+            m["id"]: m["contextWindow"] for m in overlay["providers"]["databricks-openai"]["models"]
+        }
+        assert windows == {
+            "system.ai.gpt-5-2": 400_000,
+            "databricks-gpt-5-4-nano": 400_000,
+            "databricks-gpt-5-6-sol": 1_050_000,
+        }
+
+    def test_claude_entries_pin_limits_and_capabilities(self):
+        overlay, _ = _overlay(
+            "databricks-claude-opus-4-8",
+            claude_models={
+                "opus": "databricks-claude-opus-4-8",
+                "sonnet": "system.ai.claude-sonnet-4-5",
+                "haiku": "databricks-claude-haiku-4-5",
+                "fable": "system.ai.claude-fable-5",
+            },
+        )
+        entries = {m["id"]: m for m in overlay["providers"]["databricks-claude"]["models"]}
+        opus = entries["databricks-claude-opus-4-8"]
+        assert opus["contextWindow"] == 1_000_000
+        assert opus["maxTokens"] == 128_000
+        assert opus["reasoning"] is True
+        assert opus["input"] == ["text", "image"]
+        assert opus["compat"] == {"forceAdaptiveThinking": True}
+        assert entries["system.ai.claude-sonnet-4-5"]["contextWindow"] == 1_000_000
+        assert entries["system.ai.claude-sonnet-4-5"]["maxTokens"] == 64_000
+        assert entries["databricks-claude-haiku-4-5"]["contextWindow"] == 200_000
+        fable = entries["system.ai.claude-fable-5"]
+        assert fable["contextWindow"] == 1_000_000
+        assert fable["maxTokens"] == 128_000
+        assert fable["compat"] == {"forceAdaptiveThinking": True}
+
     def test_gemini_provider_uses_google_generative_ai(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
         provider = overlay["providers"]["databricks-gemini"]
         assert provider["api"] == "google-generative-ai"
         assert provider["baseUrl"] == f"{WS}/ai-gateway/gemini/v1beta"
 
-    def test_all_three_providers_when_all_present(self):
+    def test_mlflow_provider_uses_openai_completions(self):
+        overlay, _ = _overlay("system.ai.glm-5-2", oss_models=["system.ai.glm-5-2"])
+        provider = overlay["providers"]["databricks-mlflow"]
+        assert provider["api"] == "openai-completions"
+        assert provider["baseUrl"] == f"{WS}/ai-gateway/mlflow/v1"
+        assert provider["compat"] == {"supportsStore": False, "supportsStrictMode": False}
+
+    def test_no_mlflow_provider_when_no_oss_models(self):
+        overlay, _ = _overlay("gpt-5", codex_models=["gpt-5"])
+        assert "databricks-mlflow" not in overlay.get("providers", {})
+
+    def test_all_four_providers_when_all_present(self):
         overlay, _ = _overlay(
             "claude-sonnet",
             claude_models={"sonnet": "claude-sonnet"},
             codex_models=["gpt-5"],
             gemini_models=["gemini-2"],
+            oss_models=["system.ai.glm-5-2"],
         )
         assert set(overlay["providers"].keys()) == {
             "databricks-claude",
             "databricks-openai",
             "databricks-gemini",
+            "databricks-mlflow",
+        }
+
+
+class TestRenderOverlayOssEnrichment:
+    """OSS mlflow model entries carry reasoning + contextWindow + maxTokens
+    from the shared databricks.model_token_limits / model_is_reasoning tables."""
+
+    def test_reasoning_model_enriched(self):
+        overlay, _ = _overlay("system.ai.glm-5-2", oss_models=["system.ai.glm-5-2"])
+        entry = overlay["providers"]["databricks-mlflow"]["models"][0]
+        assert entry["id"] == "system.ai.glm-5-2"
+        assert entry["reasoning"] is True
+        assert entry["contextWindow"] == 1_000_000
+        assert entry["maxTokens"] == 65_536
+
+    def test_unvalidated_model_has_no_inferred_metadata(self):
+        # Discovery does not offer this model; even if supplied directly, Pi
+        # must not infer capabilities for an unvalidated coding model.
+        overlay, _ = _overlay("system.ai.inkling", oss_models=["system.ai.inkling"])
+        entry = overlay["providers"]["databricks-mlflow"]["models"][0]
+        assert entry == {"id": "system.ai.inkling"}
+
+    def test_unknown_oss_model_bare(self):
+        # No limits/reasoning table entry -> only id, client keeps defaults.
+        overlay, _ = _overlay("system.ai.mystery-7b", oss_models=["system.ai.mystery-7b"])
+        assert overlay["providers"]["databricks-mlflow"]["models"][0] == {
+            "id": "system.ai.mystery-7b"
         }
 
 
@@ -118,6 +243,7 @@ class TestRenderOverlayCompatFlags:
         overlay, _ = _overlay("claude-sonnet", claude_models={"sonnet": "claude-sonnet"})
         compat = overlay["providers"]["databricks-claude"]["compat"]
         assert compat["supportsEagerToolInputStreaming"] is False
+        assert compat["sendSessionAffinityHeaders"] is True
 
     def test_openai_and_gemini_have_no_compat_flags(self):
         # Their gateway routes accept pi's request shape as-is.
@@ -193,6 +319,10 @@ class TestRenderOverlayModelSelector:
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
         assert overlay["model"] == "databricks-gemini/gemini-2"
 
+    def test_prefixes_oss_model(self):
+        overlay, _ = _overlay("system.ai.glm-5-2", oss_models=["system.ai.glm-5-2"])
+        assert overlay["model"] == "databricks-mlflow/system.ai.glm-5-2"
+
     def test_preserves_already_prefixed_model(self):
         overlay, _ = _overlay(
             "databricks-claude/claude-sonnet",
@@ -220,13 +350,37 @@ class TestPiDefaultModel:
         state = {"claude_models": {"haiku": "h4"}}
         assert pi.default_model(state) == "h4"
 
-    def test_falls_back_to_codex(self):
-        state = {"claude_models": {}, "codex_models": ["gpt-5"]}
-        assert pi.default_model(state) == "gpt-5"
+    def test_falls_back_to_newest_codex_model(self):
+        state = {
+            "claude_models": {},
+            "codex_models": ["databricks-gpt-5", "system.ai.gpt-5-6-sol", "gpt-5-5"],
+        }
+        assert pi.default_model(state) == "system.ai.gpt-5-6-sol"
+
+    def test_falls_back_to_generic_responses_endpoint(self):
+        state = {"claude_models": {}, "codex_models": ["c1"]}
+        assert pi.default_model(state) == "c1"
+
+    def test_does_not_route_gpt_oss_to_responses(self):
+        state = {
+            "claude_models": {},
+            "codex_models": ["gpt-oss-120b"],
+            "gemini_models": ["gemini-2"],
+        }
+        assert pi.default_model(state) == "gemini-2"
 
     def test_falls_back_to_gemini(self):
         state = {"claude_models": {}, "codex_models": [], "gemini_models": ["gemini-2"]}
         assert pi.default_model(state) == "gemini-2"
+
+    def test_falls_back_to_oss_last(self):
+        state = {
+            "claude_models": {},
+            "codex_models": [],
+            "gemini_models": [],
+            "oss_models": ["system.ai.glm-5-2"],
+        }
+        assert pi.default_model(state) == "system.ai.glm-5-2"
 
     def test_returns_none_when_empty(self):
         assert pi.default_model({}) is None
@@ -240,9 +394,13 @@ class TestBuildRuntimeEnv:
         env = pi.build_runtime_env("tok")
         assert env["OAUTH_TOKEN"] == "tok"
 
-    def test_sets_ucode_home(self):
+    def test_sets_private_agent_dir_without_replacing_home(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/real-user-home")
+
         env = pi.build_runtime_env("tok")
-        assert env["HOME"] == str(pi.PI_UCODE_HOME)
+
+        assert env["PI_CODING_AGENT_DIR"] == str(pi.PI_CONFIG_DIR)
+        assert env["HOME"] == "/real-user-home"
 
 
 class TestPiValidateCmd:
@@ -296,6 +454,7 @@ class TestWriteToolConfig:
                 "databricks-claude": {"old": True},
                 "databricks-openai": {"old": True},
                 "databricks-gemini": {"old": True},
+                "databricks-mlflow": {"old": True},
                 "user-provider": {"keep": True},
             }
         }
@@ -311,6 +470,7 @@ class TestWriteToolConfig:
         providers = written.get("providers", {})
         assert providers.get("databricks-claude") != {"old": True}
         assert "old" not in providers.get("databricks-claude", {})
+        assert "databricks-mlflow" not in providers
         assert providers.get("user-provider") == {"keep": True}
 
     def test_legacy_providers_removed_on_upgrade(self, tmp_path, monkeypatch):

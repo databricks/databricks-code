@@ -28,6 +28,17 @@ runner = CliRunner()
 TOOLS = ["codex", "claude", "gemini", "opencode"]
 
 
+def test_oss_discovery_diagnostic_names_all_consumers(monkeypatch):
+    import ucode.cli as cli_mod
+
+    notes = []
+    monkeypatch.setattr(cli_mod, "print_note", notes.append)
+
+    cli_mod._print_discovery_diagnostics({"_discovery_reasons": {"oss": "not found"}})
+
+    assert notes[0] == "OSS models (needed for: opencode, pi): not found"
+
+
 @pytest.fixture(autouse=True)
 def no_state_writes():
     """Prevent any test from writing to the real state file on disk."""
@@ -1923,6 +1934,7 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        monkeypatch.setattr(cli_mod, "discover_oss_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
         return cli_mod, logins, ensures, saved
 
@@ -2129,6 +2141,7 @@ class TestConfigureSharedStateUsePat:
     def test_falls_back_to_legacy_when_uc_empty(self, monkeypatch):
         # No UC model-services: each family falls back to the legacy listing.
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        calls: list[str] = []
         monkeypatch.setattr(
             cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], "no model services")
         )
@@ -2140,12 +2153,33 @@ class TestConfigureSharedStateUsePat:
                 None,
             ),
         )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_codex_models",
+            lambda w, t: (calls.append("codex") or ["databricks-gpt-5-6-sol"], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_models",
+            lambda w, t: (calls.append("oss") or ["databricks-glm-5-2"], None),
+        )
 
         state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
 
+        assert calls == ["codex", "oss"]
         assert state["claude_models"] == {
             "opus": "databricks-claude-opus-4-8",
             "sonnet": "databricks-claude-sonnet-4-6",
+        }
+        assert state["codex_models"] == ["databricks-gpt-5-6-sol"]
+        assert state["oss_models"] == ["databricks-glm-5-2"]
+        assert state["opencode_models"] == {
+            "anthropic": [
+                "databricks-claude-opus-4-8",
+                "databricks-claude-sonnet-4-6",
+            ],
+            "openai": ["databricks-gpt-5-6-sol"],
+            "oss": ["databricks-glm-5-2"],
         }
 
 
@@ -2221,6 +2255,7 @@ class TestConfigureSharedStateMcpCleanup:
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        monkeypatch.setattr(cli_mod, "discover_oss_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
 
     def test_purges_residue_when_workspace_changes(self, monkeypatch):

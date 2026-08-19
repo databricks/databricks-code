@@ -42,6 +42,7 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
+    discover_oss_models,
     ensure_ai_gateway,
     ensure_databricks_auth,
     ensure_pat_bearer,
@@ -141,9 +142,9 @@ from ucode.usage import usage as usage_report
 
 _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
     "claude": ("claude", "opencode", "copilot", "pi"),
-    "codex": ("codex", "copilot", "pi"),
+    "codex": ("codex", "copilot", "opencode", "pi"),
     "gemini": ("gemini", "opencode", "pi"),
-    "oss": ("opencode",),
+    "oss": ("opencode", "pi"),
 }
 
 
@@ -554,8 +555,10 @@ def configure_shared_state(
         fetch_all or "claude" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools
     )
     want_gemini = fetch_all or "gemini" in tools or "opencode" in tools or "pi" in tools
-    want_codex = fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools
-    want_oss = fetch_all or "opencode" in tools
+    want_codex = (
+        fetch_all or "codex" in tools or "copilot" in tools or "opencode" in tools or "pi" in tools
+    )
+    want_oss = fetch_all or "opencode" in tools or "pi" in tools
 
     claude_reason: str | None = None
     gemini_reason: str | None = None
@@ -607,10 +610,14 @@ def configure_shared_state(
                     codex_models, codex_reason = discover_codex_models(workspace, token)
             if want_oss:
                 oss_models, oss_reason = ms_oss, ms_reason
+                if not oss_models:
+                    oss_models, oss_reason = discover_oss_models(workspace, token)
         if claude_models:
             opencode_models["anthropic"] = list(claude_models.values())
         if gemini_models:
             opencode_models["gemini"] = gemini_models
+        if codex_models:
+            opencode_models["openai"] = codex_models
         if oss_models:
             opencode_models["oss"] = oss_models
 
