@@ -1163,25 +1163,22 @@ def skills_add(
 ) -> None:
     """Add Databricks Skills to your coding tools, keeping any already configured.
 
-    Like `ucode configure skills`, but additive. With ``--mcp``, unions the given
-    schemas into the skills MCP connection's scope instead of replacing it;
-    otherwise downloads each schema's skills to disk (under ``--path``, or your home
-    dir), leaving already-downloaded skills in place. ``--skill`` narrows a download
-    to a named subset of a single schema's skills. Requires ``--location``.
+    With ``--mcp``, adds the given schemas to the skills MCP connection's scope.
+    Otherwise downloads each schema's skills to disk (under ``--path``, or your home
+    dir), keeping already-downloaded skills. ``--skill`` narrows a download to a
+    named subset of a single schema's skills. Requires ``--location``.
     """
     try:
         locations = _parse_skill_locations(location)
-        # `--skill` absent -> None (whole schema); present (even empty) -> the
-        # explicit subset, so `--skill ""` downloads nothing.
         selected_skills = (
             None if skill is None else {s.strip() for s in skill.split(",") if s.strip()}
         )
         if not locations:
             raise RuntimeError("--location is required for `ucode skills add`.")
         if mcp and path is not None:
-            raise RuntimeError("--path is not valid with --mcp.")
+            raise RuntimeError("--path is not supported when using --mcp")
         if mcp and selected_skills is not None:
-            raise RuntimeError("--skill is not valid with --mcp; it only applies when downloading.")
+            raise RuntimeError("--skill is not supported when using --mcp")
         if selected_skills is not None and len(locations) != 1:
             raise RuntimeError(
                 f"--skill requires a single --location (got: {', '.join(locations)})."

@@ -212,11 +212,9 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 
 #### Add skill scopes without replacing existing ones
 
-`ucode configure skills --mcp` **replaces** the connection's location set with your selection. To
-**add** to it instead, use `ucode skills add`. It takes the same `--location`, `--mcp`, `--path`,
-and `--skill` options, but is additive: with `--mcp` it unions the given schemas into the scope
-rather than replacing it, and download mode leaves already-downloaded skills in place. It requires
-`--location`.
+`ucode skills add` registers skills additively, keeping anything already configured. It requires
+`--location`; with `--mcp` it adds the schemas to the connection's scope, otherwise it downloads
+their skills to disk.
 
 ```bash
 # Add schemas to the skills MCP scope, keeping any already configured.

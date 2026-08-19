@@ -2161,21 +2161,12 @@ def register_schemaless_skills_connection(
 
 
 def _union_locations(base: list[str], new: list[str]) -> list[str]:
-    """Return ``base`` followed by every location in ``new`` not already present.
-    The scalar analog of ``_union_missing`` for the skills connection's
-    ``skill_locations``, so ``ucode skills add --mcp`` grows the scope instead of
-    replacing it."""
     have = set(base)
     return [*base, *[loc for loc in new if loc not in have]]
 
 
 def add_skills_command(locations: list[str]) -> int:
-    """`ucode skills add --mcp`: union ``locations`` into the skills MCP
-    connection's ``skill_locations`` WITHOUT dropping any already configured.
-
-    The additive sibling of ``configure_skills_mcp_command`` (which replaces the
-    scope), mirroring how ``add_mcp_command`` registers servers without removing
-    the rest."""
+    """Add ``locations`` to the skills MCP connection's scope, keeping any already configured."""
     state = load_state()
     workspace, profile, clients = setup_mcp_clients(state, "Add Skills MCP")
     merged = _union_locations(_skill_mcp_locations(state), locations)
