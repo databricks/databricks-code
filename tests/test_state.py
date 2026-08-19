@@ -109,7 +109,7 @@ class TestSaveLoadRoundTrip:
         assert loaded["workspace"] == FAKE_WS
         assert loaded["claude_models"]["sonnet"] == "databricks-claude-sonnet-4"
 
-    def test_persists_codex_launcher_default_in_agent_state(self):
+    def test_persists_latest_gpt_launcher_default_in_agent_state(self):
         save_state(
             {
                 "workspace": FAKE_WS,
@@ -122,9 +122,11 @@ class TestSaveLoadRoundTrip:
         )
 
         persisted = load_full_state()["workspaces"][FAKE_WS]
+        # Preserve the active listing verbatim, but both GPT-capable launchers
+        # select its newest numeric model rather than relying on list order.
         assert persisted["codex_models"][0] == "system.ai.gpt-5"
         assert persisted["agents"]["codex"]["model"] == "system.ai.gpt-5-6-luna"
-        assert persisted["agents"]["pi"]["model"] == "system.ai.gpt-5"
+        assert persisted["agents"]["pi"]["model"] == "system.ai.gpt-5-6-luna"
 
     def test_save_respects_dry_run(self):
         import ucode.config_io as config_io_mod

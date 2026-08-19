@@ -2040,6 +2040,59 @@ class TestConfigureSharedStateUsePat:
         assert legacy_called == []
         assert "uc_enabled" not in state
 
+    def test_active_listing_replaces_unlisted_gpt_in_state_and_overlays(self, monkeypatch):
+        from ucode.agents import opencode as opencode_mod
+        from ucode.agents import pi as pi_mod
+
+        unlisted = "system.ai.gpt-5"
+        active = "system.ai.gpt-5-6-luna"
+        cli_mod, _, _, saved = self._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": self.WS,
+                "profile": "DEFAULT",
+                "codex_models": [unlisted],
+                "opencode_models": {"openai": [unlisted]},
+            },
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [active], [], [], None),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        # The current model listing replaces stale persisted discovery state;
+        # unavailable models cannot survive into either agent's provider map.
+        assert state["codex_models"] == [active]
+        assert state["opencode_models"]["openai"] == [active]
+        assert saved[-1]["codex_models"] == [active]
+        assert saved[-1]["opencode_models"]["openai"] == [active]
+
+        pi_overlay, _ = pi_mod.render_overlay(
+            pi_mod.default_model(state),
+            "token",
+            {"openai": "https://example/codex"},
+            {},
+            state["codex_models"],
+            [],
+            [],
+            [],
+        )
+        pi_models = pi_overlay["providers"]["databricks-openai"]["models"]
+        assert [model["id"] for model in pi_models] == [active]
+
+        opencode_overlay, _ = opencode_mod.render_overlay(
+            opencode_mod.default_model(state),
+            "token",
+            {"openai": "https://example/codex"},
+            state["opencode_models"],
+        )
+        openai_models = opencode_overlay["provider"]["databricks-openai"]["models"]
+        assert list(openai_models) == [active]
+
     def test_uc_oss_ids_persist_matching_capability_specs(self, monkeypatch):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
         monkeypatch.setattr(
