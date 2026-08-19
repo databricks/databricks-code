@@ -143,7 +143,7 @@ def _patch_launch(tool: str):
             "ucode.cli.configure_tool",
             return_value=MINIMAL_STATE,
         ),
-        patch("ucode.cli._fetch_managed_config", return_value=None),
+        patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
         patch("ucode.cli.launch_agent"),
     ]
 
@@ -267,7 +267,7 @@ class TestSubcommandRouting:
                 return_value=(decision, None),
             ),
             patch("ucode.cli.configure_tool", return_value=state) as mock_configure,
-            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["codex"])
@@ -299,7 +299,7 @@ class TestClaudeModelFlag:
             patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
             patch("ucode.cli.resolve_launch_model", return_value=(MINIMAL_STATE, "system.ai.opus")),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE) as mock_configure,
-            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["claude", "--model", "cat.schema.claude-opus-5"])
@@ -328,7 +328,7 @@ class TestClaudeModelFlag:
             patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
             patch("ucode.cli.resolve_launch_model", return_value=(MINIMAL_STATE, "system.ai.opus")),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch(
                 "ucode.cli.claude_agent.managed_settings_model_overrides",
                 return_value=Path("/etc/claude-code/managed-settings.json"),
@@ -348,7 +348,7 @@ class TestClaudeModelFlag:
             patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
             patch("ucode.cli.resolve_launch_model", return_value=(MINIMAL_STATE, "system.ai.opus")),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch("ucode.cli.claude_agent.managed_settings_model_overrides", return_value=None),
             patch("ucode.cli.launch_agent"),
         ):
@@ -880,7 +880,7 @@ class TestAutoConfigureOnFirstRun:
                 return_value=(configured_state, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=configured_state),
-            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["claude"])
@@ -905,7 +905,7 @@ class TestAutoConfigureOnFirstRun:
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, ["claude"])
@@ -929,7 +929,7 @@ class TestAutoConfigureOnFirstRun:
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch("ucode.cli.launch_agent"),
         ):
             runner.invoke(app, ["claude"])
@@ -1617,7 +1617,7 @@ class TestConfigureAgentsSelection:
             return {**MINIMAL_STATE, "workspace": workspace, "profile": profile}
 
         monkeypatch.setattr(cli_mod, "configure_shared_state", fake_configure_shared_state)
-        monkeypatch.setattr(cli_mod, "save_state", lambda state: None)
+        monkeypatch.setattr(cli_mod, "save_state", lambda state: (None, False))
         monkeypatch.setattr(cli_mod, "check_gateway_endpoint", lambda state, tool: True)
         monkeypatch.setattr(cli_mod, "prompt_for_tools", lambda available: ["claude"])
         monkeypatch.setattr(cli_mod, "_maybe_select_provider_service", lambda tool, state: state)
@@ -2389,7 +2389,7 @@ class TestSkipPreflightFlag:
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
             ),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch("ucode.cli._fetch_managed_config", return_value=None),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch("ucode.cli.launch_agent"),
         ]
 
@@ -2450,9 +2450,9 @@ class TestFetchManagedConfig:
     def test_fetches_fresh_when_enabled(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config", lambda state: {"enabled_agents": {}}
+            "ucode.cli.refresh_managed_config", lambda state: ({"enabled_agents": {}}, False)
         )
-        assert self._fetch({"workspace": "https://w"}) == {"enabled_agents": {}}
+        assert self._fetch({"workspace": "https://w"}) == ({"enabled_agents": {}}, False)
 
     @pytest.mark.parametrize("env_value", [None, "", "0", "off", "no"])
     def test_disabled_reads_nothing_at_all(self, monkeypatch, env_value):
@@ -2466,7 +2466,7 @@ class TestFetchManagedConfig:
                 f"ucode.cli.{name}",
                 lambda *a, called=name, **k: pytest.fail(f"{called} must not run when disabled"),
             )
-        assert self._fetch({"workspace": "https://w"}) is None
+        assert self._fetch({"workspace": "https://w"}) == (None, False)
 
     def test_skip_managed_config_makes_the_fetch_a_no_op(self, monkeypatch):
         # --skip-managed-config clears the enabling env var, so the read behaves as feature-off:
@@ -2478,7 +2478,7 @@ class TestFetchManagedConfig:
         import ucode.cli as cli_mod
 
         cli_mod._disable_managed_config_if_requested(True)
-        assert self._fetch({"workspace": "https://w"}) is None
+        assert self._fetch({"workspace": "https://w"}) == (None, False)
 
 
 class TestManagedConfigDecidesDiscoveryFromFreshRead:
@@ -2495,7 +2495,7 @@ class TestManagedConfigDecidesDiscoveryFromFreshRead:
         }
         fresh = {"enabled_agents": {"claude": {"model_config": {}}}}
         monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: stale_cache)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: fresh)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (fresh, False))
 
         state = dict(MINIMAL_STATE)
         with (
@@ -2532,7 +2532,7 @@ class TestConfigureDeprecation:
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         monkeypatch.setattr(
             "ucode.cli.refresh_managed_config",
-            lambda state: {"enabled_agents": {"claude": {}}},
+            lambda state: ({"enabled_agents": {"claude": {}}}, False),
         )
         with pytest.raises(typer.Exit) as exc:
             self._resolve([("https://w", None)])
@@ -2553,7 +2553,7 @@ class TestConfigureDeprecation:
         monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
         monkeypatch.setattr(
             "ucode.cli.refresh_managed_config",
-            lambda state: {"enabled_agents": {"claude": {}}},
+            lambda state: ({"enabled_agents": {"claude": {}}}, False),
         )
         with pytest.raises(typer.Exit) as exc:
             self._resolve([("https://w", None)])
@@ -2574,7 +2574,7 @@ class TestConfigureDeprecation:
             "ucode.cli._prompt_for_configuration", lambda tool=None: ("https://picked", None)
         )
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: picked.append(ws))
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
         self._stub_not_admin(monkeypatch)
         entries = self._resolve(None)
         assert picked == ["https://picked"]
@@ -2585,7 +2585,7 @@ class TestConfigureDeprecation:
         # workspace back to the caller instead of re-prompting.
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
         self._stub_not_admin(monkeypatch)
         entries = self._resolve([("https://w", None)])
         assert entries == [("https://w", None)]
@@ -2596,7 +2596,7 @@ class TestConfigureDeprecation:
         # the normal configure flow runs to completion and returns the resolved workspace.
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
         monkeypatch.setattr(
@@ -2616,7 +2616,7 @@ class TestConfigureDeprecation:
     def test_non_admin_sees_no_setup_note(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: False)
         notes: list[str] = []
@@ -2629,9 +2629,26 @@ class TestConfigureDeprecation:
         # `is_workspace_admin` returns None when the check itself fails; treat as "not an admin".
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: None)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: None)
+        notes: list[str] = []
+        monkeypatch.setattr("ucode.cli.print_note", lambda msg: notes.append(msg))
+        entries = self._resolve([("https://w", None)])
+        assert entries == [("https://w", None)]
+        assert notes == []
+
+    def test_admin_sees_no_setup_fyi_when_feature_is_disabled(self, monkeypatch):
+        # The coding-agent-configs feature isn't enabled server-side, so `ucode setup` can't
+        # publish. An admin should not be told to run it.
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+
+        monkeypatch.setattr(
+            "ucode.cli.refresh_managed_config", lambda state: (None, True)
+        )
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
         notes: list[str] = []
         monkeypatch.setattr("ucode.cli.print_note", lambda msg: notes.append(msg))
         entries = self._resolve([("https://w", None)])
@@ -2646,7 +2663,7 @@ class TestConfigureDeprecation:
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         monkeypatch.setattr(
             "ucode.cli.refresh_managed_config",
-            lambda state: {"enabled_agents": {"claude": {}}},
+            lambda state: ({"enabled_agents": {"claude": {}}}, False),
         )
         with (
             patch("ucode.cli.install_databricks_cli"),
@@ -2740,13 +2757,20 @@ class TestBareUcode:
     MANAGED = {"default_agent": "claude", "enabled_agents": {"claude": {}, "opencode": {}}}
 
     @staticmethod
-    def _run(monkeypatch, *, managed, is_admin=False, args=None, cached=None):
+    def _run(
+        monkeypatch, *, managed, is_admin=False, args=None, cached=None, coding_agent_config_feature_disabled=False
+    ):
         launched: list[tuple] = []
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: managed)
+
+        if coding_agent_config_feature_disabled:
+            monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, True))
+        else:
+            monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (managed, False))
+
         monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: cached)
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda *a, **k: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda *a, **k: is_admin)
@@ -2782,6 +2806,22 @@ class TestBareUcode:
         assert launched == []
         assert "Ask a workspace admin" in result.output
 
+    def test_admin_without_a_config_sees_no_setup_when_feature_disabled(self, monkeypatch):
+        result, launched = self._run(
+            monkeypatch, managed=None, is_admin=True, coding_agent_config_feature_disabled=True
+        )
+        assert result.exit_code == 0, result.output
+        assert launched == []
+        assert "ucode setup" not in result.output
+
+    def test_non_admin_without_a_config_sees_no_setup_when_feature_disabled(self, monkeypatch):
+        result, launched = self._run(
+            monkeypatch, managed=None, is_admin=False, coding_agent_config_feature_disabled=True
+        )
+        assert result.exit_code == 0, result.output
+        assert launched == []
+        assert "ucode setup" not in result.output
+
     def test_dry_run_uses_the_cache_and_does_not_fetch(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
@@ -2812,7 +2852,7 @@ class TestBareUcode:
             "default_agent": "claude",
             "enabled_agents": {"claude": {"model_config": {"default_model": "m"}}},
         }
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: managed)
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (managed, False))
         monkeypatch.setattr("ucode.cli._fetch_budget_recommendation", lambda state, m: None)
         monkeypatch.setattr("ucode.cli._print_managed_summary", lambda *a, **k: None)
         seen: dict = {}

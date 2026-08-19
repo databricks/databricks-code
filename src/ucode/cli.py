@@ -247,10 +247,13 @@ def _resolve_workspace_then_maybe_reject(
     # cache is empty until the first launch, so a cache read would miss a config the workspace does
     # publish and wrongly fall through to the local configure flow. `refresh_managed_config` reaches
     # the workspace and never raises — it falls back to the persisted copy, then None, on failure.
-    with spinner("Checking for a managed coding agent config..."):
-        managed = refresh_managed_config({"workspace": workspace, "profile": profile})
-    if not managed:
+    with spinner("Loading..."):
+        managed, coding_agent_config_feature_disabled = refresh_managed_config(
+            {"workspace": workspace, "profile": profile}
+        )
+    if not managed and not coding_agent_config_feature_disabled:
         _maybe_offer_admin_setup(workspace, profile)
+    if not managed:
         return entries
     print_success("A managed config has been detected for your workspace — you're all set.")
     _print_managed_summary(managed, load_state(), tool=None)
@@ -1422,15 +1425,16 @@ def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
         )
 
 
-def _fetch_managed_config(state: dict) -> dict | None:
-    """The workspace's managed config for this launch, or None when there is none.
+def _fetch_managed_config(state: dict) -> tuple[dict | None, bool]:
+    """The workspace's managed config for this launch, or ``(None, _)`` when there is none.
 
-    Returns None when managed configs are switched off — either the feature is disabled or the launch
-    passed ``--skip-managed-config`` (which clears the enabling env var for the process).
+    Returns ``(None, False)`` when managed configs are switched off — either the feature is disabled
+    or the launch passed ``--skip-managed-config`` (which clears the enabling env var for the process).
     """
+
     if not managed_agent_config_enabled():
-        return None
-    with spinner("Checking for a managed coding agent config..."):
+        return None, False
+    with spinner("Loading..."):
         return refresh_managed_config(state)
 
 
@@ -1639,7 +1643,7 @@ def _launch_tool(
         # Bare `ucode` already fetched one to choose the agent; refetching would double the
         # control-plane round trip and any fallback warning it printed.
         if managed is None:
-            managed = _fetch_managed_config(state)
+            managed, _coding_agent_config_feature_disabled = _fetch_managed_config(state)
         # Checked before discovery, which can take tens of seconds, so a blocked launch fails fast.
         _reject_disabled_agent(managed, tool)
         # Discovery exists to find models and isn't needed for managed config that already names them.
@@ -1981,10 +1985,11 @@ def _launch_managed_default(
     if dry_run:
         managed = load_managed_state(current)
     else:
-        with spinner("Checking for a managed coding agent config..."):
-            managed = refresh_managed_config(state)
-    if not managed:
+        with spinner("Loading..."):
+            managed, coding_agent_config_feature_disabled = refresh_managed_config(state)
+    if not managed and not coding_agent_config_feature_disabled:
         _print_no_managed_config_guidance(current, state.get("profile"))
+    if not managed:
         return
     # The budget tier can move the org to a cheaper agent, so it outranks the config's
     # default_agent. Fetched here and handed to _launch_tool so it is read once per launch.
