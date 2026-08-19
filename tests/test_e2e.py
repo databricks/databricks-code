@@ -977,13 +977,18 @@ class TestPiLaunch:
     test exercises each one end-to-end through the validation path.
     """
 
+    # The CI project's upstream OpenAI account cannot serve this snapshot in
+    # its geography. Codex's e2e excludes the same otherwise-discoverable model.
+    INCOMPATIBLE_MODEL_FRAGMENTS = ("gpt-5-3-codex",)
+
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
         claude_models: dict = e2e_state.get("claude_models") or {}
         for family, model_id in _launchable_model_items(claude_models):
             out.append((f"claude-{family}", model_id))
         for model in e2e_state.get("codex_models") or []:
-            out.append(("codex", model))
+            if not any(fragment in model for fragment in self.INCOMPATIBLE_MODEL_FRAGMENTS):
+                out.append(("codex", model))
         for model in e2e_state.get("gemini_models") or []:
             out.append(("gemini", model))
         return out
