@@ -25,6 +25,7 @@ import pytest
 from ucode.databricks import (
     build_shared_base_urls,
     build_tool_base_url,
+    discover_model_services,
     discover_sql_warehouses,
     ensure_ai_gateway,
     fetch_ai_gateway_claude_models,
@@ -748,7 +749,7 @@ class TestGeminiFreshInstall:
 
 
 class TestOpencodeLaunch:
-    """Run opencode against every available opencode model (anthropic + gemini)."""
+    """Run OpenCode against the available native and OSS model providers."""
 
     # Models that hang opencode well past 180s on the staging gateway with
     # no stderr beyond the initial `> build · <model>` line, while every
@@ -843,6 +844,55 @@ class TestOpencodeLaunch:
                 )
 
         assert not failures, "OpenCode launch failures:\n" + "\n".join(failures)
+
+    def test_launch_deepseek_v4_pro(
+        self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
+    ):
+        """Discover and invoke the live versioned DeepSeek V4 Pro model."""
+        import ucode.config_io as config_io_mod
+        from ucode.agents import opencode
+
+        _require_binary("opencode")
+        _, _, _, oss_models, reason = discover_model_services(e2e_workspace, e2e_token)
+        assert reason is None, reason
+        model = next((m for m in oss_models if "deepseek-v4-pro" in m), None)
+        if model is None:
+            pytest.skip("DeepSeek V4 Pro is not available on this workspace")
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        xdg = tmp_path / "opencode-xdg"
+        monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
+        monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", xdg / "opencode" / "opencode.json")
+        monkeypatch.setattr(
+            opencode, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-config.backup.json"
+        )
+        monkeypatch.setattr("ucode.state.save_state", lambda state: None)
+        monkeypatch.setattr(
+            "ucode.agents.opencode.get_databricks_token",
+            lambda workspace, profile=None, **kwargs: e2e_token,
+        )
+
+        state = {
+            **e2e_state,
+            "workspace": e2e_workspace,
+            "oss_models": oss_models,
+            "opencode_models": {
+                **(e2e_state.get("opencode_models") or {}),
+                "oss": oss_models,
+            },
+        }
+        opencode.write_tool_config(state, model, token=e2e_token)
+
+        result = _run_agent(
+            opencode.validate_cmd("opencode"),
+            env=opencode.build_runtime_env(e2e_token),
+            timeout=180,
+        )
+        combined = (result.stdout + result.stderr).strip()
+        assert result.returncode == 0 and combined, (
+            f"DeepSeek model={model} rc={result.returncode} "
+            f"stdout={result.stdout[:300]!r} stderr={result.stderr[:500]!r}"
+        )
 
 
 class TestCopilotLaunch:
