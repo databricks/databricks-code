@@ -94,6 +94,7 @@ from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
     add_mcp_command,
+    add_skills_command,
     apply_managed_mcp_servers,
     apply_managed_skills,
     configure_mcp_command,
@@ -1047,6 +1048,8 @@ configure_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(configure_app, name="configure", help="Configure workspace and tool settings.")
 mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
+skills_app = typer.Typer(add_completion=False, no_args_is_help=True)
+app.add_typer(skills_app, name="skills", help="Databricks Skills for your coding tools.")
 setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(
     setup_app,
@@ -1124,6 +1127,75 @@ def mcp_web_search_cmd() -> None:
     from ucode.mcp_web_search import serve
 
     serve()
+
+
+@skills_app.command("add")
+def skills_add(
+    location: Annotated[
+        str | None,
+        typer.Option(
+            "--location", help="Comma-separated `<catalog>.<schema>` skill scopes to add."
+        ),
+    ] = None,
+    mcp: Annotated[
+        bool,
+        typer.Option(
+            "--mcp",
+            help="Add the schemas to the skills MCP connection's scope instead of downloading.",
+        ),
+    ] = False,
+    path: Annotated[
+        str | None,
+        typer.Option(
+            "--path",
+            help="(download) Existing absolute dir to download into; defaults to your home dir.",
+        ),
+    ] = None,
+    skill: Annotated[
+        str | None,
+        typer.Option(
+            "--skill",
+            help="(download) Download only this comma-separated subset of skills (by "
+            "securable name, e.g. `my-skill`) from the schema, instead of every skill. "
+            "Requires a single --location; not valid with --mcp.",
+        ),
+    ] = None,
+) -> None:
+    """Add Databricks Skills to your coding tools, keeping any already configured.
+
+    Like `ucode configure skills`, but additive. With ``--mcp``, unions the given
+    schemas into the skills MCP connection's scope instead of replacing it;
+    otherwise downloads each schema's skills to disk (under ``--path``, or your home
+    dir), leaving already-downloaded skills in place. ``--skill`` narrows a download
+    to a named subset of a single schema's skills. Requires ``--location``.
+    """
+    try:
+        locations = _parse_skill_locations(location)
+        # `--skill` absent -> None (whole schema); present (even empty) -> the
+        # explicit subset, so `--skill ""` downloads nothing.
+        selected_skills = (
+            None if skill is None else {s.strip() for s in skill.split(",") if s.strip()}
+        )
+        if not locations:
+            raise RuntimeError("--location is required for `ucode skills add`.")
+        if mcp and path is not None:
+            raise RuntimeError("--path is not valid with --mcp.")
+        if mcp and selected_skills is not None:
+            raise RuntimeError("--skill is not valid with --mcp; it only applies when downloading.")
+        if selected_skills is not None and len(locations) != 1:
+            raise RuntimeError(
+                f"--skill requires a single --location (got: {', '.join(locations)})."
+            )
+        if mcp:
+            add_skills_command(locations)
+        else:
+            configure_skills_download_command(locations, path=path, skills=selected_skills)
+    except (RuntimeError, ValueError) as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
 
 
 @app.command("mcp-proxy", hidden=True)

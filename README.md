@@ -210,6 +210,22 @@ ucode configure skills --location main.default,ml.prod --mcp
 Each run prints the registered server, its URL, the configured agents, and its tools, and reminds
 you to run `ucode <agent>` (existing agent sessions need a restart before the MCP tools load).
 
+#### Add skill scopes without replacing existing ones
+
+`ucode configure skills --mcp` **replaces** the connection's location set with your selection. To
+**add** to it instead, use `ucode skills add`. It takes the same `--location`, `--mcp`, `--path`,
+and `--skill` options, but is additive: with `--mcp` it unions the given schemas into the scope
+rather than replacing it, and download mode leaves already-downloaded skills in place. It requires
+`--location`.
+
+```bash
+# Add schemas to the skills MCP scope, keeping any already configured.
+ucode skills add --location main.default,ml.prod --mcp
+
+# Download a schema's skills to disk, keeping existing downloads.
+ucode skills add --location main.default
+```
+
 ### Managed config for a workspace (admins)
 
 Author the coding config your developers pick up automatically, instead of asking each of them to
@@ -297,6 +313,8 @@ their next ucode run.
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
 | `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
+| `ucode skills add --location main.default --mcp` | Add schemas to the skills MCP scope, keeping any already configured (additive; never replaces) |
+| `ucode skills add --location main.default` | Download a schema's skills to disk without removing existing downloads |
 | `ucode setup` | Author the managed config's agents and models (workspace admins only) |
 | `ucode setup mcps` | Add or change the managed config's MCP servers |
 | `ucode setup skills [--location a.b,c.d]` | Add or change the managed config's skills |

@@ -2398,6 +2398,52 @@ class TestSkillMcpLocations:
         assert mcp._skill_mcp_locations(_skills_state()) == []
 
 
+class TestUnionLocations:
+    def test_appends_new_after_existing(self):
+        assert mcp._union_locations(["a.b"], ["c.d"]) == ["a.b", "c.d"]
+
+    def test_drops_locations_already_present(self):
+        assert mcp._union_locations(["a.b", "c.d"], ["c.d", "e.f"]) == ["a.b", "c.d", "e.f"]
+
+    def test_empty_base_returns_new(self):
+        assert mcp._union_locations([], ["a.b", "c.d"]) == ["a.b", "c.d"]
+
+
+class TestAddSkillsCommand:
+    """`ucode skills add --mcp` unions schemas into the connection scope rather
+    than replacing it (unlike `configure_skills_mcp_command`)."""
+
+    def test_unions_into_existing_scope(self, monkeypatch):
+        state = _skills_state(mcp._resolve_skills_mcp_servers(WS, ["claude"], ["A.a"], []))
+        _stub_location_base(monkeypatch, state)
+        monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a, **kw: [])
+        monkeypatch.setattr(mcp, "save_state", lambda s: None)
+
+        assert mcp.add_skills_command(["B.b"]) == 0
+
+        assert _find_skills(state["mcp_servers"])[0]["skill_locations"] == ["A.a", "B.b"]
+
+    def test_existing_schema_leaves_scope_unchanged(self, monkeypatch):
+        state = _skills_state(mcp._resolve_skills_mcp_servers(WS, ["claude"], ["A.a", "B.b"], []))
+        _stub_location_base(monkeypatch, state)
+        monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a, **kw: [])
+        monkeypatch.setattr(mcp, "save_state", lambda s: None)
+
+        assert mcp.add_skills_command(["A.a"]) == 0
+
+        assert _find_skills(state["mcp_servers"])[0]["skill_locations"] == ["A.a", "B.b"]
+
+    def test_registers_scope_from_empty_state(self, monkeypatch):
+        state = _skills_state()
+        _stub_location_base(monkeypatch, state)
+        monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a, **kw: [])
+        monkeypatch.setattr(mcp, "save_state", lambda s: None)
+
+        assert mcp.add_skills_command(["A.a"]) == 0
+
+        assert _find_skills(state["mcp_servers"])[0]["skill_locations"] == ["A.a"]
+
+
 class TestRegisterSchemalessSkillsConnection:
     def _stub(self, monkeypatch):
         saved_states: list[dict] = []

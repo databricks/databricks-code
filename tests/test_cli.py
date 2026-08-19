@@ -681,6 +681,84 @@ class TestConfigureSkillsCommand:
         mock_download.assert_not_called()
 
 
+class TestSkillsAddCommand:
+    """`ucode skills add` is the additive sibling of `configure skills`: `--mcp`
+    unions schemas into the connection scope, the default mode downloads."""
+
+    def test_mcp_flag_unions_locations(self):
+        with patch("ucode.cli.add_skills_command") as mock_add:
+            result = runner.invoke(app, ["skills", "add", "--location", "a.b", "--mcp"])
+        assert result.exit_code == 0, result.output
+        mock_add.assert_called_once_with(["a.b"])
+
+    def test_comma_location_yields_multiple_schemas(self):
+        with patch("ucode.cli.add_skills_command") as mock_add:
+            result = runner.invoke(app, ["skills", "add", "--location", "a.b, c.d", "--mcp"])
+        assert result.exit_code == 0, result.output
+        mock_add.assert_called_once_with(["a.b", "c.d"])
+
+    def test_default_mode_dispatches_download(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["skills", "add", "--location", "a.b", "--path", "/tmp/s"])
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path="/tmp/s", skills=None)
+
+    def test_skill_filter_dispatches_download_with_subset(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["skills", "add", "--location", "a.b", "--skill", "s1, s2"])
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path=None, skills={"s1", "s2"})
+
+    def test_without_location_exit_1(self):
+        with (
+            patch("ucode.cli.add_skills_command") as mock_add,
+            patch("ucode.cli.configure_skills_download_command") as mock_download,
+        ):
+            result = runner.invoke(app, ["skills", "add"])
+        assert result.exit_code == 1
+        assert "--location is required" in _strip_ansi(result.output)
+        mock_add.assert_not_called()
+        mock_download.assert_not_called()
+
+    def test_skill_with_mcp_exit_1(self):
+        with (
+            patch("ucode.cli.add_skills_command") as mock_add,
+            patch("ucode.cli.configure_skills_download_command") as mock_download,
+        ):
+            result = runner.invoke(
+                app, ["skills", "add", "--location", "a.b", "--mcp", "--skill", "s1"]
+            )
+        assert result.exit_code == 1
+        assert "--skill" in _strip_ansi(result.output)
+        mock_add.assert_not_called()
+        mock_download.assert_not_called()
+
+    def test_path_with_mcp_exit_1(self):
+        with patch("ucode.cli.add_skills_command") as mock_add:
+            result = runner.invoke(
+                app, ["skills", "add", "--location", "a.b", "--mcp", "--path", "/tmp/s"]
+            )
+        assert result.exit_code == 1
+        assert "--path" in _strip_ansi(result.output)
+        mock_add.assert_not_called()
+
+    def test_skill_with_multiple_locations_exit_1(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(
+                app, ["skills", "add", "--location", "a.b, c.d", "--skill", "s1"]
+            )
+        assert result.exit_code == 1
+        assert "--skill requires a single --location" in _strip_ansi(result.output)
+        mock_download.assert_not_called()
+
+    def test_malformed_location_exit_1(self):
+        with patch("ucode.cli.add_skills_command") as mock_add:
+            result = runner.invoke(app, ["skills", "add", "--location", "a.b.c", "--mcp"])
+        assert result.exit_code == 1
+        assert "--location" in _strip_ansi(result.output)
+        mock_add.assert_not_called()
+
+
 class TestApplyManagedSkills:
     """The launch path both registers the skills MCP connection and downloads bundles to disk."""
 
