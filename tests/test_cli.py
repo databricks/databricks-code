@@ -2951,7 +2951,7 @@ class TestBudgetRecommendationAtLaunch:
             patch("ucode.cli.configure_shared_state", return_value=state),
             patch("ucode.cli.configure_tool", return_value=state) as cfg,
             patch("ucode.cli.get_databricks_token", return_value="tok"),
-            patch("ucode.cli._fetch_managed_config", return_value=managed),
+            patch("ucode.cli._fetch_managed_config", return_value=(managed, False)),
             patch("ucode.cli.launch_agent"),
         ):
             result = runner.invoke(app, [tool])
@@ -3027,7 +3027,7 @@ class TestBudgetRecommendationAtLaunch:
             patch("ucode.cli.get_databricks_token", side_effect=RuntimeError("token expired")),
             patch(
                 "ucode.cli._fetch_managed_config",
-                return_value={"enabled_agents": {"claude": {}}},
+                return_value=({"enabled_agents": {"claude": {}}}, False),
             ),
             patch("ucode.cli.launch_agent"),
         ):
