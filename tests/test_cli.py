@@ -2644,9 +2644,7 @@ class TestConfigureDeprecation:
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
 
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config", lambda state: (None, True)
-        )
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, True))
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
         notes: list[str] = []
@@ -2758,7 +2756,13 @@ class TestBareUcode:
 
     @staticmethod
     def _run(
-        monkeypatch, *, managed, is_admin=False, args=None, cached=None, coding_agent_config_feature_disabled=False
+        monkeypatch,
+        *,
+        managed,
+        is_admin=False,
+        args=None,
+        cached=None,
+        coding_agent_config_feature_disabled=False,
     ):
         launched: list[tuple] = []
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
