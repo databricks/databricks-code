@@ -20,7 +20,9 @@ from ucode.databricks import (
     TOKEN_REFRESH_INTERVAL_SECONDS,
     build_opencode_base_urls,
     get_databricks_token,
+    gpt_model_token_limits,
     model_token_limits,
+    preferred_gpt_model,
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
@@ -41,6 +43,7 @@ SPEC: ToolSpec = {
 PROVIDER_KEYS: list[list[str]] = [
     ["provider", "databricks-anthropic"],
     ["provider", "databricks-google"],
+    ["provider", "databricks-openai"],
     ["provider", "databricks-oss"],
 ]
 
@@ -51,7 +54,14 @@ def is_update_available() -> tuple[str, str] | None:
 
 def _resolve_model_selector(model: str, opencode_models: dict[str, list[str]]) -> str:
     """Return an OpenCode model selector in provider/model form when possible."""
-    if model.startswith(("databricks-anthropic/", "databricks-google/", "databricks-oss/")):
+    if model.startswith(
+        (
+            "databricks-anthropic/",
+            "databricks-google/",
+            "databricks-openai/",
+            "databricks-oss/",
+        )
+    ):
         return model
 
     anthropic_models = opencode_models.get("anthropic") or []
@@ -61,6 +71,10 @@ def _resolve_model_selector(model: str, opencode_models: dict[str, list[str]]) -
     gemini_models = opencode_models.get("gemini") or []
     if model in gemini_models:
         return f"databricks-google/{model}"
+
+    openai_models = opencode_models.get("openai") or []
+    if model in openai_models:
+        return f"databricks-openai/{model}"
 
     oss_models = opencode_models.get("oss") or []
     if model in oss_models:
@@ -83,6 +97,15 @@ def _oss_model_overlay(model: str, ua_header: dict[str, str]) -> dict:
     return overlay
 
 
+def _openai_model_overlay(model: str, ua_header: dict[str, str]) -> dict:
+    """Per-model Responses API options and explicit GPT token limits."""
+    return {
+        "headers": ua_header,
+        "limit": gpt_model_token_limits(model),
+        "options": {"useResponsesApi": True},
+    }
+
+
 def render_overlay(
     model: str,
     token: str,
@@ -101,6 +124,7 @@ def render_overlay(
 
     anthropic_models = opencode_models.get("anthropic") or []
     gemini_models = opencode_models.get("gemini") or []
+    openai_models = opencode_models.get("openai") or []
     oss_models = opencode_models.get("oss") or []
 
     providers: dict = {}
@@ -136,6 +160,22 @@ def render_overlay(
             "models": {m: {"headers": ua_header} for m in gemini_models},
         }
         keys.append(["provider", "databricks-google"])
+    if openai_models:
+        # @ai-sdk/openai supports both the Responses API and the legacy
+        # chat-completions API. Databricks GPT-5 / GPT-5.6 / Codex models are
+        # Responses-only on /ai-gateway/codex/v1, so the per-model flag
+        # `useResponsesApi: true` lives in models.<m>.options where opencode
+        # reads it (provider-level options is read by the SDK only).
+        providers["databricks-openai"] = {
+            "npm": "@ai-sdk/openai",
+            "options": {
+                "baseURL": opencode_base_urls["openai"],
+                "apiKey": token,
+                "headers": auth_headers,
+            },
+            "models": {m: _openai_model_overlay(m, ua_header) for m in openai_models},
+        }
+        keys.append(["provider", "databricks-openai"])
     if oss_models:
         providers["databricks-oss"] = {
             "npm": "@ai-sdk/openai",
@@ -234,6 +274,9 @@ def default_model(state: dict) -> str | None:
     anthropic = opencode_models.get("anthropic") or []
     if anthropic:
         return anthropic[0]
+    openai = preferred_gpt_model(opencode_models.get("openai") or [])
+    if openai:
+        return openai
     gemini = opencode_models.get("gemini") or []
     if gemini:
         return gemini[0]
