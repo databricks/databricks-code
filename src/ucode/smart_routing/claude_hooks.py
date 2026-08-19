@@ -1,6 +1,7 @@
 """Claude Code hook configuration for smart subagent routing.
 
-Written into ``~/.claude/ucode-settings.json`` under Claude Code's hook events.
+Written into ``ucode-settings.json`` in Claude Code's config directory (``~/.claude``
+by default, or ``$CLAUDE_CONFIG_DIR`` when set) under Claude Code's hook events.
 The ``PreToolUse`` hook matches the subagent-spawn tool (``Agent``, formerly
 ``Task``) and rewrites its ``model`` input to the router's pick; ``SessionStart``
 and ``SubagentStart`` drive the canary/audit trail. Mirrors ``codex_hooks`` but

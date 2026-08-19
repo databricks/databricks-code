@@ -1549,7 +1549,7 @@ def _download_managed_skills(managed: dict, state: dict) -> None:
 
     Registering the skills MCP connection (see :func:`_apply_managed_skills`) exposes the skill
     *tools* over the gateway, but the agent's ``/skills`` picker reads skill bundles from
-    ``~/.claude/skills`` / ``~/.agents/skills`` on disk. Without this download those directories stay
+    ``<claude config dir>/skills`` / ``~/.agents/skills`` on disk. Without this download those stay
     empty, so a workspace-published skill never shows up in ``/skills``. Skills already on disk are
     left untouched, so a steady-state launch only lists each schema and writes nothing. Best-effort:
     a failure here never blocks the launch.
@@ -2598,7 +2598,7 @@ def configure_skills(
         str | None,
         typer.Option(
             "--path",
-            help="(download) Existing absolute dir to download into; defaults to your home dir.",
+            help="(download) Existing absolute dir to download into; defaults to the user scope.",
         ),
     ] = None,
     skill: Annotated[
@@ -2618,7 +2618,7 @@ def configure_skills(
 
     When ``--location`` is provided: with ``--mcp``, sets the connection's scope to
     exactly the listed schemas (no download); otherwise, downloads every skill in
-    each schema to disk (under ``--path``, or your home dir when omitted) and
+    each schema to disk (under ``--path``, or the user-scope skill dirs when omitted) and
     registers the MCP connection with utility tools only. ``--skill`` narrows a
     download to a named subset of a single schema's skills (requires exactly one
     ``--location``).

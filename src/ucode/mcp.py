@@ -1466,7 +1466,7 @@ def apply_mcp_server_changes(
     # rewrites a config file, so a large diff means hundreds of operations; we
     # run them concurrently ACROSS clients but SERIALLY within a client, since
     # every operation for one client mutates that client's single shared config
-    # (`claude mcp add-json` edits ~/.claude.json, etc.) and concurrent
+    # (`claude mcp add-json` edits Claude Code's .claude.json, etc.) and concurrent
     # read-modify-writes would clobber each other.
     work: dict[str, list[Callable[[], object]]] = {client: [] for client in clients}
     changed = False
