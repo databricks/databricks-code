@@ -1404,7 +1404,7 @@ _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 
 # Supported OSS chat families, matched by name substring. Add an entry to
 # support a new family.
-_OSS_MODEL_FAMILIES = ("kimi-", "glm-")
+_OSS_MODEL_FAMILIES = ("kimi-", "glm-", "deepseek-")
 
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to

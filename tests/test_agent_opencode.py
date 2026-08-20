@@ -63,6 +63,14 @@ class TestRenderOverlay:
         )
         assert overlay["provider"]["databricks-oss"]["npm"] == "@ai-sdk/openai"
 
+    def test_deepseek_uses_oss_provider(self):
+        model = "system.ai.deepseek-v4-pro"
+
+        overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), {"oss": [model]})
+
+        assert overlay["model"] == f"databricks-oss/{model}"
+        assert model in overlay["provider"]["databricks-oss"]["models"]
+
     def test_both_providers_when_both_present(self):
         models = {"anthropic": ["claude-sonnet"], "gemini": ["gemini-2"]}
         overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)

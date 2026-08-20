@@ -263,9 +263,11 @@ def _resolve_workspace_then_maybe_reject(
     locally would be overridden at launch anyway: show the admin's config and point the developer
     at `ucode`.
 
-    Returns the resolved entries to configure when there is no managed config so the caller reuses
-    them instead of prompting again. Without the feature enabled it returns ``workspace_entries``
-    unchanged and prompts nothing.
+    When there is no managed config the developer's own ``configure`` always proceeds — an admin
+    just sees an FYI that they could publish one with ``ucode setup`` (never a prompt, never a
+    diversion). Returns the resolved entries to configure so the caller reuses them instead of
+    prompting again. Without the feature enabled it returns ``workspace_entries`` unchanged and
+    prompts nothing.
     """
     if not managed_agent_config_enabled():
         return workspace_entries
@@ -276,10 +278,13 @@ def _resolve_workspace_then_maybe_reject(
     # cache is empty until the first launch, so a cache read would miss a config the workspace does
     # publish and wrongly fall through to the local configure flow. `refresh_managed_config` reaches
     # the workspace and never raises — it falls back to the persisted copy, then None, on failure.
-    with spinner("Checking for a managed coding agent config..."):
-        managed = refresh_managed_config({"workspace": workspace, "profile": profile})
-    if not managed:
+    with spinner("Loading..."):
+        managed, coding_agent_config_feature_disabled = refresh_managed_config(
+            {"workspace": workspace, "profile": profile}
+        )
+    if not managed and not coding_agent_config_feature_disabled:
         _maybe_offer_admin_setup(workspace, profile)
+    if not managed:
         return entries
     print_success("A managed config has been detected for your workspace — you're all set.")
     _print_managed_summary(managed, load_state(), tool=None)
@@ -288,13 +293,13 @@ def _resolve_workspace_then_maybe_reject(
 
 
 def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
-    """When a workspace admin runs ``configure`` on a workspace with no managed config, offer to
-    bail out so they can publish one with ``ucode setup`` instead.
+    """When a workspace admin runs ``configure`` on a workspace with no managed config, drop an FYI
+    that they could publish one with ``ucode setup`` — without interrupting the configure flow.
 
-    Admins are the ones who'd want a managed config; a plain developer just gets the normal
-    configure flow. If they accept, exit cleanly (assuming they'll run `ucode setup`); if they
-    decline, fall through to configure their own local settings. The check is best-effort: any
-    failure to determine admin status (auth or SCIM unreachable) silently skips the prompt.
+    Admins are the ones who'd want a managed config, so the note is only shown to them; a plain
+    developer sees nothing. This never prompts and never diverts the command: the developer's own
+    ``configure`` always runs to completion, with the note printed alongside it. The check is
+    best-effort: any failure to determine admin status (auth or SCIM unreachable) silently skips it.
     """
     try:
         token = get_databricks_token(workspace, profile)
@@ -305,23 +310,10 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
     if not is_admin:
         return
     print_note(
-        "✨ New: as a workspace admin you can publish a managed config with `ucode setup` — set the "
-        "agents and models once (then MCP servers and skills with `ucode setup mcps` / `skills`), and "
-        "every developer picks them up automatically."
+        "✨ New: run `ucode setup` to publish a managed config to a workspace — set agents, models, mcps "
+        "and skills once, and every developer inherits them when running `ucode`. This scales "
+        "delivery of coding agents to all developers without each one setting up ucode themselves."
     )
-    if prompt_yes_no("Set one up now with `ucode setup`?"):
-        # Launch the setup flow in place rather than telling them to re-run a command. Reuse the
-        # workspace/profile we already resolved and authenticated against so setup doesn't prompt
-        # for them again.
-        try:
-            code = setup_command(workspace=workspace, profile=profile)
-        except RuntimeError as exc:
-            print_err(str(exc))
-            raise typer.Exit(1) from None
-        except KeyboardInterrupt:
-            print_err("Interrupted.")
-            raise typer.Exit(130) from None
-        raise typer.Exit(code or 0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
@@ -1474,15 +1466,16 @@ def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
         )
 
 
-def _fetch_managed_config(state: dict) -> dict | None:
-    """The workspace's managed config for this launch, or None when there is none.
+def _fetch_managed_config(state: dict) -> tuple[dict | None, bool]:
+    """The workspace's managed config for this launch, or ``(None, _)`` when there is none.
 
-    Returns None when managed configs are switched off — either the feature is disabled or the launch
-    passed ``--skip-managed-config`` (which clears the enabling env var for the process).
+    Returns ``(None, False)`` when managed configs are switched off — either the feature is disabled
+    or the launch passed ``--skip-managed-config`` (which clears the enabling env var for the process).
     """
+
     if not managed_agent_config_enabled():
-        return None
-    with spinner("Checking for a managed coding agent config..."):
+        return None, False
+    with spinner("Loading..."):
         return refresh_managed_config(state)
 
 
@@ -1691,7 +1684,7 @@ def _launch_tool(
         # Bare `ucode` already fetched one to choose the agent; refetching would double the
         # control-plane round trip and any fallback warning it printed.
         if managed is None:
-            managed = _fetch_managed_config(state)
+            managed, _coding_agent_config_feature_disabled = _fetch_managed_config(state)
         # Checked before discovery, which can take tens of seconds, so a blocked launch fails fast.
         _reject_disabled_agent(managed, tool)
         # Discovery exists to find models and isn't needed for managed config that already names them.
@@ -2033,10 +2026,11 @@ def _launch_managed_default(
     if dry_run:
         managed = load_managed_state(current)
     else:
-        with spinner("Checking for a managed coding agent config..."):
-            managed = refresh_managed_config(state)
-    if not managed:
+        with spinner("Loading..."):
+            managed, coding_agent_config_feature_disabled = refresh_managed_config(state)
+    if not managed and not coding_agent_config_feature_disabled:
         _print_no_managed_config_guidance(current, state.get("profile"))
+    if not managed:
         return
     # The budget tier can move the org to a cheaper agent, so it outranks the config's
     # default_agent. Fetched here and handed to _launch_tool so it is read once per launch.
