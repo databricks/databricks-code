@@ -127,14 +127,24 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert overlay["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
-    def test_enables_gateway_model_discovery(self):
+    @pytest.mark.parametrize("env_value", [None, "", "0", "off", "no"])
+    def test_gateway_model_discovery_disabled_unless_opted_in(self, monkeypatch, env_value):
+        if env_value is not None:
+            monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", env_value)
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
+
+    @pytest.mark.parametrize("env_value", ["1", "true", "yes", " TRUE "])
+    def test_enables_gateway_model_discovery(self, monkeypatch, env_value):
+        monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", env_value)
         overlay, _ = claude.render_overlay(WS, "s4")
         assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
 
-    def test_gateway_model_discovery_skipped_under_provider(self):
+    def test_gateway_model_discovery_skipped_under_provider(self, monkeypatch):
         # A Model Provider Service routes every request to the external provider,
         # so a discovered gateway endpoint id would reach a provider that can't
         # resolve it — discovery must be off in that mode.
+        monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", "1")
         overlay, _ = claude.render_overlay(WS, "s4", provider="main.x.claude-svc")
         assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
