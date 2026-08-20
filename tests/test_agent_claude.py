@@ -127,16 +127,15 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert overlay["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
-    @pytest.mark.parametrize("env_value", [None, "", "0", "off", "no"])
+    @pytest.mark.parametrize("env_value", [None, "", "0", "true", "yes"])
     def test_gateway_model_discovery_disabled_unless_opted_in(self, monkeypatch, env_value):
         if env_value is not None:
             monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", env_value)
         overlay, _ = claude.render_overlay(WS, "s4")
         assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
-    @pytest.mark.parametrize("env_value", ["1", "true", "yes", " TRUE "])
-    def test_enables_gateway_model_discovery(self, monkeypatch, env_value):
-        monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", env_value)
+    def test_enables_gateway_model_discovery(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", "1")
         overlay, _ = claude.render_overlay(WS, "s4")
         assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
 
