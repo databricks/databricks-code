@@ -18,6 +18,7 @@ from ucode.agents import (
     configure_tool,
     ensure_bootstrap_dependencies,
     ensure_provider_state,
+    install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
     provider_permission_error,
@@ -41,7 +42,7 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
-    ensure_ai_gateway_v2,
+    ensure_ai_gateway,
     ensure_databricks_auth,
     ensure_pat_bearer,
     find_profile_name_for_host,
@@ -80,15 +81,25 @@ from ucode.managed_resolve import (
     recommended_agent,
     resolve_state,
 )
-from ucode.managed_wizard import apply_command, setup_command, show_command
+from ucode.managed_wizard import (
+    apply_command,
+    setup_budget_policy_command,
+    setup_command,
+    setup_help_command,
+    setup_mcp_command,
+    setup_skills_command,
+    show_command,
+)
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
+    add_mcp_command,
     apply_managed_mcp_servers,
     apply_managed_skills,
     configure_mcp_command,
     configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
+    remove_mcp_command,
     revert_mcp_configs,
 )
 from ucode.skills_download import (
@@ -137,7 +148,7 @@ _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
 
 
 def _policy_summary_lines(managed: dict) -> list[str]:
-    """Rich-markup lines describing the admin's budget policy, or empty when it sets none."""
+    """Rich-markup lines describing the admin's tiered spend policy, or empty when it sets none."""
     policy = managed.get("budget_policy")
     if not isinstance(policy, dict):
         return []
@@ -164,13 +175,23 @@ def _policy_summary_lines(managed: dict) -> list[str]:
     return lines
 
 
-def _print_managed_summary(managed: dict, state: dict, tool: str | None) -> None:
+def _print_managed_summary(
+    managed: dict, state: dict, tool: str | None, *, abridged: bool = False
+) -> None:
     """Show which of the admin's settings are in force.
 
     With ``tool`` set (launch path) the per-agent Agent/Provider/Model lines are included;
     with ``tool=None`` (e.g. ``ucode configure`` under a managed config) they are skipped
     since no single agent has been chosen yet.
+
+    ``abridged`` prints only what changes launch-to-launch — the agent and model this run will use,
+    and the policy in force — with a pointer to ``ucode status`` for the rest. Bare ``ucode`` runs
+    every session, so re-enumerating the workspace's full MCP/skills/tier list each time is noise;
+    the full box stays for ``status`` and ``configure``, where the reader asked to see it.
     """
+    if abridged:
+        _print_managed_summary_abridged(managed, state, tool)
+        return
     lines = [f"[bold]Workspace:[/bold] [cyan]{state.get('workspace', '?')}[/cyan]"]
     if tool is not None:
         lines.append(f"[bold]Agent:[/bold] [green]{TOOL_SPECS[tool]['display']}[/green]")
@@ -209,6 +230,27 @@ def _print_managed_summary(managed: dict, state: dict, tool: str | None) -> None
     )
 
 
+def _print_managed_summary_abridged(managed: dict, state: dict, tool: str | None) -> None:
+    """One-line launch banner: which agent (and model) this managed run is launching.
+
+    Bare ``ucode`` runs every session, so the full box's MCP/skills/policy enumeration is noise
+    each time; ``ucode status`` still shows all of it. See ``_print_managed_summary``'s ``abridged``
+    note. ``tool`` is always set on the launch path, but is guarded for callers that pass None."""
+    if tool is None:
+        print_note("Using managed config.")
+        return
+    agent = TOOL_SPECS[tool]["display"]
+    model = managed_default_model(managed, tool)
+    model_suffix = f" with [magenta]{model}[/magenta]" if model else ""
+    # "as the default agent" only when this really is the config's default: a budget tier can
+    # override the default and launch a different agent, and the tier note in `_launch_tool` already
+    # explains that case — so claiming "default" here would contradict it.
+    role = " as the default agent" if tool == managed.get("default_agent") else ""
+    console.print(
+        f"[dim]•[/dim] Using managed config — launching [green]{agent}[/green]{role}{model_suffix}"
+    )
+
+
 def _resolve_workspace_then_maybe_reject(
     workspace_entries: list[tuple[str, str | None]] | None,
 ) -> list[tuple[str, str | None]] | None:
@@ -221,9 +263,11 @@ def _resolve_workspace_then_maybe_reject(
     locally would be overridden at launch anyway: show the admin's config and point the developer
     at `ucode`.
 
-    Returns the resolved entries to configure when there is no managed config so the caller reuses
-    them instead of prompting again. Without the feature enabled it returns ``workspace_entries``
-    unchanged and prompts nothing.
+    When there is no managed config the developer's own ``configure`` always proceeds — an admin
+    just sees an FYI that they could publish one with ``ucode setup`` (never a prompt, never a
+    diversion). Returns the resolved entries to configure so the caller reuses them instead of
+    prompting again. Without the feature enabled it returns ``workspace_entries`` unchanged and
+    prompts nothing.
     """
     if not managed_agent_config_enabled():
         return workspace_entries
@@ -234,10 +278,13 @@ def _resolve_workspace_then_maybe_reject(
     # cache is empty until the first launch, so a cache read would miss a config the workspace does
     # publish and wrongly fall through to the local configure flow. `refresh_managed_config` reaches
     # the workspace and never raises — it falls back to the persisted copy, then None, on failure.
-    with spinner("Checking for a managed coding agent config..."):
-        managed = refresh_managed_config({"workspace": workspace, "profile": profile})
-    if not managed:
+    with spinner("Loading..."):
+        managed, coding_agent_config_feature_disabled = refresh_managed_config(
+            {"workspace": workspace, "profile": profile}
+        )
+    if not managed and not coding_agent_config_feature_disabled:
         _maybe_offer_admin_setup(workspace, profile)
+    if not managed:
         return entries
     print_success("A managed config has been detected for your workspace — you're all set.")
     _print_managed_summary(managed, load_state(), tool=None)
@@ -246,13 +293,13 @@ def _resolve_workspace_then_maybe_reject(
 
 
 def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
-    """When a workspace admin runs ``configure`` on a workspace with no managed config, offer to
-    bail out so they can publish one with ``ucode setup`` instead.
+    """When a workspace admin runs ``configure`` on a workspace with no managed config, drop an FYI
+    that they could publish one with ``ucode setup`` — without interrupting the configure flow.
 
-    Admins are the ones who'd want a managed config; a plain developer just gets the normal
-    configure flow. If they accept, exit cleanly (assuming they'll run `ucode setup`); if they
-    decline, fall through to configure their own local settings. The check is best-effort: any
-    failure to determine admin status (auth or SCIM unreachable) silently skips the prompt.
+    Admins are the ones who'd want a managed config, so the note is only shown to them; a plain
+    developer sees nothing. This never prompts and never diverts the command: the developer's own
+    ``configure`` always runs to completion, with the note printed alongside it. The check is
+    best-effort: any failure to determine admin status (auth or SCIM unreachable) silently skips it.
     """
     try:
         token = get_databricks_token(workspace, profile)
@@ -263,22 +310,10 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
     if not is_admin:
         return
     print_note(
-        "✨ New: as a workspace admin you can publish a managed config with `ucode setup` — set "
-        "the agents, models, MCPs, and skills once, and every developer picks them up automatically."
+        "✨ New: run `ucode setup` to publish a managed config to a workspace — set agents, models, mcps "
+        "and skills once, and every developer inherits them when running `ucode`. This scales "
+        "delivery of coding agents to all developers without each one setting up ucode themselves."
     )
-    if prompt_yes_no("Set one up now with `ucode setup`?"):
-        # Launch the setup flow in place rather than telling them to re-run a command. Reuse the
-        # workspace/profile we already resolved and authenticated against so setup doesn't prompt
-        # for them again.
-        try:
-            code = setup_command(workspace=workspace, profile=profile)
-        except RuntimeError as exc:
-            print_err(str(exc))
-            raise typer.Exit(1) from None
-        except KeyboardInterrupt:
-            print_err("Interrupted.")
-            raise typer.Exit(130) from None
-        raise typer.Exit(code or 0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
@@ -543,7 +578,7 @@ def configure_shared_state(
             state["profile"] = profile
     with spinner("Verifying Unity AI Gateway..."):
         token = get_databricks_token(workspace, profile)
-        ensure_ai_gateway_v2(workspace, token)
+        ensure_ai_gateway(workspace, token)
     print_success("Unity AI Gateway detected")
 
     want_claude = (
@@ -714,7 +749,7 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
         return _use_databricks()
 
     choice = prompt_for_selection(
-        f"How should {display} be configured?",
+        f"How should {display} get its models?",
         [
             ("databricks", "Databricks Hosted"),
             ("mps", "External Models"),
@@ -769,6 +804,7 @@ def configure_workspace_command(
         )
         state = states[0]
         state = configure_single_tool(tool, state)
+        install_databricks_ai_tools_for_agents([tool], state)
         spec = TOOL_SPECS[tool]
         console.print(
             Panel(
@@ -913,6 +949,16 @@ def status() -> int:
     if profile:
         print_kv("CLI profile", profile)
 
+    # When the workspace publishes a managed config and this run has the feature switched on, that
+    # admin-authored config is what launches actually apply — so surface the whole setup as one box
+    # here too, rather than leaving a developer to infer it from the per-agent rows below. Read from
+    # the local cache (no network): status is a quick, offline-safe glance, and the cache is what the
+    # last launch persisted for this workspace.
+    if workspace and managed_agent_config_enabled():
+        managed = load_managed_state(workspace)
+        if managed:
+            _print_managed_summary(managed, state, None)
+
     print_heading("Coding Agents")
     for tool, spec in TOOL_SPECS.items():
         configured = tool in configured_tools
@@ -1044,7 +1090,9 @@ mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
 setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(
-    setup_app, name="setup", help="Author the workspace's managed coding config (admins only)."
+    setup_app,
+    name="setup",
+    help="Author the workspace's managed coding config (admins only). See `ucode setup help`.",
 )
 
 
@@ -1054,6 +1102,61 @@ def _version_callback(value: bool) -> None:
 
         print(ucode_version())
         raise typer.Exit()
+
+
+@mcp_app.command("add")
+def mcp_add(
+    location: Annotated[
+        str | None,
+        typer.Option(
+            "--location",
+            help="Non-interactive: register the MCP services in the given Unity Catalog "
+            "`<catalog>.<schema>` (e.g. `system.ai`) and exit without showing the picker. "
+            "Servers already configured outside this location are kept.",
+        ),
+    ] = None,
+    services: Annotated[
+        str | None,
+        typer.Option(
+            "--services",
+            help="Register this comma-separated subset of MCP services (additively). Full names "
+            "like `system.ai.github` work on their own; bare short names like `github` need "
+            "--location to locate them. Omit --services to register the whole --location schema; "
+            'an empty `--services ""` adds nothing (no-op).',
+        ),
+    ] = None,
+) -> None:
+    """Add Databricks MCP servers to installed coding tools.
+
+    Like `ucode configure mcp`, but purely additive: it never removes MCP servers
+    that are already configured, only registers new ones.
+    """
+    selected = None if services is None else {s.strip() for s in services.split(",") if s.strip()}
+    try:
+        add_mcp_command(location=location, services=selected)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+
+
+@mcp_app.command("remove")
+def mcp_remove() -> None:
+    """Remove configured Databricks MCP servers from your coding tools.
+
+    Interactive: shows the servers you currently have configured and unregisters the
+    ones you select. Needs no Databricks login.
+    """
+    try:
+        remove_mcp_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
 
 
 @mcp_app.command("web-search")
@@ -1363,15 +1466,16 @@ def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
         )
 
 
-def _fetch_managed_config(state: dict) -> dict | None:
-    """The workspace's managed config for this launch, or None when there is none.
+def _fetch_managed_config(state: dict) -> tuple[dict | None, bool]:
+    """The workspace's managed config for this launch, or ``(None, _)`` when there is none.
 
-    Returns None when managed configs are switched off — either the feature is disabled or the launch
-    passed ``--skip-managed-config`` (which clears the enabling env var for the process).
+    Returns ``(None, False)`` when managed configs are switched off — either the feature is disabled
+    or the launch passed ``--skip-managed-config`` (which clears the enabling env var for the process).
     """
+
     if not managed_agent_config_enabled():
-        return None
-    with spinner("Checking for a managed coding agent config..."):
+        return None, False
+    with spinner("Loading..."):
         return refresh_managed_config(state)
 
 
@@ -1580,7 +1684,7 @@ def _launch_tool(
         # Bare `ucode` already fetched one to choose the agent; refetching would double the
         # control-plane round trip and any fallback warning it printed.
         if managed is None:
-            managed = _fetch_managed_config(state)
+            managed, _coding_agent_config_feature_disabled = _fetch_managed_config(state)
         # Checked before discovery, which can take tens of seconds, so a blocked launch fails fast.
         _reject_disabled_agent(managed, tool)
         # Discovery exists to find models and isn't needed for managed config that already names them.
@@ -1922,10 +2026,11 @@ def _launch_managed_default(
     if dry_run:
         managed = load_managed_state(current)
     else:
-        with spinner("Checking for a managed coding agent config..."):
-            managed = refresh_managed_config(state)
-    if not managed:
+        with spinner("Loading..."):
+            managed, coding_agent_config_feature_disabled = refresh_managed_config(state)
+    if not managed and not coding_agent_config_feature_disabled:
         _print_no_managed_config_guidance(current, state.get("profile"))
+    if not managed:
         return
     # The budget tier can move the org to a cheaper agent, so it outranks the config's
     # default_agent. Fetched here and handed to _launch_tool so it is read once per launch.
@@ -1938,7 +2043,7 @@ def _launch_managed_default(
             "Your workspace's managed config names no agent to launch. Ask an admin to set a "
             "default agent, or run `ucode <agent>` directly."
         )
-    _print_managed_summary(managed, state, tool)
+    _print_managed_summary(managed, state, tool, abridged=True)
     _launch_tool(
         tool,
         ctx,
@@ -2620,7 +2725,10 @@ def setup(
         ),
     ] = None,
 ) -> None:
-    """Author the managed coding config for your workspace (workspace admins only)."""
+    """Choose the agents and models for your workspace's managed config (admins only).
+
+    MCP servers, skills, and the tiered spend policy have their own commands — see `ucode setup help`.
+    """
     if ctx.invoked_subcommand is not None:
         return
     # `typer.Exit` subclasses RuntimeError, so it must be raised outside the try — inside, the
@@ -2634,6 +2742,80 @@ def setup(
     except KeyboardInterrupt:
         print_err("Interrupted.")
         raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@setup_app.command("mcps")
+def setup_mcp_cmd() -> None:
+    """Choose the MCP servers the managed config gives developers (admins only)."""
+    # Same `typer.Exit`/RuntimeError ordering trap as the `setup` callback above.
+    try:
+        install_databricks_cli()
+        code = setup_mcp_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@setup_app.command("skills")
+def setup_skills_cmd(
+    location: Annotated[
+        str | None,
+        typer.Option(
+            "--location",
+            help="Skill schemas to publish as `<catalog>.<schema>` (comma-separated for several). "
+            "Skips the prompt.",
+        ),
+    ] = None,
+) -> None:
+    """Choose the skills the managed config gives developers (admins only)."""
+    try:
+        install_databricks_cli()
+        # None means "prompt"; an explicit `--location` is parsed to the list to publish.
+        locations = None if location is None else _parse_skill_locations(location)
+        code = setup_skills_command(locations)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@setup_app.command("spend-tiers")
+def setup_budget_policy_cmd() -> None:
+    """Route developers to cheaper agents as the workspace spends its budget (admins only)."""
+    try:
+        install_databricks_cli()
+        code = setup_budget_policy_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+    if code:
+        raise typer.Exit(code)
+
+
+@setup_app.command("help")
+def setup_help_cmd() -> None:
+    """Walk through the managed-config setup: every command, in order, and what's already done."""
+    # No auth and no CLI install: this reads the local draft only, so it works before `ucode
+    # configure` and on a machine without the Databricks CLI.
+    try:
+        code = setup_help_command()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
     if code:
         raise typer.Exit(code)
 

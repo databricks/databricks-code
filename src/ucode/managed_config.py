@@ -310,6 +310,8 @@ def get_managed_config(workspace: str, token: str) -> tuple[dict | None, str | N
     """
     configs, reason = fetch_managed_coding_agent_configs(workspace, token)
     if reason is not None:
+        if _is_feature_disabled(reason):
+            return None, reason
         # A NOT_FOUND means the admin hasn't defined a config for this workspace — not a failure.
         if _is_not_found(reason):
             return None, None
@@ -403,38 +405,47 @@ def managed_state_workspace() -> str | None:
     return workspace if isinstance(workspace, str) and workspace else None
 
 
-def refresh_managed_config(state: dict) -> dict | None:
-    """Fetch the workspace's managed config and persist it, returning the normalized manifest.
+def refresh_managed_config(state: dict) -> tuple[dict | None, bool]:
+    """Fetch the workspace's managed config and persist it, returning ``(manifest, coding_agent_config_feature_disabled)``.
 
     Runs on every launch so a developer picks up an admin's edits without re-running
-    ``ucode configure``. Returns None when the workspace has no managed config — the normal case for
-    a workspace whose admin hasn't published one.
+    ``ucode configure``. The manifest is None when the workspace has no managed config — the normal
+    case for a workspace whose admin hasn't published one.
 
     A failed fetch never blocks the launch: an unreachable control plane shouldn't stop someone from
     coding. Instead it falls back to the last config persisted for this workspace, so the admin's
     most recent known policy still applies; only when there is no persisted config either does the
     launch fall through to the developer's own settings.
+
+    ``coding_agent_config_feature_disabled`` is True when the gateway returned ``FEATURE_DISABLED`` and there was no
+    persisted config to fall back on — the coding-agent-configs feature isn't enabled server-side,
+    so callers suppress the ``ucode setup`` recommendation.
     """
     workspace = state.get("workspace")
     if not workspace:
-        return None
+        return None, False
     try:
         token = get_databricks_token(workspace, state.get("profile"))
     except RuntimeError as exc:
-        return _persisted_fallback(workspace, str(exc))
+        return _persisted_fallback(workspace, str(exc)), False
     managed, reason = get_managed_config(workspace, token)
     if reason is not None:
         # A refused read leaves the cached config alone: it says nothing about whether the admin's
         # config still exists, unlike a successful "no config" answer below.
-        return _persisted_fallback(workspace, reason, refused=_is_permission_denied(reason))
+        fallback = _persisted_fallback(workspace, reason, refused=_is_permission_denied(reason))
+        return fallback, _is_feature_disabled(reason) and fallback is None
     if managed is None:
         # Record that this workspace has no config, rather than leaving an earlier one on disk:
         # the file doubles as the fallback above, so a removed policy would otherwise come back
         # into force after the next transient outage.
         save_managed_state(workspace, {})
-        return None
+        return None, False
     save_managed_state(workspace, managed)
-    return managed
+    return managed, False
+
+
+def _is_feature_disabled(reason: str) -> bool:
+    return "feature_disabled" in reason.lower()
 
 
 def _persisted_fallback(workspace: str, reason: str, *, refused: bool = False) -> dict | None:

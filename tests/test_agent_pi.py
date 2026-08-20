@@ -240,9 +240,13 @@ class TestBuildRuntimeEnv:
         env = pi.build_runtime_env("tok")
         assert env["OAUTH_TOKEN"] == "tok"
 
-    def test_sets_ucode_home(self):
+    def test_sets_private_agent_dir_without_replacing_home(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/real-user-home")
+
         env = pi.build_runtime_env("tok")
-        assert env["HOME"] == str(pi.PI_UCODE_HOME)
+
+        assert env["PI_CODING_AGENT_DIR"] == str(pi.PI_CONFIG_DIR)
+        assert env["HOME"] == "/real-user-home"
 
 
 class TestPiValidateCmd:
