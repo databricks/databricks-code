@@ -92,9 +92,8 @@ GLOBAL_SETTINGS_FILES = {
 
 # Shown whenever the workspace's coding-agent-config APIs return FEATURE_DISABLED.
 CODING_AGENT_CONFIGS_DISABLED_MESSAGE = (
-    "Workspace-managed coding agent configuration is not available on this workspace, so this "
-    "configuration cannot be published. Use `ucode configure` to set up agents for individual "
-    "users instead."
+    "Workspace-managed coding agent configuration is not available on this workspace. Use "
+    "`ucode configure` to set up agents for individual users instead."
 )
 
 BUDGET_POLICY_BLURB = (
@@ -1285,11 +1284,9 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
         existing, reason = get_managed_config(workspace, token)
     if reason is not None:
         if "feature_disabled" in reason.lower():
-            # The coding-agent-config APIs aren't enabled for this workspace, so there can't be an
-            # existing config to reconcile. Say so plainly rather than dumping the raw 404 body,
-            # which reads like a spurious "not found".
-            print_warning(CODING_AGENT_CONFIGS_DISABLED_MESSAGE)
-            return True, None
+            # Authoring a draft that the workspace cannot publish only leads the admin through a
+            # dead-end wizard. Stop before model discovery and point them to per-user setup instead.
+            raise RuntimeError(CODING_AGENT_CONFIGS_DISABLED_MESSAGE)
         print_note(f"Could not check for an existing config: {reason}")
         return True, None
     if existing is None:

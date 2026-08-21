@@ -247,9 +247,9 @@ class TestExistingConfigHandling:
         assert not select.called
         assert note.called
 
-    def test_feature_disabled_continues_with_a_clean_warning(self):
+    def test_feature_disabled_blocks_setup_with_an_actionable_error(self):
         # When the coding-agent-config APIs aren't enabled, the read fails with a FEATURE_DISABLED
-        # 404. Continue authoring, but warn plainly instead of dumping the raw 404 body.
+        # 404. Stop before authoring a draft that can never be published.
         reason = (
             'HTTP 404 Not Found: {"error_code":"FEATURE_DISABLED",'
             '"message":"Coding agent config APIs are not enabled for this workspace."}'
@@ -257,14 +257,13 @@ class TestExistingConfigHandling:
         with (
             patch.object(wizard, "get_managed_config", return_value=(None, reason)),
             patch.object(wizard, "prompt_for_selection") as select,
-            patch.object(wizard, "print_warning") as warn,
             patch.object(wizard, "print_note") as note,
+            pytest.raises(RuntimeError) as exc_info,
         ):
-            assert wizard._handle_existing_config(WORKSPACE, "token") == (True, None)
+            wizard._handle_existing_config(WORKSPACE, "token")
         assert not select.called
-        message = warn.call_args[0][0]
+        message = str(exc_info.value)
         assert message == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
-        assert "cannot be published" in message
         assert "`ucode configure`" in message
         # The raw 404 / JSON body must not leak into the message.
         assert "404" not in message
@@ -2556,7 +2555,6 @@ class TestPublishFailureMessages:
             'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED","message":"..."}'
         )
         assert message == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
-        assert "cannot be published" in message
         assert "`ucode configure`" in message
 
     def test_permission_denied_says_admin_is_required(self):
