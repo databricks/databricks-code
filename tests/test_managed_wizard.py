@@ -247,6 +247,28 @@ class TestExistingConfigHandling:
         assert not select.called
         assert note.called
 
+    def test_feature_disabled_continues_with_a_clean_warning(self):
+        # When the coding-agent-config APIs aren't enabled, the read fails with a FEATURE_DISABLED
+        # 404. Continue authoring, but warn plainly instead of dumping the raw 404 body.
+        reason = (
+            'HTTP 404 Not Found: {"error_code":"FEATURE_DISABLED",'
+            '"message":"Coding agent config APIs are not enabled for this workspace."}'
+        )
+        with (
+            patch.object(wizard, "get_managed_config", return_value=(None, reason)),
+            patch.object(wizard, "prompt_for_selection") as select,
+            patch.object(wizard, "print_warning") as warn,
+            patch.object(wizard, "print_note") as note,
+        ):
+            assert wizard._handle_existing_config(WORKSPACE, "token") == (True, None)
+        assert not select.called
+        message = warn.call_args[0][0]
+        assert message == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
+        # The raw 404 / JSON body must not leak into the message.
+        assert "404" not in message
+        assert "FEATURE_DISABLED" not in message
+        assert not note.called
+
     def test_choosing_create_continues_authoring(self):
         with (
             patch.object(
@@ -2527,11 +2549,11 @@ class TestApplyCommand:
 class TestPublishFailureMessages:
     """The server's error codes, turned into something an admin can act on."""
 
-    def test_feature_disabled_names_the_flag(self):
+    def test_feature_disabled_uses_the_shared_message(self):
         message = wizard._explain_publish_failure(
             'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED","message":"..."}'
         )
-        assert "codingAgentConfigCrudEnabled" in message
+        assert message == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
 
     def test_permission_denied_says_admin_is_required(self):
         message = wizard._explain_publish_failure(

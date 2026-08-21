@@ -90,6 +90,11 @@ GLOBAL_SETTINGS_FILES = {
     "codex": "managed_config.toml",
 }
 
+# Shown whenever the workspace's coding-agent-config APIs return FEATURE_DISABLED.
+CODING_AGENT_CONFIGS_DISABLED_MESSAGE = (
+    "Coding agent governance is not enabled for this workspace yet."
+)
+
 BUDGET_POLICY_BLURB = (
     "As the workspace spends more of a budget, a tiered spend policy automatically switches "
     "everyone's default agent and model to a cheaper one — for example Claude Code / Opus normally, "
@@ -1277,6 +1282,12 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
     with spinner("Checking for an existing managed config..."):
         existing, reason = get_managed_config(workspace, token)
     if reason is not None:
+        if "feature_disabled" in reason.lower():
+            # The coding-agent-config APIs aren't enabled for this workspace, so there can't be an
+            # existing config to reconcile. Say so plainly rather than dumping the raw 404 body,
+            # which reads like a spurious "not found".
+            print_warning(CODING_AGENT_CONFIGS_DISABLED_MESSAGE)
+            return True, None
         print_note(f"Could not check for an existing config: {reason}")
         return True, None
     if existing is None:
@@ -1928,11 +1939,7 @@ def show_command() -> int:
 def _explain_publish_failure(reason: str) -> str:
     lowered = reason.lower()
     if "feature_disabled" in lowered:
-        return (
-            "Managed coding-agent configs aren't enabled on this workspace yet. Ask your Databricks "
-            "contact to enable the `codingAgentConfigCrudEnabled` flag for it, then re-run "
-            "`ucode apply`."
-        )
+        return CODING_AGENT_CONFIGS_DISABLED_MESSAGE
     if "permission_denied" in lowered or "http 403" in lowered:
         return (
             "Publishing a managed config requires workspace admin. Your account can read the "
