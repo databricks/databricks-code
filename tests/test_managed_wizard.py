@@ -264,6 +264,8 @@ class TestExistingConfigHandling:
         assert not select.called
         message = warn.call_args[0][0]
         assert message == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
+        assert "cannot be published" in message
+        assert "`ucode configure`" in message
         # The raw 404 / JSON body must not leak into the message.
         assert "404" not in message
         assert "FEATURE_DISABLED" not in message
@@ -2554,6 +2556,8 @@ class TestPublishFailureMessages:
             'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED","message":"..."}'
         )
         assert message == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
+        assert "cannot be published" in message
+        assert "`ucode configure`" in message
 
     def test_permission_denied_says_admin_is_required(self):
         message = wizard._explain_publish_failure(

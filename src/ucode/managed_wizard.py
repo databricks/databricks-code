@@ -92,7 +92,9 @@ GLOBAL_SETTINGS_FILES = {
 
 # Shown whenever the workspace's coding-agent-config APIs return FEATURE_DISABLED.
 CODING_AGENT_CONFIGS_DISABLED_MESSAGE = (
-    "Coding agent governance is not enabled for this workspace yet."
+    "Workspace-managed coding agent configuration is not available on this workspace, so this "
+    "configuration cannot be published. Use `ucode configure` to set up agents for individual "
+    "users instead."
 )
 
 BUDGET_POLICY_BLURB = (
