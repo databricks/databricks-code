@@ -1337,9 +1337,7 @@ class TestProviderServiceSelection:
     def test_only_relayed_services_falls_back_to_databricks_for_claude(self):
         relayed = {**ANTHROPIC_SERVICE, "targets": [], "relayed": True}
         with (
-            patch.object(
-                wizard, "list_model_provider_services", return_value=([relayed], None)
-            ),
+            patch.object(wizard, "list_model_provider_services", return_value=([relayed], None)),
             patch.object(wizard, "prompt_for_selection") as select,
             patch.object(wizard, "print_note"),
         ):
