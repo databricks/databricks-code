@@ -262,14 +262,10 @@ def _select_provider_service(tool: str, workspace: str, token: str) -> dict | No
             print_note("Falling back to Databricks-hosted models.")
         return None
 
-    usable = [
-        service
-        for service in services
-        if service_usable_for_tool(tool, service)
-        # Claude Max/Team/Enterprise subscription relays are not reliable enough for managed
-        # configurations yet. Keep them out of the External Models picker until that path is ready.
-        and not (tool == "claude" and service.get("relayed"))
-    ]
+    usable = [service for service in services if service_usable_for_tool(tool, service)]
+    if tool == "claude":
+        # Claude subscription relays are not reliable enough for managed configurations yet.
+        usable = [service for service in usable if not service.get("relayed")]
     if not usable:
         if services:
             # Services exist but none match this agent's dialect — say so, since "no picker appeared"
