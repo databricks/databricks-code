@@ -1309,6 +1309,43 @@ class TestProviderServiceSelection:
         offered = [value for value, _ in select.call_args_list[1][0][1]]
         assert offered == ["main.default.lilly-anthropic"]
 
+    def test_relayed_services_are_not_offered_for_claude(self):
+        relayed = {
+            **ANTHROPIC_SERVICE,
+            "name": "main.default.claude-enterprise",
+            "targets": [],
+            "relayed": True,
+        }
+        with (
+            patch.object(
+                wizard,
+                "list_model_provider_services",
+                return_value=([relayed, ANTHROPIC_SERVICE], None),
+            ),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=["mps", "main.default.lilly-anthropic"],
+            ) as select,
+            patch.object(wizard, "all_users_can_use_schema", return_value=True),
+        ):
+            service = wizard._select_provider_service("claude", WORKSPACE, "token")
+        assert service == ANTHROPIC_SERVICE
+        offered = [value for value, _ in select.call_args_list[1][0][1]]
+        assert offered == ["main.default.lilly-anthropic"]
+
+    def test_only_relayed_services_falls_back_to_databricks_for_claude(self):
+        relayed = {**ANTHROPIC_SERVICE, "targets": [], "relayed": True}
+        with (
+            patch.object(
+                wizard, "list_model_provider_services", return_value=([relayed], None)
+            ),
+            patch.object(wizard, "prompt_for_selection") as select,
+            patch.object(wizard, "print_note"),
+        ):
+            assert wizard._select_provider_service("claude", WORKSPACE, "token") is None
+        assert not select.called
+
     def test_warns_when_all_users_lack_schema_access(self):
         # The picked MPS's schema isn't granted to all workspace users, so developers who pull the
         # config may hit "does not have USE_SCHEMA"; warn but still return the service (never block).
