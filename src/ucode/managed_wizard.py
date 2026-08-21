@@ -2037,6 +2037,8 @@ def apply_command(*, yes: bool = False) -> int:
     with spinner("Checking for an existing managed config..."):
         existing, reason = get_managed_config(workspace, token)
     if reason is not None:
+        if "feature_disabled" in reason.lower():
+            raise RuntimeError(CODING_AGENT_CONFIGS_DISABLED_MESSAGE)
         raise RuntimeError(
             f"Could not check whether {workspace} already has a managed config: {reason}. "
             "Refusing to publish without knowing, since that could overwrite a config silently."

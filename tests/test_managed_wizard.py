@@ -2541,6 +2541,24 @@ class TestApplyCommand:
             )
         assert created["called"] is False
 
+    def test_feature_disabled_read_uses_the_shared_blocking_message(self):
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
+        created = {"called": False}
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {}, None
+
+        reason = 'HTTP 404 Not Found: {"error_code":"FEATURE_DISABLED"}'
+        with pytest.raises(RuntimeError) as exc_info:
+            self._run(
+                get_managed_config=lambda *a, **k: (None, reason),
+                create_coding_agent_config=fake_create,
+            )
+        assert str(exc_info.value) == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
+        assert "FEATURE_DISABLED" not in str(exc_info.value)
+        assert created["called"] is False
+
     def test_existing_config_without_a_resource_name_is_an_error(self):
         managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         with pytest.raises(RuntimeError, match="resource name"):
