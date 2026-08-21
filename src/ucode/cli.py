@@ -1048,8 +1048,8 @@ configure_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(configure_app, name="configure", help="Configure workspace and tool settings.")
 mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
-skills_app = typer.Typer(add_completion=False, no_args_is_help=True)
-app.add_typer(skills_app, name="skills", help="Databricks Skills for your coding tools.")
+skill_app = typer.Typer(add_completion=False, no_args_is_help=True)
+app.add_typer(skill_app, name="skill", help="Databricks Skills for your coding tools.")
 setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(
     setup_app,
@@ -1129,7 +1129,7 @@ def mcp_web_search_cmd() -> None:
     serve()
 
 
-@skills_app.command("add")
+@skill_app.command("add")
 def skills_add(
     location: Annotated[
         str | None,
@@ -1151,13 +1151,14 @@ def skills_add(
             help="(download) Existing absolute dir to download into; defaults to your home dir.",
         ),
     ] = None,
-    skill: Annotated[
+    skills: Annotated[
         str | None,
         typer.Option(
-            "--skill",
-            help="(download) Download only this comma-separated subset of skills (by "
-            "securable name, e.g. `my-skill`) from the schema, instead of every skill. "
-            "Requires a single --location; not valid with --mcp.",
+            "--skills",
+            help="(download) Download only this comma-separated subset of skills instead of "
+            "every skill in the schema. Bare securable names (e.g. `my-skill`) need a single "
+            "--location; fully-qualified `<catalog>.<schema>.<name>` names work on their own. "
+            "Not valid with --mcp.",
         ),
     ] = None,
 ) -> None:
@@ -1165,24 +1166,42 @@ def skills_add(
 
     With ``--mcp``, adds the given schemas to the skills MCP connection's scope.
     Otherwise downloads each schema's skills to disk (under ``--path``, or your home
-    dir), keeping already-downloaded skills. ``--skill`` narrows a download to a
-    named subset of a single schema's skills. Requires ``--location``.
+    dir), keeping already-downloaded skills. ``--skills`` narrows a download to a
+    subset of one schema's skills, by bare name (with ``--location``) or
+    fully-qualified ``<catalog>.<schema>.<name>``.
     """
     try:
         locations = _parse_skill_locations(location)
-        selected_skills = (
-            None if skill is None else {s.strip() for s in skill.split(",") if s.strip()}
+        requested_skills = (
+            None if skills is None else {s.strip() for s in skills.split(",") if s.strip()}
         )
-        if not locations:
-            raise RuntimeError("--location is required for `ucode skills add`.")
         if mcp and path is not None:
             raise RuntimeError("--path is not supported when using --mcp")
-        if mcp and selected_skills is not None:
-            raise RuntimeError("--skill is not supported when using --mcp")
-        if selected_skills is not None and len(locations) != 1:
+        if mcp and requested_skills is not None:
+            raise RuntimeError("--skills is not supported when using --mcp")
+        if requested_skills is not None and not locations:
+            schemas = {".".join(s.split(".")[:2]) for s in requested_skills if s.count(".") >= 2}
+            bare = sorted(s for s in requested_skills if s.count(".") < 2)
+            if bare:
+                raise RuntimeError(
+                    "--skills short names need --location (or pass full names like "
+                    f"`<catalog>.<schema>.<name>`): {', '.join(bare)}"
+                )
+            if len(schemas) != 1:
+                raise RuntimeError(
+                    "--skills without --location must all share one `<catalog>.<schema>` "
+                    f"(got: {', '.join(sorted(schemas)) or 'none'}); pass --location instead."
+                )
+            locations = list(schemas)
+        if not locations:
+            raise RuntimeError("--location is required for `ucode skill add`.")
+        if requested_skills is not None and len(locations) != 1:
             raise RuntimeError(
-                f"--skill requires a single --location (got: {', '.join(locations)})."
+                f"--skills requires a single --location (got: {', '.join(locations)})."
             )
+        selected_skills = (
+            None if requested_skills is None else {s.split(".")[-1] for s in requested_skills}
+        )
         if mcp:
             add_skills_command(locations)
         else:
