@@ -242,8 +242,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # instead of surfacing to Claude Code as a spurious Anthropic prompt.
             try:
                 self.cache.refresh()
-            except RuntimeError:
-                pass  # refresh failed; retry with the existing token and relay whatever comes
+            except RuntimeError as exc:
+                # Refresh failed: the Databricks OAuth session is dead (not just the
+                # access token) and can't be re-minted non-interactively. Surface the
+                # `databricks auth login` hint rather than silently relaying a bare 401,
+                # which otherwise reads as an Anthropic `/login` prompt and sends the
+                # user to the wrong re-auth. Still retry + relay with the existing token.
+                _log_refresh_failure(exc)
             headers = _forwarded_request_headers(self, self.cache.token)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 _diagnostic_log(
