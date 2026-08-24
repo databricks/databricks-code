@@ -1,9 +1,9 @@
 """Interactive `ucode setup`: author the workspace's managed coding-agent config.
 
 Workspace admins run this to build the ``CodingAgentConfig`` their developers will pull, then publish
-it with ``ucode apply`` (a separate command, so the manifest can be reviewed first). The config lives
-at ``~/.ucode/managed-state.json`` (the one local managed-config file, owned by
-:mod:`ucode.managed_config`).
+it with ``ucode apply`` (a separate command, so the manifest can be reviewed or tested first). The
+editable draft lives at ``~/.ucode/managed-state.json`` and is never overwritten by ordinary
+launches.
 
 Authoring is split across commands so an admin can change one part without walking the whole flow:
 ``ucode setup`` picks the agents and models, and ``ucode setup mcps`` / ``skills`` / ``spend-tiers``
@@ -1447,6 +1447,7 @@ def _print_next_steps(manifest: dict) -> None:
         # would report "run `ucode setup` first".
         print_note("Dry run — nothing was saved. Re-run without --dry-run to author the config.")
         return
+    print_note("Local draft: [bold]~/.ucode/managed-state.json[/bold]")
     # These sections aren't required to publish — call them out as optional so an admin doesn't read
     # a config with none configured as unfinished.
     print_note("[dim]Optional — configure any of these, or skip straight to publishing:[/dim]")
@@ -1454,7 +1455,10 @@ def _print_next_steps(manifest: dict) -> None:
         console.print(line)
     print_panel(
         "All done?",
-        ["Publish with [bold]ucode apply[/bold] so all developers use this configuration."],
+        [
+            "Optionally test the draft with [bold]ucode --local[/bold] or "
+            "[bold]ucode <agent> --local[/bold]. Publish it with [bold]ucode apply[/bold]."
+        ],
     )
 
 
@@ -1845,8 +1849,8 @@ def setup_help_command() -> int:
     """Walk through the whole managed-config setup, marking what this machine has authored.
 
     Hand-written rather than left to `--help`: the point is the *order* of the commands and the fact
-    that nothing reaches developers until `ucode apply`, neither of which a flag listing conveys. Reads
-    the manifest but never authenticates, so it works before `ucode configure`.
+    that nothing reaches developers until `ucode apply`, neither of which a flag listing conveys.
+    Reads the manifest but never authenticates, so it works before `ucode configure`.
     """
     print_section("ucode setup")
     print_note(
@@ -1854,8 +1858,7 @@ def setup_help_command() -> int:
         "and get the agents, models, MCP servers, and skills you chose here. Admins only."
     )
     print_note(
-        "Each command below edits your local draft; nothing reaches the workspace until "
-        "`ucode apply`."
+        "Each command below edits your local draft; nothing reaches developers until `ucode apply`."
     )
 
     workspace = load_state().get("workspace") or managed_state_workspace()
@@ -1864,6 +1867,7 @@ def setup_help_command() -> int:
     # One column width across all three groups, so the commands line up as a single list.
     width = max(len(command) for command, _, _ in SETUP_SECTIONS)
     width = max(width, len("ucode setup --from-file <file>"))
+    width = max(width, len("ucode <agent> --local"))
 
     print_heading("1. Start here")
     console.print(
@@ -1882,11 +1886,13 @@ def setup_help_command() -> int:
     for line in _section_status_lines(manifest, width):
         console.print(line)
 
-    print_heading("3. Review and publish")
+    print_heading("3. Review, optionally test, and publish")
     console.print(
         _command_line("ucode setup show", "The draft, and the payload `apply` sends", width=width)
     )
-    console.print(_command_line("ucode apply", "Publish it to the workspace", width=width))
+    console.print(_command_line("ucode --local", "Test the configured default agent", width=width))
+    console.print(_command_line("ucode <agent> --local", "Test a specific agent", width=width))
+    console.print(_command_line("ucode apply", "Publish it for every developer", width=width))
 
     print_heading("Also")
     console.print(

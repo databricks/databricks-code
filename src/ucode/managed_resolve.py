@@ -1,10 +1,9 @@
 """Resolve the effective agent settings from the managed config plus local ucode state.
 
-The managed config (``~/.ucode/managed-state.json`` — authored by ``ucode setup`` and refreshed
-from the workspace at launch, both through :mod:`ucode.managed_config`) and the developer's own
-ucode state (``~/.ucode/state.json``) stay separate files — they are never merged on disk. Instead
-this module resolves them *per key* at config-write time: whatever the manifest specifies wins, and
-anything it leaves unset falls back to
+The selected managed config (the workspace-published config normally, or the local setup draft when
+``--local`` is passed) and the developer's own ucode state (``~/.ucode/state.json``) are never merged
+on disk. Instead this module resolves them *per key* at config-write time: whatever the manifest
+specifies wins, and anything it leaves unset falls back to
 the developer's ucode state. The resolved view is what gets rendered into the agent config files
 (e.g. ``~/.claude/ucode-settings.json``), so managed settings take precedence for every ``ucode``
 command without either file being rewritten.

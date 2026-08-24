@@ -2255,6 +2255,8 @@ class TestSetupHelp:
             "ucode setup skills",
             "ucode setup spend-tiers",
             "ucode setup show",
+            "ucode --local",
+            "ucode <agent> --local",
             "ucode apply",
         ):
             assert command in out
@@ -2579,7 +2581,7 @@ class TestCliWiring:
         assert result.exit_code == 0
         assert "apply" in result.output
 
-    def test_apply_declares_yes_and_no_dry_run(self):
+    def test_apply_declares_yes_and_no_mode_flags(self):
         # `--dry-run` was removed: apply always validates before publishing, so a separate
         # validate-only mode is redundant. Asserted on declared options rather than rendered help,
         # which Rich ellipsizes at narrow widths (see test_setup_help_lists_from_file).
@@ -2587,6 +2589,15 @@ class TestCliWiring:
         declared = {opt for param in command.params for opt in param.opts}
         assert "--yes" in declared
         assert "--dry-run" not in declared
+        assert "--local" not in declared
+        assert "--workspace" not in declared
+
+    def test_apply_publishes_the_latest_draft(self):
+        with patch.object(cli_mod, "apply_command", return_value=0) as apply:
+            result = runner.invoke(app, ["apply", "--yes"])
+
+        assert result.exit_code == 0, result.output
+        assert apply.call_args.kwargs == {"yes": True}
 
     def test_apply_error_exits_nonzero_with_a_message(self):
         with patch.object(cli_mod, "apply_command", side_effect=RuntimeError("no config authored")):

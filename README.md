@@ -222,7 +222,9 @@ ucode setup                 # agents and models (start here)
 ucode setup mcps            # managed MCP servers
 ucode setup skills          # managed skills
 ucode setup spend-tiers     # spend-based routing
-ucode apply                 # publish it to the workspace
+ucode claude --local        # optionally test the local draft
+ucode codex --local         # edit and test as often as needed
+ucode apply                 # publish the latest draft to the workspace
 ```
 
 `ucode setup` walks through the agents to enable and which one bare `ucode` launches, then per agent:
@@ -238,10 +240,10 @@ that switches the default agent and model as the workspace burns through a budge
 command also offers to publish right away, so you can apply changes incrementally; answering the
 section prompts also runs the matching `ucode configure` step, which does configure this machine.
 
-Everything is written to `~/.ucode/managed-state.json` — the one local managed-config file — which
-`ucode apply` publishes. Re-running `ucode setup` keeps the MCP servers, skills, tracing table, and
-tiered spend policy already authored, rather than clearing them; to drop one, edit the file and reload
-it with `ucode setup --from-file`.
+Everything is written to `~/.ucode/managed-state.json` — the editable local draft — which
+`ucode apply` publishes. Re-running `ucode setup` keeps the MCP servers, skills, tracing
+table, and tiered spend policy already authored, rather than clearing them; to drop one, edit the
+file and reload it with `ucode setup --from-file`.
 
 ```bash
 # Review the manifest and the exact payload `ucode apply` would publish.
@@ -250,6 +252,18 @@ ucode setup show
 # Skip the prompts and load a hand-written config instead (validated before saving).
 ucode setup --from-file ./managed-config.json
 ```
+
+To test before publishing, add `--local` to a launch. The override lasts for that invocation only:
+
+```bash
+ucode --local            # test the draft's configured default agent
+ucode claude --local     # or test a specific enabled agent
+```
+
+Without `--local`, launches always use the workspace-published config when one exists. The local
+draft is never turned into a persistent mode and ordinary launches never overwrite it, so an admin
+can edit and test it repeatedly. Spend-tier recommendations begin after publication because they
+are resolved server-side.
 
 Once the manifest looks right, publish it:
 
@@ -304,7 +318,9 @@ their next ucode run.
 | `ucode setup help` | Walk through the whole setup sequence, marking what's already configured |
 | `ucode setup show` | Print the authored config and the payload `ucode apply` would publish |
 | `ucode setup --from-file <file>` | Load a hand-written managed config instead of running the prompts |
-| `ucode apply` | Publish the authored managed config to the workspace, after a diff and confirmation (admins only) |
+| `ucode --local` | Launch the draft's default agent for an optional local test |
+| `ucode <agent> --local` | Launch a specific agent using the local draft for this invocation only |
+| `ucode apply` | Publish the latest local draft to the workspace, whether or not it was tested |
 | `ucode apply --yes` | Publish without the confirmation prompt |
 
 ## Managed Local Files
