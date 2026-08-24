@@ -55,6 +55,7 @@ from ucode.databricks import (
     list_tool_provider_services,
     normalize_workspace_url,
     resolve_pat_token,
+    resolve_provider_launch_model,
     run_databricks_login,
 )
 from ucode.managed_budget import (
@@ -1862,10 +1863,9 @@ def _launch_tool(
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
-        # A provider service routes by header and pins no model id, so pairing it with an explicit
-        # model is contradictory — reject rather than silently ignore one.
-        if model and provider:
-            raise RuntimeError("Use either --model or --provider, not both.")
+        # `--model` is claude-only (no other launch command exposes it). Under a provider it selects
+        # which tier the service offers to launch on, rather than being rejected — see the provider
+        # branch below.
         # An explicit --workspace targets that workspace for this launch (and
         # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
         # works without a prior `ucode configure`.
@@ -2015,6 +2015,26 @@ def _launch_tool(
             # provider). Skip model resolution, which would otherwise fail when
             # the workspace has no matching Databricks models.
             resolved_model = None
+            # Claude Code starts on its built-in "family default" (opus), which the gateway 403s when
+            # the service declares no opus target. Pick the launch model explicitly and pin it via
+            # ANTHROPIC_MODEL (route_root_model): the user's --model when given, else the most capable
+            # tier the service actually offers. A relayed service selects the model server-side, so
+            # there's nothing to pin — and --model can't be honored, so say so rather than ignore it.
+            #
+            # KNOWN GAP (deferred): ANTHROPIC_MODEL is checked client-side, so this covers services
+            # whose targets are canonical Anthropic names (an API-key Anthropic service); a Bedrock
+            # service's region-prefixed slug can be rejected there. Only an opus-less Bedrock service
+            # hits this — an opus-having one returns None above and is unaffected — and that case was
+            # already broken (bare launch 403s on opus). The follow-up fix is to pin the servable
+            # target into the opus family slot instead (that channel is passed through unchecked).
+            if tool == "claude" and relayed:
+                if model:
+                    print_warning(
+                        "This is a subscription-relay Model Provider Service; the gateway selects "
+                        "the model, so --model is ignored."
+                    )
+            elif tool == "claude" and (model or provider_models):
+                route_root_model = resolve_provider_launch_model(model, provider_models or {})
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
             # in as the explicit model rather than being applied afterwards: for codex the proto has
@@ -2085,13 +2105,19 @@ def _launch_tool(
             provider_models=provider_models,
             relayed=relayed,
             route_root_model=route_root_model,
-            custom_model=model if tool == "claude" else None,
+            # Under a provider, --model is honored via route_root_model (above), not custom_model —
+            # the latter pins a raw id into every family alias, which would clobber the service's
+            # per-family target pins.
+            custom_model=model if (tool == "claude" and not provider) else None,
         )
         print_section(_launch_title(tool))
         if managed is not None:
             print_kv("Config", "workspace-managed")
         if provider:
             print_kv("Provider", provider)
+            # The tier the session will start on when it isn't Claude Code's own opus default.
+            if route_root_model:
+                print_kv("Model", route_root_model)
         elif model and tool == "claude":
             # Claude's --model is pinned via the family aliases, not resolved_model/route_root_model.
             print_kv("Model", model)
@@ -2393,7 +2419,8 @@ def claude_cmd(
             help="Launch on a specific Databricks model id (e.g. a UC "
             "`<catalog>.<schema>.<name>`). Pinned via ANTHROPIC_MODEL so the gateway "
             "resolves it — unlike Claude Code's own --model, which rejects non-catalog ids. "
-            "Pass before any `--` separator; not usable with --provider.",
+            "With --provider, pass a family (opus/sonnet/haiku) or a target the service allows to "
+            "start on that tier instead of Claude Code's opus default. Pass before any `--` separator.",
         ),
     ] = None,
     refresh: Annotated[
