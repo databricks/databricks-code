@@ -3,7 +3,7 @@
 Workspace admins run this to build the ``CodingAgentConfig`` their developers will pull, then publish
 it with ``ucode apply`` (a separate command, so the manifest can be reviewed or tested first). The
 editable draft lives at ``~/.ucode/managed-state.json`` and is never overwritten by ordinary
-launches.
+workspace-managed launches.
 
 Authoring is split across commands so an admin can change one part without walking the whole flow:
 ``ucode setup`` picks the agents and models, and ``ucode setup mcps`` / ``skills`` / ``spend-tiers``
@@ -32,6 +32,7 @@ from ucode.databricks import (
     create_coding_agent_config,
     delete_coding_agent_config,
     discover_claude_models_unbucketed,
+    ensure_ai_gateway,
     ensure_databricks_auth,
     get_databricks_token,
     has_cached_model_provider_services,
@@ -64,6 +65,7 @@ from ucode.state import load_state
 from ucode.ui import (
     console,
     format_usd,
+    inquirerpy_wizard,
     kv_line,
     print_err,
     print_heading,
@@ -73,6 +75,9 @@ from ucode.ui import (
     print_success,
     print_warning,
     print_warning_panel,
+    print_wizard_header,
+    print_wizard_outro,
+    print_wizard_step,
     prompt_for_multi_selection,
     prompt_for_percentage,
     prompt_for_selection,
@@ -81,14 +86,6 @@ from ucode.ui import (
     prompt_yes_no_default,
     spinner,
 )
-
-# The OS-level managed settings file `use_as_global_settings` writes for each agent — named in the
-# prompt so an admin sees exactly what answering "yes" touches. Yes writes this file (needs sudo
-# once) so a bare `claude`/`codex` reaches the gateway on its own; no keeps it ucode-only.
-GLOBAL_SETTINGS_FILES = {
-    "claude": "managed-settings.json",
-    "codex": "managed_config.toml",
-}
 
 BUDGET_POLICY_BLURB = (
     "As the workspace spends more of a budget, a tiered spend policy automatically switches "
@@ -412,8 +409,8 @@ def _confirm_agent(tool: str, agent_config: dict) -> None:
     """One consistent closing line per agent in step 2, whatever its model shape.
 
     Every agent — a single-model codex, a multi-model opencode, a family-slotted claude — ends its
-    block with the same `✔ <agent> configured — <default> · <scope>` line, so the step reads as a
-    uniform checklist rather than each agent's picker trailing off differently.
+    block with the same `✔ <agent> configured — <default>` line, so the step reads as a uniform
+    checklist rather than each agent's picker trailing off differently.
     """
     display = TOOL_SPECS.get(tool, {}).get("display", tool)
     model_config = agent_config.get("model_config") or {}
@@ -421,24 +418,7 @@ def _confirm_agent(tool: str, agent_config: dict) -> None:
     provider = model_config.get("model_provider_service")
     if provider:
         detail = f"{detail} via {provider}"
-    if tool in GLOBAL_SETTINGS_AGENTS:
-        scope = "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
-        detail = f"{detail} · {scope}"
     print_success(f"{display} configured — {detail}")
-
-
-def _render_family_slots(slots: dict[str, str]) -> None:
-    """Recap the Claude family → model slots just chosen, before the overall-default question.
-
-    Same "form filling in" motif as :func:`_selected_recap`: the per-family answers scrolled by one at
-    a time, so gathering them into one box makes "which of these is the overall default?" a choice
-    over something the admin can see rather than recall.
-    """
-    lines = [
-        kv_line(slot.removeprefix("default_").removesuffix("_model"), model)
-        for slot, model in slots.items()
-    ]
-    print_panel("Claude Code models", lines)
 
 
 def _prompt_claude_models(state: dict) -> dict:
@@ -463,10 +443,6 @@ def _prompt_claude_models(state: dict) -> dict:
         print_warning(f"No Claude models were discovered for {display} on this workspace.")
         return {"default_model": _require_text(f"Default model for {display}")}
 
-    print_note(
-        "Claude Code picks a model by family, so set a default per family. Skip any family you "
-        "don't want configured — it falls back to the overall default."
-    )
     slots: dict[str, str] = {}
     custom: list[str] = []
     for family in ANTHROPIC_FAMILIES:
@@ -510,9 +486,8 @@ def _prompt_claude_models(state: dict) -> dict:
         model_config["default_model"] = chosen[0]
         print_note(f"Only one model configured, so it's {display}'s overall default.")
     else:
-        _render_family_slots(slots)
         model_config["default_model"] = _require_selection(
-            f"Which of those is {display}'s overall default?", [(m, m) for m in chosen]
+            "Overall Default Model", [(m, m) for m in chosen]
         )
     if custom:
         model_config["custom_models"] = list(dict.fromkeys(custom))
@@ -598,10 +573,6 @@ def _prompt_claude_provider_family_models(targets: list[str], service_name: str)
         print_note(f"Quick setup — {summary} (default: {default_family}).")
         return model_config
 
-    print_note(
-        f"Claude Code picks a model by family, so set a default per family from {service_name}. "
-        "Skip any family you don't want configured — it falls back to the overall default."
-    )
     slots: dict[str, str] = {}
     for family in ANTHROPIC_FAMILIES:
         family_targets = by_family.get(family)
@@ -625,13 +596,11 @@ def _prompt_claude_provider_family_models(targets: list[str], service_name: str)
         model_config["default_model"] = chosen[0]
         print_note(f"Only one model configured, so it's {display}'s overall default.")
     else:
-        if slots:
-            _render_family_slots(slots)
         # Offered over every target, not just the slots: `default_model` needn't be a family model,
         # and a mixed-catalog service may expose one an admin wants as the overall default.
         options = chosen or list(targets)
         model_config["default_model"] = _require_selection(
-            f"Which of those is {display}'s overall default?", [(m, m) for m in options]
+            "Overall Default Model", [(m, m) for m in options]
         )
     return model_config
 
@@ -1077,8 +1046,10 @@ def _render_summary(workspace: str, manifest: dict) -> None:
         provider = model_config.get("model_provider_service")
         if provider:
             detail = f"{detail} via {provider}"
-        # Only agents that can use global settings carry the scope label; for the rest it's not a choice.
-        if tool in GLOBAL_SETTINGS_AGENTS:
+        # Older/imported manifests can still carry this field even though the interactive setup flow
+        # no longer authors it. Show an explicit legacy value without labelling every newly-authored
+        # agent "ucode-only" as though setup had asked for a scope.
+        if tool in GLOBAL_SETTINGS_AGENTS and "use_as_global_settings" in agent_config:
             scope = (
                 "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
             )
@@ -1124,7 +1095,7 @@ def _render_summary(workspace: str, manifest: dict) -> None:
     else:
         lines.append(kv_line("Tiered Spend Policy", "none"))
 
-    print_panel("Configuration summary", lines)
+    print_panel("Complete configuration", lines)
 
 
 def _config_facts(manifest: dict) -> list[tuple[str, str, str]]:
@@ -1158,7 +1129,7 @@ def _config_facts(manifest: dict) -> list[tuple[str, str, str]]:
                 facts.append((f"agent:{tool}:model:{family}", f"{display} ({family})", str(model)))
         elif isinstance(models, list) and len(models) > 1:
             facts.append((f"agent:{tool}:models", f"{display} models", ", ".join(map(str, models))))
-        if tool in GLOBAL_SETTINGS_AGENTS:
+        if tool in GLOBAL_SETTINGS_AGENTS and "use_as_global_settings" in agent_config:
             scope = (
                 "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
             )
@@ -1240,7 +1211,7 @@ def _render_config_diff(existing: dict | None, incoming: dict, workspace: str) -
     return True
 
 
-def _require_admin(workspace: str, token: str) -> None:
+def _require_admin(workspace: str, token: str, *, quiet: bool = False) -> bool | None:
     """Stop unless the caller is a workspace admin.
 
     An unverifiable check (SCIM unreachable) warns and continues: the API enforces the same rule, so
@@ -1254,12 +1225,14 @@ def _require_admin(workspace: str, token: str) -> None:
             "coding config, so it is restricted to workspace admins."
         )
     if admin is None:
-        print_warning(
-            "Could not verify workspace admin permissions. Continuing — `ucode apply` will fail "
-            "if you lack them."
-        )
-    else:
+        if not quiet:
+            print_warning(
+                "Could not verify workspace admin permissions. Continuing — `ucode apply` will "
+                "fail if you lack them."
+            )
+    elif not quiet:
         print_success("Admin permissions verified")
+    return admin
 
 
 def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | None]:
@@ -1282,15 +1255,12 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
     if existing is None:
         return True, None
 
-    print_warning(
-        "This workspace already has a managed configuration — one config covers every agent, MCP "
-        "server, skill, tracing table, and budget policy for the whole workspace."
-    )
+    print_warning("This workspace already has a managed config.")
     choice = prompt_for_selection(
         "What would you like to do?",
         [
-            ("create", "Author a new config (replaces the existing one when you publish)"),
-            ("delete", "Delete the existing config (removes it from the workspace, leaves none)"),
+            ("create", "Author a replacement (takes effect when published)"),
+            ("delete", "Delete it from the workspace"),
         ],
     )
     if choice is None:
@@ -1367,7 +1337,7 @@ def setup_from_file(path: str) -> int:
 
     save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
-    print_success(f"Saved to {manifest_path.name} -> ~/.ucode/managed-state.json")
+    print_success(f"Configuration loaded from {manifest_path.name}")
     _print_next_steps(manifest)
     return 0
 
@@ -1392,30 +1362,17 @@ def _command_line(command: str, description: str, *, marker: str = " ", width: i
 
 # `ucode setup` walks these phases in order; the banners announce each one so the admin can see how
 # far along the flow they are, the way a multi-page form numbers its pages.
-SETUP_STEP_TITLES = ["Coding agents", "Models & settings", "Default agent"]
+SETUP_STEP_TITLES = [
+    "Select the workspace",
+    "Select coding agents",
+    "Select models for each agent",
+    "Select the default agent",
+]
 
 
 def _step_banner(index: int, title: str) -> None:
-    """Announce one phase of `ucode setup` as `step N of M`."""
-    print_section(f"ucode setup · step {index} of {len(SETUP_STEP_TITLES)} · {title}")
-
-
-def _selected_recap(workspace: str, enabled_agents: dict, default_agent: str | None) -> None:
-    """A compact panel of what's chosen so far, reprinted as the flow advances.
-
-    Turns the run of prompts into something that reads like a form filling in: each phase reprints
-    the growing set of decisions before asking the next question. Agents still mid-configuration show
-    a `…` placeholder for their model.
-    """
-    lines = [kv_line("Workspace", workspace)]
-    for tool, config in enabled_agents.items():
-        model = (config.get("model_config") or {}).get("default_model") or "…"
-        lines.append(kv_line(TOOL_SPECS.get(tool, {}).get("display", tool), model))
-    if default_agent:
-        lines.append(
-            kv_line("Default", TOOL_SPECS.get(default_agent, {}).get("display", default_agent))
-        )
-    print_panel("Selected so far", lines)
+    """Announce one phase of `ucode setup` on its vertical progress rail."""
+    print_wizard_step(index, len(SETUP_STEP_TITLES), title)
 
 
 def _section_status_lines(manifest: dict, width: int = 0) -> list[str]:
@@ -1528,6 +1485,7 @@ def _carry_forward_sections(previous: dict, manifest: dict) -> None:
         print_note(f"Rebuild it with `{rebuild}`.")
 
 
+@inquirerpy_wizard
 def setup_command(
     from_file: str | None = None,
     *,
@@ -1555,25 +1513,45 @@ def setup_command(
     # would be circular.
     from ucode.cli import _prompt_for_configuration, configure_shared_state
 
-    print_section("ucode setup")
-    print_note("Choose the coding agents and models for this workspace's managed config.")
-    print_note("Developers pull it automatically when they run ucode.")
+    print_wizard_header(
+        "ucode setup",
+        "Workspace-wide agent and model defaults · developers get updates automatically",
+    )
 
+    _step_banner(1, SETUP_STEP_TITLES[0])
     if workspace is None:
-        workspace, profile = _prompt_for_configuration()
+        workspace, profile = _prompt_for_configuration(show_section=False, prompt="Workspace:")
+    else:
+        print_note(f"Using {workspace}")
     # `configure_shared_state` below authenticates too and prints its own success line, so this one
     # stays quiet rather than reporting the same thing twice. It still has to run first: the admin
     # gate and the existing-config check both need a token before discovery.
     ensure_databricks_auth(workspace, profile, quiet=True)
     token = get_databricks_token(workspace, profile)
 
-    _require_admin(workspace, token)
+    admin_verified = _require_admin(workspace, token, quiet=True)
+    with spinner("Verifying Unity AI Gateway..."):
+        ensure_ai_gateway(workspace, token)
+    if admin_verified:
+        print_success("Workspace checks complete")
+    else:
+        print_warning(
+            "Workspace checks incomplete (2/3) — authentication · Unity AI Gateway; "
+            "permissions unverified"
+        )
+
     keep_going, published = _handle_existing_config(workspace, token)
     if not keep_going:
+        print_wizard_outro("Setup complete")
         return 0
 
     # Discover the workspace's models and gateway URLs. This also logs in and persists local state.
-    state = configure_shared_state(workspace, profile=profile, force_login=False)
+    state = configure_shared_state(
+        workspace,
+        profile=profile,
+        force_login=False,
+        connection_checks_verified=True,
+    )
     workspace = state.get("workspace") or workspace
     profile = state.get("profile") or profile
 
@@ -1595,47 +1573,38 @@ def setup_command(
     previously_enabled = [
         tool for tool in (previous.get("enabled_agents") or {}) if tool in available
     ]
-    _step_banner(1, SETUP_STEP_TITLES[0])
+    _step_banner(2, SETUP_STEP_TITLES[1])
     picked = prompt_for_tools(
         [(tool, TOOL_SPECS[tool]["display"]) for tool in available],
         preselected=previously_enabled or None,
+        prompt="Coding agents:",
     )
     if not picked:
         print_note("No coding agents selected — nothing to configure.")
+        print_wizard_outro("No changes")
         return 0
 
-    _step_banner(2, SETUP_STEP_TITLES[1])
+    _step_banner(3, SETUP_STEP_TITLES[2])
     enabled_agents: dict[str, dict] = {}
-    for index, tool in enumerate(picked, start=1):
-        print_heading(f"{TOOL_SPECS[tool]['display']}  ({index} of {len(picked)})")
+    for tool in picked:
+        print_heading(f"Configure {TOOL_SPECS[tool]['display']}")
         provider_service = _select_provider_service(tool, workspace, token)
         # Always set: `_prompt_models_for_agent` re-prompts rather than returning empty, so every
         # enabled agent carries a default_model and any of them can be the default_agent.
         agent_config: dict = {
             "model_config": _prompt_models_for_agent(tool, state, provider_service)
         }
-        # Only claude and codex have an OS-level managed settings file that a bare `claude`/`codex`
-        # reads (`/etc/claude-code/managed-settings.json`, `/etc/codex/managed_config.toml`); the
-        # other agents don't, so we don't offer them the choice.
-        if tool in GLOBAL_SETTINGS_AGENTS:
-            binary = TOOL_SPECS[tool]["binary"]
-            agent_config["use_as_global_settings"] = prompt_yes_no_default(
-                f"Route `{binary}` through the gateway too, not just `ucode {binary}`? "
-                f"(writes {GLOBAL_SETTINGS_FILES[tool]}, needs sudo once)",
-                default=False,
-            )
         enabled_agents[tool] = agent_config
         _confirm_agent(tool, agent_config)
 
     # Pick the default after configuring each agent, not before: by now the admin has seen every
     # agent's models go by, so "which is the default?" is a choice among things they've just set up
-    # rather than a bare list up front. The recap reprints those picks so the choice is informed.
-    _step_banner(3, SETUP_STEP_TITLES[2])
+    # rather than a bare list up front.
+    _step_banner(4, SETUP_STEP_TITLES[3])
     default_agent = picked[0]
     if len(picked) > 1:
-        _selected_recap(workspace, enabled_agents, default_agent=None)
         chosen = prompt_for_selection(
-            "Which coding agent should be the default?",
+            "Default agent:",
             [(tool, TOOL_SPECS[tool]["display"]) for tool in picked],
         )
         if not chosen:
@@ -1658,12 +1627,13 @@ def setup_command(
         print_err("The generated config is not valid:")
         for error in errors:
             print_note(error)
+        print_wizard_outro("Configuration could not be created", kind="error")
         return 1
 
     save_managed_state(workspace, manifest)
+    print_wizard_outro("Setup complete")
+    print_success("Configuration saved")
     _render_summary(workspace, manifest)
-    console.print()
-    print_success("Saved to ~/.ucode/managed-state.json")
     _print_next_steps(manifest)
     _offer_apply()
     return 0
@@ -1731,7 +1701,7 @@ def _save_section_update(workspace: str, manifest: dict) -> int:
     save_managed_state(workspace, manifest)
     _render_summary(workspace, manifest)
     console.print()
-    print_success("Saved to ~/.ucode/managed-state.json")
+    print_success("Configuration saved")
     _print_next_steps(manifest)
     _offer_apply()
     return 0
@@ -1849,8 +1819,8 @@ def setup_help_command() -> int:
     """Walk through the whole managed-config setup, marking what this machine has authored.
 
     Hand-written rather than left to `--help`: the point is the *order* of the commands and the fact
-    that nothing reaches developers until `ucode apply`, neither of which a flag listing conveys.
-    Reads the manifest but never authenticates, so it works before `ucode configure`.
+    that nothing reaches developers until a workspace apply, neither of which a flag listing
+    conveys. Reads the manifest but never authenticates, so it works before `ucode configure`.
     """
     print_section("ucode setup")
     print_note(
@@ -1903,7 +1873,7 @@ def setup_help_command() -> int:
         )
     )
     print_note(
-        f"The draft lives in ~/.ucode/managed-state.json (workspace: {workspace or 'none'})."
+        f"The draft is saved at ~/.ucode/managed-state.json (workspace: {workspace or 'none'})."
     )
     print_note(
         "Re-running `ucode setup` keeps the sections in step 2; to drop one, edit the draft and "
@@ -2023,7 +1993,7 @@ def apply_command(*, yes: bool = False) -> int:
         print_err("The authored config is not valid, so it was not published:")
         for error in errors:
             print_note(error)
-        print_note("Re-run `ucode setup` to fix it, or edit ~/.ucode/managed-state.json.")
+        print_note("Re-run `ucode setup` to fix it, or edit the local managed configuration.")
         return 1
 
     token = get_databricks_token(workspace, profile)

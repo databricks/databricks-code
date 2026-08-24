@@ -279,9 +279,9 @@ def _maybe_offer_admin_setup(workspace: str, profile: str | None) -> None:
     if not is_admin:
         return
     print_note(
-        "✨ New: run `ucode setup` to publish a managed config to a workspace — set agents, models, mcps "
-        "and skills once, and every developer inherits them when running `ucode`. This scales "
-        "delivery of coding agents to all developers without each one setting up ucode themselves."
+        "✨ New: run `ucode setup` to publish a managed config to a workspace — set agents, models, "
+        "MCP servers, and skills once, and every developer inherits them when running `ucode`. "
+        "This scales delivery of coding agents without each developer setting up ucode themselves."
     )
 
 
@@ -307,14 +307,19 @@ def _print_discovery_diagnostics(state: dict) -> None:
     print_note("Re-run with `UCODE_DEBUG=1` to log raw discovery responses to ~/.ucode/debug.log.")
 
 
-def _prompt_for_configuration(tool: str | None = None) -> tuple[str, str | None]:
+def _prompt_for_configuration(
+    tool: str | None = None,
+    *,
+    show_section: bool = True,
+    prompt: str = "Select workspace:",
+) -> tuple[str, str | None]:
     if tool is None:
         desc = "Configure your Databricks workspace"
     else:
         desc = f"Configure {TOOL_SPECS[tool]['display']} to use your Databricks endpoint."
     with spinner("Loading Databricks workspaces and profiles..."):
         profiles = get_databricks_profiles()
-    return prompt_for_workspace(desc, profiles)
+    return prompt_for_workspace(desc, profiles, show_section=show_section, prompt=prompt)
 
 
 def _parse_agents_option(agents: str) -> list[str]:
@@ -425,6 +430,7 @@ def configure_shared_state(
     use_pat: bool | None = None,
     skip_model_discovery: bool = False,
     skip_preflight: bool = False,
+    connection_checks_verified: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
 ) -> dict:
@@ -446,6 +452,9 @@ def configure_shared_state(
     in ``_launch_tool``) and the gateway was verified by that earlier configure.
     Only the local profile resolution and the shared state assembly still run;
     the saved model lists are preserved.
+    ``connection_checks_verified`` skips only the auth and AI Gateway probes while still running
+    model discovery. This is for callers such as ``ucode setup`` that perform those checks earlier
+    in their own ordered UI; it prevents duplicate network calls and success messages.
     ``fable_enabled`` opts the premium Claude Fable family into Claude Code's
     ``ANTHROPIC_DEFAULT_FABLE_MODEL`` pin (default off). ``None`` means "inherit":
     a launch re-run keeps whatever the workspace was configured with; ``True``/
@@ -534,21 +543,27 @@ def configure_shared_state(
         # empty one as absent, so it never shadows the PAT. Pass the validated
         # token to avoid re-reading ~/.databrickscfg.
         ensure_pat_bearer(profile, pat)
-        ensure_databricks_auth(workspace, profile)
-    elif force_login:
-        run_databricks_login(workspace, profile)
-    else:
-        ensure_databricks_auth(workspace, profile)
+        if not connection_checks_verified:
+            ensure_databricks_auth(workspace, profile)
+    elif not connection_checks_verified:
+        if force_login:
+            run_databricks_login(workspace, profile)
+        else:
+            ensure_databricks_auth(workspace, profile)
     # After login the profile exists in ~/.databrickscfg, so a host->profile
     # lookup is reliable even when it returned nothing above.
     if profile is None:
         profile = find_profile_name_for_host(workspace)
         if profile:
             state["profile"] = profile
-    with spinner("Verifying Unity AI Gateway..."):
-        token = get_databricks_token(workspace, profile)
-        ensure_ai_gateway(workspace, token)
-    print_success("Unity AI Gateway detected")
+    # Discovery always needs a bearer token. ``connection_checks_verified`` means the caller
+    # already performed the visible auth and gateway probes; it does not mean this function can
+    # skip obtaining the token used by the model-list APIs below.
+    token = get_databricks_token(workspace, profile)
+    if not connection_checks_verified:
+        with spinner("Verifying Unity AI Gateway..."):
+            ensure_ai_gateway(workspace, token)
+        print_success("Unity AI Gateway detected")
 
     want_claude = (
         fetch_all or "claude" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools
@@ -917,7 +932,6 @@ def status() -> int:
     profile = state.get("profile")
     if profile:
         print_kv("CLI profile", profile)
-
     print_heading("Coding Agents")
     for tool, spec in TOOL_SPECS.items():
         configured = tool in configured_tools

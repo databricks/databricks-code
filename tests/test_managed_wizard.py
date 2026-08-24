@@ -272,7 +272,7 @@ class TestExistingConfigHandling:
         ):
             wizard._handle_existing_config(WORKSPACE, "token")
         message = warn.call_args[0][0]
-        assert "one config covers every agent" in message
+        assert message == "This workspace already has a managed config."
         for leaked in ("Claude Code", "OpenCode", "lillys_budget", "main.default"):
             assert leaked not in message, leaked
 
@@ -332,6 +332,96 @@ class TestExistingConfigHandling:
             pytest.raises(KeyboardInterrupt),
         ):
             wizard._handle_existing_config(WORKSPACE, "token")
+
+
+class TestSetupStepLayout:
+    def test_workspace_is_the_first_of_four_steps(self):
+        assert wizard.SETUP_STEP_TITLES == [
+            "Select the workspace",
+            "Select coding agents",
+            "Select models for each agent",
+            "Select the default agent",
+        ]
+
+    def test_workspace_picker_uses_the_first_step_banner(self):
+        steps: list[tuple[int, str]] = []
+        successes: list[str] = []
+        with (
+            patch("ucode.cli._prompt_for_configuration", return_value=(WORKSPACE, "p")) as pick_ws,
+            patch(
+                "ucode.cli.configure_shared_state", return_value={**STATE, "profile": "p"}
+            ) as configure,
+            patch.object(
+                wizard, "_step_banner", side_effect=lambda i, title: steps.append((i, title))
+            ),
+            patch.object(wizard, "ensure_databricks_auth"),
+            patch.object(wizard, "get_databricks_token", return_value="token"),
+            patch.object(wizard, "_require_admin", return_value=True),
+            patch.object(wizard, "ensure_ai_gateway"),
+            patch.object(wizard, "_handle_existing_config", return_value=(True, None)),
+            patch.object(wizard, "check_gateway_endpoint", return_value=True),
+            patch.object(wizard, "load_managed_state", return_value=None),
+            patch.object(wizard, "prompt_for_tools", return_value=[]) as pick_agents,
+            patch.object(wizard, "print_success", side_effect=successes.append),
+        ):
+            assert wizard.setup_command() == 0
+
+        pick_ws.assert_called_once_with(show_section=False, prompt="Workspace:")
+        assert steps == [(1, "Select the workspace"), (2, "Select coding agents")]
+        assert pick_agents.call_args.kwargs["prompt"] == "Coding agents:"
+        assert successes == ["Workspace checks complete"]
+        assert configure.call_args.kwargs["connection_checks_verified"] is True
+
+    def test_agent_setup_does_not_offer_global_routing(self):
+        completion_order: list[str] = []
+        with (
+            patch("ucode.cli._prompt_for_configuration", return_value=(WORKSPACE, "p")),
+            patch("ucode.cli.configure_shared_state", return_value={**STATE, "profile": "p"}),
+            patch.object(wizard, "ensure_databricks_auth"),
+            patch.object(wizard, "get_databricks_token", return_value="token"),
+            patch.object(wizard, "_require_admin", return_value=True),
+            patch.object(wizard, "ensure_ai_gateway"),
+            patch.object(wizard, "_handle_existing_config", return_value=(True, None)),
+            patch.object(wizard, "check_gateway_endpoint", return_value=True),
+            patch.object(wizard, "load_managed_state", return_value=None),
+            patch.object(wizard, "prompt_for_tools", return_value=["codex"]),
+            patch.object(wizard, "_select_provider_service", return_value=None),
+            patch.object(
+                wizard,
+                "_prompt_models_for_agent",
+                return_value={"default_model": "system.ai.gpt-5-6"},
+            ),
+            patch.object(wizard, "validate_manifest", return_value=[]),
+            patch.object(wizard, "save_managed_state") as save,
+            patch.object(
+                wizard,
+                "_render_summary",
+                side_effect=lambda *_: completion_order.append("summary"),
+            ),
+            patch.object(
+                wizard,
+                "print_wizard_outro",
+                side_effect=lambda *_args, **_kwargs: completion_order.append("outro"),
+            ),
+            patch.object(
+                wizard,
+                "print_success",
+                side_effect=lambda message: (
+                    completion_order.append("saved") if message == "Configuration saved" else None
+                ),
+            ),
+            patch.object(wizard, "_print_next_steps"),
+            patch.object(wizard, "_offer_apply"),
+            patch.object(wizard, "prompt_yes_no_default") as yes_no,
+        ):
+            assert wizard.setup_command() == 0
+
+        yes_no.assert_not_called()
+        manifest = save.call_args.args[1]
+        assert manifest["enabled_agents"]["codex"] == {
+            "model_config": {"default_model": "system.ai.gpt-5-6"}
+        }
+        assert completion_order == ["outro", "saved", "summary"]
 
 
 class TestModelPrompting:
@@ -423,6 +513,7 @@ class TestModelPrompting:
             patch.object(wizard, "_claude_candidates", return_value=candidates),
             patch.object(wizard, "prompt_for_selection", side_effect=fake_sel),
             patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_panel") as panel,
         ):
             config = wizard._prompt_models_for_agent("claude", STATE, None)
 
@@ -430,6 +521,7 @@ class TestModelPrompting:
         # never name a model the config doesn't carry.
         assert set(prompts[-1]) == {"system.ai.claude-opus-5", "system.ai.claude-sonnet-5"}
         assert config["default_model"] in config["models"].values()
+        panel.assert_not_called()
 
     def test_claude_single_slot_skips_the_default_prompt(self):
         candidates = {"opus": ["system.ai.claude-opus-5"]}
@@ -1682,6 +1774,8 @@ class TestSummary:
         }
         wizard._render_summary(WORKSPACE, manifest)
         out = capsys.readouterr().out
+        assert "Complete configuration" in out
+        assert "╭" in out and "╯" in out
         assert "opus" in out and "haiku" in out
         assert "system.ai.claude-haiku-4-5" in out
 
@@ -1712,8 +1806,9 @@ class TestSummary:
         assert "system.ai.gemini-3-flash" in out
         assert "models:" not in out
 
-    def test_scope_label_only_for_global_capable_agents(self, capsys):
-        # claude/codex can use global settings, so they carry the scope; gemini can't, so it doesn't.
+    def test_scope_label_only_for_explicit_legacy_setting(self, capsys):
+        # Imported/older manifests keep their explicit scope visible; newly-authored entries that
+        # omit the retired setup choice do not get an implied "ucode-only" label.
         manifest = {
             "default_agent": "claude",
             "enabled_agents": {
@@ -1722,6 +1817,7 @@ class TestSummary:
                     "use_as_global_settings": True,
                 },
                 "gemini": {"model_config": {"default_model": "system.ai.gemini-3-flash"}},
+                "codex": {"model_config": {"default_model": "system.ai.gpt-5-6"}},
             },
         }
         wizard._render_summary(WORKSPACE, manifest)
@@ -1730,6 +1826,8 @@ class TestSummary:
         # The gemini line names its model but carries no global-settings/ucode-only scope.
         gemini_line = next(line for line in out.splitlines() if "gemini-3-flash" in line)
         assert "ucode-only" not in gemini_line and "global settings" not in gemini_line
+        codex_line = next(line for line in out.splitlines() if "gpt-5-6" in line)
+        assert "ucode-only" not in codex_line and "global settings" not in codex_line
 
 
 class TestSetupFromFile:
@@ -1818,7 +1916,7 @@ class TestSummaryPanel:
             },
         )
         out = capsys.readouterr().out
-        assert "Configuration summary" in out
+        assert "Complete configuration" in out
         # Rich box-drawing characters: the panel border.
         assert "╭" in out and "╰" in out
         assert "system.ai.claude-opus-5" in out
@@ -2588,9 +2686,9 @@ class TestCliWiring:
         command = typer.main.get_command(app).commands["apply"]  # type: ignore[attr-defined]
         declared = {opt for param in command.params for opt in param.opts}
         assert "--yes" in declared
-        assert "--dry-run" not in declared
         assert "--local" not in declared
         assert "--workspace" not in declared
+        assert "--dry-run" not in declared
 
     def test_apply_publishes_the_latest_draft(self):
         with patch.object(cli_mod, "apply_command", return_value=0) as apply:

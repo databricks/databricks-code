@@ -17,16 +17,193 @@ from ucode.ui import (
     format_meter,
     format_token_count,
     format_usd,
+    inquirerpy_wizard,
     normalize_workspace_url,
+    print_success,
+    print_wizard_header,
+    print_wizard_outro,
+    print_wizard_step,
     prompt_for_multi_selection,
     prompt_for_percentage,
     prompt_for_selection,
     prompt_for_text,
+    prompt_for_tools,
     prompt_for_workspace,
     prompt_yes_no_default,
     render_box_table,
     status_badge,
 )
+
+
+class TestWizardLayout:
+    def test_header_is_branded_without_a_box(self, capsys):
+        print_wizard_header("ucode setup", "Managed defaults")
+        print_wizard_outro("Ready")
+        out = capsys.readouterr().out
+        assert "ucode setup" in out
+        assert "Managed defaults" in out
+        assert "┌" in out and "└" in out
+        assert "╭" not in out and "╰" not in out
+
+    def test_steps_form_a_compact_vertical_rail(self, capsys):
+        print_wizard_step(1, 4, "Select the workspace")
+        print_wizard_step(2, 4, "Select coding agents")
+        out = capsys.readouterr().out
+        assert "◇  1/4  Select the workspace" in out
+        assert "◇  2/4  Select coding agents" in out
+        assert "│" in out
+        assert "╭" not in out and "╰" not in out
+
+    def test_status_output_stays_inside_the_rail(self, capsys):
+        @inquirerpy_wizard
+        def render():
+            print_wizard_header("ucode setup", "Managed defaults")
+            print_wizard_step(1, 4, "Select the workspace")
+            print_success("Admin permissions verified")
+            print_wizard_outro("Ready")
+
+        render()
+        status_line = next(line for line in capsys.readouterr().out.splitlines() if "Admin" in line)
+        assert status_line.startswith("│  ✔")
+
+    def test_inquirer_choice_rows_stay_inside_the_rail(self):
+        class FakeControl:
+            def _get_hover_text(self, choice):
+                return [("class:pointer", "❯"), ("", f" {choice}")]
+
+            def _get_normal_text(self, choice):
+                return [("", "  "), ("", str(choice))]
+
+        class FakeQuestion:
+            content_control = FakeControl()
+
+        @inquirerpy_wizard
+        def render():
+            print_wizard_header("ucode setup", "Managed defaults")
+            question = ui_mod._with_inquirer_rail(FakeQuestion())
+            return (
+                question.content_control._get_hover_text("first"),
+                question.content_control._get_normal_text("second"),
+            )
+
+        hover, normal = render()
+        assert "".join(text for _, text in hover) == "│  ❯ first"
+        assert "".join(text for _, text in normal) == "│    second"
+
+
+class TestInquirerPyPrompts:
+    def test_agent_picker_uses_clack_style_controls_and_summary(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_checkbox(**kwargs):
+            captured.update(kwargs)
+            return _StubInquirerPrompt(["codex", "claude"])
+
+        monkeypatch.setattr(ui_mod.inquirer, "checkbox", fake_checkbox)
+
+        @inquirerpy_wizard
+        def run():
+            print_wizard_header("ucode setup", "Managed defaults")
+            result = prompt_for_tools(
+                [("codex", "Codex"), ("claude", "Claude Code"), ("pi", "Pi")],
+                preselected=["codex", "claude"],
+                prompt="Coding agents:",
+            )
+            print_wizard_outro("Ready")
+            return result
+
+        assert run() == ["codex", "claude"]
+        assert captured["qmark"] == "│ "
+        assert captured["enabled_symbol"] == "◉"
+        assert captured["disabled_symbol"] == "○"
+        assert captured["transformer"](["codex", "claude"]) == "Codex, Claude Code"
+
+    def test_short_searchable_picker_has_one_cursor_and_no_blank_filter_row(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_select(**kwargs):
+            captured.update(kwargs)
+            return _StubInquirerPrompt("custom")
+
+        monkeypatch.setattr(ui_mod.inquirer, "select", fake_select)
+        monkeypatch.setattr(
+            ui_mod.inquirer,
+            "fuzzy",
+            lambda **_: pytest.fail("a short picker should not render a fuzzy-search input"),
+        )
+
+        @inquirerpy_wizard
+        def run():
+            return prompt_for_selection(
+                "Default fable model:",
+                [("fable", "system.ai.claude-fable-5"), ("custom", "Enter a custom model…")],
+                searchable=True,
+            )
+
+        assert run() == "custom"
+        assert captured["pointer"] == "❯"
+
+    def test_long_fuzzy_picker_labels_its_filter_row(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_fuzzy(**kwargs):
+            captured.update(kwargs)
+            return _StubInquirerPrompt("m0")
+
+        monkeypatch.setattr(ui_mod.inquirer, "fuzzy", fake_fuzzy)
+
+        @inquirerpy_wizard
+        def run():
+            print_wizard_header("ucode setup", "Managed defaults")
+            result = prompt_for_selection(
+                "Model:", [(f"m{i}", f"model {i}") for i in range(11)], searchable=True
+            )
+            print_wizard_outro("Ready")
+            return result
+
+        assert run() == "m0"
+        assert captured["prompt"] == "│  Filter"
+
+    def test_long_fuzzy_multi_picker_toggles_with_space(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_fuzzy(**kwargs):
+            captured.update(kwargs)
+            return _StubInquirerPrompt(["m0"])
+
+        monkeypatch.setattr(ui_mod.inquirer, "fuzzy", fake_fuzzy)
+
+        @inquirerpy_wizard
+        def run():
+            print_wizard_header("ucode setup", "Managed defaults")
+            result = prompt_for_multi_selection(
+                "Models:", [(f"m{i}", f"model {i}") for i in range(11)], searchable=True
+            )
+            print_wizard_outro("Ready")
+            return result
+
+        assert run() == ["m0"]
+        assert captured["prompt"] == "│  Filter"
+        assert captured["keybindings"] == {"toggle": [{"key": "space"}]}
+
+    def test_confirmation_names_the_default_instead_of_claiming_it_is_highlighted(
+        self, monkeypatch
+    ):
+        captured: dict = {}
+
+        def fake_confirm(**kwargs):
+            captured.update(kwargs)
+            return _StubInquirerPrompt(False)
+
+        monkeypatch.setattr(ui_mod.inquirer, "confirm", fake_confirm)
+
+        @inquirerpy_wizard
+        def run():
+            return prompt_yes_no_default("Publish?", default=False)
+
+        assert run() is False
+        assert captured["instruction"] == "y/N · enter selects No"
+        assert "highlight" not in captured["instruction"]
 
 
 class TestPromptYesNoDefault:
@@ -354,6 +531,14 @@ class _StubQuestion:
         return self._answer
 
 
+class _StubInquirerPrompt:
+    def __init__(self, answer):
+        self._answer = answer
+
+    def execute(self):
+        return self._answer
+
+
 class TestPromptForWorkspace:
     """Capture the choices passed to ``questionary.select`` so we can assert on
     layout (header alignment + duplicate-host preservation) without driving
@@ -396,6 +581,47 @@ class TestPromptForWorkspace:
         assert profiles[1][0] in choices[2].title
         # Final fallback entry still present.
         assert choices[3].title == "Enter a different URL"
+
+    def test_uses_the_standard_section_panel(self, monkeypatch):
+        profiles = [("https://a.cloud.databricks.com", "alpha")]
+        self._capture_select(monkeypatch, answer=profiles[0])
+        with patch.object(ui_mod, "print_section") as section:
+            prompt_for_workspace("Databricks workspace", profiles)
+        section.assert_called_once_with("Databricks workspace")
+
+    def test_larger_wizard_can_supply_its_own_step_banner(self, monkeypatch):
+        profiles = [("https://a.cloud.databricks.com", "alpha")]
+        captured = self._capture_select(monkeypatch, answer=profiles[0])
+        with patch.object(ui_mod, "print_section") as section:
+            prompt_for_workspace("unused", profiles, show_section=False, prompt="Workspace:")
+        section.assert_not_called()
+        assert captured["message"] == "Workspace:"
+
+    def test_inquirerpy_workspace_prompt_inherits_the_wizard_rail(self, monkeypatch):
+        profiles = [("https://a.cloud.databricks.com", "alpha")]
+        captured: dict = {}
+
+        def fake_select(**kwargs):
+            captured.update(kwargs)
+            return _StubInquirerPrompt(profiles[0])
+
+        monkeypatch.setattr(ui_mod.inquirer, "select", fake_select)
+
+        @inquirerpy_wizard
+        def run():
+            print_wizard_header("ucode setup", "Managed defaults")
+            result = prompt_for_workspace(
+                "unused", profiles, show_section=False, prompt="Workspace:"
+            )
+            print_wizard_outro("Ready")
+            return result
+
+        assert run() == profiles[0]
+        assert captured["qmark"] == "│ "
+        assert captured["amark"] == "│ "
+        assert captured["pointer"] == "❯"
+        selected_row = "alpha  https://a.cloud.databricks.com"
+        assert captured["transformer"](selected_row) == selected_row
 
     def test_keeps_duplicate_hosts_as_separate_rows(self, monkeypatch):
         profiles = [

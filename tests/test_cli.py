@@ -1984,6 +1984,33 @@ class TestConfigureSharedStateUsePat:
         assert logins == [(self.WS, "DEFAULT")]
         assert "use_pat" not in state
 
+    def test_verified_connection_skips_duplicate_auth_and_gateway_checks(self, monkeypatch):
+        cli_mod, logins, ensures, _ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        gateway_checks: list[tuple[str, str]] = []
+        token_fetches: list[tuple[str, str | None]] = []
+        monkeypatch.setattr(
+            cli_mod,
+            "get_databricks_token",
+            lambda workspace, profile: token_fetches.append((workspace, profile)) or "token",
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "ensure_ai_gateway",
+            lambda workspace, token: gateway_checks.append((workspace, token)),
+        )
+
+        cli_mod.configure_shared_state(
+            self.WS,
+            profile="DEFAULT",
+            skip_model_discovery=True,
+            connection_checks_verified=True,
+        )
+
+        assert logins == []
+        assert ensures == []
+        assert gateway_checks == []
+        assert token_fetches == [(self.WS, "DEFAULT")]
+
     def test_uc_models_used_without_legacy_fallback(self, monkeypatch):
         # When model-services returns models, they're used and the legacy
         # per-family discovery is never consulted.

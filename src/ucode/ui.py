@@ -9,10 +9,18 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
+from functools import wraps
+from types import MethodType
+from typing import Any, TypedDict
 
 import questionary
+from InquirerPy import inquirer
+from InquirerPy.base.control import Choice as InquirerChoice
+from InquirerPy.separator import Separator as InquirerSeparator
+from InquirerPy.utils import InquirerPyStyle, get_style
 from prompt_toolkit.layout.containers import Window
 from prompt_toolkit.layout.dimension import Dimension
 from questionary.prompts.common import InquirerControl
@@ -23,6 +31,136 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 
 console = Console(highlight=False)
 err_console = Console(stderr=True, highlight=False)
+
+# `ucode setup` opts into InquirerPy while the rest of the CLI stays on Questionary. Context-local
+# state keeps nested helpers on the same backend without threading a presentation flag through every
+# model/provider/budget function, and won't bleed between concurrent callers or tests.
+_prompt_backend: ContextVar[str] = ContextVar("ucode_prompt_backend", default="questionary")
+_wizard_rail_open: ContextVar[bool] = ContextVar("ucode_wizard_rail_open", default=False)
+
+
+def _using_inquirerpy() -> bool:
+    return _prompt_backend.get() == "inquirerpy"
+
+
+def _rail_prefix() -> str:
+    return "[dim]│[/dim]  " if _wizard_rail_open.get() else ""
+
+
+def _print_blank(*, stderr: bool = False) -> None:
+    target = err_console if stderr else console
+    target.print("[dim]│[/dim]" if _wizard_rail_open.get() else "")
+
+
+def inquirerpy_wizard[**P, R](func: Callable[P, R]) -> Callable[P, R]:
+    """Run one wizard on InquirerPy and reset all terminal-layout state afterwards."""
+
+    @wraps(func)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        backend_token = _prompt_backend.set("inquirerpy")
+        rail_token = _wizard_rail_open.set(False)
+        try:
+            return func(*args, **kwargs)
+        except KeyboardInterrupt:
+            if _wizard_rail_open.get():
+                print_wizard_outro("Setup interrupted", kind="warning")
+            raise
+        except Exception:
+            if _wizard_rail_open.get():
+                print_wizard_outro("Setup stopped", kind="error")
+            raise
+        finally:
+            _wizard_rail_open.reset(rail_token)
+            _prompt_backend.reset(backend_token)
+
+    return wrapped
+
+
+_INQUIRER_STYLE = get_style(
+    {
+        "questionmark": "#666666",
+        "answermark": "#666666",
+        "answer": "#00d7d7 bold",
+        "input": "#00d7d7",
+        "question": "bold",
+        "answered_question": "bold",
+        "instruction": "#666666",
+        "long_instruction": "#666666",
+        "pointer": "#00d7d7 bold",
+        "checkbox": "#00d7d7",
+        "separator": "#8a8a8a bold",
+        "marker": "#00d7d7",
+        "fuzzy_prompt": "#00d7d7",
+        "fuzzy_info": "#666666",
+        "fuzzy_match": "#00d7d7 bold",
+    },
+    style_override=False,
+)
+
+
+def _inquirer_marks() -> tuple[str, str]:
+    # InquirerPy inserts one space after the mark. Include one more while the wizard rail is open so
+    # question text aligns with Rich output's ``│  `` gutter.
+    return ("│ ", "│ ") if _wizard_rail_open.get() else ("◇", "◆")
+
+
+class _InquirerCommon(TypedDict):
+    style: InquirerPyStyle
+    qmark: str
+    amark: str
+    raise_keyboard_interrupt: bool
+
+
+def _inquirer_common() -> _InquirerCommon:
+    qmark, amark = _inquirer_marks()
+    return {
+        "style": _INQUIRER_STYLE,
+        "qmark": qmark,
+        "amark": amark,
+        "raise_keyboard_interrupt": True,
+    }
+
+
+def _with_inquirer_rail(question: Any) -> Any:
+    """Prefix every row in an InquirerPy choice list with the wizard's live rail.
+
+    InquirerPy applies ``qmark`` only to the question. Its option window starts back at column zero,
+    which both breaks the vertical rail and makes the highlighted row look less indented than status
+    output. Wrapping the control's two row formatters keeps highlighted, normal, and separator rows
+    under the same ``│  `` gutter without changing their values or key handling.
+
+    Test doubles and non-list prompts have no ``content_control`` and pass through unchanged.
+    """
+    if not _wizard_rail_open.get():
+        return question
+    control = getattr(question, "content_control", None)
+    if control is None:
+        return question
+
+    original_hover = control._get_hover_text
+    original_normal = control._get_normal_text
+
+    def hover(_: Any, choice: Any) -> list[tuple[str, str]]:
+        return [("class:questionmark", "│  "), *original_hover(choice)]
+
+    def normal(_: Any, choice: Any) -> list[tuple[str, str]]:
+        return [("class:questionmark", "│  "), *original_normal(choice)]
+
+    control._get_hover_text = MethodType(hover, control)
+    control._get_normal_text = MethodType(normal, control)
+    return question
+
+
+def _inquirer_filter_prompt() -> str:
+    return "│  Filter" if _wizard_rail_open.get() else "Filter"
+
+
+def _choice_summary(values: list[str], labels: dict[str, str]) -> str:
+    selected = [labels.get(str(value), str(value)) for value in values]
+    if len(selected) <= 3:
+        return ", ".join(selected)
+    return f"{len(selected)} selected"
+
 
 # Past this many options the choice list is pinned to a fixed-height scrolling viewport (see
 # `_cap_choice_viewport`) rather than growing to fill the terminal, and the pickers append a
@@ -91,13 +229,53 @@ def print_section(title: str) -> None:
     console.print(Panel(title, style="bold blue", expand=False))
 
 
-def print_heading(text: str) -> None:
+def print_wizard_header(command: str, description: str) -> None:
+    """Open an interactive flow with compact command branding and a continuous rail.
+
+    A wizard is one continuous composition, so a panel around its name makes the following steps
+    look like separate cards. Styling the command itself gives the flow an identity while leaving
+    the rest of the terminal as one canvas.
+    """
+    head, separator, tail = command.partition(" ")
+    rendered = f"[bold cyan]{escape(head)}[/bold cyan]"
+    if separator:
+        rendered += f" [bold]{escape(tail)}[/bold]"
     console.print()
-    console.print(f"[bold]{text}[/bold]")
+    console.print(f"[bold cyan]┌[/bold cyan]  {rendered}")
+    console.print(f"[dim]│[/dim]  [dim]{escape(description)}[/dim]")
+    _wizard_rail_open.set(True)
+
+
+def print_wizard_step(index: int, total: int, title: str) -> None:
+    """Render one node in a compact vertical stepper.
+
+    The connector is printed immediately before every node after the first. Output and prompts from
+    the previous phase remain between the two nodes, so the rail visually joins the whole flow
+    without requiring a full-screen TUI or redrawing terminal history.
+    """
+    console.print("[dim]│[/dim]")
+    console.print(
+        f"[bold cyan]◇[/bold cyan]  [dim]{index}/{total}[/dim]  [bold]{escape(title)}[/bold]"
+    )
+
+
+def print_wizard_outro(message: str, *, kind: str = "success") -> None:
+    """Close the active wizard rail and return subsequent output to the normal left margin."""
+    if not _wizard_rail_open.get():
+        return
+    color = {"success": "green", "warning": "yellow", "error": "red"}.get(kind, "cyan")
+    console.print("[dim]│[/dim]")
+    console.print(f"[bold {color}]└[/bold {color}]  [bold]{escape(message)}[/bold]")
+    _wizard_rail_open.set(False)
+
+
+def print_heading(text: str) -> None:
+    _print_blank()
+    console.print(f"{_rail_prefix()}[bold]{text}[/bold]")
 
 
 def print_kv(key: str, val: str) -> None:
-    console.print(f"  [bold]{key}:[/bold] [cyan]{val}[/cyan]")
+    console.print(f"{_rail_prefix()}[bold]{key}:[/bold] [cyan]{val}[/cyan]")
 
 
 def kv_line(key: str, val: str) -> str:
@@ -118,6 +296,11 @@ def print_panel(title: str, lines: list[str]) -> None:
     should be read as one unit (a config summary an admin is about to publish) reads as one, rather
     than as loose lines that blend into whatever the flow printed before it.
     """
+    if _wizard_rail_open.get():
+        print_heading(title)
+        for line in lines:
+            console.print(f"{_rail_prefix()}{line}")
+        return
     console.print()
     console.print(Panel("\n".join(lines), title=title, style="blue", expand=False))
 
@@ -129,6 +312,10 @@ def print_warning_panel(message: str, *, title: str = "Warning") -> None:
     dead-end message (e.g. "no budgets exist, nothing to do") the weight to be read before the flow
     exits, rather than scrolling past as one more line.
     """
+    if _wizard_rail_open.get():
+        print_heading(title)
+        console.print(f"{_rail_prefix()}[bold yellow]![/bold yellow] {message}")
+        return
     console.print()
     console.print(
         Panel(f"[bold yellow]![/bold yellow] {message}", title=title, style="yellow", expand=False)
@@ -136,24 +323,24 @@ def print_warning_panel(message: str, *, title: str = "Warning") -> None:
 
 
 def print_note(text: str) -> None:
-    console.print(f"[dim]•[/dim] {text}")
+    console.print(f"{_rail_prefix()}[dim]•[/dim] {text}")
 
 
 def print_success(message: str) -> None:
-    console.print(f"[bold green]✔[/bold green] {message}")
+    console.print(f"{_rail_prefix()}[bold green]✔[/bold green] {message}")
 
 
 def print_warning(message: str) -> None:
-    console.print(f"[bold yellow]![/bold yellow] {message}")
+    console.print(f"{_rail_prefix()}[bold yellow]![/bold yellow] {message}")
 
 
 def print_warning_err(message: str) -> None:
     """``print_warning`` on stderr, for when stdout is a machine-read stream."""
-    err_console.print(f"[bold yellow]![/bold yellow] {message}")
+    err_console.print(f"{_rail_prefix()}[bold yellow]![/bold yellow] {message}")
 
 
 def print_err(message: str) -> None:
-    err_console.print(f"[bold red]ERROR[/bold red] {message}")
+    err_console.print(f"{_rail_prefix()}[bold red]ERROR[/bold red] {message}")
 
 
 def heading(text: str) -> str:
@@ -195,6 +382,9 @@ def spinner(message: str | Callable[[], str]):
         current_message = message
 
     stop_event = threading.Event()
+    # Context variables don't propagate into this animation thread, so capture the wizard gutter
+    # now; otherwise the spinner is the one line that jumps outside an otherwise continuous rail.
+    spinner_prefix = "\033[2m│\033[0m  " if _wizard_rail_open.get() else ""
 
     def spin() -> None:
         for frame in itertools.cycle("|/-\\"):
@@ -202,7 +392,7 @@ def spinner(message: str | Callable[[], str]):
                 break
             # `\033[K` erases to end of line so a shrinking dynamic message
             # doesn't leave stale characters behind.
-            sys.stdout.write(f"\r\033[2m{frame}\033[0m {current_message()}\033[K")
+            sys.stdout.write(f"\r{spinner_prefix}\033[2m{frame}\033[0m {current_message()}\033[K")
             sys.stdout.flush()
             time.sleep(0.1)
         sys.stdout.write("\r\033[K")
@@ -344,65 +534,109 @@ def normalize_workspace_url(workspace: str) -> str:
 def prompt_for_workspace(
     description: str,
     profiles: list[tuple[str, str]] | None = None,
+    *,
+    show_section: bool = True,
+    prompt: str = "Select workspace:",
 ) -> tuple[str, str | None]:
     """Ask the user for a workspace URL, offering profiles as quick-select.
 
     `profiles` is a list of (host_url, profile_name) tuples. Caller fetches
     them — `ui.py` stays Databricks-agnostic. Duplicate hosts (multiple
     profiles pointing at the same workspace) are shown separately; the picker
-    returns the exact (host, profile_name) the user selected. Returns
-    ``(url, profile_name)``; profile_name is ``None`` when the user typed a
-    URL manually.
+    returns the exact (host, profile_name) the user selected. ``show_section=False`` lets a larger
+    wizard supply its own step banner. Returns ``(url, profile_name)``; profile_name is ``None``
+    when the user typed a URL manually.
     """
-    console.print()
-    console.print(Panel(description, title="ucode setup", style="bold blue", expand=False))
+    # Keep section labels visually consistent with every other CLI phase: the label is the panel
+    # body, not a border title. Callers that already printed a larger flow's step banner can suppress
+    # this local section rather than showing two boxes back to back.
+    if show_section:
+        print_section(description)
 
     if profiles:
         name_header = "Profile Name"
         url_header = "Workspace URL"
-        # Clamp so a single very long profile name can't push the URL column
-        # off-screen on an 80-col terminal — questionary doesn't wrap row
-        # titles cleanly, and a wrapped row breaks the picker visually.
+        # Clamp so a single very long profile name can't push the URL column off-screen.
         max_name_width = 40
         name_width = min(
             max_name_width,
             max(len(name_header), *(len(name) for _, name in profiles)),
         )
-        # Match the 2-char cursor gutter so the header line aligns with rows.
         header_title = f"  {name_header.ljust(name_width)}  {url_header}"
-        choices: list[questionary.Choice | questionary.Separator] = [
-            questionary.Separator(header_title)
-        ]
-        for host, profile_name in profiles:
+
+        def profile_row(host: str, profile_name: str) -> str:
             display_name = (
                 profile_name
                 if len(profile_name) <= name_width
                 else profile_name[: name_width - 1] + "…"
             )
-            row_title = f"{display_name.ljust(name_width)}  {host}"
-            # Value carries the full untruncated profile name so downstream
-            # `--profile` calls always use the real name, not the display form.
-            choices.append(questionary.Choice(title=row_title, value=(host, profile_name)))
-        choices.append(questionary.Choice(title="Enter a different URL", value=None))
-        style = questionary.Style(
-            [
-                ("highlighted", "fg:cyan bold"),
-                ("pointer", "fg:cyan bold"),
-                ("answer", "fg:cyan"),
-                ("separator", "fg:white bold"),
+            return f"{display_name.ljust(name_width)}  {host}"
+
+        if _using_inquirerpy():
+            inquirer_choices: list[InquirerChoice | InquirerSeparator] = [
+                InquirerSeparator(header_title),
+                *[
+                    InquirerChoice(value=(host, profile_name), name=profile_row(host, profile_name))
+                    for host, profile_name in profiles
+                ],
+                InquirerChoice(value=None, name="Enter a different URL"),
             ]
-        )
-        choice = questionary.select(
-            "Select workspace:", choices=choices, style=style, pointer="›", qmark=""
-        ).ask()
+
+            def workspace_summary(answer: object) -> str:
+                # InquirerPy passes the selected row's display name to transformers, not its raw
+                # value. A tuple check therefore mislabeled every completed profile selection as
+                # "Enter a different URL". Preserve the actual profile-and-workspace display row.
+                return str(answer)
+
+            question = inquirer.select(
+                message=prompt,
+                choices=inquirer_choices,
+                pointer="❯",
+                instruction="↑↓ move · enter select",
+                transformer=workspace_summary,
+                max_height=_SCROLL_HINT_THRESHOLD,
+                **_inquirer_common(),
+            )
+            choice = _with_inquirer_rail(question).execute()
+        else:
+            choices: list[questionary.Choice | questionary.Separator] = [
+                questionary.Separator(header_title),
+                *[
+                    questionary.Choice(
+                        title=profile_row(host, profile_name), value=(host, profile_name)
+                    )
+                    for host, profile_name in profiles
+                ],
+                questionary.Choice(title="Enter a different URL", value=None),
+            ]
+            style = questionary.Style(
+                [
+                    ("highlighted", "fg:cyan bold"),
+                    ("pointer", "fg:cyan bold"),
+                    ("answer", "fg:cyan"),
+                    ("separator", "fg:white bold"),
+                ]
+            )
+            choice = questionary.select(
+                prompt, choices=choices, style=style, pointer="›", qmark=""
+            ).ask()
         if isinstance(choice, tuple):
             host, profile_name = choice
             return normalize_workspace_url(host), profile_name
 
     while True:
-        raw_value = console.input(f"  [bold]Workspace URL[/bold] {muted('›')} ").strip()
+        if _using_inquirerpy():
+            raw_value = inquirer.text(
+                message=prompt,
+                validate=lambda value: bool(str(value).strip()),
+                invalid_message="Enter a workspace URL",
+                mandatory=True,
+                **_inquirer_common(),
+            ).execute()
+        else:
+            raw_value = console.input(f"  [bold]Workspace URL[/bold] {muted('›')} ").strip()
         try:
-            return normalize_workspace_url(raw_value), None
+            return normalize_workspace_url(str(raw_value)), None
         except ValueError as exc:
             print_err(str(exc))
 
@@ -420,6 +654,32 @@ def prompt_for_tools(
     agents an existing managed config already enables). Returns [] if the user
     submits an empty selection.
     """
+    preselected_set = {str(item) for item in preselected} if preselected is not None else None
+    if _using_inquirerpy():
+        labels = dict(available)
+        choices = [
+            InquirerChoice(
+                value=tool_id,
+                name=display,
+                enabled=(preselected_set is None or tool_id in preselected_set),
+            )
+            for tool_id, display in available
+        ]
+        question = inquirer.checkbox(
+            message=prompt,
+            choices=choices,
+            pointer="❯",
+            enabled_symbol="◉",
+            disabled_symbol="○",
+            instruction="↑↓ move · space toggle · enter confirm",
+            transformer=lambda values: _choice_summary(values, labels),
+            max_height=_SCROLL_HINT_THRESHOLD,
+            mandatory=False,
+            **_inquirer_common(),
+        )
+        answer = _with_inquirer_rail(question).execute()
+        return list(answer or [])
+
     style = questionary.Style(
         [
             # Theme-agnostic picker: every row renders in the terminal's
@@ -432,7 +692,6 @@ def prompt_for_tools(
             ("answer", "fg:cyan"),
         ]
     )
-    preselected_set = {str(item) for item in preselected} if preselected is not None else None
     choices = [
         questionary.Choice(
             title=display,
@@ -470,6 +729,52 @@ def prompt_for_multi_selection(
     ``searchable`` lets the user narrow a long list by typing; see
     :func:`prompt_for_selection` for why it trades away j/k navigation.
     """
+    preselected_set = {str(item) for item in preselected} if preselected is not None else set()
+    if _using_inquirerpy():
+        labels = dict(options)
+        choices = [
+            InquirerChoice(
+                value=value,
+                name=option_label,
+                enabled=value in preselected_set,
+            )
+            for value, option_label in options
+        ]
+        # Fuzzy search owns a separate input row. On a short list that row looks like a blank first
+        # choice with a second cursor, so reserve it for lists long enough to benefit from filtering.
+        if searchable and len(options) > _SCROLL_HINT_THRESHOLD:
+            question = inquirer.fuzzy(
+                message=prompt,
+                choices=choices,
+                pointer="❯",
+                transformer=lambda values: _choice_summary(values, labels),
+                max_height=_SCROLL_HINT_THRESHOLD,
+                mandatory=False,
+                multiselect=True,
+                prompt=_inquirer_filter_prompt(),
+                marker="◉",
+                marker_pl="○",
+                info=False,
+                instruction="type filter · space toggle · enter confirm",
+                keybindings={"toggle": [{"key": "space"}]},
+                **_inquirer_common(),
+            )
+        else:
+            question = inquirer.checkbox(
+                message=prompt,
+                choices=choices,
+                pointer="❯",
+                transformer=lambda values: _choice_summary(values, labels),
+                max_height=_SCROLL_HINT_THRESHOLD,
+                mandatory=False,
+                enabled_symbol="◉",
+                disabled_symbol="○",
+                instruction="↑↓ move · space toggle · enter confirm",
+                **_inquirer_common(),
+            )
+        answer = _with_inquirer_rail(question).execute()
+        return None if answer is None else list(answer)
+
     style = questionary.Style(
         [
             ("pointer", "fg:cyan bold"),
@@ -478,7 +783,6 @@ def prompt_for_multi_selection(
             ("answer", "fg:cyan"),
         ]
     )
-    preselected_set = {str(item) for item in preselected} if preselected is not None else set()
     choices = [
         questionary.Choice(title=option_label, value=value, checked=value in preselected_set)
         for value, option_label in options
@@ -524,6 +828,18 @@ def prompt_for_text(
     word-like default vanished from the prompt entirely — numeric ones like ``[80]`` are not valid
     tags and survived, which is why this looked fine wherever it was checked.
     """
+    if _using_inquirerpy():
+        answer = inquirer.text(
+            message=prompt,
+            default=default or "",
+            instruction="enter to accept current value" if default else "",
+            validate=lambda value: bool(str(value).strip()),
+            invalid_message="Enter a value",
+            mandatory=True,
+            **_inquirer_common(),
+        ).execute()
+        return str(answer).strip() if answer is not None else default
+
     hint = f" {escape(f'[{default}]')} (enter to accept)" if default else ""
     while True:
         try:
@@ -553,6 +869,28 @@ def prompt_for_percentage(prompt: str, *, default: float | None = None) -> float
 
     Raises ``KeyboardInterrupt`` on closed stdin when there is no default — see the handler below.
     """
+    if _using_inquirerpy():
+        default_percent = f"{default * 100:g}" if default is not None else ""
+
+        def valid_percentage(value: str) -> bool:
+            try:
+                percent = float(str(value).rstrip("%"))
+            except ValueError:
+                return False
+            return 0 <= percent <= 100
+
+        answer = inquirer.text(
+            message=prompt,
+            default=default_percent,
+            instruction="0–100",
+            validate=valid_percentage,
+            invalid_message="Enter a number between 0 and 100",
+            transformer=lambda value: f"{float(str(value).rstrip('%')):g}%",
+            mandatory=True,
+            **_inquirer_common(),
+        ).execute()
+        return float(str(answer).rstrip("%")) / 100
+
     hint = f" {escape(f'[{default * 100:g}]')} (enter to accept)" if default is not None else ""
     while True:
         try:
@@ -589,6 +927,37 @@ def prompt_for_selection(
     rejects both at once, since j and k are also search characters — so it is opt-in for the pickers
     that are actually long (model and budget lists), leaving short ones on plain arrow keys.
     """
+    if _using_inquirerpy():
+        labels = dict(options)
+        choices = [
+            InquirerChoice(value=value, name=option_label) for value, option_label in options
+        ]
+        # InquirerPy's fuzzy control always adds a search-input row. Use it only when the list
+        # actually needs filtering; otherwise that empty row reads as a duplicate selection cursor.
+        if searchable and len(options) > _SCROLL_HINT_THRESHOLD:
+            question = inquirer.fuzzy(
+                message=prompt,
+                choices=choices,
+                pointer="❯",
+                transformer=lambda selected: labels.get(str(selected), str(selected)),
+                max_height=_SCROLL_HINT_THRESHOLD,
+                prompt=_inquirer_filter_prompt(),
+                info=False,
+                instruction="type filter · ↑↓ move · enter select",
+                **_inquirer_common(),
+            )
+        else:
+            question = inquirer.select(
+                message=prompt,
+                choices=choices,
+                pointer="❯",
+                transformer=lambda selected: labels.get(str(selected), str(selected)),
+                max_height=_SCROLL_HINT_THRESHOLD,
+                instruction="↑↓ move · enter select",
+                **_inquirer_common(),
+            )
+        return _with_inquirer_rail(question).execute()
+
     style = questionary.Style(
         [
             ("pointer", "fg:cyan bold"),
@@ -627,6 +996,19 @@ def prompt_yes_no(prompt: str) -> bool:
 
 def prompt_yes_no_default(prompt: str, *, default: bool) -> bool:
     """Empty answer or closed stdin (EOF) takes ``default`` (no abort on piped runs)."""
+    if _using_inquirerpy():
+        default_label = "Yes" if default else "No"
+        keys = "Y/n" if default else "y/N"
+        return bool(
+            inquirer.confirm(
+                message=prompt,
+                default=default,
+                instruction=f"{keys} · enter selects {default_label}",
+                transformer=lambda answer: "Yes" if answer else "No",
+                **_inquirer_common(),
+            ).execute()
+        )
+
     hint = "(Y/n)" if default else "(y/N)"
     while True:
         try:

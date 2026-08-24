@@ -18,6 +18,9 @@ dependencies = [
   # transitively by mcp itself); `ucode.mcp_proxy` selects whichever the
   # installed SDK uses at runtime, so no direct httpx2 dependency is declared.
   "httpx>=0.27.1",
+  # Polished searchable/selectable prompts for the managed-config setup wizard. Questionary remains
+  # in use for the specialized MCP pickers, whose custom viewport and toolbar depend on its API.
+  "InquirerPy>=0.3.4",
   # `ucode mcp-proxy` bridges a client's stdio MCP transport to a Databricks
   # streamable-HTTP MCP endpoint, injecting a freshly-minted OAuth bearer per
   # request, via the SDK's stdio server + streamable-HTTP client. Works against
