@@ -12,6 +12,7 @@ import ucode.usage as usage_mod
 from ucode.databricks import SqlWarehouse
 from ucode.ui import label, value
 from ucode.usage import (
+    TOOL_MODEL_TABLE_HEADERS,
     USAGE_BREAKDOWN_DAYS,
     USAGE_SUMMARY_DAYS,
     ModelPrice,
@@ -464,6 +465,9 @@ class TestBuildToolModelRows:
         records = [self._records()[1]]  # only the unpriced mystery-model
         _, totals = build_tool_model_rows(records, "claude", self._lookup())
         assert totals.cost is None
+
+    def test_cost_header_is_explicitly_estimated(self):
+        assert TOOL_MODEL_TABLE_HEADERS[-1] == "Est. Cost (USD)"
 
 
 class TestRenderBudgetLines:
