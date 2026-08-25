@@ -1,5 +1,3 @@
-"""Tests for the experimental ENABLE_SMART_ROUTING_V2 Codex launch path."""
-
 from __future__ import annotations
 
 import json
@@ -31,7 +29,6 @@ class TestGenerateV2Home:
         assert doc["model"] == "gpt-5.6-luna"
         provider = doc["model_providers"][codex.CODEX_MODEL_PROVIDER_NAME]
         assert provider["base_url"].endswith("/ai-gateway/codex/v1")
-        # Self-refreshing auth command is preserved (app-server rejects --profile).
         assert provider["auth"]["command"].endswith("ucode")
         assert "myprof" in provider["auth"]["args"]
 
@@ -143,8 +140,6 @@ def test_interposer_startup_failure_is_propagated(monkeypatch):
 
 
 class TestInterposerSession:
-    """The interposer's hold-then-switch + settings-injection logic (the novel behavior)."""
-
     def _turn_start(self, model: str, thread_id: str = "t1") -> str:
         return json.dumps(
             {
@@ -192,15 +187,12 @@ class TestInterposerSession:
         )
         sess.on_tui_frame(self._turn_start("luna"))
         injected = sess.on_engine_frame(self._turn_started("turn-1"))
-        # The note is a full agentMessage lifecycle: item/started THEN item/completed,
-        # both carrying the same item (a lone item/completed renders nothing in the TUI).
         started = next(m for m in injected if m["method"] == codex_interposer.ITEM_STARTED)
         completed = next(m for m in injected if m["method"] == codex_interposer.ITEM_COMPLETED)
         assert started["params"]["turnId"] == "turn-1"
         assert completed["params"]["turnId"] == "turn-1"
         for frame in (started, completed):
             item = frame["params"]["item"]
-            # An agentMessage renders as plain chat text, not a yellow warning banner.
             assert item["type"] == "agentMessage"
             assert item["text"] == "selected glm-5-2 because X"
         assert started["params"]["item"]["id"] == completed["params"]["item"]["id"]

@@ -1,32 +1,3 @@
-"""WebSocket interposer for the Codex TUI's ``--remote`` transport (smart routing v2).
-
-Codex's remote transport (``codex --remote ws://…``) is WebSocket: a plain-JSONL
-client is rejected with HTTP 400 ("Connection header did not include 'upgrade'"),
-a proper upgrade returns 101, and each JSON-RPC message is one WebSocket text
-frame. This module sits between the real TUI and a real ``codex app-server``,
-forwarding every frame untouched except:
-
-  - ``turn/start`` (TUI->engine): its ``model`` is rewritten.
-    ``turn/start.model`` is documented as "override the model for this turn and
-    subsequent turns", so the live session retargets with history preserved.
-  - When the first switched turn starts — on that turn's ``turn/started``, before
-    any response items stream — two things are injected (engine->TUI): a
-    ``thread/settings/updated`` carrying the new model, so the TUI's on-screen
-    model indicator follows the switch, and — when a ``switch_message`` is
-    configured — an ``agentMessage`` item (as an ``item/started`` + ``item/completed``
-    pair) that surfaces an explanation of why the model was switched, ahead
-    of the model's reply. An ``agentMessage`` renders as ordinary chat text (no
-    warning styling); Codex's protocol has no neutral free-text notification
-    (``warning``, ``configWarning``, ``deprecationNotice`` all render as warnings),
-    so an item is the way to show an informational note. The ``item/started`` is
-    required: the TUI creates the message widget on ``item/started``, so a lone
-    ``item/completed`` has no widget to finalize and renders nothing.
-
-``ucode.smart_routing.v2`` runs :func:`start_interposer_thread` in a daemon
-thread while it owns the app-server subprocess and the ``codex --remote`` TUI,
-so the whole thing launches from the single ``ucode codex`` command.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -49,8 +20,6 @@ TURN_STARTED = "turn/started"
 
 
 class _Session:
-    """Per-TUI-connection state for switching the model once."""
-
     def __init__(
         self,
         target_model: str,
@@ -66,7 +35,6 @@ class _Session:
         self.injected = False
 
     def on_tui_frame(self, raw: str) -> str:
-        """TUI->engine: rewrite ``turn/start.model`` to the selected model."""
         try:
             msg = json.loads(raw)
         except ValueError:
@@ -86,15 +54,6 @@ class _Session:
         return raw
 
     def on_engine_frame(self, raw: str) -> list[dict]:
-        """engine->TUI: capture thread id/settings; when the first switched turn
-        starts, return the frames to inject (empty list = none).
-
-        On the switched turn's ``turn/started`` — before its response streams —
-        this yields a ``thread/settings/updated`` (flips the TUI's model chip)
-        and, when ``switch_message`` is set, an ``item/started`` +
-        ``item/completed`` pair carrying an ``agentMessage`` — plain chat text
-        (no warning styling) that explains why the model changed, shown ahead of
-        the model's reply."""
         try:
             msg = json.loads(raw)
         except ValueError:
@@ -140,9 +99,7 @@ class _Session:
                     "memoryCitation": None,
                 }
                 self.log(f"[INJECT] agentMessage note (started+completed): {self.switch_message!r}")
-                # The TUI creates the message widget on item/started; a lone item/completed
-                # has no widget to finalize and renders nothing. Send the full lifecycle with
-                # the text already populated (no deltas needed for a static note).
+                # Codex renders the message only when it receives both lifecycle events.
                 injected.append(
                     {
                         "method": ITEM_STARTED,
@@ -213,7 +170,7 @@ async def _serve(
     async def handler(tui):
         try:
             await _handle_tui(tui, upstream_uri, model, log, switch_message)
-        except Exception as exc:  # noqa: BLE001 - one session must never kill the server
+        except Exception as exc:  # noqa: BLE001
             log(f"[ERR] session: {exc!r}")
 
     server = await serve(handler, host, port, max_size=None)
@@ -231,14 +188,6 @@ def start_interposer_thread(
     log_path: Path | None = None,
     ready_timeout: float = 10.0,
 ) -> tuple[int, Callable[[], None]]:
-    """Run the interposer's asyncio server in a daemon thread.
-
-    Binds an OS-assigned loopback port and returns ``(port, stop)``. ``stop()``
-    shuts the server down and joins its thread. ``switch_message``, when set, is surfaced as an
-    ``agentMessage`` explaining why the model switched. Logs go to ``log_path`` (appended) when
-    given — never to stdout/stderr, which the foreground TUI owns. Blocks until
-    the server is listening (or ``ready_timeout`` elapses)."""
-
     def log(message: str) -> None:
         if log_path is None:
             return
@@ -260,7 +209,7 @@ def start_interposer_thread(
                 _serve(host, 0, upstream_uri, model, log, switch_message)
             )
             holder["port"] = holder["server"].sockets[0].getsockname()[1]
-        except Exception as exc:  # noqa: BLE001 - surface bind/connect failures to the log
+        except Exception as exc:  # noqa: BLE001
             holder["error"] = exc
             log(f"[ERR] failed to start interposer: {exc!r}")
             ready.set()
@@ -268,7 +217,6 @@ def start_interposer_thread(
             return
         ready.set()
         loop.run_forever()
-        # Stopped: close the server and drain.
         server = holder.get("server")
         if server is not None:
             server.close()

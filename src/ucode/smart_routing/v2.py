@@ -1,11 +1,3 @@
-"""Runtime model-switching launch path for smart routing v2.
-
-Smart routing v2 launches an agent's real TUI against a ucode-run app-server with a
-WebSocket interposer that switches the model mid-session (see e.g.
-``smart_routing.codex_interposer``). The enable flag, launch configuration, and process
-lifecycle live here so agent modules only need to supply their provider overlay.
-"""
-
 from __future__ import annotations
 
 import os
@@ -23,7 +15,6 @@ from ucode.config_io import APP_DIR, deep_merge_dict, read_toml_safe, write_toml
 from ucode.databricks import get_databricks_token
 from ucode.smart_routing import codex_interposer
 
-# Single env var that enables the v2 launch path for every routing-capable agent.
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
 
 CODEX_TARGET_MODEL = "system.ai.glm-5-2"  # TODO(lilly): replace with smart router.
@@ -41,7 +32,6 @@ HEALTH_POLL_INTERVAL_SECONDS = 0.25
 
 
 def enabled() -> bool:
-    """Return whether the smart-routing-v2 launch path is enabled via the env var."""
     return os.environ.get(ENV_VAR) == "1"
 
 
@@ -50,24 +40,22 @@ def _loopback_websocket_url(port: int) -> str:
 
 
 def _free_port() -> int:
-    """Return an available loopback port for the app-server to bind."""
     with socket.socket() as sock:
         sock.bind((LOOPBACK_HOST, 0))
         return sock.getsockname()[1]
 
 
 def _wait_for_app_server(port: int, timeout: float) -> bool:
-    """Poll the app-server's health endpoint until it is ready or times out."""
     url = f"http://{LOOPBACK_HOST}:{port}/healthz"
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         try:
-            with urllib.request.urlopen(  # noqa: S310 - fixed loopback URL
+            with urllib.request.urlopen(  # noqa: S310
                 url, timeout=HEALTH_REQUEST_TIMEOUT_SECONDS
             ) as response:
                 if response.status == 200:
                     return True
-        except Exception:  # noqa: BLE001 - the app-server is not ready yet
+        except Exception:  # noqa: BLE001
             time.sleep(HEALTH_POLL_INTERVAL_SECONDS)
     return False
 
@@ -88,7 +76,6 @@ def _generate_codex_app_server_home(
     model: str,
     render_overlay: Callable[..., dict],
 ) -> Path:
-    """Write the isolated CODEX_HOME used by the ucode-run app-server."""
     CODEX_APP_SERVER_HOME.mkdir(parents=True, exist_ok=True)
     config_path = CODEX_APP_SERVER_HOME / "config.toml"
     overlay = render_overlay(
@@ -111,7 +98,6 @@ def launch_codex(
     start_model: str | None,
     render_overlay: Callable[..., dict],
 ) -> NoReturn:
-    """Launch the Codex app-server, interposer, and remote TUI as one lifecycle."""
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError(
@@ -148,7 +134,6 @@ def launch_codex(
             log_path=CODEX_INTERPOSER_LOG,
         )
         tui_url = _loopback_websocket_url(tui_port)
-        # Keep ucode alive while the TUI runs so it can tear down the app-server and interposer.
         tui = subprocess.Popen([binary, "--remote", tui_url, "--model", start_model, *tool_args])
         try:
             returncode = tui.wait()
@@ -161,6 +146,6 @@ def launch_codex(
         app_server.terminate()
         try:
             app_server.wait(timeout=PROCESS_SHUTDOWN_TIMEOUT_SECONDS)
-        except Exception:  # noqa: BLE001 - the app-server must never linger
+        except Exception:  # noqa: BLE001
             app_server.kill()
     sys.exit(returncode)
