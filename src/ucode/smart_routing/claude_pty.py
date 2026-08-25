@@ -266,10 +266,9 @@ def run_claude_pty(
     route_prompt: Callable[[str], str],
     switch_message: str,
     socket_path: Path,
-    restore_default_model: Callable[[], object],
     log_path: Path | None = None,
 ) -> int:
-    """Run Claude in a PTY, switch its model, restore the default, and replay."""
+    """Run Claude in a PTY, switch its model, and replay the first prompt."""
 
     def log(message: str) -> None:
         if log_path is None:
@@ -388,13 +387,11 @@ def run_claude_pty(
                     and switch_complete is not None
                     and switch_complete.triggered
                 ):
-                    restore_default_model()
                     inject_prompt(master_fd, routed_prompt)
                     phase = "done"
-                    log("[RESTORE] default model restored; first prompt replayed")
+                    log("[REPLAY] first prompt submitted")
                 elif phase == "switching" and now - switch_started >= SWITCH_TIMEOUT_S:
                     os.write(master_fd, b"\x1b")
-                    restore_default_model()
                     inject_note(
                         1,
                         "Smart Routing could not confirm the model switch. "

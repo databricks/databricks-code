@@ -96,7 +96,6 @@ class TestV2Launch:
             captured["settings"] = json.loads(generated.read_text())
             # Simulate `/model` changing the user file, plus an unrelated concurrent edit.
             user_settings.write_text(json.dumps({"model": "routed", "theme": "light", "new": True}))
-            kwargs["restore_default_model"]()
             return 0
 
         monkeypatch.setattr(claude_pty, "run_claude_pty", fake_run)
@@ -166,18 +165,14 @@ capture_path.write_text(json.dumps({
 }))
 """.lstrip()
         )
-        restored: list[bool] = []
-
         result = claude_pty.run_claude_pty(
             [sys.executable, str(fake_claude), str(socket_path), str(capture)],
             route_prompt=lambda _prompt: "system.ai.claude-sonnet-5",
             switch_message="router selected sonnet",
             socket_path=socket_path,
-            restore_default_model=lambda: restored.append(True),
         )
 
         assert result == 0
-        assert restored == [True]
         assert json.loads(capture.read_text()) == {
             "command": "/model system.ai.claude-sonnet-5\r",
             "replayed": "\x1b[200~fix\nthe parser\x1b[201~\r",

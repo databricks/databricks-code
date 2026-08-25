@@ -1177,12 +1177,12 @@ def _launch_smart_routing_v2(
                 "low complexity, unclear intent, and no code reference."
             ),
             socket_path=socket_path,
-            restore_default_model=restore_default_model,
             log_path=SMART_ROUTING_V2_CLAUDE_LOG,
         )
     finally:
-        # The PTY restores immediately after a confirmed switch. This fallback
-        # covers startup failures, timeouts, signals, and normal child exit.
+        # Restore only after Claude exits. Claude persists `/model` asynchronously;
+        # restoring as soon as its success message renders races that delayed write.
+        # The journal repairs hard-killed and concurrent launches before they start.
         restore_default_model()
         settings_path.unlink(missing_ok=True)
         socket_path.unlink(missing_ok=True)
