@@ -423,8 +423,10 @@ def configure_single_tool(tool: str, state: dict, explicit_model: str | None = N
     """Check availability, configure, and persist state for one tool only.
 
     ``explicit_model`` is a caller-requested model (e.g. `ucode copilot --model X` on a
-    first-time configure) that must win over the automatic default pick — otherwise a bad
-    automatic pick can fail the availability/validation check before X is ever tried.
+    first-time configure) that must win over the automatic default pick, so the model written
+    to the config and smoke-tested is X — otherwise a bad automatic pick can fail validation
+    before X is ever tried. The availability check above is model-independent
+    (``check_gateway_endpoint``), so it still gates on discovery finding any model at all.
     """
     provider = get_provider_service(state, tool)
     # A Model Provider Service routes through the same gateway and pins no
