@@ -1927,6 +1927,35 @@ class TestConfigureProfilesFlag:
         mock_cfg.assert_not_called()
 
 
+def _stub_configure_deps(monkeypatch, *, pat_token, existing_state=None):
+    """Stub every external call `configure_shared_state` makes.
+
+    Module-level so the tests for each of its behaviors can share it without one test
+    class reaching into another's helper.
+    """
+    import ucode.cli as cli_mod
+
+    logins: list[tuple] = []
+    ensures: list[tuple] = []
+    saved: list[dict] = []
+    monkeypatch.setattr(cli_mod, "load_state", lambda: dict(existing_state or {}))
+    monkeypatch.setattr(cli_mod, "save_state", lambda s: saved.append(dict(s)))
+    monkeypatch.setattr(cli_mod, "run_databricks_login", lambda w, p: logins.append((w, p)))
+    monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda w, p=None: ensures.append((w, p)))
+    monkeypatch.setattr(cli_mod, "resolve_pat_token", lambda p: pat_token)
+    monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
+    monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
+    monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: None)
+    monkeypatch.setattr(
+        cli_mod, "discover_model_services", lambda w, t, **kw: ({}, [], [], [], None)
+    )
+    monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t, **kw: ({}, None))
+    monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
+    monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+    monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
+    return cli_mod, logins, ensures, saved
+
+
 class TestConfigureSharedStateUsePat:
     """--use-pat reads the profile's PAT from ~/.databrickscfg, exports it as
     DATABRICKS_BEARER, persists the mode, and never opens a browser."""
@@ -1946,36 +1975,10 @@ class TestConfigureSharedStateUsePat:
         else:
             os_mod.environ["DATABRICKS_BEARER"] = original
 
-    @staticmethod
-    def _stub_deps(monkeypatch, *, pat_token, existing_state=None):
-        import ucode.cli as cli_mod
-
-        logins: list[tuple] = []
-        ensures: list[tuple] = []
-        saved: list[dict] = []
-        monkeypatch.setattr(cli_mod, "load_state", lambda: dict(existing_state or {}))
-        monkeypatch.setattr(cli_mod, "save_state", lambda s: saved.append(dict(s)))
-        monkeypatch.setattr(cli_mod, "run_databricks_login", lambda w, p: logins.append((w, p)))
-        monkeypatch.setattr(
-            cli_mod, "ensure_databricks_auth", lambda w, p=None: ensures.append((w, p))
-        )
-        monkeypatch.setattr(cli_mod, "resolve_pat_token", lambda p: pat_token)
-        monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
-        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
-        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: None)
-        monkeypatch.setattr(
-            cli_mod, "discover_model_services", lambda w, t, **kw: ({}, [], [], [], None)
-        )
-        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t, **kw: ({}, None))
-        monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
-        monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
-        monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
-        return cli_mod, logins, ensures, saved
-
     def test_use_pat_exports_bearer_and_skips_login(self, monkeypatch):
         import os as os_mod
 
-        cli_mod, logins, ensures, saved = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        cli_mod, logins, ensures, saved = _stub_configure_deps(monkeypatch, pat_token="dapi-pat")
 
         state = cli_mod.configure_shared_state(
             self.WS, profile="DEFAULT", force_login=True, use_pat=True
@@ -1988,7 +1991,7 @@ class TestConfigureSharedStateUsePat:
         assert saved and saved[-1]["use_pat"] is True
 
     def test_use_pat_without_pat_profile_raises(self, monkeypatch):
-        cli_mod, logins, _, _ = self._stub_deps(monkeypatch, pat_token=None)
+        cli_mod, logins, _, _ = _stub_configure_deps(monkeypatch, pat_token=None)
 
         with pytest.raises(RuntimeError, match="no personal access token"):
             cli_mod.configure_shared_state(
@@ -1997,7 +2000,7 @@ class TestConfigureSharedStateUsePat:
         assert logins == []
 
     def test_use_pat_without_profile_raises(self, monkeypatch):
-        cli_mod, _, _, _ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        cli_mod, _, _, _ = _stub_configure_deps(monkeypatch, pat_token="dapi-pat")
 
         with pytest.raises(RuntimeError, match="requires a Databricks CLI profile"):
             cli_mod.configure_shared_state(self.WS, force_login=True, use_pat=True)
@@ -2005,7 +2008,7 @@ class TestConfigureSharedStateUsePat:
     def test_launch_inherits_persisted_use_pat(self, monkeypatch):
         # A launch re-run passes use_pat=None; the persisted mode for the same
         # workspace must apply so no OAuth login is forced.
-        cli_mod, logins, ensures, _ = self._stub_deps(
+        cli_mod, logins, ensures, _ = _stub_configure_deps(
             monkeypatch,
             pat_token="dapi-pat",
             existing_state={"workspace": self.WS, "profile": "DEFAULT", "use_pat": True},
@@ -2017,7 +2020,7 @@ class TestConfigureSharedStateUsePat:
         assert state["use_pat"] is True
 
     def test_reconfigure_without_flag_clears_use_pat(self, monkeypatch):
-        cli_mod, logins, _, _ = self._stub_deps(
+        cli_mod, logins, _, _ = _stub_configure_deps(
             monkeypatch,
             pat_token="dapi-pat",
             existing_state={"workspace": self.WS, "profile": "DEFAULT", "use_pat": True},
@@ -2033,7 +2036,7 @@ class TestConfigureSharedStateUsePat:
     def test_uc_models_used_without_legacy_fallback(self, monkeypatch):
         # When model-services returns models, they're used and the legacy
         # per-family discovery is never consulted.
-        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        cli_mod, *_ = _stub_configure_deps(monkeypatch, pat_token="dapi-pat")
         monkeypatch.setattr(
             cli_mod,
             "discover_model_services",
@@ -2060,7 +2063,7 @@ class TestConfigureSharedStateUsePat:
         assert "uc_enabled" not in state
 
     def _stub_with_fable(self, monkeypatch):
-        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        cli_mod, *_ = _stub_configure_deps(monkeypatch, pat_token="dapi-pat")
         monkeypatch.setattr(
             cli_mod,
             "discover_model_services",
@@ -2095,7 +2098,7 @@ class TestConfigureSharedStateUsePat:
     def test_launch_inherits_persisted_fable_opt_in(self, monkeypatch):
         # A launch re-run passes fable_enabled=None; the persisted opt-in for the
         # same workspace applies, so fable stays in the discovered bundle.
-        cli_mod, *_ = self._stub_deps(
+        cli_mod, *_ = _stub_configure_deps(
             monkeypatch,
             pat_token="dapi-pat",
             existing_state={"workspace": self.WS, "profile": "DEFAULT", "fable_enabled": True},
@@ -2112,7 +2115,7 @@ class TestConfigureSharedStateUsePat:
         assert state["fable_enabled"] is True
 
     def test_reconfigure_with_disable_fable_clears_opt_in(self, monkeypatch):
-        cli_mod, *_ = self._stub_deps(
+        cli_mod, *_ = _stub_configure_deps(
             monkeypatch,
             pat_token="dapi-pat",
             existing_state={"workspace": self.WS, "profile": "DEFAULT", "fable_enabled": True},
@@ -2129,7 +2132,7 @@ class TestConfigureSharedStateUsePat:
         assert "fable" not in state["claude_models"]
 
     def test_ai_tools_disable_persists(self, monkeypatch):
-        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        cli_mod, *_ = _stub_configure_deps(monkeypatch, pat_token="dapi-pat")
         state = cli_mod.configure_shared_state(
             self.WS, profile="DEFAULT", databricks_ai_tools_enabled=False
         )
@@ -2137,7 +2140,7 @@ class TestConfigureSharedStateUsePat:
 
     def test_ai_tools_enable_persists_explicit_true(self, monkeypatch):
         # We ask explicitly, so store the on choice too (not just absent-default).
-        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        cli_mod, *_ = _stub_configure_deps(monkeypatch, pat_token="dapi-pat")
         state = cli_mod.configure_shared_state(
             self.WS, profile="DEFAULT", databricks_ai_tools_enabled=True
         )
@@ -2145,7 +2148,7 @@ class TestConfigureSharedStateUsePat:
 
     def test_ai_tools_disable_inherited_same_workspace(self, monkeypatch):
         # No flag on a re-configure of the same workspace keeps the prior opt-out.
-        cli_mod, *_ = self._stub_deps(
+        cli_mod, *_ = _stub_configure_deps(
             monkeypatch,
             pat_token="dapi-pat",
             existing_state={
@@ -2160,7 +2163,7 @@ class TestConfigureSharedStateUsePat:
     def test_ai_tools_disable_does_not_leak_across_workspaces(self, monkeypatch):
         # A different workspace's opt-out must NOT carry into this one; no flag
         # here resolves to the default (install=True), matching use_pat/fable scoping.
-        cli_mod, *_ = self._stub_deps(
+        cli_mod, *_ = _stub_configure_deps(
             monkeypatch,
             pat_token="dapi-pat",
             existing_state={
@@ -2174,7 +2177,7 @@ class TestConfigureSharedStateUsePat:
 
     def test_falls_back_to_legacy_when_uc_empty(self, monkeypatch):
         # No UC model-services: each family falls back to the legacy listing.
-        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        cli_mod, *_ = _stub_configure_deps(monkeypatch, pat_token="dapi-pat")
         monkeypatch.setattr(
             cli_mod,
             "discover_model_services",
@@ -2206,7 +2209,7 @@ class TestConfigureSharedStateSmartRoutingGate:
     def test_forwards_persisted_smart_routing_opt_in(self, monkeypatch):
         seen: dict = {}
 
-        cli_mod, *_ = TestConfigureSharedStateUsePat._stub_deps(
+        cli_mod, *_ = _stub_configure_deps(
             monkeypatch,
             pat_token="dapi-pat",
             existing_state={
@@ -2228,7 +2231,7 @@ class TestConfigureSharedStateSmartRoutingGate:
     def test_defaults_to_false_without_a_prior_opt_in(self, monkeypatch):
         seen: dict = {}
 
-        cli_mod, *_ = TestConfigureSharedStateUsePat._stub_deps(monkeypatch, pat_token="dapi-pat")
+        cli_mod, *_ = _stub_configure_deps(monkeypatch, pat_token="dapi-pat")
         monkeypatch.setattr(
             cli_mod,
             "discover_model_services",
@@ -2238,6 +2241,108 @@ class TestConfigureSharedStateSmartRoutingGate:
         cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
 
         assert seen["smart_routing_enabled"] is False
+
+    def test_explicit_opt_in_wins_over_absent_state(self, monkeypatch):
+        # `claude --enable-smart-routing` persists the opt-in only after discovery has run, so the
+        # flag has to arrive as an argument. Without this the first such launch discovers opus-5
+        # and then fails the router's own opus-4-8 availability check for the whole session.
+        seen: dict = {}
+
+        cli_mod, *_ = _stub_configure_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t, **kw: seen.update(kw) or ({}, [], [], [], None),
+        )
+
+        cli_mod.configure_shared_state(self.WS, profile="DEFAULT", smart_routing_enabled=True)
+
+        assert seen["smart_routing_enabled"] is True
+
+    def test_ignores_another_workspaces_opt_in(self, monkeypatch):
+        # State is per-workspace, but `configure_shared_state` starts from the previous
+        # workspace's block. Without a workspace check, routing enabled on one workspace would
+        # pin another workspace's opus slot to 4-8.
+        seen: dict = {}
+
+        cli_mod, _, _, saved = _stub_configure_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": "https://other.databricks.com",
+                "smart_routing_enabled": True,
+            },
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t, **kw: seen.update(kw) or ({}, [], [], [], None),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert seen["smart_routing_enabled"] is False
+        # Also dropped from the state written to disk, or the next launch would read the other
+        # workspace's opt-in back as this workspace's own.
+        assert "smart_routing_enabled" not in state
+        assert saved and "smart_routing_enabled" not in saved[-1]
+
+    def test_keeps_this_workspaces_own_opt_in(self, monkeypatch):
+        cli_mod, _, _, saved = _stub_configure_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={"workspace": self.WS, "smart_routing_enabled": True},
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert state["smart_routing_enabled"] is True
+        assert saved and saved[-1]["smart_routing_enabled"] is True
+
+
+class TestSmartRoutingFlagReachesDiscovery:
+    """`claude --enable-smart-routing` must reach discovery on the same launch that sets it.
+
+    `_launch_tool` persists the opt-in after `configure_shared_state` returns, so only the
+    forwarded argument can pin opus-4-8 in time for the router's availability check.
+    """
+
+    @staticmethod
+    def _patches(cfg):
+        return [
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli._auto_configure_tool"),
+            patch("ucode.cli.load_state", return_value=dict(MINIMAL_STATE)),
+            patch("ucode.cli.ensure_provider_state", return_value=dict(MINIMAL_STATE)),
+            patch("ucode.cli.configure_shared_state", cfg),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(dict(MINIMAL_STATE), "databricks-claude-sonnet-4"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=dict(MINIMAL_STATE)),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent"),
+        ]
+
+    def _invoke(self, argv):
+        cfg = MagicMock(return_value=dict(MINIMAL_STATE))
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(cfg):
+                stack.enter_context(p)
+            result = runner.invoke(app, argv)
+        assert result.exit_code == 0, result.output
+        return cfg.call_args.kwargs["smart_routing_enabled"]
+
+    def test_claude_flag_forwards_the_opt_in(self):
+        assert self._invoke(["claude", "--enable-smart-routing"]) is True
+
+    def test_absent_flag_inherits_from_state(self):
+        # None, not False: a workspace that already opted in must keep its pin.
+        assert self._invoke(["claude"]) is None
+
+    def test_codex_flag_does_not_pin_claudes_opus(self):
+        # CODEX_ROUTE_ARMS names no claude model, so codex routing needs no opus pin.
+        assert self._invoke(["codex", "--enable-smart-routing"]) is None
 
 
 class TestConfigureSkipValidate:
