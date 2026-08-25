@@ -357,6 +357,59 @@ class TestClaudeModelFlag:
         assert "enterprise managed settings" not in _strip_ansi(result.output)
 
 
+class TestCopilotModelFlag:
+    """`ucode copilot --model <id>` outranks the automatic sonnet/opus/haiku/codex pick and
+    stays pinned across ucode's automatic token refreshes (unlike claude, copilot takes the
+    id as its resolved model directly rather than as a custom_model override)."""
+
+    def test_model_threads_through_to_launch_tool(self):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, ["copilot", "--model", "cat.schema.claude-opus-5"])
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.kwargs["model"] == "cat.schema.claude-opus-5"
+
+    def test_model_becomes_resolved_model_for_configure_tool(self):
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli._auto_configure_tool"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE) as mock_configure,
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch_agent,
+        ):
+            result = runner.invoke(app, ["copilot", "--model", "cat.schema.claude-opus-5"])
+        assert result.exit_code == 0, result.output
+        # Unlike claude, copilot has no family-alias pinning — the explicit id rides as the
+        # ordinary resolved model, both into configure_tool and into the launch call.
+        assert mock_configure.call_args.args[2] == "cat.schema.claude-opus-5"
+        assert mock_launch_agent.call_args.kwargs["model"] == "cat.schema.claude-opus-5"
+
+    def test_no_model_flag_passes_none_to_launch_agent(self):
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli._auto_configure_tool"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch_agent,
+        ):
+            result = runner.invoke(app, ["copilot"])
+        assert result.exit_code == 0, result.output
+        assert mock_launch_agent.call_args.kwargs["model"] is None
+
+
 class TestMcpSubcommands:
     def test_web_search_subcommand_help(self):
         result = runner.invoke(app, ["mcp", "web-search", "--help"])

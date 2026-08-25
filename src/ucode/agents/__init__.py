@@ -366,8 +366,15 @@ def configure_tool(
     return result
 
 
-def launch(tool: str, state: dict, tool_args: list[str]) -> None:
-    _MODULES[tool].launch(state, tool_args)
+def launch(tool: str, state: dict, tool_args: list[str], model: str | None = None) -> None:
+    # Only copilot's launch loop re-derives its model on every token refresh
+    # (default_model(state)), so only it needs an explicit override threaded
+    # through past that point; other tools already bake --model into the
+    # config file written by configure_tool.
+    if tool == "copilot":
+        copilot.launch(state, tool_args, model_override=model)
+    else:
+        _MODULES[tool].launch(state, tool_args)
 
 
 def check_gateway_endpoint(state: dict, tool: str) -> bool:

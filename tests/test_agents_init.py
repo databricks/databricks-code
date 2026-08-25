@@ -178,6 +178,34 @@ class TestCheckGatewayEndpoint:
     def test_copilot_unavailable_when_no_models(self):
         assert check_gateway_endpoint({}, "copilot") is False
 
+
+class TestLaunch:
+    def test_copilot_forwards_model_as_override(self, monkeypatch):
+        calls: list[tuple] = []
+        monkeypatch.setattr(
+            agents_mod.copilot,
+            "launch",
+            lambda state, tool_args, model_override=None: calls.append(
+                (state, tool_args, model_override)
+            ),
+        )
+
+        agents_mod.launch("copilot", {"workspace": "ws"}, ["--foo"], model="explicit-model")
+
+        assert calls == [({"workspace": "ws"}, ["--foo"], "explicit-model")]
+
+    def test_non_copilot_tools_ignore_model_argument(self, monkeypatch):
+        calls: list[tuple] = []
+        monkeypatch.setitem(
+            agents_mod._MODULES,
+            "gemini",
+            type("_Stub", (), {"launch": staticmethod(lambda s, a: calls.append((s, a)))}),
+        )
+
+        agents_mod.launch("gemini", {"workspace": "ws"}, ["--foo"], model="ignored-for-gemini")
+
+        assert calls == [({"workspace": "ws"}, ["--foo"])]
+
     def test_pi_available_with_claude(self):
         assert check_gateway_endpoint({"claude_models": {"sonnet": "s4"}}, "pi") is True
 

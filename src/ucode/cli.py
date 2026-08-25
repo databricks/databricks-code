@@ -1958,7 +1958,7 @@ def _launch_tool(
             _register_managed_mcp_servers(managed, tool, state)
             _apply_managed_skills(managed, tool, state)
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
-        launch_agent(tool, state, ctx.args)
+        launch_agent(tool, state, ctx.args, model=model if tool == "copilot" else None)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
@@ -2271,12 +2271,21 @@ def opencode_cmd(
 @app.command("copilot", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def copilot_cmd(
     ctx: typer.Context,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Launch on a specific Databricks model id (e.g. a UC "
+            "`<catalog>.<schema>.<name>`). Outranks the automatic sonnet/opus/haiku/codex "
+            "pick and stays pinned across ucode's automatic token refreshes.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
 ) -> None:
     """Launch GitHub Copilot CLI via Databricks."""
     _disable_managed_config_if_requested(skip_managed_config)
-    _launch_tool("copilot", ctx, skip_preflight=skip_preflight)
+    _launch_tool("copilot", ctx, model=model, skip_preflight=skip_preflight)
 
 
 @app.command("pi", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
