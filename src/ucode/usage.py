@@ -35,6 +35,7 @@ from ucode.ui import (
     print_heading,
     print_note,
     print_warning,
+    prompt_for_selection,
     prompt_yes_no_default,
     render_box_table,
     spinner,
@@ -692,6 +693,21 @@ def run_query_on_first_working_warehouse(
     raise last_error or RuntimeError("No SQL warehouse could run the usage query.")
 
 
+def select_sql_warehouse(candidates: list[SqlWarehouse]) -> SqlWarehouse | None:
+    """Ask which discovered warehouse should run the detailed usage query."""
+    selected_path = prompt_for_selection(
+        "Select a SQL warehouse for the usage query:",
+        [
+            (warehouse.http_path, f"{warehouse.label} ({warehouse.state})")
+            for warehouse in candidates
+        ],
+    )
+    return next(
+        (warehouse for warehouse in candidates if warehouse.http_path == selected_path),
+        None,
+    )
+
+
 def _query_with_progress(
     workspace: str,
     token: str,
@@ -746,6 +762,12 @@ def usage(warehouse_id: str | None = None) -> int:
 
     with spinner("Discovering SQL warehouse..."):
         candidates = discover_sql_warehouses(workspace, token, warehouse_id=warehouse_id)
+    if warehouse_id is None:
+        selected = select_sql_warehouse(candidates)
+        if selected is None:
+            print_note("Usage details cancelled.")
+            return 0
+        candidates = [selected]
 
     resolved_http_path, columns, rows = run_query_on_first_working_warehouse(
         workspace, token, candidates, build_usage_report_query()
