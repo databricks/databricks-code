@@ -32,6 +32,18 @@ class TestGenerateV2Home:
         assert "myprof" in provider["auth"]["args"]
 
 
+def test_smart_routing_switch_message_is_boxed():
+    message = codex._smart_routing_switch_message("model-x", "Because X.")
+
+    assert message == (
+        "┌───────────────────────────────────┐\n"
+        "│ Using Unity Gateway Smart Router. │\n"
+        "│ Selected Model : model-x          │\n"
+        "│ Reason : Because X.               │\n"
+        "└───────────────────────────────────┘"
+    )
+
+
 class TestInterposerSession:
     """The interposer's hold-then-switch + settings-injection logic (the novel behavior)."""
 

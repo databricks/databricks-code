@@ -35,7 +35,7 @@ from ucode.smart_routing.codex_hooks import (
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
-from ucode.ui import print_note, print_warning_err
+from ucode.ui import print_warning_err
 
 CODEX_CONFIG_DIR = Path.home() / ".codex"
 CODEX_PROFILE_NAME = "ucode"
@@ -52,18 +52,25 @@ MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
 # tool (codex, claude), so a workspace turns it on once.
 SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 
-# Codex-specific smart-routing-v2 settings. The shared enable flag + hold-turns live in
-# `smart_routing.v2`; here we keep only what is Codex-specific: the switch-to model and the
-# app-server's CODEX_HOME / interposer log paths. When enabled, a single `ucode codex`
-# launches the REAL Codex TUI against a ucode-run `codex app-server` with a WebSocket
-# interposer (smart_routing.codex_interposer); ucode owns all three processes and tears the
-# app-server + interposer down when the TUI exits.
-SMART_ROUTING_V2_START_MODEL = "gpt-5.5"  # hardcoded start model for now
 SMART_ROUTING_V2_TARGET_MODEL = "system.ai.glm-5-2"  # hardcoded switch-to model for now
 SMART_ROUTING_V2_HOME = APP_DIR / "codex-v2-home"  # CODEX_HOME for the ucode-run app-server
 SMART_ROUTING_V2_LOG = (
     APP_DIR / "codex-v2-interposer.log"
 )  # interposer log (not stdout: TUI owns it)
+SMART_ROUTING_V2_REASON = "Low complexity, unclear intent, and no code reference."
+
+
+def _smart_routing_switch_message(model: str, reason: str) -> str:
+    lines = [
+        "Using Unity Gateway Smart Router.",
+        f"Selected Model : {model}",
+        f"Reason : {reason}",
+    ]
+    width = max(len(line) for line in lines)
+    border = "─" * (width + 2)
+    return "\n".join(
+        [f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"]
+    )
 
 
 SPEC: ToolSpec = {
@@ -519,18 +526,16 @@ def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
         raise RuntimeError(
             "Smart routing v2 needs a configured workspace; run `ucode configure codex` first."
         )
-    start_model = SMART_ROUTING_V2_START_MODEL
+    start_model = default_model(state)
+    if not start_model:
+        raise RuntimeError(
+            "Smart routing v2 could not determine a starting Codex model for this workspace."
+        )
 
     os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     home = _generate_v2_app_server_home(state, start_model)
     app_port = codex_interposer.free_port()
     tui_port = codex_interposer.free_port()
-
-    print_note(
-        f"Smart routing v2: starting on {start_model}, switching to "
-        f"{SMART_ROUTING_V2_TARGET_MODEL} after the first prompt "
-        f"(interposer log: {SMART_ROUTING_V2_LOG})."
-    )
 
     app_server = subprocess.Popen(
         [binary, "app-server", "--listen", f"ws://127.0.0.1:{app_port}"],
@@ -551,9 +556,9 @@ def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
             f"ws://127.0.0.1:{app_port}",
             SMART_ROUTING_V2_TARGET_MODEL,
             smart_routing_v2.SWITCH_AFTER_TURNS,
-            switch_message=(
-                f"✨ Databricks Smart Router selected model {SMART_ROUTING_V2_TARGET_MODEL} "
-                "due to low complexity, unclear intent, and no code reference."
+            switch_message=_smart_routing_switch_message(
+                SMART_ROUTING_V2_TARGET_MODEL,
+                SMART_ROUTING_V2_REASON,
             ),
             log_path=SMART_ROUTING_V2_LOG,
         )
