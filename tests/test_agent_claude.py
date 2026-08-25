@@ -665,6 +665,11 @@ class TestClaudeLaunch:
         monkeypatch.setattr(
             claude, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
         )
+        monkeypatch.setattr(
+            claude,
+            "_snapshot_user_model_setting",
+            lambda: {"present": True, "value": "opus"},
+        )
         monkeypatch.setattr(os, "execvp", fake_execvp)
 
         try:
@@ -676,7 +681,14 @@ class TestClaudeLaunch:
         assert exec_calls == [
             (
                 "claude",
-                ["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"],
+                [
+                    "claude",
+                    "--settings",
+                    str(claude.CLAUDE_SETTINGS_PATH),
+                    "--model",
+                    "opus",
+                    "--debug",
+                ],
             )
         ]
 
@@ -772,6 +784,26 @@ class TestBuildClaudeArgv:
         monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
         argv = claude._build_claude_argv("claude", ["-p", "hi"], relayed=False)
         assert "--setting-sources" not in argv
+
+    def test_saved_default_is_passed_as_launch_model(self):
+        argv = claude._build_claude_argv("claude", ["-p", "hi"], launch_model="opus")
+        assert argv == [
+            "claude",
+            "--settings",
+            str(claude.CLAUDE_SETTINGS_PATH),
+            "--model",
+            "opus",
+            "-p",
+            "hi",
+        ]
+
+    @pytest.mark.parametrize(
+        "explicit", [["--model", "sonnet"], ["--model=sonnet"], ["-m", "sonnet"]]
+    )
+    def test_explicit_model_overrides_saved_default(self, explicit):
+        argv = claude._build_claude_argv("claude", explicit, launch_model="opus")
+        assert "opus" not in argv
+        assert argv[-len(explicit) :] == explicit
 
     def test_relayed_excludes_user_scope_via_setting_sources(self, monkeypatch):
         # Relayed must drop the user scope so a stale ~/.claude/settings.json
@@ -886,6 +918,47 @@ class TestBuildClaudeArgv:
         monkeypatch.setattr(claude, "read_json_safe", lambda p: {"apiKeyHelper": "u"})
         with pytest.raises(RuntimeError, match="not valid JSON"):
             claude._build_claude_argv("claude", ["--settings", str(bad_file)])
+
+
+class TestClaudeDefaultModelRecovery:
+    def _paths(self, monkeypatch, tmp_path):
+        user = tmp_path / "settings.json"
+        snapshot = tmp_path / "model-snapshot.json"
+        monkeypatch.setattr(claude, "CLAUDE_USER_SETTINGS_PATH", user)
+        monkeypatch.setattr(claude, "CLAUDE_MODEL_SNAPSHOT_PATH", snapshot)
+        return user, snapshot
+
+    def test_restore_changes_only_model_field(self, monkeypatch, tmp_path):
+        user, _snapshot = self._paths(monkeypatch, tmp_path)
+        user.write_text(json.dumps({"model": "opus", "theme": "dark"}))
+        original = claude._snapshot_user_model_setting()
+        claude._save_user_model_snapshot(original)
+
+        user.write_text(json.dumps({"model": "routed", "theme": "light", "new": True}))
+        assert claude._restore_user_model_snapshot() is True
+        assert json.loads(user.read_text()) == {"model": "opus", "theme": "light", "new": True}
+        assert claude._restore_user_model_snapshot() is False
+
+    def test_restore_removes_model_when_original_was_absent(self, monkeypatch, tmp_path):
+        user, _snapshot = self._paths(monkeypatch, tmp_path)
+        user.write_text(json.dumps({"theme": "dark"}))
+        claude._save_user_model_snapshot(claude._snapshot_user_model_setting())
+        user.write_text(json.dumps({"model": "routed", "theme": "light"}))
+
+        claude._restore_user_model_snapshot()
+        assert json.loads(user.read_text()) == {"theme": "light"}
+
+    def test_missing_user_default_falls_back_to_ucode_model(self):
+        state = {"claude_models": {"opus": "system.ai.claude-opus-4-8"}}
+        assert (
+            claude._original_launch_model({"present": False, "value": None}, state)
+            == "system.ai.claude-opus-4-8"
+        )
+
+    def test_transient_launch_override_wins_over_saved_default(self):
+        state = {"_claude_launch_model": "system.ai.claude-sonnet-5"}
+        snapshot = {"present": True, "value": "opus"}
+        assert claude._original_launch_model(snapshot, state) == "system.ai.claude-sonnet-5"
 
 
 class TestClaudeSmartRouting:
