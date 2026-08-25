@@ -24,7 +24,9 @@ import sys
 import threading
 import time
 import uuid
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -67,6 +69,9 @@ _DEFAULT_TTL_S = 3600
 # and exception class names — never headers, bodies, or credentials.
 _DIAGNOSTICS_ENV = "UCODE_RELAYED_PROXY_DIAGNOSTICS"
 _DIAGNOSTICS_TRUE = frozenset({"1", "true", "yes", "on"})
+_MODEL_ALIAS_PREFIX = "anthropic-aigw-"
+_ANTHROPIC_MODELS_PATH = "/anthropic/v1/models"
+_ANTHROPIC_MESSAGES_PATH = "/anthropic/v1/messages"
 
 
 def _diagnostics_enabled() -> bool:
@@ -195,11 +200,83 @@ def _forwarded_request_headers(
     return headers
 
 
+class _AnthropicModelAliases:
+    """Maps Claude-compatible discovery IDs back to their gateway model IDs."""
+
+    def __init__(self) -> None:
+        self._original_by_alias: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def advertise_models(self, body: bytes) -> bytes:
+        try:
+            payload = json.loads(body)
+            models = payload["data"]
+            if not isinstance(models, list):
+                return body
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+            return body
+
+        aliases: dict[str, str] = {}
+        for model in models:
+            if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+                continue
+            model_id = model["id"]
+            lowered = model_id.lower()
+            if "claude" in lowered or "anthropic" in lowered:
+                continue
+            alias = f"{_MODEL_ALIAS_PREFIX}{model_id}"
+            model["id"] = alias
+            aliases[alias] = model_id
+
+        with self._lock:
+            self._original_by_alias.update(aliases)
+
+        for cursor in ("first_id", "last_id"):
+            model_id = payload.get(cursor)
+            alias = f"{_MODEL_ALIAS_PREFIX}{model_id}"
+            if alias in aliases:
+                payload[cursor] = alias
+        return json.dumps(payload, separators=(",", ":")).encode()
+
+    def original_id(self, model_id: str) -> str:
+        with self._lock:
+            return self._original_by_alias.get(model_id, model_id)
+
+    def rewrite_path(self, path: str) -> str:
+        parsed = urlsplit(path)
+        if parsed.path != _ANTHROPIC_MODELS_PATH:
+            return path
+        query = [
+            (key, self.original_id(value) if key == "after_id" else value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        ]
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+        )
+
+    def rewrite_body(self, path: str, body: bytes | None) -> bytes | None:
+        if urlsplit(path).path != _ANTHROPIC_MESSAGES_PATH or body is None:
+            return body
+        try:
+            payload = json.loads(body)
+            model_id = payload.get("model")
+            if not isinstance(model_id, str):
+                return body
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            return body
+        original_id = self.original_id(model_id)
+        if original_id == model_id:
+            return body
+        payload["model"] = original_id
+        return json.dumps(payload, separators=(",", ":")).encode()
+
+
 class _ProxyHandler(BaseHTTPRequestHandler):
     # Set by the server factory.
     cache: _TokenCache
     client: httpx.Client
     token_header = AI_GATEWAY_TOKEN_HEADER
+    anthropic_model_aliases: _AnthropicModelAliases
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -217,7 +294,12 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         started = time.monotonic()
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
-        url = self.path.lstrip("/")
+        upstream_path = f"/anthropic{self.path}"
+        body = self.anthropic_model_aliases.rewrite_body(upstream_path, body)
+        url = self.anthropic_model_aliases.rewrite_path(upstream_path).lstrip("/")
+        should_transform_model_names = (
+            self.command == "GET" and urlsplit(upstream_path).path == _ANTHROPIC_MODELS_PATH
+        )
         _diagnostic_log(
             "request_start",
             request_id=diagnostic_id,
@@ -236,7 +318,12 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     elapsed_ms=round((time.monotonic() - started) * 1000),
                 )
                 if resp.status_code not in (401, 403):
-                    self._relay_response(resp, diagnostic_id=diagnostic_id, started=started)
+                    self._relay_response(
+                        resp,
+                        transform_model_names=should_transform_model_names,
+                        diagnostic_id=diagnostic_id,
+                        started=started,
+                    )
                     return
                 # Auth rejected. Drain the (small) error body so the pooled
                 # connection can be reused, then fall through to one retry.
@@ -265,7 +352,12 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     status=resp.status_code,
                     elapsed_ms=round((time.monotonic() - started) * 1000),
                 )
-                self._relay_response(resp, diagnostic_id=diagnostic_id, started=started)
+                self._relay_response(
+                    resp,
+                    transform_model_names=should_transform_model_names,
+                    diagnostic_id=diagnostic_id,
+                    started=started,
+                )
         except (BrokenPipeError, ConnectionResetError):
             # Client closed before/while we relayed headers — routine on cancel.
             _diagnostic_log(
@@ -296,6 +388,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self,
         resp: httpx.Response,
         *,
+        transform_model_names: bool,
         diagnostic_id: str | None = None,
         started: float | None = None,
     ) -> None:
@@ -306,7 +399,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         try:
             self.send_response(resp.status_code)
             for key, value in resp.headers.items():
-                if key.lower() not in _HOP_BY_HOP:
+                header_name = key.lower()
+                drop_stale_content_encoding = (
+                    transform_model_names and header_name == "content-encoding"
+                )
+                if header_name not in _HOP_BY_HOP and not drop_stale_content_encoding:
                     self.send_header(key, value)
             self.end_headers()
             # Do not pass a fixed chunk size here. httpx accumulates bytes until
@@ -315,7 +412,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # With ``chunk_size=None`` (the default), raw upstream chunks are
             # yielded as they arrive and pings keep the downstream connection
             # alive even before the model produces a large content block.
-            for chunk in resp.iter_raw():
+            response_chunks = (
+                [self.anthropic_model_aliases.advertise_models(resp.read())]
+                if transform_model_names
+                and HTTPStatus.OK <= resp.status_code < HTTPStatus.MULTIPLE_CHOICES
+                else resp.iter_raw()
+            )
+            for chunk in response_chunks:
                 if chunk:
                     if first_byte_ms is None:
                         first_byte_ms = round((time.monotonic() - started) * 1000)
@@ -385,7 +488,7 @@ def start_proxy(
     Returns (server, cache, client); the caller runs the server (e.g. in a
     thread) and calls shutdown()/cache.stop()/client.close() on exit.
     """
-    upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
+    upstream_base = f"{workspace.rstrip('/')}/ai-gateway/"
     cache = _TokenCache(
         workspace,
         profile,
@@ -395,11 +498,17 @@ def start_proxy(
     # to the gateway instead of a fresh handshake per request. Don't follow
     # redirects — a proxy relays 3xx verbatim.
     client = httpx.Client(base_url=upstream_base, timeout=_UPSTREAM_TIMEOUT, follow_redirects=False)
+    anthropic_model_aliases = _AnthropicModelAliases()
 
     handler = type(
         "BoundProxyHandler",
         (_ProxyHandler,),
-        {"cache": cache, "client": client, "token_header": token_header},
+        {
+            "cache": cache,
+            "client": client,
+            "token_header": token_header,
+            "anthropic_model_aliases": anthropic_model_aliases,
+        },
     )
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), handler)

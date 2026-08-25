@@ -105,7 +105,7 @@ class TestRelayResponseClientDisconnect:
         handler = _relay_handler(_BrokenPipeWriter())
         resp = _FakeResponse(200, {}, [b'{"ok":true}'])
         # Must not raise — a dead client is a routine teardown, not an error.
-        handler._relay_response(resp)
+        handler._relay_response(resp, transform_model_names=False)
 
     def test_relay_swallows_connection_reset_mid_stream(self):
         # Headers flush ok, then the client resets while streaming body chunks.
@@ -123,7 +123,7 @@ class TestRelayResponseClientDisconnect:
 
         handler = _relay_handler(_ResetAfterHeaders())
         resp = _FakeResponse(200, {}, [b"chunk-of-sse-data"])
-        handler._relay_response(resp)
+        handler._relay_response(resp, transform_model_names=False)
 
     def test_relay_swallows_upstream_error_mid_stream(self):
         # Upstream drops mid-body after headers are already sent — we can't signal
@@ -141,7 +141,7 @@ class TestRelayResponseClientDisconnect:
 
         handler = _relay_handler(_Ok())
         resp = _FakeResponse(200, {}, _chunks())
-        handler._relay_response(resp)  # must not raise
+        handler._relay_response(resp, transform_model_names=False)  # must not raise
 
     def test_relay_forwards_status_and_skips_hop_by_hop_headers(self):
         # A non-200 status (e.g. 429 rate limit) and content headers are relayed;
@@ -162,7 +162,7 @@ class TestRelayResponseClientDisconnect:
             {"Content-Type": "application/json", "Transfer-Encoding": "chunked"},
             [b'{"type":"error"}'],
         )
-        handler._relay_response(resp)
+        handler._relay_response(resp, transform_model_names=False)
         blob = b"".join(chunks_written)
         assert b"429" in blob
         assert b"Content-Type: application/json" in blob
@@ -186,6 +186,7 @@ class TestRelayResponseClientDisconnect:
         handler = _relay_handler(_Ok())
         handler._relay_response(
             _FakeResponse(200, {}, _chunks()),
+            transform_model_names=False,
             diagnostic_id="local-id",
             started=time.monotonic(),
         )
@@ -202,7 +203,7 @@ class TestRelayResponseClientDisconnect:
     def test_diagnostics_are_silent_by_default(self, monkeypatch, capsys):
         monkeypatch.delenv(gateway_proxy._DIAGNOSTICS_ENV, raising=False)
         handler = _relay_handler(_Collect())
-        handler._relay_response(_FakeResponse(200, {}, [b"ok"]))
+        handler._relay_response(_FakeResponse(200, {}, [b"ok"]), transform_model_names=False)
         assert capsys.readouterr().err == ""
 
 
@@ -328,9 +329,11 @@ class _FakeClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.sent_tokens: list[str | None] = []
+        self.sent_urls: list[str] = []
 
     def stream(self, _method, _url, headers, content):
         self.sent_tokens.append(headers.get(gateway_proxy.AI_GATEWAY_TOKEN_HEADER))
+        self.sent_urls.append(_url)
         return self._responses.pop(0)
 
 
@@ -352,6 +355,7 @@ def _handle_handler(client, cache, wfile) -> gateway_proxy._ProxyHandler:
     h = object.__new__(gateway_proxy._ProxyHandler)
     h.client = client
     h.cache = cache
+    h.anthropic_model_aliases = gateway_proxy._AnthropicModelAliases()
     h.headers = {}
     h.rfile = io.BytesIO(b"")
     h.path = "/v1/messages"
@@ -361,6 +365,85 @@ def _handle_handler(client, cache, wfile) -> gateway_proxy._ProxyHandler:
     h.requestline = "POST /v1/messages HTTP/1.1"
     h._headers_buffer = []
     return h
+
+
+class TestAnthropicModelAliases:
+    def test_advertises_custom_models_without_changing_display_name(self):
+        aliases = gateway_proxy._AnthropicModelAliases()
+        body = json.dumps(
+            {
+                "data": [
+                    {"id": "catalog.schema.custom", "display_name": "Custom model"},
+                    {"id": "system.ai.claude-sonnet"},
+                    {"id": "claude-sonnet"},
+                    {"id": "catalog.schema.anthropic-provider"},
+                    {"id": "anthropic-provider"},
+                ],
+                "first_id": "catalog.schema.custom",
+                "last_id": "catalog.schema.anthropic-provider",
+            }
+        ).encode()
+
+        payload = json.loads(aliases.advertise_models(body))
+
+        assert payload == {
+            "data": [
+                {
+                    "id": "anthropic-aigw-catalog.schema.custom",
+                    "display_name": "Custom model",
+                },
+                {"id": "system.ai.claude-sonnet"},
+                {"id": "claude-sonnet"},
+                {"id": "catalog.schema.anthropic-provider"},
+                {"id": "anthropic-provider"},
+            ],
+            "first_id": "anthropic-aigw-catalog.schema.custom",
+            "last_id": "catalog.schema.anthropic-provider",
+        }
+
+    def test_rewrites_known_alias_in_messages_body(self):
+        aliases = gateway_proxy._AnthropicModelAliases()
+        aliases.advertise_models(b'{"data":[{"id":"catalog.schema.custom"}]}')
+
+        body = aliases.rewrite_body(
+            "/anthropic/v1/messages",
+            b'{"model":"anthropic-aigw-catalog.schema.custom","messages":[]}',
+        )
+
+        assert json.loads(body) == {"model": "catalog.schema.custom", "messages": []}
+
+    def test_rewrites_known_alias_in_pagination_cursor(self):
+        aliases = gateway_proxy._AnthropicModelAliases()
+        aliases.advertise_models(b'{"data":[{"id":"catalog.schema.custom"}]}')
+
+        assert (
+            aliases.rewrite_path(
+                "/anthropic/v1/models?limit=1000&after_id=anthropic-aigw-catalog.schema.custom"
+            )
+            == "/anthropic/v1/models?limit=1000&after_id=catalog.schema.custom"
+        )
+
+    def test_ignores_non_anthropic_models_path(self):
+        aliases = gateway_proxy._AnthropicModelAliases()
+        path = "/codex/v1/models?after_id=anthropic-aigw-catalog.schema.custom"
+
+        assert aliases.rewrite_path(path) == path
+
+    def test_does_not_strip_unknown_prefixed_id(self):
+        aliases = gateway_proxy._AnthropicModelAliases()
+        unknown = "anthropic-aigw-legitimate-upstream-id"
+
+        assert aliases.rewrite_path(f"/anthropic/v1/models?after_id={unknown}") == (
+            f"/anthropic/v1/models?after_id={unknown}"
+        )
+        assert (
+            aliases.rewrite_body("/anthropic/v1/messages", json.dumps({"model": unknown}).encode())
+            == json.dumps({"model": unknown}).encode()
+        )
+
+    def test_leaves_malformed_discovery_response_unchanged(self):
+        aliases = gateway_proxy._AnthropicModelAliases()
+        assert aliases.advertise_models(b"not-json") == b"not-json"
 
 
 class _Collect(io.RawIOBase):
@@ -405,6 +488,7 @@ class TestRetryOn401:
         _handle_handler(client, cache, out)._handle()
         assert cache.refreshed == 0
         assert client.sent_tokens == ["Bearer tok1"]
+        assert client.sent_urls == ["anthropic/v1/messages"]
         assert b"hi" in bytes(out.data)
 
 
