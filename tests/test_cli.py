@@ -280,6 +280,34 @@ class TestSubcommandRouting:
             in _strip_ansi(result.output)
         )
 
+    def test_claude_v2_skips_legacy_prelaunch_routing(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
+        state = {
+            **MINIMAL_STATE,
+            "smart_routing_enabled": True,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+        }
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(state, "system.ai.claude-opus-4-8"),
+            ),
+            patch("ucode.cli.claude_routing.route_launch_model") as mock_route,
+            patch("ucode.cli.configure_tool", return_value=state) as mock_configure,
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["claude"])
+
+        assert result.exit_code == 0, result.output
+        mock_route.assert_not_called()
+        assert mock_configure.call_args.kwargs["route_root_model"] is None
+        assert "_claude_launch_model" not in mock_launch.call_args.args[1]
+
 
 class TestClaudeModelFlag:
     """`ucode claude --model <id>` pins the id into the family aliases so the gateway resolves any

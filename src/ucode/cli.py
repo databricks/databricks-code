@@ -107,6 +107,7 @@ from ucode.skills_download import (
     download_managed_skills_on_launch,
 )
 from ucode.smart_routing import claude_routing, codex_routing
+from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.state import (
     STATE_PATH,
     clear_state,
@@ -1881,7 +1882,12 @@ def _launch_tool(
                 managed_launch_model(managed, recommendation, tool) if managed is not None else None
             )
             state, resolved_model = resolve_launch_model(tool, state, managed_model)
-            if routing_agent is not None and routing_agent.smart_routing_enabled(state):
+            first_prompt_routes_claude = tool == "claude" and smart_routing_v2.enabled()
+            if (
+                routing_agent is not None
+                and routing_agent.smart_routing_enabled(state)
+                and not first_prompt_routes_claude
+            ):
                 display = TOOL_SPECS[tool]["display"]
                 with spinner(f"Selecting a {display} model with smart routing..."):
                     decision, routing_error = _ROUTING_MODULES[tool].route_launch_model(
