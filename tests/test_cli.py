@@ -390,7 +390,11 @@ class TestCopilotModelFlag:
         assert mock_configure.call_args.args[2] == "cat.schema.claude-opus-5"
         assert mock_launch_agent.call_args.kwargs["model"] == "cat.schema.claude-opus-5"
 
-    def test_no_model_flag_passes_none_to_launch_agent(self):
+    def test_no_model_flag_still_pins_the_resolved_model_to_launch_agent(self):
+        # Without an explicit --model, resolved_model (whatever resolve_launch_model/managed
+        # config/budget recommendation settled on) must still ride to launch_agent — passing None
+        # here would make copilot.launch() recompute default_model(state) fresh and can silently
+        # diverge from what configure_tool actually wrote to the config file.
         with (
             patch("ucode.cli.ensure_bootstrap_dependencies"),
             patch("ucode.cli._auto_configure_tool"),
@@ -407,7 +411,7 @@ class TestCopilotModelFlag:
         ):
             result = runner.invoke(app, ["copilot"])
         assert result.exit_code == 0, result.output
-        assert mock_launch_agent.call_args.kwargs["model"] is None
+        assert mock_launch_agent.call_args.kwargs["model"] == "databricks-claude-sonnet-4"
 
 
 class TestMcpSubcommands:

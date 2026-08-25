@@ -1958,7 +1958,11 @@ def _launch_tool(
             _register_managed_mcp_servers(managed, tool, state)
             _apply_managed_skills(managed, tool, state)
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
-        launch_agent(tool, state, ctx.args, model=model if tool == "copilot" else None)
+        # Pass the already-settled resolved_model (which absorbs --model, a managed config's
+        # default, and any budget recommendation), not the raw --model flag — otherwise a launch
+        # without an explicit --model would have copilot.launch() call default_model(state) fresh
+        # and silently rewrite whatever configure_tool just wrote, and every refresh after it.
+        launch_agent(tool, state, ctx.args, model=resolved_model if tool == "copilot" else None)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
