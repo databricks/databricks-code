@@ -229,12 +229,12 @@ def mcp_config_args() -> list[str]:
     return ["--additional-mcp-config", f"@{COPILOT_MCP_CONFIG_PATH}"]
 
 
-def validate_env(state: dict) -> dict[str, str]:
+def validate_env(state: dict, model_override: str | None = None) -> dict[str, str]:
     """Inject BYOK env vars for the validation subprocess (Copilot doesn't auto-load .env)."""
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError("No workspace configured.")
-    model = default_model(state)
+    model = model_override or default_model(state)
     if not model:
         raise RuntimeError("No Copilot model is available on this workspace.")
     token = get_databricks_token(workspace, state.get("profile"))

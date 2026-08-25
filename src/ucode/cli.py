@@ -1469,8 +1469,14 @@ def claude_router_hook_cmd(
         sys.stdout.write(json.dumps(output))
 
 
-def _auto_configure_tool(tool: str) -> None:
-    """First-time setup for a single tool — mirrors configure_workspace_command."""
+def _auto_configure_tool(tool: str, model: str | None = None) -> None:
+    """First-time setup for a single tool — mirrors configure_workspace_command.
+
+    ``model`` is an explicit --model request (currently only threaded for copilot): without it,
+    a first-time `ucode copilot --model X` would auto-configure and validate against the
+    automatic sonnet/opus/haiku/codex default instead of X, so a bad automatic pick could fail
+    validation and abort the launch before X is ever tried.
+    """
     existing = load_state()
     workspace = existing.get("workspace")
     profile = existing.get("profile")
@@ -1478,7 +1484,7 @@ def _auto_configure_tool(tool: str) -> None:
         workspace, profile = _prompt_for_configuration(tool)
     state = configure_shared_state(workspace, profile=profile, tools=[tool])
 
-    state = configure_single_tool(tool, state)
+    state = configure_single_tool(tool, state, explicit_model=model)
 
     spec = TOOL_SPECS[tool]
     console.print(
@@ -1493,7 +1499,7 @@ def _auto_configure_tool(tool: str) -> None:
     )
 
     with spinner(f"Validating {spec['display']}..."):
-        ok, err = validate_tool(tool)
+        ok, err = validate_tool(tool, model=model)
     if ok:
         print_success(f"{spec['display']} is working")
     else:
@@ -1733,7 +1739,7 @@ def _launch_tool(
         )
         ensure_bootstrap_dependencies(tool, update_existing=needs_auto_configure)
         if needs_auto_configure:
-            _auto_configure_tool(tool)
+            _auto_configure_tool(tool, model=model if tool == "copilot" else None)
         state = ensure_provider_state(tool)
         # Remembered before the fallback below collapses the two cases: a managed config may not
         # silently override a provider the user typed on the command line (it errors instead).

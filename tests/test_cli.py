@@ -987,7 +987,7 @@ class TestAutoConfigureOnFirstRun:
             result = runner.invoke(app, ["claude"])
         assert result.exit_code == 0, result.output
         mock_bootstrap.assert_called_once_with("claude", update_existing=True)
-        mock_auto.assert_called_once_with("claude")
+        mock_auto.assert_called_once_with("claude", model=None)
 
     def test_triggers_when_tool_not_in_available_tools(self):
         """Auto-configure runs when workspace exists but the tool wasn't configured."""
@@ -1012,7 +1012,7 @@ class TestAutoConfigureOnFirstRun:
             result = runner.invoke(app, ["claude"])
         assert result.exit_code == 0, result.output
         mock_bootstrap.assert_called_once_with("claude", update_existing=True)
-        mock_auto.assert_called_once_with("claude")
+        mock_auto.assert_called_once_with("claude", model=None)
 
     def test_skipped_when_already_configured(self):
         """Auto-configure is skipped when workspace and tool are already set up."""
