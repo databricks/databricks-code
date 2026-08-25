@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from ucode.agents import claude
-from ucode.smart_routing import claude_routing
+from ucode.smart_routing import claude_routing, v2
 
 WS = "https://example.databricks.com"
 
@@ -666,9 +666,9 @@ class TestClaudeLaunch:
             claude, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
         )
         monkeypatch.setattr(
-            claude,
-            "_snapshot_user_model_setting",
-            lambda: {"present": True, "value": "opus"},
+            v2,
+            "snapshot_claude_model_setting",
+            lambda _path: {"present": True, "value": "opus"},
         )
         monkeypatch.setattr(os, "execvp", fake_execvp)
 
@@ -920,34 +920,7 @@ class TestBuildClaudeArgv:
             claude._build_claude_argv("claude", ["--settings", str(bad_file)])
 
 
-class TestClaudeDefaultModelRecovery:
-    def _paths(self, monkeypatch, tmp_path):
-        user = tmp_path / "settings.json"
-        snapshot = tmp_path / "model-snapshot.json"
-        monkeypatch.setattr(claude, "CLAUDE_USER_SETTINGS_PATH", user)
-        monkeypatch.setattr(claude, "CLAUDE_MODEL_SNAPSHOT_PATH", snapshot)
-        return user, snapshot
-
-    def test_restore_changes_only_model_field(self, monkeypatch, tmp_path):
-        user, _snapshot = self._paths(monkeypatch, tmp_path)
-        user.write_text(json.dumps({"model": "opus", "theme": "dark"}))
-        original = claude._snapshot_user_model_setting()
-        claude._save_user_model_snapshot(original)
-
-        user.write_text(json.dumps({"model": "routed", "theme": "light", "new": True}))
-        assert claude._restore_user_model_snapshot() is True
-        assert json.loads(user.read_text()) == {"model": "opus", "theme": "light", "new": True}
-        assert claude._restore_user_model_snapshot() is False
-
-    def test_restore_removes_model_when_original_was_absent(self, monkeypatch, tmp_path):
-        user, _snapshot = self._paths(monkeypatch, tmp_path)
-        user.write_text(json.dumps({"theme": "dark"}))
-        claude._save_user_model_snapshot(claude._snapshot_user_model_setting())
-        user.write_text(json.dumps({"model": "routed", "theme": "light"}))
-
-        claude._restore_user_model_snapshot()
-        assert json.loads(user.read_text()) == {"theme": "light"}
-
+class TestClaudeLaunchModel:
     def test_missing_user_default_falls_back_to_ucode_model(self):
         state = {"claude_models": {"opus": "system.ai.claude-opus-4-8"}}
         assert (

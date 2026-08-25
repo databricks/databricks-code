@@ -11,7 +11,6 @@ import signal
 import socket
 import subprocess
 import threading
-import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -27,7 +26,6 @@ from ucode.config_io import (
 )
 from ucode.databricks import (
     build_auth_shell_command,
-    build_auth_token_argv,
     build_tool_base_url,
     get_databricks_token,
 )
@@ -35,9 +33,7 @@ from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.claude_hooks import (
-    FIRST_PROMPT_SOCKET_ENV,
     remove_smart_routing_hooks,
-    sync_first_prompt_hook,
     sync_smart_routing_hooks,
 )
 from ucode.state import mark_tool_managed, save_state
@@ -50,7 +46,6 @@ CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
 CLAUDE_USER_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
-CLAUDE_MODEL_SNAPSHOT_PATH = APP_DIR / "claude-default-model.snapshot.json"
 
 SPEC: ToolSpec = {
     "binary": "claude",
@@ -68,10 +63,6 @@ SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 # Claude Code settings.json hook events ucode manages when routing is enabled;
 # marked managed so they're tracked/reverted with the rest of ucode's config.
 CLAUDE_ROUTING_HOOK_EVENTS = ("PreToolUse", "SessionStart", "SubagentStart")
-
-# Smart-routing-v2 currently uses a fixed route while its dynamic router is wired up.
-SMART_ROUTING_V2_MODEL = "system.ai.claude-sonnet-4-6[1m]"
-SMART_ROUTING_V2_CLAUDE_LOG = APP_DIR / "claude-v2-pty.log"
 
 
 def is_update_available() -> tuple[str, str] | None:
@@ -886,46 +877,13 @@ def _merge_claude_settings(base: dict, overlay: dict) -> dict:
     return merged
 
 
-def _snapshot_user_model_setting() -> dict:
-    """Capture only Claude's user-level ``model`` setting."""
-    settings = read_json_safe(CLAUDE_USER_SETTINGS_PATH)
-    return {"present": "model" in settings, "value": settings.get("model")}
-
-
-def _save_user_model_snapshot(snapshot: dict, snapshot_path: Path | None = None) -> None:
-    """Journal the pre-switch model so the next launch can recover after a crash."""
-    snapshot_path = snapshot_path or CLAUDE_MODEL_SNAPSHOT_PATH
-    write_json_file(snapshot_path, snapshot)
-
-
-def _restore_user_model_snapshot(
-    snapshot_path: Path | None = None,
-    snapshot: dict | None = None,
-) -> bool:
-    """Restore only the journaled ``model`` field, preserving every sibling setting."""
-    snapshot_path = snapshot_path or CLAUDE_MODEL_SNAPSHOT_PATH
-    if snapshot is None and not snapshot_path.exists():
-        return False
-    snapshot = snapshot if snapshot is not None else read_json_safe(snapshot_path)
-    present = snapshot.get("present")
-    if not isinstance(present, bool):
-        raise RuntimeError(f"Claude model recovery snapshot is invalid: {snapshot_path}")
-    settings = read_json_safe(CLAUDE_USER_SETTINGS_PATH)
-    if present:
-        settings["model"] = snapshot.get("value")
-    else:
-        settings.pop("model", None)
-    write_json_file(CLAUDE_USER_SETTINGS_PATH, settings)
-    snapshot_path.unlink(missing_ok=True)
-    return True
-
-
-def _recover_user_model_snapshots() -> None:
-    """Repair defaults left by interrupted PTY launches."""
-    candidates = {CLAUDE_MODEL_SNAPSHOT_PATH}
-    candidates.update(APP_DIR.glob("claude-default-model.*.snapshot.json"))
-    for path in sorted(candidates):
-        _restore_user_model_snapshot(path)
+def _compose_v2_settings(tool_args: list[str]) -> tuple[dict, list[str]]:
+    """Compose caller settings with ucode's Claude settings for a v2 launch."""
+    caller_values, remaining = _extract_caller_settings(tool_args)
+    settings: dict = {}
+    for value in caller_values:
+        settings = _merge_claude_settings(settings, _load_caller_settings(value))
+    return _merge_claude_settings(settings, read_json_safe(CLAUDE_SETTINGS_PATH)), remaining
 
 
 def _original_launch_model(snapshot: dict, state: dict) -> str | None:
@@ -1108,105 +1066,27 @@ def _launch_relayed(
     raise SystemExit(returncode)
 
 
-def _v2_router(state: dict):
-    """Return the first-prompt router; currently fixed while routing is prototyped."""
-
-    def route(_prompt: str) -> str:
-        return SMART_ROUTING_V2_MODEL
-
-    return route
-
-
-def _launch_smart_routing_v2(
-    state: dict,
-    tool_args: list[str],
-    *,
-    model_snapshot: dict,
-    launch_model: str | None,
-) -> None:
-    """Launch Claude in the first-prompt routing PTY wrapper."""
-    from ucode.smart_routing import claude_pty
-
-    binary = SPEC["binary"]
-    workspace = state["workspace"]
-    os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
-
-    run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    socket_path = APP_DIR / f"claude-v2-{run_id}.sock"
-    settings_path = APP_DIR / f"claude-v2-{run_id}.json"
-    model_snapshot_path = APP_DIR / f"claude-default-model.{run_id}.snapshot.json"
-
-    caller_values, remaining = _extract_caller_settings(tool_args)
-    settings: dict = {}
-    for value in caller_values:
-        settings = _merge_claude_settings(settings, _load_caller_settings(value))
-    settings = _merge_claude_settings(settings, read_json_safe(CLAUDE_SETTINGS_PATH))
-    hook_executable = build_auth_token_argv(
-        workspace, state.get("profile"), use_pat=bool(state.get("use_pat"))
-    )[0]
-    env = settings.setdefault("env", {})
-    if not isinstance(env, dict):
-        raise RuntimeError("Claude settings 'env' must be an object for smart routing.")
-    env[FIRST_PROMPT_SOCKET_ENV] = str(socket_path)
-    sync_first_prompt_hook(settings, hook_executable)
-    write_json_file(settings_path, settings)
-    model_args = _launch_model_args(remaining, launch_model)
-    argv = [binary, "--settings", str(settings_path), *model_args, *remaining]
-
-    _save_user_model_snapshot(model_snapshot, model_snapshot_path)
-    restored = False
-
-    def restore_default_model() -> bool:
-        nonlocal restored
-        if restored:
-            return False
-        result = _restore_user_model_snapshot(model_snapshot_path, model_snapshot)
-        restored = True
-        return result
-
-    print_note(
-        "Smart routing v2: the first submitted prompt will select Claude Code's "
-        f"model (stub -> {SMART_ROUTING_V2_MODEL}); log: {SMART_ROUTING_V2_CLAUDE_LOG}."
-    )
-    try:
-        returncode = claude_pty.run_claude_pty(
-            argv,
-            route_prompt=_v2_router(state),
-            switch_message=(
-                f"✨ Databricks Smart Router selected {SMART_ROUTING_V2_MODEL} due to "
-                "low complexity, unclear intent, and no code reference."
-            ),
-            socket_path=socket_path,
-            log_path=SMART_ROUTING_V2_CLAUDE_LOG,
-        )
-    finally:
-        # Restore only after Claude exits. Claude persists `/model` asynchronously;
-        # restoring as soon as its success message renders races that delayed write.
-        # The journal repairs hard-killed and concurrent launches before they start.
-        restore_default_model()
-        settings_path.unlink(missing_ok=True)
-        socket_path.unlink(missing_ok=True)
-    raise SystemExit(returncode)
-
-
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     # Recover a prior switch interrupted before its surgical settings restore.
-    _recover_user_model_snapshots()
-    model_snapshot = _snapshot_user_model_setting()
+    smart_routing_v2.recover_claude_model_snapshots(CLAUDE_USER_SETTINGS_PATH)
+    model_snapshot = smart_routing_v2.snapshot_claude_model_setting(CLAUDE_USER_SETTINGS_PATH)
     launch_model = _original_launch_model(model_snapshot, state)
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args, launch_model)
         return
     if smart_routing_v2.enabled() and workspace and os.name != "nt":
-        _launch_smart_routing_v2(
+        smart_routing_v2.launch_claude(
             state,
             tool_args,
+            binary=binary,
+            user_settings_path=CLAUDE_USER_SETTINGS_PATH,
             model_snapshot=model_snapshot,
             launch_model=launch_model,
+            compose_settings=_compose_v2_settings,
+            launch_model_args=_launch_model_args,
         )
-        return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     exec_or_spawn(_build_claude_argv(binary, tool_args, launch_model=launch_model))

@@ -7,13 +7,23 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
 
-from ucode.config_io import APP_DIR, deep_merge_dict, read_toml_safe, write_toml_file
-from ucode.databricks import get_databricks_token
-from ucode.smart_routing import codex_interposer
+from ucode.config_io import (
+    APP_DIR,
+    deep_merge_dict,
+    read_json_safe,
+    read_toml_safe,
+    write_json_file,
+    write_toml_file,
+)
+from ucode.databricks import build_auth_token_argv, get_databricks_token
+from ucode.smart_routing import claude_pty, codex_interposer
+from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, sync_first_prompt_hook
+from ucode.ui import print_note
 
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
 
@@ -21,6 +31,10 @@ CODEX_TARGET_MODEL = "system.ai.glm-5-2"  # TODO(lilly): replace with smart rout
 CODEX_APP_SERVER_HOME = APP_DIR / "codex-v2-home"
 CODEX_INTERPOSER_LOG = APP_DIR / "codex-v2-interposer.log"
 CODEX_SWITCH_REASON = "Low complexity, unclear intent, and no code reference."  # TODO(lilly): replace with smart router rationale.
+
+CLAUDE_TARGET_MODEL = "system.ai.claude-sonnet-4-6[1m]"  # TODO(lilly): replace with smart router.
+CLAUDE_PTY_LOG = APP_DIR / "claude-v2-pty.log"
+CLAUDE_MODEL_SNAPSHOT_PATH = APP_DIR / "claude-default-model.snapshot.json"
 
 APP_SERVER_READY_TIMEOUT_SECONDS = 30
 PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 5
@@ -33,6 +47,48 @@ HEALTH_POLL_INTERVAL_SECONDS = 0.25
 
 def enabled() -> bool:
     return os.environ.get(ENV_VAR) == "1"
+
+
+def snapshot_claude_model_setting(user_settings_path: Path) -> dict:
+    """Capture only Claude's user-level ``model`` setting."""
+    settings = read_json_safe(user_settings_path)
+    return {"present": "model" in settings, "value": settings.get("model")}
+
+
+def _save_claude_model_snapshot(snapshot: dict, snapshot_path: Path) -> None:
+    """Journal the pre-switch model so the next launch can recover after a crash."""
+    write_json_file(snapshot_path, snapshot)
+
+
+def restore_claude_model_snapshot(
+    user_settings_path: Path,
+    snapshot_path: Path | None = None,
+    snapshot: dict | None = None,
+) -> bool:
+    """Restore only the journaled ``model`` field, preserving every sibling setting."""
+    snapshot_path = snapshot_path or CLAUDE_MODEL_SNAPSHOT_PATH
+    if snapshot is None and not snapshot_path.exists():
+        return False
+    snapshot = snapshot if snapshot is not None else read_json_safe(snapshot_path)
+    present = snapshot.get("present")
+    if not isinstance(present, bool):
+        raise RuntimeError(f"Claude model recovery snapshot is invalid: {snapshot_path}")
+    settings = read_json_safe(user_settings_path)
+    if present:
+        settings["model"] = snapshot.get("value")
+    else:
+        settings.pop("model", None)
+    write_json_file(user_settings_path, settings)
+    snapshot_path.unlink(missing_ok=True)
+    return True
+
+
+def recover_claude_model_snapshots(user_settings_path: Path) -> None:
+    """Repair defaults left by interrupted Claude PTY launches."""
+    candidates = {CLAUDE_MODEL_SNAPSHOT_PATH}
+    candidates.update(APP_DIR.glob("claude-default-model.*.snapshot.json"))
+    for path in sorted(candidates):
+        restore_claude_model_snapshot(user_settings_path, path)
 
 
 def _loopback_websocket_url(port: int) -> str:
@@ -88,6 +144,85 @@ def _generate_codex_app_server_home(
     deep_merge_dict(doc, overlay)
     write_toml_file(config_path, doc)
     return CODEX_APP_SERVER_HOME
+
+
+def _route_claude_prompt(_prompt: str) -> str:
+    return CLAUDE_TARGET_MODEL
+
+
+def launch_claude(
+    state: dict,
+    tool_args: list[str],
+    *,
+    binary: str,
+    user_settings_path: Path,
+    model_snapshot: dict,
+    launch_model: str | None,
+    compose_settings: Callable[[list[str]], tuple[dict, list[str]]],
+    launch_model_args: Callable[[list[str], str | None], list[str]],
+) -> NoReturn:
+    """Launch Claude in the first-prompt routing PTY wrapper."""
+    workspace = state.get("workspace")
+    if not workspace:
+        raise RuntimeError(
+            "Smart routing v2 needs a configured workspace; run `ucode configure claude` first."
+        )
+    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, state.get("profile"))
+
+    run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    socket_path = APP_DIR / f"claude-v2-{run_id}.sock"
+    settings_path = APP_DIR / f"claude-v2-{run_id}.json"
+    model_snapshot_path = APP_DIR / f"claude-default-model.{run_id}.snapshot.json"
+
+    settings, remaining = compose_settings(tool_args)
+    hook_executable = build_auth_token_argv(
+        workspace, state.get("profile"), use_pat=bool(state.get("use_pat"))
+    )[0]
+    env = settings.setdefault("env", {})
+    if not isinstance(env, dict):
+        raise RuntimeError("Claude settings 'env' must be an object for smart routing.")
+    env[FIRST_PROMPT_SOCKET_ENV] = str(socket_path)
+    sync_first_prompt_hook(settings, hook_executable)
+    write_json_file(settings_path, settings)
+    model_args = launch_model_args(remaining, launch_model)
+    argv = [binary, "--settings", str(settings_path), *model_args, *remaining]
+
+    _save_claude_model_snapshot(model_snapshot, model_snapshot_path)
+    restored = False
+
+    def restore_default_model() -> bool:
+        nonlocal restored
+        if restored:
+            return False
+        result = restore_claude_model_snapshot(
+            user_settings_path, model_snapshot_path, model_snapshot
+        )
+        restored = True
+        return result
+
+    print_note(
+        "Smart routing v2: the first submitted prompt will select Claude Code's "
+        f"model ({CLAUDE_TARGET_MODEL}); log: {CLAUDE_PTY_LOG}."
+    )
+    try:
+        returncode = claude_pty.run_claude_pty(
+            argv,
+            route_prompt=_route_claude_prompt,
+            switch_message=(
+                f"✨ Databricks Smart Router selected {CLAUDE_TARGET_MODEL} due to "
+                "low complexity, unclear intent, and no code reference."
+            ),
+            socket_path=socket_path,
+            log_path=CLAUDE_PTY_LOG,
+        )
+    finally:
+        # Restore only after Claude exits. Claude persists `/model` asynchronously;
+        # restoring as soon as its success message renders races that delayed write.
+        # The journal repairs hard-killed and concurrent launches before they start.
+        restore_default_model()
+        settings_path.unlink(missing_ok=True)
+        socket_path.unlink(missing_ok=True)
+    sys.exit(returncode)
 
 
 def launch_codex(

@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from ucode.agents import claude
-from ucode.smart_routing import claude_hooks, claude_pty
+from ucode.smart_routing import claude_hooks, claude_pty, v2
 
 
 class TestDirectModelCommand:
@@ -78,16 +78,15 @@ class TestV2Launch:
     def test_saves_default_passes_model_and_restores_only_model(self, tmp_path, monkeypatch):
         ucode_settings = tmp_path / "ucode-settings.json"
         user_settings = tmp_path / "settings.json"
-        snapshot_path = tmp_path / "model-snapshot.json"
         ucode_settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gw"}}))
         user_settings.write_text(json.dumps({"model": "opus", "theme": "dark"}))
         monkeypatch.setattr(claude, "APP_DIR", tmp_path)
         monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", ucode_settings)
         monkeypatch.setattr(claude, "CLAUDE_USER_SETTINGS_PATH", user_settings)
-        monkeypatch.setattr(claude, "CLAUDE_MODEL_SNAPSHOT_PATH", snapshot_path)
-        monkeypatch.setattr(claude, "SMART_ROUTING_V2_CLAUDE_LOG", tmp_path / "v2.log")
-        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args, **_kwargs: "token")
-        monkeypatch.setattr(claude, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
+        monkeypatch.setattr(v2, "APP_DIR", tmp_path)
+        monkeypatch.setattr(v2, "CLAUDE_PTY_LOG", tmp_path / "v2.log")
+        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
+        monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
         captured: dict = {}
 
         def fake_run(argv, **kwargs):
@@ -99,13 +98,17 @@ class TestV2Launch:
             return 0
 
         monkeypatch.setattr(claude_pty, "run_claude_pty", fake_run)
-        snapshot = claude._snapshot_user_model_setting()
+        snapshot = v2.snapshot_claude_model_setting(user_settings)
         with pytest.raises(SystemExit) as exc:
-            claude._launch_smart_routing_v2(
+            v2.launch_claude(
                 {"workspace": "https://example.com"},
                 ["--debug"],
+                binary="claude",
+                user_settings_path=user_settings,
                 model_snapshot=snapshot,
                 launch_model="opus",
+                compose_settings=claude._compose_v2_settings,
+                launch_model_args=claude._launch_model_args,
             )
 
         assert exc.value.code == 0
@@ -117,8 +120,35 @@ class TestV2Launch:
             "theme": "light",
             "new": True,
         }
-        assert not snapshot_path.exists()
         assert not list(tmp_path.glob("claude-default-model.*.snapshot.json"))
+
+
+class TestModelRecovery:
+    def test_restore_changes_only_model_field(self, tmp_path):
+        user = tmp_path / "settings.json"
+        snapshot_path = tmp_path / "model-snapshot.json"
+        user.write_text(json.dumps({"model": "opus", "theme": "dark"}))
+        original = v2.snapshot_claude_model_setting(user)
+        v2._save_claude_model_snapshot(original, snapshot_path)
+
+        user.write_text(json.dumps({"model": "routed", "theme": "light", "new": True}))
+        assert v2.restore_claude_model_snapshot(user, snapshot_path) is True
+        assert json.loads(user.read_text()) == {
+            "model": "opus",
+            "theme": "light",
+            "new": True,
+        }
+        assert v2.restore_claude_model_snapshot(user, snapshot_path) is False
+
+    def test_restore_removes_model_when_original_was_absent(self, tmp_path):
+        user = tmp_path / "settings.json"
+        snapshot_path = tmp_path / "model-snapshot.json"
+        user.write_text(json.dumps({"theme": "dark"}))
+        v2._save_claude_model_snapshot(v2.snapshot_claude_model_setting(user), snapshot_path)
+        user.write_text(json.dumps({"model": "routed", "theme": "light"}))
+
+        v2.restore_claude_model_snapshot(user, snapshot_path)
+        assert json.loads(user.read_text()) == {"theme": "light"}
 
 
 class TestPtyFlow:
