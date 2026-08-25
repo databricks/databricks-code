@@ -312,9 +312,17 @@ class TestBuildRuntimeEnv:
 
         assert env["OPENCODE_CONFIG"] == str(opencode.OPENCODE_CONFIG_PATH)
 
-    def test_leaves_xdg_config_home_alone(self, monkeypatch):
-        # A redirect of XDG_CONFIG_HOME hides the whole of ~/.config/opencode:
-        # permissions, the user's MCP servers, skills, agents and tui.json.
+    # A redirect of XDG_CONFIG_HOME hides the whole of ~/.config/opencode:
+    # permissions, the user's MCP servers, skills, agents and tui.json. So ucode
+    # must neither add the variable nor overwrite the value the user set.
+    def test_passes_the_users_xdg_config_home_through(self, monkeypatch):
+        monkeypatch.setenv("XDG_CONFIG_HOME", "/sentinel/xdg")
+
+        env = opencode.build_runtime_env("tok")
+
+        assert env["XDG_CONFIG_HOME"] == "/sentinel/xdg"
+
+    def test_adds_no_xdg_config_home(self, monkeypatch):
         monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
 
         env = opencode.build_runtime_env("tok")
