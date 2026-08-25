@@ -6,10 +6,9 @@ a proper upgrade returns 101, and each JSON-RPC message is one WebSocket text
 frame. This module sits between the real TUI and a real ``codex app-server``,
 forwarding every frame untouched except:
 
-  - ``turn/start`` (TUI->engine): after an initial hold of ``after`` turns, its
-    ``model`` is rewritten. ``turn/start.model`` is documented as "override the
-    model for this turn and subsequent turns", so the live session retargets with
-    history preserved.
+  - ``turn/start`` (TUI->engine): its ``model`` is rewritten.
+    ``turn/start.model`` is documented as "override the model for this turn and
+    subsequent turns", so the live session retargets with history preserved.
   - When the first switched turn starts — on that turn's ``turn/started``, before
     any response items stream — two things are injected (engine->TUI): a
     ``thread/settings/updated`` carrying the new model, so the TUI's on-screen
@@ -33,11 +32,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import os
-import socket
 import threading
 import time
-import urllib.request
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -48,35 +44,29 @@ from websockets.asyncio.server import serve
 SETTINGS_UPDATED = "thread/settings/updated"
 ITEM_STARTED = "item/started"
 ITEM_COMPLETED = "item/completed"
-LOOPBACK_HOST = "127.0.0.1"
-
-# Set UCODE_INTERPOSER_DEBUG=1 to dump raw engine->TUI item/turn frames (and the frames we
-# inject) to the interposer log, for comparing our synthetic note against real assistant frames.
-_DEBUG = os.environ.get("UCODE_INTERPOSER_DEBUG") == "1"
+TURN_START = "turn/start"
+TURN_STARTED = "turn/started"
 
 
 class _Session:
-    """Per-TUI-connection state: hold the first ``after`` turns, then switch model."""
+    """Per-TUI-connection state for switching the model once."""
 
     def __init__(
         self,
         target_model: str,
-        after: int,
         log: Callable[[str], None],
         switch_message: str | None = None,
     ) -> None:
         self.target = target_model
-        self.after = after
         self.log = log
-        # One-line explanation surfaced in the TUI when the switch fires; None skips it.
         self.switch_message = switch_message
-        self.turns = 0
         self.thread_id: str | None = None
         self.settings: dict | None = None
+        self.switch_pending = False
         self.injected = False
 
     def on_tui_frame(self, raw: str) -> str:
-        """TUI->engine: rewrite ``turn/start.model`` once past the hold."""
+        """TUI->engine: rewrite ``turn/start.model`` to the selected model."""
         try:
             msg = json.loads(raw)
         except ValueError:
@@ -84,18 +74,15 @@ class _Session:
         if not isinstance(msg, dict):
             return raw
         params = msg.get("params")
-        if _DEBUG and isinstance(msg.get("method"), str) and msg["method"].startswith("turn/"):
-            self.log(f"[DEBUG->engine] {msg['method']}: {raw[:1200]}")
-        if msg.get("method") == "turn/start" and isinstance(params, dict):
-            self.turns += 1
+        if msg.get("method") == TURN_START and isinstance(params, dict):
             if isinstance(params.get("threadId"), str):
                 self.thread_id = params["threadId"]
-            if self.turns > self.after:
-                old = params.get("model")
-                if old != self.target:
-                    params["model"] = self.target
-                    self.log(f"[REWRITE] turn #{self.turns}: model {old!r} -> {self.target!r}")
-                    return json.dumps(msg)
+            old = params.get("model")
+            if old != self.target:
+                params["model"] = self.target
+                self.switch_pending = not self.injected
+                self.log(f"[REWRITE] model {old!r} -> {self.target!r}")
+                return json.dumps(msg)
         return raw
 
     def on_engine_frame(self, raw: str) -> list[dict]:
@@ -114,28 +101,24 @@ class _Session:
             return []
         if not isinstance(msg, dict):
             return []
-        if _DEBUG:
-            method = msg.get("method")
-            if isinstance(method, str) and (
-                method.startswith("item/") or method.startswith("turn/")
-            ):
-                self.log(f"[DEBUG<-engine] {method}: {raw[:1800]}")
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
         for src in (params, result):
-            tid = src.get("threadId") or (src.get("thread") or {}).get("id")
+            thread = src.get("thread")
+            tid = src.get("threadId") or (thread.get("id") if isinstance(thread, dict) else None)
             if isinstance(tid, str):
                 self.thread_id = tid
             ts = src.get("threadSettings")
             if isinstance(ts, dict):
                 self.settings = ts
         if (
-            msg.get("method") == "turn/started"
+            msg.get("method") == TURN_STARTED
             and not self.injected
-            and self.turns > self.after
+            and self.switch_pending
             and self.thread_id
         ):
             self.injected = True
+            self.switch_pending = False
             settings = dict(self.settings) if isinstance(self.settings, dict) else {}
             settings["model"] = self.target
             self.log(f"[INJECT] {SETTINGS_UPDATED}: model -> {self.target!r} (flip TUI chip)")
@@ -146,8 +129,7 @@ class _Session:
                 }
             ]
             if self.switch_message:
-                params_obj = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-                turn = params_obj.get("turn") if isinstance(params_obj, dict) else {}
+                turn = params.get("turn")
                 turn_id = turn.get("id") if isinstance(turn, dict) else None
                 now_ms = int(time.time() * 1000)
                 item = {
@@ -183,20 +165,17 @@ class _Session:
                         },
                     }
                 )
-            if _DEBUG:
-                for frame in injected:
-                    self.log(f"[DEBUG-inject] {json.dumps(frame)[:1800]}")
             return injected
         return []
 
 
 async def _handle_tui(
-    tui, upstream_uri: str, target_model: str, after: int, log, switch_message: str | None = None
+    tui, upstream_uri: str, target_model: str, log, switch_message: str | None = None
 ) -> None:
     path = getattr(getattr(tui, "request", None), "path", "/") or "/"
     uri = upstream_uri.rstrip("/") + path
     log(f"[CONN] TUI connected (path={path}); dialing app-server {uri}")
-    sess = _Session(target_model, after, log, switch_message)
+    sess = _Session(target_model, log, switch_message)
     async with connect(uri, max_size=None) as upstream:
 
         async def tui_to_app():
@@ -214,11 +193,12 @@ async def _handle_tui(
 
         a = asyncio.create_task(tui_to_app())
         b = asyncio.create_task(app_to_tui())
-        _done, pending = await asyncio.wait({a, b}, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait({a, b}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await t
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
     log("[CONN] TUI session closed")
 
 
@@ -227,36 +207,34 @@ async def _serve(
     port: int,
     upstream_uri: str,
     model: str,
-    after: int,
     log,
     switch_message: str | None = None,
 ):
     async def handler(tui):
         try:
-            await _handle_tui(tui, upstream_uri, model, after, log, switch_message)
+            await _handle_tui(tui, upstream_uri, model, log, switch_message)
         except Exception as exc:  # noqa: BLE001 - one session must never kill the server
             log(f"[ERR] session: {exc!r}")
 
     server = await serve(handler, host, port, max_size=None)
-    log(f"[READY] ws://{host}:{port} -> {upstream_uri} (hold {after} turn(s), then -> {model!r})")
+    bound_port = server.sockets[0].getsockname()[1]
+    log(f"[READY] ws://{host}:{bound_port} -> {upstream_uri} (switch -> {model!r})")
     return server
 
 
 def start_interposer_thread(
     host: str,
-    port: int,
     upstream_uri: str,
     model: str,
-    after: int,
     *,
     switch_message: str | None = None,
     log_path: Path | None = None,
     ready_timeout: float = 10.0,
-) -> tuple[threading.Thread, Callable[[], None]]:
+) -> tuple[int, Callable[[], None]]:
     """Run the interposer's asyncio server in a daemon thread.
 
-    Returns ``(thread, stop)``; ``stop()`` shuts the server down and stops the
-    loop. ``switch_message``, when set, is surfaced in the TUI as an
+    Binds an OS-assigned loopback port and returns ``(port, stop)``. ``stop()``
+    shuts the server down and joins its thread. ``switch_message``, when set, is surfaced as an
     ``agentMessage`` explaining why the model switched. Logs go to ``log_path`` (appended) when
     given — never to stdout/stderr, which the foreground TUI owns. Blocks until
     the server is listening (or ``ready_timeout`` elapses)."""
@@ -279,9 +257,11 @@ def start_interposer_thread(
         asyncio.set_event_loop(loop)
         try:
             holder["server"] = loop.run_until_complete(
-                _serve(host, port, upstream_uri, model, after, log, switch_message)
+                _serve(host, 0, upstream_uri, model, log, switch_message)
             )
+            holder["port"] = holder["server"].sockets[0].getsockname()[1]
         except Exception as exc:  # noqa: BLE001 - surface bind/connect failures to the log
+            holder["error"] = exc
             log(f"[ERR] failed to start interposer: {exc!r}")
             ready.set()
             loop.close()
@@ -298,33 +278,17 @@ def start_interposer_thread(
 
     thread = threading.Thread(target=run, name="codex-interposer", daemon=True)
     thread.start()
-    ready.wait(timeout=ready_timeout)
+
+    if not ready.wait(timeout=ready_timeout):
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=ready_timeout)
+        raise RuntimeError("Codex interposer did not become ready in time.")
+    if error := holder.get("error"):
+        raise RuntimeError("Codex interposer failed to start.") from error
 
     def stop() -> None:
         with contextlib.suppress(RuntimeError):
             loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=ready_timeout)
 
-    return thread, stop
-
-
-def free_port() -> int:
-    """Grab an unused loopback TCP port (races are irrelevant for local ephemeral use)."""
-    sock = socket.socket()
-    sock.bind((LOOPBACK_HOST, 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def wait_healthz(port: int, timeout: float = 30.0) -> bool:
-    """Poll the app-server's ``/healthz`` until it returns 200, or timeout."""
-    url = f"http://{LOOPBACK_HOST}:{port}/healthz"
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            with urllib.request.urlopen(url, timeout=1) as resp:  # noqa: S310 - fixed localhost URL
-                if resp.status == 200:
-                    return True
-        except Exception:  # noqa: BLE001 - not ready yet; keep polling
-            time.sleep(0.25)
-    return False
+    return holder["port"], stop

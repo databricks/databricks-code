@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import os
 import signal
+import socket
 import subprocess
 import sys
+import time
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
@@ -23,10 +26,6 @@ from ucode.smart_routing import codex_interposer
 # Single env var that enables the v2 launch path for every routing-capable agent.
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
 
-# Turns to keep the session on its starting model before switching (0 = switch immediately,
-# i.e. the very first prompt already routes to the target model and shows the switch note).
-SWITCH_AFTER_TURNS = 0
-
 CODEX_TARGET_MODEL = "system.ai.glm-5-2"  # TODO(lilly): replace with smart router.
 CODEX_APP_SERVER_HOME = APP_DIR / "codex-v2-home"
 CODEX_INTERPOSER_LOG = APP_DIR / "codex-v2-interposer.log"
@@ -36,6 +35,9 @@ APP_SERVER_READY_TIMEOUT_SECONDS = 30
 PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 5
 OAUTH_TOKEN_ENV_VAR = "OAUTH_TOKEN"
 CODEX_HOME_ENV_VAR = "CODEX_HOME"
+LOOPBACK_HOST = "127.0.0.1"
+HEALTH_REQUEST_TIMEOUT_SECONDS = 1
+HEALTH_POLL_INTERVAL_SECONDS = 0.25
 
 
 def enabled() -> bool:
@@ -44,7 +46,30 @@ def enabled() -> bool:
 
 
 def _loopback_websocket_url(port: int) -> str:
-    return f"ws://{codex_interposer.LOOPBACK_HOST}:{port}"
+    return f"ws://{LOOPBACK_HOST}:{port}"
+
+
+def _free_port() -> int:
+    """Return an available loopback port for the app-server to bind."""
+    with socket.socket() as sock:
+        sock.bind((LOOPBACK_HOST, 0))
+        return sock.getsockname()[1]
+
+
+def _wait_for_app_server(port: int, timeout: float) -> bool:
+    """Poll the app-server's health endpoint until it is ready or times out."""
+    url = f"http://{LOOPBACK_HOST}:{port}/healthz"
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            with urllib.request.urlopen(  # noqa: S310 - fixed loopback URL
+                url, timeout=HEALTH_REQUEST_TIMEOUT_SECONDS
+            ) as response:
+                if response.status == 200:
+                    return True
+        except Exception:  # noqa: BLE001 - the app-server is not ready yet
+            time.sleep(HEALTH_POLL_INTERVAL_SECONDS)
+    return False
 
 
 def _switch_message(model: str, reason: str) -> str:
@@ -99,10 +124,8 @@ def launch_codex(
 
     os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, state.get("profile"))
     home = _generate_codex_app_server_home(state, start_model, render_overlay)
-    app_port = codex_interposer.free_port()
-    tui_port = codex_interposer.free_port()
+    app_port = _free_port()
     app_server_url = _loopback_websocket_url(app_port)
-    tui_url = _loopback_websocket_url(tui_port)
 
     app_server = subprocess.Popen(
         [binary, "app-server", "--listen", app_server_url],
@@ -113,19 +136,18 @@ def launch_codex(
     )
     stop_interposer = None
     try:
-        if not codex_interposer.wait_healthz(app_port, timeout=APP_SERVER_READY_TIMEOUT_SECONDS):
+        if not _wait_for_app_server(app_port, timeout=APP_SERVER_READY_TIMEOUT_SECONDS):
             raise RuntimeError(
                 "Codex app-server did not become ready for smart routing v2; check workspace auth."
             )
-        _thread, stop_interposer = codex_interposer.start_interposer_thread(
-            codex_interposer.LOOPBACK_HOST,
-            tui_port,
+        tui_port, stop_interposer = codex_interposer.start_interposer_thread(
+            LOOPBACK_HOST,
             app_server_url,
             CODEX_TARGET_MODEL,
-            SWITCH_AFTER_TURNS,
             switch_message=_switch_message(CODEX_TARGET_MODEL, CODEX_SWITCH_REASON),
             log_path=CODEX_INTERPOSER_LOG,
         )
+        tui_url = _loopback_websocket_url(tui_port)
         # Keep ucode alive while the TUI runs so it can tear down the app-server and interposer.
         tui = subprocess.Popen([binary, "--remote", tui_url, "--model", start_model, *tool_args])
         try:

@@ -73,7 +73,6 @@ class TestLaunchCodex:
             def send_signal(self, _signal):
                 raise AssertionError("test does not interrupt the TUI")
 
-        ports = iter([41001, 41002])
         monkeypatch.setattr(v2.subprocess, "Popen", FakeProcess)
         monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
         monkeypatch.setattr(
@@ -81,13 +80,13 @@ class TestLaunchCodex:
             "_generate_codex_app_server_home",
             lambda state, model, render_overlay: tmp_path,
         )
-        monkeypatch.setattr(codex_interposer, "free_port", lambda: next(ports))
-        monkeypatch.setattr(codex_interposer, "wait_healthz", lambda port, timeout: True)
+        monkeypatch.setattr(v2, "_free_port", lambda: 41001)
+        monkeypatch.setattr(v2, "_wait_for_app_server", lambda port, timeout: True)
 
         def start_interposer(*args, **kwargs):
             interposer_args["args"] = args
             interposer_args["kwargs"] = kwargs
-            return object(), lambda: stopped.append(True)
+            return 41002, lambda: stopped.append(True)
 
         monkeypatch.setattr(codex_interposer, "start_interposer_thread", start_interposer)
 
@@ -118,15 +117,29 @@ class TestLaunchCodex:
             "--search",
         ]
         assert interposer_args["args"] == (
-            codex_interposer.LOOPBACK_HOST,
-            41002,
+            v2.LOOPBACK_HOST,
             "ws://127.0.0.1:41001",
             v2.CODEX_TARGET_MODEL,
-            v2.SWITCH_AFTER_TURNS,
         )
         assert "Using Unity Gateway Smart Router." in interposer_args["kwargs"]["switch_message"]
         assert stopped == [True]
         assert processes[0].terminated is True
+
+
+def test_interposer_startup_failure_is_propagated(monkeypatch):
+    async def fail_to_serve(*args, **kwargs):
+        raise OSError("bind failed")
+
+    monkeypatch.setattr(codex_interposer, "_serve", fail_to_serve)
+
+    with pytest.raises(RuntimeError, match="failed to start") as exc:
+        codex_interposer.start_interposer_thread(
+            v2.LOOPBACK_HOST,
+            "ws://127.0.0.1:41001",
+            "model-x",
+        )
+
+    assert isinstance(exc.value.__cause__, OSError)
 
 
 class TestInterposerSession:
@@ -135,62 +148,56 @@ class TestInterposerSession:
     def _turn_start(self, model: str, thread_id: str = "t1") -> str:
         return json.dumps(
             {
-                "method": "turn/start",
+                "method": codex_interposer.TURN_START,
                 "id": 1,
                 "params": {"threadId": thread_id, "input": [], "model": model},
             }
         )
 
-    def test_holds_first_turn_then_switches(self):
-        sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
-        # Turn 1 passes through unchanged (still on the TUI's model).
-        out1 = sess.on_tui_frame(self._turn_start("system.ai.gpt-5-6-luna"))
-        assert json.loads(out1)["params"]["model"] == "system.ai.gpt-5-6-luna"
-        # Turn 2 is rewritten to the target.
-        out2 = sess.on_tui_frame(self._turn_start("system.ai.gpt-5-6-luna"))
-        assert json.loads(out2)["params"]["model"] == "gpt-5.5"
+    def test_switches_first_turn(self):
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
+        output = sess.on_tui_frame(self._turn_start("system.ai.gpt-5-6-luna"))
+        assert json.loads(output)["params"]["model"] == "gpt-5.5"
 
-    def test_after_zero_switches_immediately(self):
-        sess = codex_interposer._Session("gpt-5.5", after=0, log=lambda _m: None)
-        out1 = sess.on_tui_frame(self._turn_start("luna"))
-        assert json.loads(out1)["params"]["model"] == "gpt-5.5"
+    def test_does_not_schedule_notification_when_model_is_already_selected(self):
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
+        frame = self._turn_start("gpt-5.5")
+        assert sess.on_tui_frame(frame) == frame
+        assert sess.on_engine_frame(self._turn_started("turn-1")) == []
 
     def test_non_turn_frames_pass_through(self):
-        sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
         frame = json.dumps({"method": "initialize", "id": 1, "params": {}})
         assert sess.on_tui_frame(frame) == frame
 
     def _turn_started(self, turn_id: str, thread_id: str = "t1") -> str:
         return json.dumps(
-            {"method": "turn/started", "params": {"threadId": thread_id, "turn": {"id": turn_id}}}
+            {
+                "method": codex_interposer.TURN_STARTED,
+                "params": {"threadId": thread_id, "turn": {"id": turn_id}},
+            }
         )
 
-    def test_holds_note_until_switched_turn_starts(self):
-        # The note/chip-flip fire on the SWITCHED turn's turn/started (before its
-        # response), never on the held turn.
-        sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
-        sess.on_tui_frame(self._turn_start("luna"))  # turn 1 (held)
-        assert sess.on_engine_frame(self._turn_started("turn-1")) == []  # held: no inject
-        sess.on_tui_frame(self._turn_start("luna"))  # turn 2 (switched)
-        injected = sess.on_engine_frame(self._turn_started("turn-2"))
+    def test_injects_note_when_switched_turn_starts(self):
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
+        sess.on_tui_frame(self._turn_start("luna"))
+        injected = sess.on_engine_frame(self._turn_started("turn-1"))
         settings = next(m for m in injected if m["method"] == codex_interposer.SETTINGS_UPDATED)
         assert settings["params"]["threadId"] == "t1"
         assert settings["params"]["threadSettings"]["model"] == "gpt-5.5"
 
     def test_injects_switch_note_as_agent_message_when_message_set(self):
         sess = codex_interposer._Session(
-            "gpt-5.5", after=1, log=lambda _m: None, switch_message="selected glm-5-2 because X"
+            "gpt-5.5", log=lambda _m: None, switch_message="selected glm-5-2 because X"
         )
-        sess.on_tui_frame(self._turn_start("luna"))  # turn 1 (held)
-        sess.on_engine_frame(self._turn_started("turn-1"))
-        sess.on_tui_frame(self._turn_start("luna"))  # turn 2 (switched)
-        injected = sess.on_engine_frame(self._turn_started("turn-2"))
+        sess.on_tui_frame(self._turn_start("luna"))
+        injected = sess.on_engine_frame(self._turn_started("turn-1"))
         # The note is a full agentMessage lifecycle: item/started THEN item/completed,
         # both carrying the same item (a lone item/completed renders nothing in the TUI).
         started = next(m for m in injected if m["method"] == codex_interposer.ITEM_STARTED)
         completed = next(m for m in injected if m["method"] == codex_interposer.ITEM_COMPLETED)
-        assert started["params"]["turnId"] == "turn-2"
-        assert completed["params"]["turnId"] == "turn-2"
+        assert started["params"]["turnId"] == "turn-1"
+        assert completed["params"]["turnId"] == "turn-1"
         for frame in (started, completed):
             item = frame["params"]["item"]
             # An agentMessage renders as plain chat text, not a yellow warning banner.
@@ -198,26 +205,15 @@ class TestInterposerSession:
             assert item["text"] == "selected glm-5-2 because X"
         assert started["params"]["item"]["id"] == completed["params"]["item"]["id"]
 
-    def test_after_zero_injects_on_first_turn_start(self):
-        sess = codex_interposer._Session(
-            "gpt-5.5", after=0, log=lambda _m: None, switch_message="switched"
-        )
-        sess.on_tui_frame(self._turn_start("luna"))  # turn 1 (switched immediately)
-        injected = sess.on_engine_frame(self._turn_started("turn-1"))
-        methods = [m["method"] for m in injected]
-        assert codex_interposer.ITEM_STARTED in methods
-        assert codex_interposer.ITEM_COMPLETED in methods
-
     def test_no_note_without_message(self):
-        sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
         sess.on_tui_frame(self._turn_start("luna"))
-        sess.on_tui_frame(self._turn_start("luna"))
-        injected = sess.on_engine_frame(self._turn_started("turn-2"))
+        injected = sess.on_engine_frame(self._turn_started("turn-1"))
         assert [m["method"] for m in injected] == [codex_interposer.SETTINGS_UPDATED]
 
     def test_injects_only_once(self):
-        sess = codex_interposer._Session("gpt-5.5", after=1, log=lambda _m: None)
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
         sess.on_tui_frame(self._turn_start("luna"))
+        assert sess.on_engine_frame(self._turn_started("turn-1"))
         sess.on_tui_frame(self._turn_start("luna"))
-        assert sess.on_engine_frame(self._turn_started("turn-2"))  # switched turn: injects
-        assert sess.on_engine_frame(self._turn_started("turn-3")) == []  # later turn: no re-inject
+        assert sess.on_engine_frame(self._turn_started("turn-2")) == []
