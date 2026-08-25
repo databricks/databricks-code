@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from ucode.agents import opencode
@@ -28,10 +29,9 @@ class TestOpencodeSpec:
     def test_display(self):
         assert opencode.SPEC["display"] == "OpenCode"
 
-    def test_config_path_is_under_ucode_xdg_home(self):
-        assert opencode.SPEC["config_path"] == (
-            opencode.OPENCODE_XDG_CONFIG_HOME / "opencode" / "opencode.json"
-        )
+    def test_config_path_is_outside_the_user_config_dir(self):
+        assert opencode.SPEC["config_path"] == opencode.OPENCODE_CONFIG_DIR / "opencode.json"
+        assert Path.home() / ".config" not in opencode.OPENCODE_CONFIG_PATH.parents
 
 
 class TestRenderOverlay:
@@ -307,10 +307,19 @@ class TestBuildRuntimeEnv:
 
         assert env["OAUTH_TOKEN"] == "tok"
 
-    def test_sets_ucode_xdg_config_home(self):
+    def test_names_the_ucode_config_file(self):
         env = opencode.build_runtime_env("tok")
 
-        assert env["XDG_CONFIG_HOME"] == str(opencode.OPENCODE_XDG_CONFIG_HOME)
+        assert env["OPENCODE_CONFIG"] == str(opencode.OPENCODE_CONFIG_PATH)
+
+    def test_leaves_xdg_config_home_alone(self, monkeypatch):
+        # A redirect of XDG_CONFIG_HOME hides the whole of ~/.config/opencode:
+        # permissions, the user's MCP servers, skills, agents and tui.json.
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+        env = opencode.build_runtime_env("tok")
+
+        assert "XDG_CONFIG_HOME" not in env
 
 
 class TestOpencodeDefaultModel:

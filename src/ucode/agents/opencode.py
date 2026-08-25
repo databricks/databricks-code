@@ -25,8 +25,11 @@ from ucode.databricks import (
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 
-OPENCODE_XDG_CONFIG_HOME = APP_DIR / "opencode-xdg"
-OPENCODE_CONFIG_DIR = OPENCODE_XDG_CONFIG_HOME / "opencode"
+# ucode keeps its config outside `~/.config/opencode` so it never writes to the
+# user's own config. The `opencode-xdg` directory name is historical: ucode used
+# to export it as XDG_CONFIG_HOME. The path stays as it is so MCP servers that
+# `ucode mcp add` already registered survive an upgrade.
+OPENCODE_CONFIG_DIR = APP_DIR / "opencode-xdg" / "opencode"
 OPENCODE_CONFIG_PATH = OPENCODE_CONFIG_DIR / "opencode.json"
 OPENCODE_BACKUP_PATH = APP_DIR / "opencode-config.backup.json"
 
@@ -260,7 +263,15 @@ def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
 def build_runtime_env(token: str, state: dict | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env["OAUTH_TOKEN"] = token
-    env["XDG_CONFIG_HOME"] = str(OPENCODE_XDG_CONFIG_HOME)
+    # Name the config file instead of a redirect of XDG_CONFIG_HOME. A redirect
+    # hides all of `~/.config/opencode`: permissions, the user's MCP servers,
+    # `disabled_providers`, global skills, agents, commands, plugins, tui.json
+    # and the global AGENTS.md. OPENCODE_CONFIG is a layer above the user's
+    # global config, and opencode merges the layers — it does not replace them.
+    # Objects merge one key at a time and the later scalar wins, so ucode keeps
+    # control of `model` and `provider`. Do not put a top-level array in this
+    # file: opencode replaces an array, it does not merge it.
+    env["OPENCODE_CONFIG"] = str(OPENCODE_CONFIG_PATH)
     return env
 
 

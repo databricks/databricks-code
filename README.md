@@ -335,7 +335,7 @@ their next ucode run.
 | `~/.codex/config.toml` | Codex |
 | `~/.claude/settings.json` | Claude Code |
 | `~/.gemini/.env` | Gemini CLI |
-| `~/.config/opencode/opencode.json` | OpenCode |
+| `~/.ucode/opencode-xdg/opencode/opencode.json` | OpenCode — a config layer above your own `~/.config/opencode/opencode.json`, which OpenCode still reads |
 | `~/.copilot/.env` | GitHub Copilot CLI |
 | `~/.pi/agent/models.json` | Pi |
 | `~/.cursor/mcp.json` | Cursor Agent (MCP servers only) |
