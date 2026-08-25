@@ -1555,9 +1555,11 @@ def clear_model_services_cache() -> None:
 def has_cached_model_services(workspace: str) -> bool:
     """True when the `system.ai` model-service listing for ``workspace`` already succeeded.
 
-    Only successes are cached, so this doubles as "the UC model-services API answered". Callers use
-    it to skip a second view of the listing when the first walk failed — without it, a workspace with
-    no UC model-services would pay the full retry budget again for a call that cannot succeed.
+    Only a non-empty listing is cached, because :func:`list_model_service_api_types` reports an
+    empty result as a failure rather than as an empty success. So this doubles as "the UC
+    model-services API returned models". Callers use it to skip a second view of the listing when
+    the first walk found none — without it, a workspace with no UC model-services would pay the
+    full retry budget again for a call that cannot succeed.
     """
     return workspace in _MODEL_SERVICES_CACHE
 
@@ -1831,7 +1833,9 @@ def discover_opencode_models(
 
     - ``anthropic`` — models advertising ``anthropic/v1/messages`` (`@ai-sdk/anthropic`).
     - ``gemini`` — models advertising ``gemini/v1/generateContent`` (`@ai-sdk/google`).
-    - ``oss`` — the rest, advertising ``mlflow/v1/responses`` (`@ai-sdk/openai`).
+    - ``oss`` — models advertising ``mlflow/v1/responses`` (`@ai-sdk/openai`).
+
+    A model that advertises none of those three dialects is dropped, not bucketed.
 
     Each bucket keys on the dialect its provider's npm package actually sends, so a listed model
     always works. That is why ``oss`` keys on ``responses`` rather than ``chat/completions``: it costs
