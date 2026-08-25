@@ -176,6 +176,34 @@ class TestDiscoverClaudeModels:
         assert reason is None
         assert models["opus"] == "databricks-claude-opus-4-8"
 
+    def test_opus_5_wins_by_default_without_smart_routing(self, monkeypatch):
+        # Issue #382: everyone but smart-routing users should see newest-wins (opus-5), not
+        # the routing-compatibility pin to 4-8.
+        payload = {
+            "data": [
+                {"id": "databricks-claude-opus-4-8"},
+                {"id": "databricks-claude-opus-5"},
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, _ = db_mod.discover_claude_models(WS, "token")
+
+        assert models["opus"] == "databricks-claude-opus-5"
+
+    def test_pins_opus_4_8_when_smart_routing_enabled(self, monkeypatch):
+        payload = {
+            "data": [
+                {"id": "databricks-claude-opus-4-8"},
+                {"id": "databricks-claude-opus-5"},
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, _ = db_mod.discover_claude_models(WS, "token", smart_routing_enabled=True)
+
+        assert models["opus"] == "databricks-claude-opus-4-8"
+
     def test_buckets_fable_family(self, monkeypatch):
         payload = {
             "data": [
@@ -211,6 +239,34 @@ class TestModelTokenLimits:
 
     def test_uncapped_model_returns_none(self):
         assert db_mod.model_token_limits("system.ai.kimi-k2-7-code") is None
+
+
+class TestPreferOpus48:
+    def test_no_op_when_smart_routing_disabled(self):
+        models = {"opus": "claude-opus-5"}
+        db_mod._prefer_opus_4_8(
+            models, ["claude-opus-5", "claude-opus-4-8"], smart_routing_enabled=False
+        )
+        assert models["opus"] == "claude-opus-5"
+
+    def test_swaps_to_4_8_when_smart_routing_enabled(self):
+        models = {"opus": "claude-opus-5"}
+        db_mod._prefer_opus_4_8(
+            models, ["claude-opus-5", "claude-opus-4-8"], smart_routing_enabled=True
+        )
+        assert models["opus"] == "claude-opus-4-8"
+
+    def test_no_op_when_4_8_unavailable(self):
+        models = {"opus": "claude-opus-5"}
+        db_mod._prefer_opus_4_8(models, ["claude-opus-5"], smart_routing_enabled=True)
+        assert models["opus"] == "claude-opus-5"
+
+    def test_no_op_when_opus_is_not_version_5(self):
+        models = {"opus": "claude-opus-4-8"}
+        db_mod._prefer_opus_4_8(
+            models, ["claude-opus-4-8", "claude-opus-4-7"], smart_routing_enabled=True
+        )
+        assert models["opus"] == "claude-opus-4-8"
 
 
 class TestDiscoverModelServices:
@@ -252,6 +308,38 @@ class TestDiscoverModelServices:
             "system.ai.glm-5-2",
             "system.ai.kimi-k2-7-code",
         ]
+
+    def test_opus_5_wins_by_default_without_smart_routing(self, monkeypatch):
+        # Issue #382: the opus-4-8 pin is a smart-routing compatibility workaround, not a
+        # general default — everyone else should see the newest opus (opus-5).
+        payload = {
+            "model_services": [
+                _model_service("system.ai.claude-opus-4-8"),
+                _model_service("system.ai.claude-opus-5"),
+            ]
+        }
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=10: (payload, None)
+        )
+
+        claude, *_ = db_mod.discover_model_services(WS, "token")
+
+        assert claude["opus"] == "system.ai.claude-opus-5"
+
+    def test_pins_opus_4_8_when_smart_routing_enabled(self, monkeypatch):
+        payload = {
+            "model_services": [
+                _model_service("system.ai.claude-opus-4-8"),
+                _model_service("system.ai.claude-opus-5"),
+            ]
+        }
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=10: (payload, None)
+        )
+
+        claude, *_ = db_mod.discover_model_services(WS, "token", smart_routing_enabled=True)
+
+        assert claude["opus"] == "system.ai.claude-opus-4-8"
 
     def test_oss_allowlist_drops_unsupported_families(self, monkeypatch):
         # Only explicitly supported chat families are retained.
@@ -2329,9 +2417,9 @@ class TestModelServicesCache:
         claude, _codex, _gemini, _oss, _reason = db_mod.discover_model_services(WS, "tok")
         unbucketed, _ = db_mod.discover_claude_models_unbucketed(WS, "tok")
         assert calls["n"] == 1
-        # Both views still come back intact: newest-per-family (pinned to opus-4-8
-        # for smart-routing compatibility by _prefer_opus_4_8), and the full list.
-        assert claude["opus"] == "system.ai.claude-opus-4-8"
+        # Both views still come back intact: newest-per-family (opus-5 wins by default; the
+        # opus-4-8 pin only fires for smart-routing users) and the full list.
+        assert claude["opus"] == "system.ai.claude-opus-5"
         assert unbucketed == ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]
 
     def test_use_cache_false_forces_a_fresh_walk(self, monkeypatch):

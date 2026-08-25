@@ -615,13 +615,19 @@ def configure_shared_state(
         # failed), fall back to the per-family AI Gateway listing for that
         # family only.
         with spinner("Fetching available models..."):
+            # The opus-4-8 pin inside discovery only matters for smart-routing users (their
+            # router requires it); everyone else keeps newest-wins (opus-5). Read the workspace's
+            # persisted opt-in rather than any per-launch flag, which lands after discovery runs.
+            routing_enabled = claude_agent.smart_routing_enabled(state)
             ms_claude, ms_codex, ms_gemini, ms_oss, ms_reason = discover_model_services(
-                workspace, token
+                workspace, token, smart_routing_enabled=routing_enabled
             )
             if want_claude:
                 claude_models, claude_reason = ms_claude, ms_reason
                 if not claude_models:
-                    claude_models, claude_reason = discover_claude_models(workspace, token)
+                    claude_models, claude_reason = discover_claude_models(
+                        workspace, token, smart_routing_enabled=routing_enabled
+                    )
                 # Fable is opt-in (`configure --enable-fable`). Unless enabled,
                 # drop it from the discovered bundle entirely so it never becomes
                 # part of any agent's config — not claude's family pins, nor the

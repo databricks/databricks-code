@@ -1963,8 +1963,10 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
         monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
         monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: None)
-        monkeypatch.setattr(cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], None))
-        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
+        monkeypatch.setattr(
+            cli_mod, "discover_model_services", lambda w, t, **kw: ({}, [], [], [], None)
+        )
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t, **kw: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
@@ -2035,7 +2037,7 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(
             cli_mod,
             "discover_model_services",
-            lambda w, t: (
+            lambda w, t, **kw: (
                 {"opus": "system.ai.claude-opus-4-8"},
                 ["system.ai.gpt-5"],
                 [],
@@ -2047,7 +2049,7 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(
             cli_mod,
             "discover_claude_models",
-            lambda w, t: legacy_called.append("claude") or ({}, None),
+            lambda w, t, **kw: legacy_called.append("claude") or ({}, None),
         )
 
         state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
@@ -2062,7 +2064,7 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(
             cli_mod,
             "discover_model_services",
-            lambda w, t: (
+            lambda w, t, **kw: (
                 {"fable": "system.ai.claude-fable-5", "opus": "system.ai.claude-opus-4-8"},
                 [],
                 [],
@@ -2101,7 +2103,7 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(
             cli_mod,
             "discover_model_services",
-            lambda w, t: ({"fable": "system.ai.claude-fable-5"}, [], [], [], None),
+            lambda w, t, **kw: ({"fable": "system.ai.claude-fable-5"}, [], [], [], None),
         )
 
         state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
@@ -2118,7 +2120,7 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(
             cli_mod,
             "discover_model_services",
-            lambda w, t: ({"fable": "system.ai.claude-fable-5"}, [], [], [], None),
+            lambda w, t, **kw: ({"fable": "system.ai.claude-fable-5"}, [], [], [], None),
         )
 
         state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", fable_enabled=False)
@@ -2174,12 +2176,14 @@ class TestConfigureSharedStateUsePat:
         # No UC model-services: each family falls back to the legacy listing.
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
         monkeypatch.setattr(
-            cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], "no model services")
+            cli_mod,
+            "discover_model_services",
+            lambda w, t, **kw: ({}, [], [], [], "no model services"),
         )
         monkeypatch.setattr(
             cli_mod,
             "discover_claude_models",
-            lambda w, t: (
+            lambda w, t, **kw: (
                 {"opus": "databricks-claude-opus-4-8", "sonnet": "databricks-claude-sonnet-4-6"},
                 None,
             ),
@@ -2191,6 +2195,49 @@ class TestConfigureSharedStateUsePat:
             "opus": "databricks-claude-opus-4-8",
             "sonnet": "databricks-claude-sonnet-4-6",
         }
+
+
+class TestConfigureSharedStateSmartRoutingGate:
+    """Issue #382: the opus-4-8 pin inside discovery only matters for smart-routing users, so
+    configure_shared_state must forward the workspace's persisted opt-in, not a hardcoded True."""
+
+    WS = "https://example.databricks.com"
+
+    def test_forwards_persisted_smart_routing_opt_in(self, monkeypatch):
+        seen: dict = {}
+
+        cli_mod, *_ = TestConfigureSharedStateUsePat._stub_deps(
+            monkeypatch,
+            pat_token="dapi-pat",
+            existing_state={
+                "workspace": self.WS,
+                "profile": "DEFAULT",
+                "smart_routing_enabled": True,
+            },
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t, **kw: seen.update(kw) or ({}, [], [], [], None),
+        )
+
+        cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert seen["smart_routing_enabled"] is True
+
+    def test_defaults_to_false_without_a_prior_opt_in(self, monkeypatch):
+        seen: dict = {}
+
+        cli_mod, *_ = TestConfigureSharedStateUsePat._stub_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t, **kw: seen.update(kw) or ({}, [], [], [], None),
+        )
+
+        cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert seen["smart_routing_enabled"] is False
 
 
 class TestConfigureSkipValidate:
@@ -2261,8 +2308,10 @@ class TestConfigureSharedStateMcpCleanup:
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
         monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
         monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: None)
-        monkeypatch.setattr(cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], None))
-        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
+        monkeypatch.setattr(
+            cli_mod, "discover_model_services", lambda w, t, **kw: ({}, [], [], [], None)
+        )
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t, **kw: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
