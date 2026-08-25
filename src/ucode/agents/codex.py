@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -51,27 +50,6 @@ MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
 # Shared across agents: one opt-in enables smart routing for every routing-capable
 # tool (codex, claude), so a workspace turns it on once.
 SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
-
-SMART_ROUTING_V2_TARGET_MODEL = "system.ai.glm-5-2"  # hardcoded switch-to model for now
-SMART_ROUTING_V2_HOME = APP_DIR / "codex-v2-home"  # CODEX_HOME for the ucode-run app-server
-SMART_ROUTING_V2_LOG = (
-    APP_DIR / "codex-v2-interposer.log"
-)  # interposer log (not stdout: TUI owns it)
-SMART_ROUTING_V2_REASON = "Low complexity, unclear intent, and no code reference."
-
-
-def _smart_routing_switch_message(model: str, reason: str) -> str:
-    lines = [
-        "Using Unity Gateway Smart Router.",
-        f"Selected Model : {model}",
-        f"Reason : {reason}",
-    ]
-    width = max(len(line) for line in lines)
-    border = "─" * (width + 2)
-    return "\n".join(
-        [f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"]
-    )
-
 
 SPEC: ToolSpec = {
     "binary": "codex",
@@ -487,108 +465,17 @@ def default_model(state: dict) -> str | None:
 _PROFILE_REJECTED_MAX_SECONDS = 3.0
 
 
-def _generate_v2_app_server_home(state: dict, model: str) -> Path:
-    """Write an isolated CODEX_HOME whose config.toml carries the ucode gateway
-    provider block, for the ucode-run `codex app-server`.
-
-    The app-server rejects the global `--profile`, so a default-config CODEX_HOME
-    is how it inherits ucode's gateway (base_url + `ucode auth-token` refresh).
-    Reuses `render_overlay` — the same provider block `ucode configure codex` writes."""
-    home = SMART_ROUTING_V2_HOME
-    home.mkdir(parents=True, exist_ok=True)
-    config_path = home / "config.toml"
-    overlay = render_overlay(
-        state["workspace"],
-        model,
-        state.get("profile"),
-        use_pat=bool(state.get("use_pat")),
-    )
-    doc = read_toml_safe(config_path)
-    deep_merge_dict(doc, overlay)
-    write_toml_file(config_path, doc)
-    return home
-
-
-def _launch_smart_routing_v2(state: dict, tool_args: list[str]) -> None:
-    """Experimental single-command launch of the real Codex TUI with runtime model switching.
-
-    ucode owns three processes: a `codex app-server` subprocess, the WebSocket interposer
-    (daemon thread), and the `codex --remote` TUI (foreground). The interposer holds the first
-    turn on the normal model, then rewrites subsequent turns to SMART_ROUTING_V2_TARGET_MODEL and
-    injects a settings update so the TUI reflects the switch. The app-server + interposer are torn
-    down when the TUI exits. Mirrors the lifecycle of `claude.py::_launch_relayed`.
-    """
-    from ucode.smart_routing import codex_interposer
-
-    binary = SPEC["binary"]
-    workspace = state.get("workspace")
-    if not workspace:
-        raise RuntimeError(
-            "Smart routing v2 needs a configured workspace; run `ucode configure codex` first."
-        )
-    start_model = default_model(state)
-    if not start_model:
-        raise RuntimeError(
-            "Smart routing v2 could not determine a starting Codex model for this workspace."
-        )
-
-    os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
-    home = _generate_v2_app_server_home(state, start_model)
-    app_port = codex_interposer.free_port()
-    tui_port = codex_interposer.free_port()
-
-    app_server = subprocess.Popen(
-        [binary, "app-server", "--listen", f"ws://127.0.0.1:{app_port}"],
-        env={**os.environ, "CODEX_HOME": str(home)},
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    stop_interposer = None
-    try:
-        if not codex_interposer.wait_healthz(app_port, timeout=30):
-            raise RuntimeError(
-                "Codex app-server did not become ready for smart routing v2; check workspace auth."
-            )
-        _thread, stop_interposer = codex_interposer.start_interposer_thread(
-            "127.0.0.1",
-            tui_port,
-            f"ws://127.0.0.1:{app_port}",
-            SMART_ROUTING_V2_TARGET_MODEL,
-            smart_routing_v2.SWITCH_AFTER_TURNS,
-            switch_message=_smart_routing_switch_message(
-                SMART_ROUTING_V2_TARGET_MODEL,
-                SMART_ROUTING_V2_REASON,
-            ),
-            log_path=SMART_ROUTING_V2_LOG,
-        )
-        # Foreground TUI. Popen (not exec) so this process stays alive to tear down the
-        # app-server + interposer when the TUI exits (see claude.py::_launch_relayed).
-        tui = subprocess.Popen(
-            [binary, "--remote", f"ws://127.0.0.1:{tui_port}", "--model", start_model, *tool_args]
-        )
-        try:
-            returncode = tui.wait()
-        except KeyboardInterrupt:
-            tui.send_signal(signal.SIGINT)
-            returncode = tui.wait()
-    finally:
-        if stop_interposer is not None:
-            stop_interposer()
-        app_server.terminate()
-        try:
-            app_server.wait(timeout=5)
-        except Exception:  # noqa: BLE001 - the app-server must never linger
-            app_server.kill()
-    sys.exit(returncode)
-
-
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if smart_routing_v2.enabled():
-        _launch_smart_routing_v2(state, tool_args)
-        return
+        smart_routing_v2.launch_codex(
+            state,
+            tool_args,
+            binary=binary,
+            start_model=default_model(state),
+            render_overlay=render_overlay,
+        )
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     # Run codex with --profile first — the TUI and runtime subcommands

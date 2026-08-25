@@ -15,7 +15,7 @@ forwarding every frame untouched except:
     ``thread/settings/updated`` carrying the new model, so the TUI's on-screen
     model indicator follows the switch, and — when a ``switch_message`` is
     configured — an ``agentMessage`` item (as an ``item/started`` + ``item/completed``
-    pair) that surfaces a one-line explanation of why the model was switched, ahead
+    pair) that surfaces an explanation of why the model was switched, ahead
     of the model's reply. An ``agentMessage`` renders as ordinary chat text (no
     warning styling); Codex's protocol has no neutral free-text notification
     (``warning``, ``configWarning``, ``deprecationNotice`` all render as warnings),
@@ -23,9 +23,9 @@ forwarding every frame untouched except:
     required: the TUI creates the message widget on ``item/started``, so a lone
     ``item/completed`` has no widget to finalize and renders nothing.
 
-``ucode.agents.codex`` runs :func:`start_interposer_thread` in a daemon thread
-while it owns the app-server subprocess and the ``codex --remote`` TUI, so the
-whole thing launches from the single ``ucode codex`` command.
+``ucode.smart_routing.v2`` runs :func:`start_interposer_thread` in a daemon
+thread while it owns the app-server subprocess and the ``codex --remote`` TUI,
+so the whole thing launches from the single ``ucode codex`` command.
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from websockets.asyncio.server import serve
 SETTINGS_UPDATED = "thread/settings/updated"
 ITEM_STARTED = "item/started"
 ITEM_COMPLETED = "item/completed"
+LOOPBACK_HOST = "127.0.0.1"
 
 # Set UCODE_INTERPOSER_DEBUG=1 to dump raw engine->TUI item/turn frames (and the frames we
 # inject) to the interposer log, for comparing our synthetic note against real assistant frames.
@@ -103,9 +104,10 @@ class _Session:
 
         On the switched turn's ``turn/started`` — before its response streams —
         this yields a ``thread/settings/updated`` (flips the TUI's model chip)
-        and, when ``switch_message`` is set, an ``item/completed`` carrying an
-        ``agentMessage`` — plain chat text (no warning styling) that explains why
-        the model changed, shown ahead of the model's reply."""
+        and, when ``switch_message`` is set, an ``item/started`` +
+        ``item/completed`` pair carrying an ``agentMessage`` — plain chat text
+        (no warning styling) that explains why the model changed, shown ahead of
+        the model's reply."""
         try:
             msg = json.loads(raw)
         except ValueError:
@@ -114,7 +116,9 @@ class _Session:
             return []
         if _DEBUG:
             method = msg.get("method")
-            if isinstance(method, str) and (method.startswith("item/") or method.startswith("turn/")):
+            if isinstance(method, str) and (
+                method.startswith("item/") or method.startswith("turn/")
+            ):
                 self.log(f"[DEBUG<-engine] {method}: {raw[:1800]}")
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
@@ -252,8 +256,8 @@ def start_interposer_thread(
     """Run the interposer's asyncio server in a daemon thread.
 
     Returns ``(thread, stop)``; ``stop()`` shuts the server down and stops the
-    loop. ``switch_message``, when set, is surfaced in the TUI as a ``warning``
-    explaining why the model switched. Logs go to ``log_path`` (appended) when
+    loop. ``switch_message``, when set, is surfaced in the TUI as an
+    ``agentMessage`` explaining why the model switched. Logs go to ``log_path`` (appended) when
     given — never to stdout/stderr, which the foreground TUI owns. Blocks until
     the server is listening (or ``ready_timeout`` elapses)."""
 
@@ -306,7 +310,7 @@ def start_interposer_thread(
 def free_port() -> int:
     """Grab an unused loopback TCP port (races are irrelevant for local ephemeral use)."""
     sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
+    sock.bind((LOOPBACK_HOST, 0))
     port = sock.getsockname()[1]
     sock.close()
     return port
@@ -314,7 +318,7 @@ def free_port() -> int:
 
 def wait_healthz(port: int, timeout: float = 30.0) -> bool:
     """Poll the app-server's ``/healthz`` until it returns 200, or timeout."""
-    url = f"http://127.0.0.1:{port}/healthz"
+    url = f"http://{LOOPBACK_HOST}:{port}/healthz"
     end = time.time() + timeout
     while time.time() < end:
         try:

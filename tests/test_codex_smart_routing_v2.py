@@ -4,21 +4,25 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from ucode.agents import codex
 from ucode.config_io import read_toml_safe
-from ucode.smart_routing import codex_interposer
+from ucode.smart_routing import codex_interposer, v2
 
 WS = "https://example.databricks.com"
 
 
 class TestGenerateV2Home:
     def test_writes_provider_config(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(codex, "SMART_ROUTING_V2_HOME", tmp_path / "v2home")
+        monkeypatch.setattr(v2, "CODEX_APP_SERVER_HOME", tmp_path / "v2home")
         monkeypatch.setattr(codex, "ucode_version", lambda: "0.1.0")
         monkeypatch.setattr(codex, "agent_version", lambda binary: "0.148.0")
 
-        home = codex._generate_v2_app_server_home(
-            {"workspace": WS, "profile": "myprof"}, "gpt-5.6-luna"
+        home = v2._generate_codex_app_server_home(
+            {"workspace": WS, "profile": "myprof"},
+            "gpt-5.6-luna",
+            codex.render_overlay,
         )
 
         assert home == tmp_path / "v2home"
@@ -33,7 +37,7 @@ class TestGenerateV2Home:
 
 
 def test_smart_routing_switch_message_is_boxed():
-    message = codex._smart_routing_switch_message("model-x", "Because X.")
+    message = v2._switch_message("model-x", "Because X.")
 
     assert message == (
         "┌───────────────────────────────────┐\n"
@@ -42,6 +46,87 @@ def test_smart_routing_switch_message_is_boxed():
         "│ Reason : Because X.               │\n"
         "└───────────────────────────────────┘"
     )
+
+
+class TestLaunchCodex:
+    def test_owns_app_server_interposer_and_tui_lifecycle(self, tmp_path, monkeypatch):
+        processes = []
+        interposer_args = {}
+        stopped = []
+
+        class FakeProcess:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.kwargs = kwargs
+                self.terminated = False
+                processes.append(self)
+
+            def wait(self, timeout=None):
+                return 0 if timeout is not None else 7
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                raise AssertionError("clean shutdown should not need kill")
+
+            def send_signal(self, _signal):
+                raise AssertionError("test does not interrupt the TUI")
+
+        ports = iter([41001, 41002])
+        monkeypatch.setattr(v2.subprocess, "Popen", FakeProcess)
+        monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
+        monkeypatch.setattr(
+            v2,
+            "_generate_codex_app_server_home",
+            lambda state, model, render_overlay: tmp_path,
+        )
+        monkeypatch.setattr(codex_interposer, "free_port", lambda: next(ports))
+        monkeypatch.setattr(codex_interposer, "wait_healthz", lambda port, timeout: True)
+
+        def start_interposer(*args, **kwargs):
+            interposer_args["args"] = args
+            interposer_args["kwargs"] = kwargs
+            return object(), lambda: stopped.append(True)
+
+        monkeypatch.setattr(codex_interposer, "start_interposer_thread", start_interposer)
+
+        with pytest.raises(SystemExit) as exc:
+            v2.launch_codex(
+                {"workspace": WS, "profile": "myprof"},
+                ["--search"],
+                binary="codex",
+                start_model="gpt-start",
+                render_overlay=codex.render_overlay,
+            )
+
+        assert exc.value.code == 7
+        assert processes[0].argv == [
+            "codex",
+            "app-server",
+            "--listen",
+            "ws://127.0.0.1:41001",
+        ]
+        assert processes[0].kwargs["env"][v2.OAUTH_TOKEN_ENV_VAR] == "token"
+        assert processes[0].kwargs["env"][v2.CODEX_HOME_ENV_VAR] == str(tmp_path)
+        assert processes[1].argv == [
+            "codex",
+            "--remote",
+            "ws://127.0.0.1:41002",
+            "--model",
+            "gpt-start",
+            "--search",
+        ]
+        assert interposer_args["args"] == (
+            codex_interposer.LOOPBACK_HOST,
+            41002,
+            "ws://127.0.0.1:41001",
+            v2.CODEX_TARGET_MODEL,
+            v2.SWITCH_AFTER_TURNS,
+        )
+        assert "Using Unity Gateway Smart Router." in interposer_args["kwargs"]["switch_message"]
+        assert stopped == [True]
+        assert processes[0].terminated is True
 
 
 class TestInterposerSession:
