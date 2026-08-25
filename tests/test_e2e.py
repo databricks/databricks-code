@@ -434,6 +434,8 @@ class TestCodexLaunch:
         # ("invalid response from an upstream server"), so the launch fails after codex-cli
         # exhausts its five reconnects. Nothing ucode writes can fix it.
         "gpt-5-3-codex",
+        # Bedrock Grok rejects the Responses tool schema Codex sends (missing nested `function`).
+        "grok",
     )
 
     def _codex_models(self, e2e_state: dict) -> list[str]:
@@ -916,6 +918,8 @@ class TestCopilotLaunch:
         "gpt-5-5",
         # gpt-5.6 models similarly reject /chat/completions with 404.
         "gpt-5-6",
+        # Bedrock Grok rejects the gateway's llm/v1/chat task type.
+        "grok",
     )
 
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
@@ -979,9 +983,12 @@ class TestPiLaunch:
     test exercises each one end-to-end through the validation path.
     """
 
-    # The CI project's upstream OpenAI account cannot serve this snapshot in
-    # its geography. Codex's e2e excludes the same otherwise-discoverable model.
-    INCOMPATIBLE_MODEL_FRAGMENTS = ("gpt-5-3-codex",)
+    INCOMPATIBLE_MODEL_FRAGMENTS = (
+        # The CI project's upstream OpenAI account cannot serve this snapshot in its geography.
+        "gpt-5-3-codex",
+        # Bedrock Grok currently rejects Pi's OpenAI request with HTTP 400.
+        "grok",
+    )
 
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
