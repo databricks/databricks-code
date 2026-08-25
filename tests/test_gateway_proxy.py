@@ -47,6 +47,13 @@ class TestForwardedRequestHeaders:
         out = gateway_proxy._forwarded_request_headers(handler, "fresh")
         assert out["X-Databricks-AI-Gateway-Token"] == "Bearer fresh"
 
+    def test_overwrites_authorization_header(self):
+        handler = _FakeHandler({"Authorization": "Bearer stale"})
+        out = gateway_proxy._forwarded_request_headers(
+            handler, "fresh", gateway_proxy.AUTHORIZATION_HEADER
+        )
+        assert out["Authorization"] == "Bearer fresh"
+
     def test_strips_hop_by_hop_headers(self):
         handler = _FakeHandler(
             {"Host": "localhost:9", "Content-Length": "5", "Connection": "keep-alive"}
@@ -228,40 +235,44 @@ def _install_fake_token(monkeypatch, exp_offsets, delay=0.0):
 
 
 class TestTokenCache:
-    def test_initial_mint_is_forced(self, monkeypatch):
+    def test_initial_mint_preserves_default_nonforce_refresh(self, monkeypatch):
         state = _install_fake_token(monkeypatch, [5000])
         gateway_proxy._TokenCache("ws", None)
-        assert state["forces"] == [True]  # full-TTL start
+        assert state["forces"] == [False]
 
     def test_fresh_token_is_not_refreshed(self, monkeypatch):
         state = _install_fake_token(monkeypatch, [5000])
         cache = gateway_proxy._TokenCache("ws", None)
         _ = cache.token
         _ = cache.token
-        assert state["forces"] == [True]  # no extra mint while fresh
+        assert state["forces"] == [False]  # no extra mint while fresh
 
-    def test_near_expiry_triggers_nonforce_refresh(self, monkeypatch):
-        # First mint expires within the buffer -> reading .token refreshes once,
-        # non-force (so a token another process just wrote can satisfy it).
+    def test_near_expiry_preserves_default_nonforce_refresh(self, monkeypatch):
         state = _install_fake_token(monkeypatch, [100, 5000])
         cache = gateway_proxy._TokenCache("ws", None)
         _ = cache.token
-        assert state["forces"] == [True, False]
+        assert state["forces"] == [False, False]
         _ = cache.token  # now fresh again
-        assert state["forces"] == [True, False]
+        assert state["forces"] == [False, False]
+
+    def test_near_expiry_can_force_refresh(self, monkeypatch):
+        state = _install_fake_token(monkeypatch, [100, 5000])
+        cache = gateway_proxy._TokenCache("ws", None, force_refresh_near_expiry=True)
+        _ = cache.token
+        assert state["forces"] == [True, True]
 
     def test_refresh_is_single_flighted(self, monkeypatch):
         # A burst of concurrent requests at the expiry boundary must trigger ONE
         # refresh, not a thundering herd on the shared token cache.
         state = _install_fake_token(monkeypatch, [100, 5000], delay=0.05)
-        cache = gateway_proxy._TokenCache("ws", None)
+        cache = gateway_proxy._TokenCache("ws", None, force_refresh_near_expiry=True)
         threads = [threading.Thread(target=lambda: cache.token) for _ in range(10)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        # 1 forced init + exactly 1 non-force refresh shared by all 10 readers.
-        assert state["forces"] == [True, False]
+        # 1 forced init + exactly 1 forced refresh shared by all 10 readers.
+        assert state["forces"] == [True, True]
 
     def test_ensure_fresh_keeps_token_when_refresh_fails(self, monkeypatch):
         _install_fake_token(monkeypatch, [5000])
@@ -319,7 +330,7 @@ class _FakeClient:
         self.sent_tokens: list[str | None] = []
 
     def stream(self, _method, _url, headers, content):
-        self.sent_tokens.append(headers.get(gateway_proxy._SWAP_HEADER))
+        self.sent_tokens.append(headers.get(gateway_proxy.AI_GATEWAY_TOKEN_HEADER))
         return self._responses.pop(0)
 
 
@@ -405,7 +416,11 @@ class TestStartProxyPortFallback:
             def run_refresher(self):
                 return None
 
-        monkeypatch.setattr(gateway_proxy, "_TokenCache", lambda workspace, profile: _StubCache())
+        monkeypatch.setattr(
+            gateway_proxy,
+            "_TokenCache",
+            lambda workspace, profile, **_kwargs: _StubCache(),
+        )
         # Occupy a port to simulate the leftover proxy holding it.
         occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -414,7 +429,11 @@ class TestStartProxyPortFallback:
         busy_port = occupied.getsockname()[1]
         try:
             server, _cache, client = gateway_proxy.start_proxy(
-                "https://x.staging.cloud.databricks.com", None, busy_port
+                "https://x.staging.cloud.databricks.com",
+                None,
+                busy_port,
+                token_header=gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
+                force_refresh_near_expiry=False,
             )
             try:
                 bound = server.server_address[1]
