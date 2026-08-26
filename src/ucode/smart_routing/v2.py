@@ -81,6 +81,8 @@ def _toml_value(value: str | int | float | bool | list[object] | dict[str, objec
 def _codex_config_args(overlay: dict) -> list[str]:
     args: list[str] = []
     for key, value in overlay.items():
+        # This is Codex's AI Gateway transport definition, not Unity Catalog
+        # Model Provider Service support; smart routing still cannot use --provider.
         if key == "model_providers" and isinstance(value, dict):
             for provider_name, provider_config in value.items():
                 args.extend(
