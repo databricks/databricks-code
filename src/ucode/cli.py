@@ -2955,6 +2955,35 @@ def apply_cmd(
         raise typer.Exit(code)
 
 
+@app.command("export")
+def export_cmd(
+    output: Annotated[
+        str | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Write the exported config JSON to this file (atomically) instead of stdout. "
+            "The parent directory must already exist.",
+        ),
+    ] = None,
+) -> None:
+    """Export this workspace's managed coding-agent config as portable JSON.
+
+    Serializes the local managed config to the external `CodingAgentConfig` format that
+    `ucode publish -f <path>` consumes, with credentials and server-owned fields (resource name,
+    workspace id, timestamps, user ids) excluded. Any user can run it; it makes no network calls
+    and mutates no workspace or local state. Without --output the JSON is printed to stdout;
+    diagnostics and errors go to stderr.
+    """
+    from ucode.managed_export import export_command
+
+    try:
+        export_command(output=output)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+
+
 @app.command("status")
 def status_cmd() -> None:
     """Show current workspace, tool configs, and saved model selections."""

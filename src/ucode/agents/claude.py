@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import cast
 
 from ucode.agent_updates import available_npm_package_update
+from ucode.anthropic_model_discovery_proxy import (
+    start_proxy as start_anthropic_model_discovery_proxy,
+)
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -24,12 +27,16 @@ from ucode.config_io import (
     read_json_safe,
     write_json_file,
 )
+from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import (
     build_auth_shell_command,
     build_tool_base_url,
     get_databricks_token,
 )
-from ucode.gateway_proxy import AI_GATEWAY_TOKEN_HEADER, AUTHORIZATION_HEADER, start_proxy
+from ucode.gateway_proxy import (
+    AI_GATEWAY_TOKEN_HEADER,
+    AUTHORIZATION_HEADER,
+)
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing import v2 as smart_routing_v2
@@ -216,10 +223,10 @@ def relayed_proxy_base_url(state: dict) -> str:
     port = state.get("relayed_proxy_port")
     if not isinstance(port, int):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
+            sock.bind((LOOPBACK_HOST, 0))
             port = sock.getsockname()[1]
         state["relayed_proxy_port"] = port
-    return f"http://127.0.0.1:{port}"
+    return f"http://{LOOPBACK_HOST}:{port}"
 
 
 def _web_search_mcp_entry(workspace: str, search_model: str, profile: str | None = None) -> dict:
@@ -1007,7 +1014,7 @@ def _rewrite_relayed_port(state: dict, port: int) -> None:
     settings = read_json_safe(CLAUDE_SETTINGS_PATH)
     env = settings.get("env")
     if isinstance(env, dict):
-        env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+        env["ANTHROPIC_BASE_URL"] = f"http://{LOOPBACK_HOST}:{port}"
         write_json_file(CLAUDE_SETTINGS_PATH, settings)
 
 
@@ -1040,7 +1047,7 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     if not isinstance(port, int):
         raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
 
-    server, cache, client = start_proxy(
+    server, cache, client = start_anthropic_model_discovery_proxy(
         workspace,
         state.get("profile"),
         port,
@@ -1075,7 +1082,7 @@ def _launch_gateway(
 ) -> None:
     """Launch discovery-enabled Claude through a refreshing gateway proxy."""
     workspace = state["workspace"]
-    server, cache, client = start_proxy(
+    server, cache, client = start_anthropic_model_discovery_proxy(
         workspace,
         state.get("profile"),
         0,
@@ -1085,7 +1092,7 @@ def _launch_gateway(
     token = cache.token
     os.environ["OAUTH_TOKEN"] = token
     os.environ["ANTHROPIC_AUTH_TOKEN"] = token
-    os.environ["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{server.server_address[1]}"
+    os.environ["ANTHROPIC_BASE_URL"] = f"http://{LOOPBACK_HOST}:{server.server_address[1]}"
     os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
 
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
