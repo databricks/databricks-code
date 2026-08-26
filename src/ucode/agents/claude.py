@@ -1011,9 +1011,7 @@ def _rewrite_relayed_port(state: dict, port: int) -> None:
         write_json_file(CLAUDE_SETTINGS_PATH, settings)
 
 
-def _launch_relayed(
-    state: dict, binary: str, tool_args: list[str], launch_model: str | None = None
-) -> None:
+def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     """Relayed launch: sign into the Claude subscription, start the loopback
     refresh proxy, then run Claude Code alongside it (the proxy must outlive the
     exec, so we spawn-and-wait rather than replacing the process)."""
@@ -1059,9 +1057,7 @@ def _launch_relayed(
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
-    proc = subprocess.Popen(
-        _build_claude_argv(binary, tool_args, relayed=True, launch_model=launch_model)
-    )
+    proc = subprocess.Popen(_build_claude_argv(binary, tool_args, relayed=True))
     try:
         returncode = proc.wait()
     except KeyboardInterrupt:
@@ -1123,7 +1119,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
     model_snapshot = smart_routing_v2.snapshot_claude_model_setting(CLAUDE_USER_SETTINGS_PATH)
     launch_model = _original_launch_model(model_snapshot, state)
     if state.get("claude_relayed"):
-        _launch_relayed(state, binary, tool_args, launch_model)
+        _launch_relayed(state, binary, tool_args)
         return
     if smart_routing_v2.enabled() and workspace and os.name != "nt":
         smart_routing_v2.launch_claude(
