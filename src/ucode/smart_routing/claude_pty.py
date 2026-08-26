@@ -55,6 +55,20 @@ def valid_model_name(name: object) -> bool:
     )
 
 
+def switch_message(model: str, reason: str) -> str:
+    """Format the routed-model notice shown in Claude Code."""
+    lines = [
+        "Using Unity Gateway Smart Router.",
+        f"Selected Model : {model}",
+        f"Reason : {reason}",
+    ]
+    width = max(len(line) for line in lines)
+    border = "─" * (width + 2)
+    return "\n".join(
+        [f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"]
+    )
+
+
 class ConfirmationState:
     """Detect and accept Claude's optional cache-cost confirmation dialog."""
 
@@ -156,9 +170,8 @@ def first_prompt_hook_output(response: dict | None) -> dict | None:
         return None
     return {
         "decision": "block",
-        "reason": (
-            f"✨ Smart Router selected {model} due to low complexity, unclear intent, "
-            "and no code reference."
+        "reason": switch_message(
+            model, "Low complexity, unclear intent, and no code reference."
         ),
     }
 

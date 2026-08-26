@@ -38,6 +38,16 @@ class TestDirectModelCommand:
 
 
 class TestFirstPromptHook:
+    def test_renders_boxed_router_notice(self):
+        model = "system.ai.claude-sonnet-4-6[1m]"
+        reason = "Low complexity, unclear intent, and no code reference."
+        result = claude_pty.first_prompt_hook_output(
+            {"action": "block", "model": model}
+        )
+
+        assert result == {"decision": "block", "reason": v2._switch_message(model, reason)}
+        assert claude_pty.switch_message(model, reason) == v2._switch_message(model, reason)
+
     def test_blocks_once_then_allows_replay(self, tmp_path):
         socket_path = tmp_path / "first.sock"
         blocked: list[tuple[str, str]] = []

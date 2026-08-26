@@ -24,7 +24,7 @@ ENV_VAR = "ENABLE_SMART_ROUTING_V2"
 
 CODEX_TARGET_MODEL = "system.ai.glm-5-2"  # TODO(lilly): replace with smart router.
 CODEX_INTERPOSER_LOG = APP_DIR / "codex-v2-interposer.log"
-CODEX_SWITCH_REASON = "Low complexity, unclear intent, and no code reference."  # TODO(lilly): replace with smart router rationale.
+STUBBED_SWITCH_REASON = "Low complexity, unclear intent, and no code reference."  # TODO(lilly): replace with smart router rationale.
 
 CLAUDE_TARGET_MODEL = "system.ai.claude-sonnet-4-6[1m]"  # TODO(lilly): replace with smart router.
 CLAUDE_PTY_LOG = APP_DIR / "claude-v2-pty.log"
@@ -182,9 +182,8 @@ def launch_claude(
         returncode = claude_pty.run_claude_pty(
             argv,
             route_prompt=_route_claude_prompt,
-            switch_message=(
-                f"✨ Databricks Smart Router selected {CLAUDE_TARGET_MODEL} due to "
-                "low complexity, unclear intent, and no code reference."
+            switch_message=claude_pty.switch_message(
+                CLAUDE_TARGET_MODEL, STUBBED_SWITCH_REASON
             ),
             socket_path=socket_path,
             log_path=CLAUDE_PTY_LOG,
@@ -270,7 +269,7 @@ def launch_codex(
             LOOPBACK_HOST,
             app_server_url,
             CODEX_TARGET_MODEL,
-            switch_message=_switch_message(CODEX_TARGET_MODEL, CODEX_SWITCH_REASON),
+            switch_message=_switch_message(CODEX_TARGET_MODEL, STUBBED_SWITCH_REASON),
             log_path=CODEX_INTERPOSER_LOG,
         )
         tui_url = _loopback_websocket_url(tui_port)
