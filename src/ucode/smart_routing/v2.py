@@ -15,6 +15,7 @@ from typing import NoReturn
 import tomlkit
 
 from ucode.config_io import APP_DIR, read_json_safe, write_json_file
+from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import build_auth_token_argv, get_databricks_token
 from ucode.smart_routing import claude_pty, codex_interposer
 from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, sync_first_prompt_hook
@@ -33,7 +34,6 @@ CLAUDE_MODEL_SNAPSHOT_PATH = APP_DIR / "claude-default-model.snapshot.json"
 APP_SERVER_READY_TIMEOUT_SECONDS = 30
 PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 5
 OAUTH_TOKEN_ENV_VAR = "OAUTH_TOKEN"
-LOOPBACK_HOST = "127.0.0.1"
 HEALTH_REQUEST_TIMEOUT_SECONDS = 1
 HEALTH_POLL_INTERVAL_SECONDS = 0.25
 
