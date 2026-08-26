@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import cast
 
 from ucode.agent_updates import available_npm_package_update
-from ucode.anthropic_gateway_proxy import (
-    start_proxy as start_anthropic_gateway_proxy,
+from ucode.anthropic_model_discovery_proxy import (
+    start_proxy as start_anthropic_model_discovery_proxy,
 )
 from ucode.config_io import (
     APP_DIR,
@@ -1006,7 +1006,7 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     if not isinstance(port, int):
         raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
 
-    server, cache, client = start_anthropic_gateway_proxy(
+    server, cache, client = start_anthropic_model_discovery_proxy(
         workspace,
         state.get("profile"),
         port,
@@ -1038,7 +1038,7 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
 
 def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
     workspace = state["workspace"]
-    server, cache, client = start_anthropic_gateway_proxy(
+    server, cache, client = start_anthropic_model_discovery_proxy(
         workspace,
         state.get("profile"),
         0,

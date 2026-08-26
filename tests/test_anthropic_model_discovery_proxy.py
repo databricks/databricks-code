@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import json
 
-from ucode import anthropic_gateway_proxy
+from ucode import anthropic_model_discovery_proxy
 
 
 class _FakeResponse:
@@ -61,20 +61,20 @@ class _Collect(io.RawIOBase):
 
 
 def _handler(wfile, path="/v1/models", command="GET"):
-    handler = object.__new__(anthropic_gateway_proxy._AnthropicGatewayHandler)
+    handler = object.__new__(anthropic_model_discovery_proxy._AnthropicModelDiscoveryHandler)
     handler.wfile = wfile
     handler.request_version = "HTTP/1.1"
     handler.requestline = f"{command} {path} HTTP/1.1"
     handler.command = command
     handler.path = path
     handler._headers_buffer = []
-    handler.anthropic_model_aliases = anthropic_gateway_proxy._AnthropicModelAliases()
+    handler.anthropic_model_aliases = anthropic_model_discovery_proxy._AnthropicModelAliases()
     return handler
 
 
 class TestAnthropicModelAliases:
     def test_prefixes_custom_model_ids_without_changing_display_name(self):
-        aliases = anthropic_gateway_proxy._AnthropicModelAliases()
+        aliases = anthropic_model_discovery_proxy._AnthropicModelAliases()
         body = json.dumps(
             {
                 "data": [
@@ -107,7 +107,7 @@ class TestAnthropicModelAliases:
         }
 
     def test_rewrites_known_alias_in_messages_body(self):
-        aliases = anthropic_gateway_proxy._AnthropicModelAliases()
+        aliases = anthropic_model_discovery_proxy._AnthropicModelAliases()
         aliases.prefix_model_ids(b'{"data":[{"id":"catalog.schema.custom"}]}')
 
         body = aliases.rewrite_body(
@@ -118,7 +118,7 @@ class TestAnthropicModelAliases:
         assert json.loads(body) == {"model": "catalog.schema.custom", "messages": []}
 
     def test_rewrites_known_alias_in_pagination_cursor(self):
-        aliases = anthropic_gateway_proxy._AnthropicModelAliases()
+        aliases = anthropic_model_discovery_proxy._AnthropicModelAliases()
         aliases.prefix_model_ids(b'{"data":[{"id":"catalog.schema.custom"}]}')
 
         assert (
@@ -129,13 +129,13 @@ class TestAnthropicModelAliases:
         )
 
     def test_ignores_non_anthropic_models_path(self):
-        aliases = anthropic_gateway_proxy._AnthropicModelAliases()
+        aliases = anthropic_model_discovery_proxy._AnthropicModelAliases()
         path = "/codex/v1/models?after_id=anthropic-aigw-catalog.schema.custom"
 
         assert aliases.rewrite_path(path) == path
 
     def test_does_not_strip_unknown_prefixed_id(self):
-        aliases = anthropic_gateway_proxy._AnthropicModelAliases()
+        aliases = anthropic_model_discovery_proxy._AnthropicModelAliases()
         unknown = "anthropic-aigw-legitimate-upstream-id"
 
         assert aliases.rewrite_path(f"/v1/models?after_id={unknown}") == (
@@ -147,11 +147,11 @@ class TestAnthropicModelAliases:
         )
 
     def test_leaves_malformed_discovery_response_unchanged(self):
-        aliases = anthropic_gateway_proxy._AnthropicModelAliases()
+        aliases = anthropic_model_discovery_proxy._AnthropicModelAliases()
         assert aliases.prefix_model_ids(b"not-json") == b"not-json"
 
 
-class TestAnthropicGatewayHandler:
+class TestAnthropicModelDiscoveryHandler:
     def test_inherits_relayed_auth_and_prefixes_models(self):
         out = _Collect()
         handler = _handler(out)
@@ -230,18 +230,25 @@ def test_start_proxy_uses_discovery_handler(monkeypatch):
             return None
 
     cache = _StubCache()
-    monkeypatch.setattr(anthropic_gateway_proxy, "TokenCache", lambda *_args, **_kwargs: cache)
+    monkeypatch.setattr(
+        anthropic_model_discovery_proxy,
+        "TokenCache",
+        lambda *_args, **_kwargs: cache,
+    )
 
-    server, actual_cache, client = anthropic_gateway_proxy.start_proxy(
+    server, actual_cache, client = anthropic_model_discovery_proxy.start_proxy(
         "https://workspace.example.com", "profile", 0, "header", False
     )
     try:
         handler = server.RequestHandlerClass
-        assert issubclass(handler, anthropic_gateway_proxy._AnthropicGatewayHandler)
+        assert issubclass(
+            handler,
+            anthropic_model_discovery_proxy._AnthropicModelDiscoveryHandler,
+        )
         assert handler.cache is cache
         assert isinstance(
             handler.anthropic_model_aliases,
-            anthropic_gateway_proxy._AnthropicModelAliases,
+            anthropic_model_discovery_proxy._AnthropicModelAliases,
         )
         assert actual_cache is cache
     finally:

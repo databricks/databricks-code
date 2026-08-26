@@ -1,17 +1,12 @@
-"""Loopback refresh proxy for Claude gateway requests.
+"""Loopback proxy for Claude gateway model discovery.
 
-A relayed Model Provider Service authenticates the caller's own Anthropic
-subscription OAuth (which Claude Code owns in the `Authorization` header) and
-carries a Databricks credential in the `X-Databricks-AI-Gateway-Token` swap
-header. Native gateway discovery instead carries the Databricks credential in
-`Authorization`. The proxy refreshes the applicable header, streams inference
-responses verbatim, and rewrites model discovery responses when needed.
+The proxy refreshes the Databricks credential, streams inference responses
+verbatim, and rewrites model discovery responses when needed.
 
 Security invariants (mirroring `databricks.py` token handling):
   - Binds 127.0.0.1 only; never exposed off-host.
-  - Never logs header values or bodies. The Databricks token lives in memory,
-    refreshed off the request path; the Anthropic OAuth in `Authorization` is
-    passed through untouched in relayed mode and never logged.
+  - Never logs header values or bodies. The Databricks token lives in memory
+    and is refreshed off the request path.
 """
 
 from __future__ import annotations
@@ -70,7 +65,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else None
         url, body = self._transform_request(body)
         log_proxy_diagnostic(
-            "request_start",
+            "model_discovery_request_start",
             request_id=diagnostic_id,
             method=self.command,
             path=self.path.split("?", 1)[0],
@@ -80,7 +75,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             headers = forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
-                    "upstream_headers",
+                    "model_discovery_upstream_headers",
                     request_id=diagnostic_id,
                     attempt=1,
                     status=resp.status_code,
@@ -92,25 +87,16 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 # Auth rejected. Drain the (small) error body so the pooled
                 # connection can be reused, then fall through to one retry.
                 resp.read()
-            # A relayed 401/403 may be a stale Databricks swap token rather than a
-            # bad Anthropic OAuth — the two are indistinguishable from the status
-            # alone. Force-refresh the Databricks token and retry once. If it was the
-            # Anthropic layer, the retry still 401s and we relay it verbatim, so a
-            # genuine re-auth is triggered; a stale-Databricks 401 self-heals here
-            # instead of surfacing to Claude Code as a spurious Anthropic prompt.
+            # Force-refresh the Databricks token and retry once.
             try:
                 self.cache.refresh()
             except RuntimeError as exc:
-                # Refresh failed: the Databricks OAuth session is dead (not just the
-                # access token) and can't be re-minted non-interactively. Surface the
-                # `databricks auth login` hint rather than silently relaying a bare 401,
-                # which otherwise reads as an Anthropic `/login` prompt and sends the
-                # user to the wrong re-auth. Still retry + relay with the existing token.
+                # Still retry with the existing token after reporting the failure.
                 log_token_refresh_failure(exc)
             headers = forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
-                    "upstream_headers",
+                    "model_discovery_upstream_headers",
                     request_id=diagnostic_id,
                     attempt=2,
                     status=resp.status_code,
@@ -120,7 +106,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             # Client closed before/while we relayed headers — routine on cancel.
             log_proxy_diagnostic(
-                "client_disconnect",
+                "model_discovery_client_disconnect",
                 request_id=diagnostic_id,
                 phase="request",
                 elapsed_ms=round((time.monotonic() - started) * 1000),
@@ -132,7 +118,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # only raises for transport failures — so real gateway errors are
             # relayed verbatim by `_relay_response`.)
             log_proxy_diagnostic(
-                "upstream_request_error",
+                "model_discovery_upstream_request_error",
                 request_id=diagnostic_id,
                 error_type=type(exc).__name__,
                 elapsed_ms=round((time.monotonic() - started) * 1000),
@@ -179,7 +165,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     chunks += 1
                     bytes_relayed += len(chunk)
             log_proxy_diagnostic(
-                "response_complete",
+                "model_discovery_response_complete",
                 request_id=diagnostic_id,
                 status=resp.status_code,
                 chunks=chunks,
@@ -192,7 +178,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # cancelled turns / SSE teardown. Nothing left to relay to, so stop
             # quietly rather than crashing the handler thread.
             log_proxy_diagnostic(
-                "client_disconnect",
+                "model_discovery_client_disconnect",
                 request_id=diagnostic_id,
                 phase="response",
                 chunks=chunks,
@@ -205,7 +191,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # sent, so we can't reliably signal a fresh error — stop and let the
             # client see a truncated stream rather than corrupt the framing.
             log_proxy_diagnostic(
-                "upstream_stream_error",
+                "model_discovery_upstream_stream_error",
                 request_id=diagnostic_id,
                 error_type=type(exc).__name__,
                 status=resp.status_code,
@@ -299,7 +285,7 @@ class _AnthropicModelAliases:
         return json.dumps(payload, separators=(",", ":")).encode()
 
 
-class _AnthropicGatewayHandler(_ProxyHandler):
+class _AnthropicModelDiscoveryHandler(_ProxyHandler):
     anthropic_model_aliases: _AnthropicModelAliases
 
     def _transform_request(self, body: bytes | None) -> tuple[str, bytes | None]:
@@ -327,7 +313,7 @@ def start_proxy(
     token_header: str,
     force_refresh_near_expiry: bool,
 ) -> tuple[ThreadingHTTPServer, TokenCache, httpx.Client]:
-    """Start the Anthropic loopback proxy and token refresher."""
+    """Start the Anthropic model discovery proxy and token refresher."""
     upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
     cache = TokenCache(
         workspace,
@@ -339,7 +325,7 @@ def start_proxy(
         type[BaseHTTPRequestHandler],
         type(
             "BoundProxyHandler",
-            (_AnthropicGatewayHandler,),
+            (_AnthropicModelDiscoveryHandler,),
             {
                 "cache": cache,
                 "client": client,
