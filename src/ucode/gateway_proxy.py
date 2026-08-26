@@ -34,8 +34,8 @@ from ucode.databricks import get_databricks_token
 # client-supplied value is replaced, so a stale settings.json value can't leak.
 AI_GATEWAY_TOKEN_HEADER = "X-Databricks-AI-Gateway-Token"
 AUTHORIZATION_HEADER = "Authorization"
-# Hop-by-hop headers must not be forwarded across the proxy.
-_HOP_BY_HOP = frozenset(
+# Hop-by-hop headers must not be forwarded across a proxy.
+HOP_BY_HOP_HEADERS = frozenset(
     h.lower()
     for h in (
         "connection",
@@ -73,7 +73,7 @@ def _diagnostics_enabled() -> bool:
     return os.environ.get(_DIAGNOSTICS_ENV, "").strip().lower() in _DIAGNOSTICS_TRUE
 
 
-def _diagnostic_log(event: str, **fields: object) -> None:
+def log_proxy_diagnostic(event: str, **fields: object) -> None:
     if not _diagnostics_enabled():
         return
     payload = {"event": event, **fields}
@@ -187,7 +187,7 @@ def _forwarded_request_headers(
     token: str,
     token_header: str = AI_GATEWAY_TOKEN_HEADER,
 ) -> dict[str, str]:
-    strip_on_forward = _HOP_BY_HOP | {token_header.lower()}
+    strip_on_forward = HOP_BY_HOP_HEADERS | {token_header.lower()}
     headers = {
         key: value for key, value in handler.headers.items() if key.lower() not in strip_on_forward
     }
@@ -218,7 +218,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else None
         url = self.path.lstrip("/")
-        _diagnostic_log(
+        log_proxy_diagnostic(
             "request_start",
             request_id=diagnostic_id,
             method=self.command,
@@ -228,7 +228,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # First attempt with the current token.
             headers = _forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
-                _diagnostic_log(
+                log_proxy_diagnostic(
                     "upstream_headers",
                     request_id=diagnostic_id,
                     attempt=1,
@@ -258,7 +258,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 _log_refresh_failure(exc)
             headers = _forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
-                _diagnostic_log(
+                log_proxy_diagnostic(
                     "upstream_headers",
                     request_id=diagnostic_id,
                     attempt=2,
@@ -268,7 +268,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 self._relay_response(resp, diagnostic_id=diagnostic_id, started=started)
         except (BrokenPipeError, ConnectionResetError):
             # Client closed before/while we relayed headers — routine on cancel.
-            _diagnostic_log(
+            log_proxy_diagnostic(
                 "client_disconnect",
                 request_id=diagnostic_id,
                 phase="request",
@@ -280,7 +280,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # sendable. (An HTTP *status* like 429 is not an error here — httpx
             # only raises for transport failures — so real gateway errors are
             # relayed verbatim by `_relay_response`.)
-            _diagnostic_log(
+            log_proxy_diagnostic(
                 "upstream_request_error",
                 request_id=diagnostic_id,
                 error_type=type(exc).__name__,
@@ -306,7 +306,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         try:
             self.send_response(resp.status_code)
             for key, value in resp.headers.items():
-                if key.lower() not in _HOP_BY_HOP:
+                if key.lower() not in HOP_BY_HOP_HEADERS:
                     self.send_header(key, value)
             self.end_headers()
             # Do not pass a fixed chunk size here. httpx accumulates bytes until
@@ -323,7 +323,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     chunks += 1
                     bytes_relayed += len(chunk)
-            _diagnostic_log(
+            log_proxy_diagnostic(
                 "response_complete",
                 request_id=diagnostic_id,
                 status=resp.status_code,
@@ -336,7 +336,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # Client (Claude Code) closed the connection mid-response — routine on
             # cancelled turns / SSE teardown. Nothing left to relay to, so stop
             # quietly rather than crashing the handler thread.
-            _diagnostic_log(
+            log_proxy_diagnostic(
                 "client_disconnect",
                 request_id=diagnostic_id,
                 phase="response",
@@ -349,7 +349,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # Upstream dropped mid-stream. Headers (and status) may already be
             # sent, so we can't reliably signal a fresh error — stop and let the
             # client see a truncated stream rather than corrupt the framing.
-            _diagnostic_log(
+            log_proxy_diagnostic(
                 "upstream_stream_error",
                 request_id=diagnostic_id,
                 error_type=type(exc).__name__,
