@@ -228,6 +228,12 @@ class TestSubcommandRouting:
         assert os.environ["ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"] == "1"
         assert mock_launch.call_args.args[1].args == []
 
+    def test_claude_enable_model_discovery_is_hidden_from_help(self):
+        result = runner.invoke(app, ["claude", "--help"])
+
+        assert result.exit_code == 0, result.output
+        assert "--enable-model-discovery" not in result.output
+
     def test_codex_disable_removes_hooks_without_launching(self):
         with (
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),

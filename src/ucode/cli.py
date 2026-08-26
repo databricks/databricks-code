@@ -2213,6 +2213,7 @@ def claude_cmd(
         bool,
         typer.Option(
             "--enable-model-discovery",
+            hidden=True,
             help="Enable AI Gateway models in Claude Code's model picker.",
         ),
     ] = False,
