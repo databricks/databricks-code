@@ -1,0 +1,250 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from ucode.agents import codex
+from ucode.smart_routing import codex_interposer, v2
+
+WS = "https://example.databricks.com"
+
+
+class TestCodexConfigArgs:
+    def test_layers_provider_overrides_without_replacing_user_config(self, monkeypatch):
+        monkeypatch.setattr(codex, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.148.0")
+
+        overlay = codex.render_overlay(
+            WS,
+            "gpt-5.6-luna",
+            "myprof",
+        )
+        args = v2._codex_config_args(overlay)
+
+        assert args[:4] == [
+            "--config",
+            'model_provider="ucode-databricks"',
+            "--config",
+            'model="gpt-5.6-luna"',
+        ]
+        provider_override = args[-1]
+        assert provider_override.startswith("model_providers.ucode-databricks={")
+        assert "/ai-gateway/codex/v1" in provider_override
+        assert 'command = "' in provider_override
+        assert '"myprof"' in provider_override
+
+
+def test_smart_routing_switch_message_is_boxed():
+    message = v2._switch_message("model-x", "Because X.")
+
+    assert message == (
+        "┌───────────────────────────────────┐\n"
+        "│ Using Unity Gateway Smart Router. │\n"
+        "│ Selected Model : model-x          │\n"
+        "│ Reason : Because X.               │\n"
+        "└───────────────────────────────────┘"
+    )
+
+
+class TestLaunchCodex:
+    def test_codex_launch_dispatches_when_flag_enabled(self, monkeypatch):
+        calls = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(codex, "default_model", lambda state: "gpt-start")
+
+        def launch_v2(state, tool_args, **kwargs):
+            calls.append((state, tool_args, kwargs))
+            raise SystemExit(0)
+
+        monkeypatch.setattr(v2, "launch_codex", launch_v2)
+        state = {"workspace": WS}
+
+        with pytest.raises(SystemExit) as exc:
+            codex.launch(state, ["--search"])
+
+        assert exc.value.code == 0
+        assert calls == [
+            (
+                state,
+                ["--search"],
+                {
+                    "binary": "codex",
+                    "start_model": "gpt-start",
+                    "render_overlay": codex.render_overlay,
+                },
+            )
+        ]
+
+    def test_owns_app_server_interposer_and_tui_lifecycle(self, monkeypatch):
+        processes = []
+        interposer_args = {}
+        stopped = []
+        monkeypatch.setenv("CODEX_HOME", "/user/codex-home")
+        monkeypatch.setattr(codex, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.148.0")
+
+        class FakeProcess:
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.kwargs = kwargs
+                self.terminated = False
+                processes.append(self)
+
+            def wait(self, timeout=None):
+                return 0 if timeout is not None else 7
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                raise AssertionError("clean shutdown should not need kill")
+
+            def send_signal(self, _signal):
+                raise AssertionError("test does not interrupt the TUI")
+
+        monkeypatch.setattr(v2.subprocess, "Popen", FakeProcess)
+        monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
+        monkeypatch.setattr(v2, "_free_port", lambda: 41001)
+        monkeypatch.setattr(v2, "_wait_for_app_server", lambda port, timeout: True)
+
+        def start_interposer(*args, **kwargs):
+            interposer_args["args"] = args
+            interposer_args["kwargs"] = kwargs
+            return 41002, lambda: stopped.append(True)
+
+        monkeypatch.setattr(codex_interposer, "start_interposer_thread", start_interposer)
+
+        with pytest.raises(SystemExit) as exc:
+            v2.launch_codex(
+                {"workspace": WS, "profile": "myprof"},
+                ["--search"],
+                binary="codex",
+                start_model="gpt-start",
+                render_overlay=codex.render_overlay,
+            )
+
+        assert exc.value.code == 7
+        assert processes[0].argv[:7] == [
+            "codex",
+            "app-server",
+            "--config",
+            'model_provider="ucode-databricks"',
+            "--config",
+            'model="gpt-start"',
+            "--config",
+        ]
+        assert processes[0].argv[8:] == [
+            "--listen",
+            "ws://127.0.0.1:41001",
+        ]
+        assert processes[0].argv[7].startswith("model_providers.ucode-databricks={")
+        assert processes[0].kwargs["env"][v2.OAUTH_TOKEN_ENV_VAR] == "token"
+        assert processes[0].kwargs["env"]["CODEX_HOME"] == "/user/codex-home"
+        assert processes[1].argv == [
+            "codex",
+            "--remote",
+            "ws://127.0.0.1:41002",
+            "--model",
+            "gpt-start",
+            "--search",
+        ]
+        assert interposer_args["args"] == (
+            v2.LOOPBACK_HOST,
+            "ws://127.0.0.1:41001",
+            v2.CODEX_TARGET_MODEL,
+        )
+        assert "Using Unity Gateway Smart Router." in interposer_args["kwargs"]["switch_message"]
+        assert stopped == [True]
+        assert processes[0].terminated is True
+
+
+def test_interposer_startup_failure_is_propagated(monkeypatch):
+    async def fail_to_serve(*args, **kwargs):
+        raise OSError("bind failed")
+
+    monkeypatch.setattr(codex_interposer, "_serve", fail_to_serve)
+
+    with pytest.raises(RuntimeError, match="failed to start") as exc:
+        codex_interposer.start_interposer_thread(
+            v2.LOOPBACK_HOST,
+            "ws://127.0.0.1:41001",
+            "model-x",
+        )
+
+    assert isinstance(exc.value.__cause__, OSError)
+
+
+class TestInterposerSession:
+    def _turn_start(self, model: str, thread_id: str = "t1") -> str:
+        return json.dumps(
+            {
+                "method": codex_interposer.TURN_START,
+                "id": 1,
+                "params": {"threadId": thread_id, "input": [], "model": model},
+            }
+        )
+
+    def test_switches_first_turn(self):
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
+        output = sess.on_tui_frame(self._turn_start("system.ai.gpt-5-6-luna"))
+        assert json.loads(output)["params"]["model"] == "gpt-5.5"
+
+    def test_does_not_schedule_notification_when_model_is_already_selected(self):
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
+        frame = self._turn_start("gpt-5.5")
+        assert sess.on_tui_frame(frame) == frame
+        assert sess.on_engine_frame(self._turn_started("turn-1")) == []
+        later_selection = self._turn_start("gpt-5.6")
+        assert sess.on_tui_frame(later_selection) == later_selection
+
+    def test_non_turn_frames_pass_through(self):
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
+        frame = json.dumps({"method": "initialize", "id": 1, "params": {}})
+        assert sess.on_tui_frame(frame) == frame
+
+    def _turn_started(self, turn_id: str, thread_id: str = "t1") -> str:
+        return json.dumps(
+            {
+                "method": codex_interposer.TURN_STARTED,
+                "params": {"threadId": thread_id, "turn": {"id": turn_id}},
+            }
+        )
+
+    def test_injects_note_when_switched_turn_starts(self):
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
+        sess.on_tui_frame(self._turn_start("luna"))
+        injected = sess.on_engine_frame(self._turn_started("turn-1"))
+        settings = next(m for m in injected if m["method"] == codex_interposer.SETTINGS_UPDATED)
+        assert settings["params"]["threadId"] == "t1"
+        assert settings["params"]["threadSettings"]["model"] == "gpt-5.5"
+
+    def test_injects_switch_note_as_agent_message_when_message_set(self):
+        sess = codex_interposer._Session(
+            "gpt-5.5", log=lambda _m: None, switch_message="selected glm-5-2 because X"
+        )
+        sess.on_tui_frame(self._turn_start("luna"))
+        injected = sess.on_engine_frame(self._turn_started("turn-1"))
+        started = next(m for m in injected if m["method"] == codex_interposer.ITEM_STARTED)
+        completed = next(m for m in injected if m["method"] == codex_interposer.ITEM_COMPLETED)
+        assert started["params"]["turnId"] == "turn-1"
+        assert completed["params"]["turnId"] == "turn-1"
+        for frame in (started, completed):
+            item = frame["params"]["item"]
+            assert item["type"] == "agentMessage"
+            assert item["text"] == "selected glm-5-2 because X"
+        assert started["params"]["item"]["id"] == completed["params"]["item"]["id"]
+
+    def test_no_note_without_message(self):
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
+        sess.on_tui_frame(self._turn_start("luna"))
+        injected = sess.on_engine_frame(self._turn_started("turn-1"))
+        assert [m["method"] for m in injected] == [codex_interposer.SETTINGS_UPDATED]
+
+    def test_routes_only_first_turn_and_preserves_later_model_selection(self):
+        sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
+        sess.on_tui_frame(self._turn_start("luna"))
+        assert sess.on_engine_frame(self._turn_started("turn-1"))
+        second_turn = self._turn_start("luna")
+        assert sess.on_tui_frame(second_turn) == second_turn
+        assert sess.on_engine_frame(self._turn_started("turn-2")) == []
