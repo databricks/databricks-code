@@ -27,7 +27,6 @@ from ucode.databricks import (
 )
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
-from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
@@ -468,7 +467,11 @@ _PROFILE_REJECTED_MAX_SECONDS = 3.0
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
-    if smart_routing_v2.enabled():
+    if os.environ.get("ENABLE_SMART_ROUTING_V2") == "1":
+        # V2 imports the WebSocket interposer; keep it out of the legacy import
+        # path so flag-off launches retain their existing dependencies and behavior.
+        from ucode.smart_routing import v2 as smart_routing_v2
+
         smart_routing_v2.launch_codex(
             state,
             tool_args,

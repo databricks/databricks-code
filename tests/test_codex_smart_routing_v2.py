@@ -46,6 +46,34 @@ def test_smart_routing_switch_message_is_boxed():
 
 
 class TestLaunchCodex:
+    def test_codex_launch_dispatches_when_flag_enabled(self, monkeypatch):
+        calls = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(codex, "default_model", lambda state: "gpt-start")
+
+        def launch_v2(state, tool_args, **kwargs):
+            calls.append((state, tool_args, kwargs))
+            raise SystemExit(0)
+
+        monkeypatch.setattr(v2, "launch_codex", launch_v2)
+        state = {"workspace": WS}
+
+        with pytest.raises(SystemExit) as exc:
+            codex.launch(state, ["--search"])
+
+        assert exc.value.code == 0
+        assert calls == [
+            (
+                state,
+                ["--search"],
+                {
+                    "binary": "codex",
+                    "start_model": "gpt-start",
+                    "render_overlay": codex.render_overlay,
+                },
+            )
+        ]
+
     def test_owns_app_server_interposer_and_tui_lifecycle(self, tmp_path, monkeypatch):
         processes = []
         interposer_args = {}
