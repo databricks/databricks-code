@@ -1121,7 +1121,13 @@ def launch(state: dict, tool_args: list[str]) -> None:
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
         return
-    if smart_routing_v2.enabled() and workspace and os.name != "nt":
+    # Smart routing v2 needs Unix PTY support, which Windows does not provide.
+    if smart_routing_v2.enabled() and os.name == "nt":
+        raise RuntimeError(
+            "Smart routing in Claude Code is currently not supported on Windows. "
+            "Please use Codex or disable smart routing."
+        )
+    if smart_routing_v2.enabled() and workspace:
         smart_routing_v2.launch_claude(
             state,
             tool_args,

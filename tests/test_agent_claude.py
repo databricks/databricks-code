@@ -654,6 +654,18 @@ class TestRegisterWebSearchMcp:
 
 
 class TestClaudeLaunch:
+    def test_smart_routing_on_windows_is_not_supported(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(claude.os, "name", "nt")
+        monkeypatch.setattr(v2, "recover_claude_model_snapshots", lambda _path: None)
+        monkeypatch.setattr(v2, "snapshot_claude_model_setting", lambda _path: {"present": False})
+
+        with pytest.raises(
+            RuntimeError,
+            match="Smart routing in Claude Code is currently not supported on Windows",
+        ):
+            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+
     def test_default_launch_keeps_existing_auth_path(self, monkeypatch):
         calls: list[list[str]] = []
         monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
