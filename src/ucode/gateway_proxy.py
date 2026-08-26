@@ -53,7 +53,7 @@ HOP_BY_HOP_HEADERS = frozenset(
 # Per-operation upstream timeouts. `read` is generous because model turns stream
 # over a single response and Anthropic emits SSE pings, so inter-chunk gaps stay
 # small; `connect`/`pool` fail fast when the gateway is unreachable.
-_UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=600.0, pool=10.0)
+UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=600.0, pool=10.0)
 # Refresh once the token has less than this many seconds of life left. Databricks
 # access tokens live ~1h; a 10-min buffer leaves ample headroom for a retry.
 _REFRESH_BUFFER_S = 600
@@ -93,7 +93,7 @@ def _jwt_exp(token: str) -> float | None:
         return None
 
 
-def _log_refresh_failure(exc: BaseException) -> None:
+def log_token_refresh_failure(exc: BaseException) -> None:
     """Surface (never silently swallow) a refresh failure, without leaking any
     token or header value."""
     sys.stderr.write(
@@ -102,7 +102,7 @@ def _log_refresh_failure(exc: BaseException) -> None:
     )
 
 
-class _TokenCache:
+class TokenCache:
     """Holds the current Databricks token and its expiry, refreshing lazily as it
     nears expiry.
 
@@ -156,7 +156,7 @@ class _TokenCache:
             except RuntimeError as exc:
                 # Keep serving the current token; a request that then 401s triggers
                 # a forced refresh + retry (see _ProxyHandler._handle).
-                _log_refresh_failure(exc)
+                log_token_refresh_failure(exc)
 
     @property
     def token(self) -> str:
@@ -176,13 +176,13 @@ class _TokenCache:
             except Exception as exc:  # noqa: BLE001 - a stray error must NOT kill the thread
                 # If this thread dies, nothing refreshes and the session lapses at
                 # the ~1h mark until restart. Log and keep looping instead.
-                _log_refresh_failure(exc)
+                log_token_refresh_failure(exc)
 
     def stop(self) -> None:
         self._stop.set()
 
 
-def _forwarded_request_headers(
+def forwarded_request_headers(
     handler: BaseHTTPRequestHandler,
     token: str,
     token_header: str = AI_GATEWAY_TOKEN_HEADER,
@@ -197,7 +197,7 @@ def _forwarded_request_headers(
 
 class _ProxyHandler(BaseHTTPRequestHandler):
     # Set by the server factory.
-    cache: _TokenCache
+    cache: TokenCache
     client: httpx.Client
     token_header = AI_GATEWAY_TOKEN_HEADER
 
@@ -226,7 +226,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         )
         try:
             # First attempt with the current token.
-            headers = _forwarded_request_headers(self, self.cache.token, self.token_header)
+            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
                     "upstream_headers",
@@ -255,8 +255,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 # `databricks auth login` hint rather than silently relaying a bare 401,
                 # which otherwise reads as an Anthropic `/login` prompt and sends the
                 # user to the wrong re-auth. Still retry + relay with the existing token.
-                _log_refresh_failure(exc)
-            headers = _forwarded_request_headers(self, self.cache.token, self.token_header)
+                log_token_refresh_failure(exc)
+            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
                     "upstream_headers",
@@ -374,7 +374,7 @@ def start_proxy(
     port: int,
     token_header: str,
     force_refresh_near_expiry: bool,
-) -> tuple[ThreadingHTTPServer, _TokenCache, httpx.Client]:
+) -> tuple[ThreadingHTTPServer, TokenCache, httpx.Client]:
     """Start the loopback refresh proxy + its background token refresher.
 
     Binds ``port``, falling back to a fresh OS-assigned port when it is already
@@ -386,7 +386,7 @@ def start_proxy(
     thread) and calls shutdown()/cache.stop()/client.close() on exit.
     """
     upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
-    cache = _TokenCache(
+    cache = TokenCache(
         workspace,
         profile,
         force_refresh_near_expiry=force_refresh_near_expiry,
@@ -394,7 +394,7 @@ def start_proxy(
     # One pooled, keep-alive client shared across handler threads: reuses TCP+TLS
     # to the gateway instead of a fresh handshake per request. Don't follow
     # redirects — a proxy relays 3xx verbatim.
-    client = httpx.Client(base_url=upstream_base, timeout=_UPSTREAM_TIMEOUT, follow_redirects=False)
+    client = httpx.Client(base_url=upstream_base, timeout=UPSTREAM_TIMEOUT, follow_redirects=False)
 
     handler = type(
         "BoundProxyHandler",

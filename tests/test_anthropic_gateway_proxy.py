@@ -230,7 +230,7 @@ def test_start_proxy_uses_discovery_handler(monkeypatch):
             return None
 
     cache = _StubCache()
-    monkeypatch.setattr(anthropic_gateway_proxy, "_TokenCache", lambda *_args, **_kwargs: cache)
+    monkeypatch.setattr(anthropic_gateway_proxy, "TokenCache", lambda *_args, **_kwargs: cache)
 
     server, actual_cache, client = anthropic_gateway_proxy.start_proxy(
         "https://workspace.example.com", "profile", 0, "header", False

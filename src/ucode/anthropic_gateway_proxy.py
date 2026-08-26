@@ -16,10 +16,7 @@ Security invariants (mirroring `databricks.py` token handling):
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
-import sys
 import threading
 import time
 import uuid
@@ -32,142 +29,20 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from ucode.constants import LOOPBACK_HOST
-from ucode.databricks import get_databricks_token
 from ucode.gateway_proxy import (
     AI_GATEWAY_TOKEN_HEADER,
     HOP_BY_HOP_HEADERS,
+    UPSTREAM_TIMEOUT,
+    TokenCache,
+    forwarded_request_headers,
     log_proxy_diagnostic,
+    log_token_refresh_failure,
 )
-
-# Per-operation upstream timeouts. `read` is generous because model turns stream
-# over a single response and Anthropic emits SSE pings, so inter-chunk gaps stay
-# small; `connect`/`pool` fail fast when the gateway is unreachable.
-_UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=600.0, pool=10.0)
-# Refresh once the token has less than this many seconds of life left. Databricks
-# access tokens live ~1h; a 10-min buffer leaves ample headroom for a retry.
-_REFRESH_BUFFER_S = 600
-# How often the background thread re-checks freshness. Cheap: it only shells out
-# to the CLI when actually within the buffer, otherwise it's a bare clock compare.
-_REFRESHER_POLL_S = 120
-# Assumed lifetime when a token carries no decodable `exp` (defensive fallback).
-_DEFAULT_TTL_S = 3600
-
-
-def _jwt_exp(token: str) -> float | None:
-    """Best-effort `exp` (epoch seconds) from a JWT access token, else None."""
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)  # restore base64 padding
-        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
-    except (IndexError, ValueError, KeyError, binascii.Error, json.JSONDecodeError):
-        return None
-
-
-def _log_refresh_failure(exc: BaseException) -> None:
-    """Surface (never silently swallow) a refresh failure, without leaking any
-    token or header value."""
-    sys.stderr.write(
-        f"[ucode] Databricks token refresh failed: {exc}. If the session stalls, "
-        "run `databricks auth login` for your workspace profile.\n"
-    )
-
-
-class _TokenCache:
-    """Holds the current Databricks token and its expiry, refreshing lazily as it
-    nears expiry.
-
-    A background thread refreshes proactively so the request path rarely blocks,
-    but the request path also refreshes on demand — which is what carries the
-    token across events the timer can't (laptop sleep suspends the monotonic
-    clock, so a fixed interval silently stops advancing). All refreshes are
-    single-flighted through ``_refresh_lock`` so a burst of requests at the expiry
-    boundary triggers exactly one CLI call, not a thundering herd on the shared
-    token cache."""
-
-    def __init__(
-        self,
-        workspace: str,
-        profile: str | None,
-        *,
-        force_refresh_near_expiry: bool = False,
-    ) -> None:
-        self._workspace = workspace
-        self._profile = profile
-        self._force_refresh_near_expiry = force_refresh_near_expiry
-        self._state_lock = threading.Lock()  # guards _token / _expiry (brief)
-        self._refresh_lock = threading.Lock()  # single-flights the CLI refresh
-        self._stop = threading.Event()
-        self._token = ""
-        self._expiry = 0.0
-        # Preserve the existing non-forced relayed-auth fetch. Gateway discovery
-        # opts into a forced fetch so its static client token starts with a full TTL.
-        self._refresh(force=force_refresh_near_expiry)
-
-    def _refresh(self, *, force: bool) -> None:
-        """Mint a token and record its expiry."""
-        token = get_databricks_token(self._workspace, self._profile, force_refresh=force)
-        expiry = _jwt_exp(token) or (time.time() + _DEFAULT_TTL_S)
-        with self._state_lock:
-            self._token = token
-            self._expiry = expiry
-
-    def _fresh_enough(self) -> bool:
-        with self._state_lock:
-            return bool(self._token) and time.time() < self._expiry - _REFRESH_BUFFER_S
-
-    def _ensure_fresh(self) -> None:
-        if self._fresh_enough():
-            return
-        with self._refresh_lock:
-            if self._fresh_enough():  # another thread refreshed while we waited
-                return
-            try:
-                self._refresh(force=self._force_refresh_near_expiry)
-            except RuntimeError as exc:
-                # Keep serving the current token; a request that then 401s triggers
-                # a forced refresh + retry (see _ProxyHandler._handle).
-                _log_refresh_failure(exc)
-
-    @property
-    def token(self) -> str:
-        self._ensure_fresh()
-        with self._state_lock:
-            return self._token
-
-    def refresh(self) -> None:
-        """Force a fresh mint now (used by the retry-on-401 path)."""
-        with self._refresh_lock:
-            self._refresh(force=True)
-
-    def run_refresher(self) -> None:
-        while not self._stop.wait(_REFRESHER_POLL_S):
-            try:
-                self._ensure_fresh()
-            except Exception as exc:  # noqa: BLE001 - a stray error must NOT kill the thread
-                # If this thread dies, nothing refreshes and the session lapses at
-                # the ~1h mark until restart. Log and keep looping instead.
-                _log_refresh_failure(exc)
-
-    def stop(self) -> None:
-        self._stop.set()
-
-
-def _forwarded_request_headers(
-    handler: BaseHTTPRequestHandler,
-    token: str,
-    token_header: str = AI_GATEWAY_TOKEN_HEADER,
-) -> dict[str, str]:
-    strip_on_forward = HOP_BY_HOP_HEADERS | {token_header.lower()}
-    headers = {
-        key: value for key, value in handler.headers.items() if key.lower() not in strip_on_forward
-    }
-    headers[token_header] = f"Bearer {token}"
-    return headers
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
     # Set by the server factory.
-    cache: _TokenCache
+    cache: TokenCache
     client: httpx.Client
     token_header = AI_GATEWAY_TOKEN_HEADER
 
@@ -202,7 +77,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         )
         try:
             # First attempt with the current token.
-            headers = _forwarded_request_headers(self, self.cache.token, self.token_header)
+            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
                     "upstream_headers",
@@ -231,8 +106,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 # `databricks auth login` hint rather than silently relaying a bare 401,
                 # which otherwise reads as an Anthropic `/login` prompt and sends the
                 # user to the wrong re-auth. Still retry + relay with the existing token.
-                _log_refresh_failure(exc)
-            headers = _forwarded_request_headers(self, self.cache.token, self.token_header)
+                log_token_refresh_failure(exc)
+            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
                     "upstream_headers",
@@ -451,15 +326,15 @@ def start_proxy(
     port: int,
     token_header: str,
     force_refresh_near_expiry: bool,
-) -> tuple[ThreadingHTTPServer, _TokenCache, httpx.Client]:
+) -> tuple[ThreadingHTTPServer, TokenCache, httpx.Client]:
     """Start the Anthropic loopback proxy and token refresher."""
     upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
-    cache = _TokenCache(
+    cache = TokenCache(
         workspace,
         profile,
         force_refresh_near_expiry=force_refresh_near_expiry,
     )
-    client = httpx.Client(base_url=upstream_base, timeout=_UPSTREAM_TIMEOUT, follow_redirects=False)
+    client = httpx.Client(base_url=upstream_base, timeout=UPSTREAM_TIMEOUT, follow_redirects=False)
     handler = cast(
         type[BaseHTTPRequestHandler],
         type(
