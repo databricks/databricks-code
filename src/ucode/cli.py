@@ -82,7 +82,7 @@ from ucode.managed_resolve import (
     resolve_state,
 )
 from ucode.managed_wizard import (
-    apply_command,
+    publish_command,
     setup_budget_policy_command,
     setup_command,
     setup_help_command,
@@ -2132,7 +2132,7 @@ def _print_no_managed_config_guidance(workspace: str, profile: str | None) -> No
         print_note("Ask a workspace admin to set one up with `ucode setup`.")
     else:
         # None means the admin check itself failed; point at setup rather than a dead end.
-        print_note("Run `ucode setup` to configure one for your workspace, then `ucode apply`.")
+        print_note("Run `ucode setup` to configure one for your workspace, then `ucode publish`.")
 
 
 @app.command("codex", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -2885,7 +2885,7 @@ def setup_help_cmd() -> None:
 
 @setup_app.command("show")
 def setup_show_cmd() -> None:
-    """Print the authored managed config and the payload `ucode apply` would publish."""
+    """Print the authored managed config and the payload `ucode publish` would publish."""
     try:
         code = show_command()
     except RuntimeError as exc:
@@ -2895,8 +2895,17 @@ def setup_show_cmd() -> None:
         raise typer.Exit(code)
 
 
-@app.command("apply")
-def apply_cmd(
+@app.command("publish")
+def publish_cmd(
+    file_path: Annotated[
+        str | None,
+        typer.Option(
+            "--file",
+            "-f",
+            help="Publish a config file exported with `ucode export` instead of the locally "
+            "authored config. Its `workspace` must match the configured workspace.",
+        ),
+    ] = None,
     yes: Annotated[
         bool,
         typer.Option("--yes", "-y", help="Publish without the confirmation prompt."),
@@ -2912,7 +2921,7 @@ def apply_cmd(
     # the try block or the handler below would report a successful exit as an error.
     try:
         install_databricks_cli()
-        code = apply_command(yes=yes)
+        code = publish_command(file_path=file_path, yes=yes)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
@@ -2925,11 +2934,11 @@ def apply_cmd(
 
 @app.command("export")
 def export_cmd(
-    output: Annotated[
+    file_path: Annotated[
         str | None,
         typer.Option(
-            "--output",
-            "-o",
+            "--file",
+            "-f",
             help="Write the exported config JSON to this file (atomically) instead of stdout. "
             "The parent directory must already exist.",
         ),
@@ -2940,13 +2949,13 @@ def export_cmd(
     Serializes the local managed config to the external `CodingAgentConfig` format that
     `ucode publish -f <path>` consumes, with credentials and server-owned fields (resource name,
     workspace id, timestamps, user ids) excluded. Any user can run it; it makes no network calls
-    and mutates no workspace or local state. Without --output the JSON is printed to stdout;
+    and mutates no workspace or local state. Without --file the JSON is printed to stdout;
     diagnostics and errors go to stderr.
     """
     from ucode.managed_export import export_command
 
     try:
-        export_command(output=output)
+        export_command(file_path=file_path)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

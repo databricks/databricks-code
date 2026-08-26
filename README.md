@@ -239,7 +239,7 @@ ucode setup                 # agents and models (start here)
 ucode setup mcps            # managed MCP servers
 ucode setup skills          # managed skills
 ucode setup spend-tiers     # spend-based routing
-ucode apply                 # publish it to the workspace
+ucode publish                 # publish it to the workspace
 ```
 
 `ucode setup` walks through the agents to enable and which one bare `ucode` launches, then per agent:
@@ -256,12 +256,12 @@ command also offers to publish right away, so you can apply changes incrementall
 section prompts also runs the matching `ucode configure` step, which does configure this machine.
 
 Everything is written to `~/.ucode/managed-state.json` — the one local managed-config file — which
-`ucode apply` publishes. Re-running `ucode setup` keeps the MCP servers, skills, tracing table, and
+`ucode publish` publishes. Re-running `ucode setup` keeps the MCP servers, skills, tracing table, and
 tiered spend policy already authored, rather than clearing them; to drop one, edit the file and reload
 it with `ucode setup --from-file`.
 
 ```bash
-# Review the manifest and the exact payload `ucode apply` would publish.
+# Review the manifest and the exact payload `ucode publish` would publish.
 ucode setup show
 
 # Skip the prompts and load a hand-written config instead (validated before saving).
@@ -272,34 +272,45 @@ Once the manifest looks right, publish it:
 
 ```bash
 # Validate, show a diff against what's live, and ask before publishing.
-ucode apply
+ucode publish
 
 # Publish without the confirmation prompt (for CI).
-ucode apply --yes
+ucode publish --yes
+
+# Publish a config file exported with `ucode export` instead of the locally authored one.
+ucode publish -f ./managed-config.json
+ucode publish --file ./managed-config.json --yes
 ```
 
-`apply` updates the workspace's existing config in place rather than replacing it, so a failed
+`publish` updates the workspace's existing config in place rather than replacing it, so a failed
 publish leaves the current config intact. It shows a diff of exactly what changes against the
 published config before asking to confirm, and does nothing when the two already match. It is a
 whole-manifest write — every field ucode authors is sent — but because `ucode setup` carries the
 other sections forward, a re-run no longer silently drops them. Developers pick the new config up on
 their next ucode run.
 
+With `-f`/`--file`, `publish` reads a config file produced by `ucode export` and publishes it through
+the same validation, diff, and confirmation flow. The file's `workspace` must match the configured
+workspace (it can never redirect publication elsewhere) and its `spec_version` must be a supported
+integer; server-owned fields (resource name, workspace ids, timestamps, user ids) and unknown fields
+are rejected rather than silently dropped.
+
 ### Exporting the config
 
 Any user (not only admins) can print the workspace's managed config as portable JSON with `ucode
 export`. The output leads with the source `workspace` URL and a `spec_version` (the export format
 version), followed by the canonical external config; credentials and server-assigned fields (the
-resource name, timestamps, user ids) are excluded. Without `--output` the JSON is written to stdout;
-with `--output`/`-o` the same bytes are written to a file (atomically, and the destination's parent
-directory must already exist) while stdout stays empty.
+resource name, timestamps, user ids) are excluded. Without `--file` the JSON is written to stdout;
+with `--file`/`-f` the same bytes are written to a file (atomically, and the destination's parent
+directory must already exist) while stdout stays empty. The exported file is exactly what `ucode
+publish -f <file>` consumes.
 
 ```bash
 # Print the managed config as JSON.
 ucode export
 
 # Write it to a file; stdout stays empty.
-ucode export --output ./managed-config.json
+ucode export --file ./managed-config.json
 ```
 
 The output looks like:
@@ -320,7 +331,7 @@ The output looks like:
 | Command | Description |
 |---------|-------------|
 | `ucode status` | Show current workspace, base URLs, managed config files, and selected models |
-| `ucode export` | Print the workspace's managed config as portable JSON (`--output <file>` / `-o` to write a file) |
+| `ucode export` | Print the workspace's managed config as portable JSON (`--file <file>` / `-f` to write a file) |
 | `ucode usage` | Show AI Gateway usage summary, plus your budget spend against its alert threshold when the workspace reports one |
 | `ucode usage --warehouse-id <id>` | Query a specific SQL warehouse instead of discovering one |
 | `ucode revert` | Clear saved state and restore backed-up config files |
@@ -350,10 +361,11 @@ The output looks like:
 | `ucode setup skills [--location a.b,c.d]` | Add or change the managed config's skills |
 | `ucode setup spend-tiers` | Set the managed config's tiered spend routing policy |
 | `ucode setup help` | Walk through the whole setup sequence, marking what's already configured |
-| `ucode setup show` | Print the authored config and the payload `ucode apply` would publish |
+| `ucode setup show` | Print the authored config and the payload `ucode publish` would publish |
 | `ucode setup --from-file <file>` | Load a hand-written managed config instead of running the prompts |
-| `ucode apply` | Publish the authored managed config to the workspace, after a diff and confirmation (admins only) |
-| `ucode apply --yes` | Publish without the confirmation prompt |
+| `ucode publish` | Publish the authored managed config to the workspace, after a diff and confirmation (admins only) |
+| `ucode publish -f <file>` | Publish a config file exported with `ucode export` instead of the locally authored one |
+| `ucode publish --yes` | Publish without the confirmation prompt |
 
 ## Managed Local Files
 

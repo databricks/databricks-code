@@ -377,7 +377,7 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
         return None, f"network error: {exc.reason}"
 
 
-# Workspace group whose members are workspace admins. `ucode setup` / `ucode apply` are restricted
+# Workspace group whose members are workspace admins. `ucode setup` / `ucode publish` are restricted
 # to this group because the coding-agent-config CRUD API enforces the same check server-side.
 WORKSPACE_ADMIN_GROUP = "admins"
 
@@ -1847,6 +1847,7 @@ def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict],
 # currently populated, is what lets a re-run *clear* a field the admin removed: the server merges
 # per path, so an omitted path leaves the old value in place.
 MANAGED_CONFIG_UPDATE_MASK_PATHS: tuple[str, ...] = (
+    "spec_version",
     "display_name",
     "default_agent",
     "enabled_agents",

@@ -2678,7 +2678,7 @@ class TestCodingAgentConfigCrudClients:
                 }
             )
         )
-        assert emitted == set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS)
+        assert set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS) == emitted | {"spec_version"}
 
     def test_delete_returns_only_a_reason(self, monkeypatch):
         seen = {}
