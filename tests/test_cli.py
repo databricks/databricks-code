@@ -809,6 +809,44 @@ class TestApplyManagedSkills:
         mock_dl.assert_not_called()
 
 
+class TestRegisterManagedMcpServers:
+    def test_preserves_configuration_saved_after_launch_state_was_loaded(self):
+        stale_state = {
+            "workspace": "https://example.databricks.com",
+            "available_tools": ["pi"],
+            "managed_mcp_servers": [
+                {"name": "old-claude", "clients": ["claude"]},
+                {"name": "codex-server", "clients": ["codex"]},
+            ],
+        }
+        fresh_state = {
+            **stale_state,
+            "available_tools": ["claude", "codex", "pi"],
+            "managed_mcp_servers": [
+                {"name": "old-claude", "clients": ["claude"]},
+                {"name": "codex-server", "clients": ["codex"]},
+            ],
+        }
+        registered = [{"name": "new-claude", "clients": ["claude"]}]
+
+        with (
+            patch("ucode.cli.apply_managed_mcp_servers", return_value=registered),
+            patch("ucode.cli.load_workspace_state", return_value=fresh_state) as mock_load,
+            patch("ucode.cli.save_state") as mock_save,
+        ):
+            from ucode import cli
+
+            cli._register_managed_mcp_servers({}, "claude", stale_state)
+
+        mock_load.assert_called_once_with("https://example.databricks.com")
+        saved = mock_save.call_args.args[0]
+        assert saved["available_tools"] == ["claude", "codex", "pi"]
+        assert [server["name"] for server in saved["managed_mcp_servers"]] == [
+            "codex-server",
+            "new-claude",
+        ]
+
+
 class TestStatusSkillsSection:
     def _run(self, state):
         with patch("ucode.cli.load_state", return_value=state):

@@ -113,9 +113,12 @@ from ucode.state import (
     get_provider_service,
     load_full_state,
     load_state,
+    load_workspace_state,
     save_state,
+    serialized_state_operation,
     set_current_workspace,
     set_provider_service,
+    state_operation_lock,
 )
 from ucode.tracing import configure_tracing_command
 from ucode.ui import (
@@ -1615,25 +1618,30 @@ def _register_managed_mcp_servers(managed: dict, tool: str, state: dict) -> None
     admin later removes from the config is unregistered rather than left behind. A failure here never
     blocks the launch — the agent still starts, just without the workspace's MCP servers.
     """
-    try:
-        registered = apply_managed_mcp_servers(
-            managed,
-            tool,
-            state["workspace"],
-            state.get("profile"),
-            use_pat=bool(state.get("use_pat")),
-        )
-    except RuntimeError as exc:
-        print_warning(f"Could not register your workspace's MCP servers: {exc}")
-        return
-    # Persist even when empty so a config that dropped its last server clears the prior registration.
-    others = [
-        server
-        for server in (state.get("managed_mcp_servers") or [])
-        if isinstance(server, dict) and tool not in (server.get("clients") or [])
-    ]
-    state["managed_mcp_servers"] = others + registered
-    save_state(state)
+    with state_operation_lock():
+        persisted_state = load_workspace_state(state["workspace"])
+        try:
+            registered = apply_managed_mcp_servers(
+                managed,
+                tool,
+                state["workspace"],
+                persisted_state.get("profile"),
+                use_pat=bool(persisted_state.get("use_pat")),
+            )
+        except RuntimeError as exc:
+            print_warning(f"Could not register your workspace's MCP servers: {exc}")
+            return
+        # Persist even when empty so a config that dropped its last server clears the prior
+        # registration. The operation lock keeps this fresh read and write in one transaction.
+        others = [
+            server
+            for server in (persisted_state.get("managed_mcp_servers") or [])
+            if isinstance(server, dict) and tool not in (server.get("clients") or [])
+        ]
+        managed_mcp_servers = others + registered
+        persisted_state["managed_mcp_servers"] = managed_mcp_servers
+        state["managed_mcp_servers"] = managed_mcp_servers
+        save_state(persisted_state)
     if registered:
         names = ", ".join(str(server["name"]) for server in registered)
         print_note(f"Registered workspace MCP server(s) for {TOOL_SPECS[tool]['display']}: {names}")
@@ -1681,23 +1689,28 @@ def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
     to disk so the agent's ``/skills`` picker lists them. A failure in either step never blocks the
     launch.
     """
-    try:
-        applied = apply_managed_skills(
-            state,
-            managed,
-            tool,
-            state["workspace"],
-            state.get("profile"),
-            use_pat=bool(state.get("use_pat")),
-        )
-    except RuntimeError as exc:
-        print_warning(f"Could not register your workspace's skills: {exc}")
-    else:
-        if applied:
-            names = ", ".join(applied)
-            print_note(
-                f"Registered workspace skill schema(s) for {TOOL_SPECS[tool]['display']}: {names}"
+    with state_operation_lock():
+        persisted_state = load_workspace_state(state["workspace"])
+        try:
+            applied = apply_managed_skills(
+                persisted_state,
+                managed,
+                tool,
+                state["workspace"],
+                persisted_state.get("profile"),
+                use_pat=bool(persisted_state.get("use_pat")),
             )
+        except RuntimeError as exc:
+            print_warning(f"Could not register your workspace's skills: {exc}")
+        else:
+            state["mcp_servers"] = persisted_state.get("mcp_servers") or []
+            state["managed_skill_locations"] = persisted_state.get("managed_skill_locations") or []
+            if applied:
+                names = ", ".join(applied)
+                print_note(
+                    f"Registered workspace skill schema(s) for {TOOL_SPECS[tool]['display']}: "
+                    f"{names}"
+                )
     _download_managed_skills(managed, state)
 
 
@@ -2334,6 +2347,7 @@ def cursor_cmd(ctx: typer.Context) -> None:
 
 
 @configure_app.callback(invoke_without_command=True)
+@serialized_state_operation
 def configure(
     ctx: typer.Context,
     dry_run: Annotated[
@@ -2661,6 +2675,7 @@ def configure(
 
 
 @configure_app.command("mcp")
+@serialized_state_operation
 def configure_mcp(
     location: Annotated[
         str | None,

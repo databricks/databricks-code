@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import os
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from typing import BinaryIO
 
 from ucode.config_io import APP_DIR, is_dry_run
 from ucode.databricks import (
@@ -19,6 +27,118 @@ STATE_VERSION = 3
 MANAGED_OVERLAY_KEY = "_managed_overlay"
 AUTH_COMMAND_TIMEOUT_MS = 5000
 AUTH_REFRESH_INTERVAL_MS = 900_000
+
+_PROCESS_STATE_LOCK = threading.RLock()
+_STATE_LOCK_DEPTH = 0
+_STATE_LOCK_FILE: BinaryIO | None = None
+
+
+def _state_lock_path():
+    return STATE_PATH.with_name(f"{STATE_PATH.name}.lock")
+
+
+def _acquire_file_lock(lock_file: BinaryIO) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        while True:
+            try:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                time.sleep(0.05)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _release_file_lock(lock_file: BinaryIO) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def state_operation_lock() -> Generator[None, None, None]:
+    """Serialize stateful ucode operations across threads and processes.
+
+    Lakebox provisioning can start the ESM and Omnigent ``ucode configure`` commands against the
+    same home directory concurrently. The lock is re-entrant within one process so a command can
+    hold it across the whole operation while individual state reads and writes use the same lock.
+    """
+    global _STATE_LOCK_DEPTH, _STATE_LOCK_FILE
+
+    with _PROCESS_STATE_LOCK:
+        if _STATE_LOCK_DEPTH == 0:
+            lock_path = _state_lock_path()
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            _STATE_LOCK_FILE = lock_path.open("a+b")
+            try:
+                _acquire_file_lock(_STATE_LOCK_FILE)
+            except BaseException:
+                _STATE_LOCK_FILE.close()
+                _STATE_LOCK_FILE = None
+                raise
+        _STATE_LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _STATE_LOCK_DEPTH -= 1
+            if _STATE_LOCK_DEPTH == 0:
+                lock_file = _STATE_LOCK_FILE
+                _STATE_LOCK_FILE = None
+                if lock_file is not None:
+                    try:
+                        _release_file_lock(lock_file)
+                    finally:
+                        lock_file.close()
+
+
+def serialized_state_operation[**P, R](func: Callable[P, R]) -> Callable[P, R]:
+    """Hold :func:`state_operation_lock` for one complete CLI operation."""
+
+    @functools.wraps(func)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        with state_operation_lock():
+            return func(*args, **kwargs)
+
+    return wrapped
+
+
+def _write_full_state(full: dict) -> None:
+    """Atomically replace ``state.json`` with ``full``."""
+    temp_path: str | None = None
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{STATE_PATH.name}.", suffix=".tmp", dir=STATE_PATH.parent
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(full, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, STATE_PATH)
+        temp_path = None
+    except OSError as exc:
+        raise RuntimeError(f"Failed to write state file: {STATE_PATH}") from exc
+    finally:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
 
 
 def load_full_state() -> dict:
@@ -40,7 +160,16 @@ def load_state() -> dict:
     workspace = full.get("current_workspace")
     if not workspace:
         return {}
-    ws_state = full.get("workspaces", {}).get(workspace, {})
+    return _hydrate_workspace_state(full, workspace)
+
+
+def load_workspace_state(workspace: str) -> dict:
+    """Load one workspace's state without changing or depending on the current workspace."""
+    return _hydrate_workspace_state(load_full_state(), workspace)
+
+
+def _hydrate_workspace_state(full: dict, workspace: str) -> dict:
+    ws_state = dict(full.get("workspaces", {}).get(workspace, {}))
     ws_state["workspace"] = workspace
     return hydrate_state(ws_state)
 
@@ -56,16 +185,13 @@ def save_state(state: dict) -> None:
     """
     if is_dry_run():
         return
-    full = load_full_state()
-    workspace = state.get("workspace") or full.get("current_workspace")
-    if workspace:
-        full["current_workspace"] = workspace
-        full["workspaces"][workspace] = hydrate_state(_without_managed_overlay(state))
-    try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_PATH.write_text(json.dumps(full, indent=2), encoding="utf-8")
-    except OSError as exc:
-        raise RuntimeError(f"Failed to write state file: {STATE_PATH}") from exc
+    with state_operation_lock():
+        full = load_full_state()
+        workspace = state.get("workspace") or full.get("current_workspace")
+        if workspace:
+            full["current_workspace"] = workspace
+            full["workspaces"][workspace] = hydrate_state(_without_managed_overlay(state))
+        _write_full_state(full)
 
 
 def _without_managed_overlay(state: dict) -> dict:
@@ -95,15 +221,12 @@ def set_current_workspace(workspace: str | None) -> None:
     targets afterwards."""
     if is_dry_run():
         return
-    full = load_full_state()
-    if full.get("current_workspace") == workspace:
-        return
-    full["current_workspace"] = workspace
-    try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_PATH.write_text(json.dumps(full, indent=2), encoding="utf-8")
-    except OSError as exc:
-        raise RuntimeError(f"Failed to write state file: {STATE_PATH}") from exc
+    with state_operation_lock():
+        full = load_full_state()
+        if full.get("current_workspace") == workspace:
+            return
+        full["current_workspace"] = workspace
+        _write_full_state(full)
 
 
 def hydrate_state(state: dict) -> dict:
@@ -224,16 +347,16 @@ def build_agent_state(state: dict) -> dict[str, dict]:
 
 def clear_state() -> None:
     """Remove the current workspace entry from state."""
-    full = load_full_state()
-    workspace = full.get("current_workspace")
-    if workspace:
-        full.get("workspaces", {}).pop(workspace, None)
-        full["current_workspace"] = None
-    try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_PATH.write_text(json.dumps(full, indent=2), encoding="utf-8")
-    except OSError as exc:
-        raise RuntimeError(f"Failed to clear state file: {STATE_PATH}") from exc
+    with state_operation_lock():
+        full = load_full_state()
+        workspace = full.get("current_workspace")
+        if workspace:
+            full.get("workspaces", {}).pop(workspace, None)
+            full["current_workspace"] = None
+        try:
+            _write_full_state(full)
+        except RuntimeError as exc:
+            raise RuntimeError(f"Failed to clear state file: {STATE_PATH}") from exc
 
 
 def mark_tool_managed(state: dict, tool: str, managed_keys: list) -> dict:
