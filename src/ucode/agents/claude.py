@@ -29,6 +29,7 @@ from ucode.databricks import (
     build_tool_base_url,
     get_databricks_token,
 )
+from ucode.gateway_proxy import AI_GATEWAY_TOKEN_HEADER, AUTHORIZATION_HEADER, start_proxy
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing import v2 as smart_routing_v2
@@ -911,6 +912,7 @@ def _build_claude_argv(
     tool_args: list[str],
     relayed: bool = False,
     launch_model: str | None = None,
+    settings_override: dict | None = None,
 ) -> list[str]:
     """Build the ``claude`` argv, composing any caller ``--settings`` with
     ucode's managed settings.
@@ -935,7 +937,7 @@ def _build_claude_argv(
     source_args = ["--setting-sources", _RELAYED_SETTING_SOURCES] if relayed else []
     model_args = _launch_model_args(tool_args, launch_model)
     caller_values, remaining = _extract_caller_settings(tool_args)
-    if not caller_values:
+    if not caller_values and settings_override is None:
         # No caller --settings: hand Claude ucode's settings file directly (the
         # common path; behavior unchanged).
         return [
@@ -952,6 +954,8 @@ def _build_claude_argv(
     # ucode wins over the caller for conflicting keys (protects gateway auth);
     # hooks from both sides survive.
     merged = _merge_claude_settings(caller_settings, read_json_safe(CLAUDE_SETTINGS_PATH))
+    if settings_override is not None:
+        merged = _merge_claude_settings(merged, settings_override)
     return [
         binary,
         *source_args,
@@ -1013,8 +1017,6 @@ def _launch_relayed(
     """Relayed launch: sign into the Claude subscription, start the loopback
     refresh proxy, then run Claude Code alongside it (the proxy must outlive the
     exec, so we spawn-and-wait rather than replacing the process)."""
-    from ucode.gateway_proxy import start_proxy
-
     conflict = _managed_relayed_conflicts()
     if conflict is not None:
         managed_path, keys = conflict
@@ -1040,7 +1042,13 @@ def _launch_relayed(
     if not isinstance(port, int):
         raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
 
-    server, cache, client = start_proxy(workspace, state.get("profile"), port)
+    server, cache, client = start_proxy(
+        workspace,
+        state.get("profile"),
+        port,
+        token_header=AI_GATEWAY_TOKEN_HEADER,
+        force_refresh_near_expiry=False,
+    )
     # start_proxy falls back to an OS-assigned port when the cached one is taken
     # (stale proxy from a killed session). Reconcile settings + state to whatever
     # it actually bound, so Claude Code connects to the live port.
@@ -1053,6 +1061,47 @@ def _launch_relayed(
 
     proc = subprocess.Popen(
         _build_claude_argv(binary, tool_args, relayed=True, launch_model=launch_model)
+    )
+    try:
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        returncode = proc.wait()
+    finally:
+        cache.stop()
+        server.shutdown()
+        client.close()
+    raise SystemExit(returncode)
+
+
+def _launch_gateway(
+    state: dict, binary: str, tool_args: list[str], launch_model: str | None
+) -> None:
+    """Launch discovery-enabled Claude through a refreshing gateway proxy."""
+    workspace = state["workspace"]
+    server, cache, client = start_proxy(
+        workspace,
+        state.get("profile"),
+        0,
+        token_header=AUTHORIZATION_HEADER,
+        force_refresh_near_expiry=True,
+    )
+    token = cache.token
+    os.environ["OAUTH_TOKEN"] = token
+    os.environ["ANTHROPIC_AUTH_TOKEN"] = token
+    os.environ["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{server.server_address[1]}"
+    os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    settings_override = {"env": {"ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"]}}
+    proc = subprocess.Popen(
+        _build_claude_argv(
+            binary,
+            tool_args,
+            launch_model=launch_model,
+            settings_override=settings_override,
+        )
     )
     try:
         returncode = proc.wait()
@@ -1087,6 +1136,10 @@ def launch(state: dict, tool_args: list[str]) -> None:
             compose_settings=_compose_v2_settings,
             launch_model_args=_launch_model_args,
         )
+        return
+    if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
+        _launch_gateway(state, binary, tool_args, launch_model)
+        return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     exec_or_spawn(_build_claude_argv(binary, tool_args, launch_model=launch_model))

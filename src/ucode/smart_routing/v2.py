@@ -12,14 +12,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
 
-from ucode.config_io import (
-    APP_DIR,
-    deep_merge_dict,
-    read_json_safe,
-    read_toml_safe,
-    write_json_file,
-    write_toml_file,
-)
+import tomlkit
+
+from ucode.config_io import APP_DIR, read_json_safe, write_json_file
 from ucode.databricks import build_auth_token_argv, get_databricks_token
 from ucode.smart_routing import claude_pty, codex_interposer
 from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, sync_first_prompt_hook
@@ -28,7 +23,6 @@ from ucode.ui import print_note
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
 
 CODEX_TARGET_MODEL = "system.ai.glm-5-2"  # TODO(lilly): replace with smart router.
-CODEX_APP_SERVER_HOME = APP_DIR / "codex-v2-home"
 CODEX_INTERPOSER_LOG = APP_DIR / "codex-v2-interposer.log"
 CODEX_SWITCH_REASON = "Low complexity, unclear intent, and no code reference."  # TODO(lilly): replace with smart router rationale.
 
@@ -39,7 +33,6 @@ CLAUDE_MODEL_SNAPSHOT_PATH = APP_DIR / "claude-default-model.snapshot.json"
 APP_SERVER_READY_TIMEOUT_SECONDS = 30
 PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 5
 OAUTH_TOKEN_ENV_VAR = "OAUTH_TOKEN"
-CODEX_HOME_ENV_VAR = "CODEX_HOME"
 LOOPBACK_HOST = "127.0.0.1"
 HEALTH_REQUEST_TIMEOUT_SECONDS = 1
 HEALTH_POLL_INTERVAL_SECONDS = 0.25
@@ -127,25 +120,6 @@ def _switch_message(model: str, reason: str) -> str:
     return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
 
 
-def _generate_codex_app_server_home(
-    state: dict,
-    model: str,
-    render_overlay: Callable[..., dict],
-) -> Path:
-    CODEX_APP_SERVER_HOME.mkdir(parents=True, exist_ok=True)
-    config_path = CODEX_APP_SERVER_HOME / "config.toml"
-    overlay = render_overlay(
-        state["workspace"],
-        model,
-        state.get("profile"),
-        use_pat=bool(state.get("use_pat")),
-    )
-    doc = read_toml_safe(config_path)
-    deep_merge_dict(doc, overlay)
-    write_toml_file(config_path, doc)
-    return CODEX_APP_SERVER_HOME
-
-
 def _route_claude_prompt(_prompt: str) -> str:
     return CLAUDE_TARGET_MODEL
 
@@ -216,13 +190,36 @@ def launch_claude(
             log_path=CLAUDE_PTY_LOG,
         )
     finally:
-        # Restore only after Claude exits. Claude persists `/model` asynchronously;
-        # restoring as soon as its success message renders races that delayed write.
-        # The journal repairs hard-killed and concurrent launches before they start.
         restore_default_model()
         settings_path.unlink(missing_ok=True)
         socket_path.unlink(missing_ok=True)
     sys.exit(returncode)
+
+
+def _toml_value(value: str | int | float | bool | list[object] | dict[str, object]) -> str:
+    if isinstance(value, dict):
+        item = tomlkit.inline_table()
+        item.update(value)
+        return item.as_string()
+    return tomlkit.item(value).as_string()
+
+
+def _codex_config_args(overlay: dict) -> list[str]:
+    args: list[str] = []
+    for key, value in overlay.items():
+        # This is Codex's AI Gateway transport definition, not Unity Catalog
+        # Model Provider Service support; smart routing still cannot use --provider.
+        if key == "model_providers" and isinstance(value, dict):
+            for provider_name, provider_config in value.items():
+                args.extend(
+                    [
+                        "--config",
+                        f"model_providers.{provider_name}={_toml_value(provider_config)}",
+                    ]
+                )
+        else:
+            args.extend(["--config", f"{key}={_toml_value(value)}"])
+    return args
 
 
 def launch_codex(
@@ -244,13 +241,21 @@ def launch_codex(
         )
 
     os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, state.get("profile"))
-    home = _generate_codex_app_server_home(state, start_model, render_overlay)
+    overlay = render_overlay(
+        workspace,
+        start_model,
+        state.get("profile"),
+        use_pat=bool(state.get("use_pat")),
+    )
+    config_args = _codex_config_args(overlay)
     app_port = _free_port()
     app_server_url = _loopback_websocket_url(app_port)
 
+    # Preserve the user's normal CODEX_HOME (including MCP servers, skills, and
+    # preferences) and layer only ucode's gateway settings at CLI precedence.
     app_server = subprocess.Popen(
-        [binary, "app-server", "--listen", app_server_url],
-        env={**os.environ, CODEX_HOME_ENV_VAR: str(home)},
+        [binary, "app-server", *config_args, "--listen", app_server_url],
+        env=os.environ.copy(),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

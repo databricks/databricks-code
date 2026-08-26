@@ -5,32 +5,34 @@ import json
 import pytest
 
 from ucode.agents import codex
-from ucode.config_io import read_toml_safe
 from ucode.smart_routing import codex_interposer, v2
 
 WS = "https://example.databricks.com"
 
 
-class TestGenerateV2Home:
-    def test_writes_provider_config(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(v2, "CODEX_APP_SERVER_HOME", tmp_path / "v2home")
+class TestCodexConfigArgs:
+    def test_layers_provider_overrides_without_replacing_user_config(self, monkeypatch):
         monkeypatch.setattr(codex, "ucode_version", lambda: "0.1.0")
         monkeypatch.setattr(codex, "agent_version", lambda binary: "0.148.0")
 
-        home = v2._generate_codex_app_server_home(
-            {"workspace": WS, "profile": "myprof"},
+        overlay = codex.render_overlay(
+            WS,
             "gpt-5.6-luna",
-            codex.render_overlay,
+            "myprof",
         )
+        args = v2._codex_config_args(overlay)
 
-        assert home == tmp_path / "v2home"
-        doc = read_toml_safe(home / "config.toml")
-        assert doc["model_provider"] == codex.CODEX_MODEL_PROVIDER_NAME
-        assert doc["model"] == "gpt-5.6-luna"
-        provider = doc["model_providers"][codex.CODEX_MODEL_PROVIDER_NAME]
-        assert provider["base_url"].endswith("/ai-gateway/codex/v1")
-        assert provider["auth"]["command"].endswith("ucode")
-        assert "myprof" in provider["auth"]["args"]
+        assert args[:4] == [
+            "--config",
+            'model_provider="ucode-databricks"',
+            "--config",
+            'model="gpt-5.6-luna"',
+        ]
+        provider_override = args[-1]
+        assert provider_override.startswith("model_providers.ucode-databricks={")
+        assert "/ai-gateway/codex/v1" in provider_override
+        assert 'command = "' in provider_override
+        assert '"myprof"' in provider_override
 
 
 def test_smart_routing_switch_message_is_boxed():
@@ -46,10 +48,41 @@ def test_smart_routing_switch_message_is_boxed():
 
 
 class TestLaunchCodex:
-    def test_owns_app_server_interposer_and_tui_lifecycle(self, tmp_path, monkeypatch):
+    def test_codex_launch_dispatches_when_flag_enabled(self, monkeypatch):
+        calls = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(codex, "default_model", lambda state: "gpt-start")
+
+        def launch_v2(state, tool_args, **kwargs):
+            calls.append((state, tool_args, kwargs))
+            raise SystemExit(0)
+
+        monkeypatch.setattr(v2, "launch_codex", launch_v2)
+        state = {"workspace": WS}
+
+        with pytest.raises(SystemExit) as exc:
+            codex.launch(state, ["--search"])
+
+        assert exc.value.code == 0
+        assert calls == [
+            (
+                state,
+                ["--search"],
+                {
+                    "binary": "codex",
+                    "start_model": "gpt-start",
+                    "render_overlay": codex.render_overlay,
+                },
+            )
+        ]
+
+    def test_owns_app_server_interposer_and_tui_lifecycle(self, monkeypatch):
         processes = []
         interposer_args = {}
         stopped = []
+        monkeypatch.setenv("CODEX_HOME", "/user/codex-home")
+        monkeypatch.setattr(codex, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.148.0")
 
         class FakeProcess:
             def __init__(self, argv, **kwargs):
@@ -72,11 +105,6 @@ class TestLaunchCodex:
 
         monkeypatch.setattr(v2.subprocess, "Popen", FakeProcess)
         monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
-        monkeypatch.setattr(
-            v2,
-            "_generate_codex_app_server_home",
-            lambda state, model, render_overlay: tmp_path,
-        )
         monkeypatch.setattr(v2, "_free_port", lambda: 41001)
         monkeypatch.setattr(v2, "_wait_for_app_server", lambda port, timeout: True)
 
@@ -97,14 +125,22 @@ class TestLaunchCodex:
             )
 
         assert exc.value.code == 7
-        assert processes[0].argv == [
+        assert processes[0].argv[:7] == [
             "codex",
             "app-server",
+            "--config",
+            'model_provider="ucode-databricks"',
+            "--config",
+            'model="gpt-start"',
+            "--config",
+        ]
+        assert processes[0].argv[8:] == [
             "--listen",
             "ws://127.0.0.1:41001",
         ]
+        assert processes[0].argv[7].startswith("model_providers.ucode-databricks={")
         assert processes[0].kwargs["env"][v2.OAUTH_TOKEN_ENV_VAR] == "token"
-        assert processes[0].kwargs["env"][v2.CODEX_HOME_ENV_VAR] == str(tmp_path)
+        assert processes[0].kwargs["env"]["CODEX_HOME"] == "/user/codex-home"
         assert processes[1].argv == [
             "codex",
             "--remote",
@@ -159,6 +195,8 @@ class TestInterposerSession:
         frame = self._turn_start("gpt-5.5")
         assert sess.on_tui_frame(frame) == frame
         assert sess.on_engine_frame(self._turn_started("turn-1")) == []
+        later_selection = self._turn_start("gpt-5.6")
+        assert sess.on_tui_frame(later_selection) == later_selection
 
     def test_non_turn_frames_pass_through(self):
         sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
@@ -203,9 +241,10 @@ class TestInterposerSession:
         injected = sess.on_engine_frame(self._turn_started("turn-1"))
         assert [m["method"] for m in injected] == [codex_interposer.SETTINGS_UPDATED]
 
-    def test_injects_only_once(self):
+    def test_routes_only_first_turn_and_preserves_later_model_selection(self):
         sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
         sess.on_tui_frame(self._turn_start("luna"))
         assert sess.on_engine_frame(self._turn_started("turn-1"))
-        sess.on_tui_frame(self._turn_start("luna"))
+        second_turn = self._turn_start("luna")
+        assert sess.on_tui_frame(second_turn) == second_turn
         assert sess.on_engine_frame(self._turn_started("turn-2")) == []

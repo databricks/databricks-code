@@ -31,6 +31,7 @@ class _Session:
         self.switch_message = switch_message
         self.thread_id: str | None = None
         self.settings: dict | None = None
+        self.first_turn_seen = False
         self.switch_pending = False
         self.injected = False
 
@@ -45,10 +46,14 @@ class _Session:
         if msg.get("method") == TURN_START and isinstance(params, dict):
             if isinstance(params.get("threadId"), str):
                 self.thread_id = params["threadId"]
+            # Route only the first turn; later /model selections belong to the user.
+            if self.first_turn_seen:
+                return raw
+            self.first_turn_seen = True
             old = params.get("model")
             if old != self.target:
                 params["model"] = self.target
-                self.switch_pending = not self.injected
+                self.switch_pending = True
                 self.log(f"[REWRITE] model {old!r} -> {self.target!r}")
                 return json.dumps(msg)
         return raw
