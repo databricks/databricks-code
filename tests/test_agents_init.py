@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -705,3 +706,48 @@ class TestValidateTool:
 
         assert ok is True
         assert err == ""
+
+
+class TestReconcileGlobalSettings:
+    """`reconcile_global_settings` undoes the OS-managed write for any global-settings agent the
+    current config no longer marks global — for BOTH agents, whichever one is being launched."""
+
+    def _record(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(
+            agents_mod, "restore_managed_file", lambda path, *, display: calls.append(str(path))
+        )
+        monkeypatch.setattr(agents_mod.claude, "_managed_settings_path", lambda: Path("/x/claude"))
+        monkeypatch.setattr(agents_mod.codex, "_managed_config_path", lambda: Path("/x/codex"))
+        return calls
+
+    def test_launching_claude_reconciles_stale_codex(self, monkeypatch):
+        calls = self._record(monkeypatch)
+        agents_mod.reconcile_global_settings(
+            {"enabled_agents": {"claude": {"use_as_global_settings": True}}}
+        )
+        assert calls == ["/x/codex"]
+
+    def test_launching_codex_reconciles_stale_claude(self, monkeypatch):
+        calls = self._record(monkeypatch)
+        agents_mod.reconcile_global_settings(
+            {"enabled_agents": {"codex": {"use_as_global_settings": True}}}
+        )
+        assert calls == ["/x/claude"]
+
+    def test_no_managed_config_reconciles_both(self, monkeypatch):
+        calls = self._record(monkeypatch)
+        agents_mod.reconcile_global_settings(None)
+        assert sorted(calls) == ["/x/claude", "/x/codex"]
+
+    def test_both_global_reconciles_neither(self, monkeypatch):
+        calls = self._record(monkeypatch)
+        agents_mod.reconcile_global_settings(
+            {
+                "enabled_agents": {
+                    "claude": {"use_as_global_settings": True},
+                    "codex": {"use_as_global_settings": True},
+                }
+            }
+        )
+        assert calls == []

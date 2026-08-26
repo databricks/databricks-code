@@ -2558,6 +2558,96 @@ class TestManagedConfigDecidesDiscoveryFromFreshRead:
         assert mock_shared.call_args.kwargs["skip_model_discovery"] is False
 
 
+class TestReconcileWiring:
+    """Both the launch and the configure entry points reconcile the OS managed files, so switching
+    workspaces tears down a prior workspace's global settings."""
+
+    def test_launch_reconciles_with_the_resolved_config(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        managed = {"enabled_agents": {"claude": {}}}
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (managed, False))
+        monkeypatch.setattr("ucode.cli.reconcile_global_settings", lambda m: seen.append(m))
+        state = dict(MINIMAL_STATE)
+        with (
+            patch("ucode.cli.normalize_tool", return_value="claude"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.apply_pat_environment"),
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, ["claude"])
+        assert result.exit_code == 0, result.output
+        assert seen == [managed]
+
+    def test_launch_does_not_reconcile_when_feature_disabled(self, monkeypatch):
+        seen: list = []
+        monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
+        monkeypatch.setattr("ucode.cli.reconcile_global_settings", lambda m: seen.append(m))
+        state = dict(MINIMAL_STATE)
+        with (
+            patch("ucode.cli.normalize_tool", return_value="claude"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.apply_pat_environment"),
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(app, ["claude"])
+        assert result.exit_code == 0, result.output
+        assert seen == []
+
+    def test_configure_reconciles_when_a_managed_config_exists(self, monkeypatch):
+        import typer
+
+        seen: list = []
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
+        managed = {"enabled_agents": {"claude": {}}}
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (managed, False))
+        monkeypatch.setattr("ucode.cli.reconcile_global_settings", lambda m: seen.append(m))
+        import ucode.cli as cli_mod
+
+        with pytest.raises(typer.Exit):
+            cli_mod._resolve_workspace_then_maybe_reject([("https://w", None)])
+        assert seen == [managed]
+
+    def test_configure_reconciles_when_no_managed_config(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: False)
+        monkeypatch.setattr("ucode.cli.reconcile_global_settings", lambda m: seen.append(m))
+        import ucode.cli as cli_mod
+
+        entries = cli_mod._resolve_workspace_then_maybe_reject([("https://w", None)])
+        assert entries == [("https://w", None)]
+        assert seen == [None]
+
+    def test_bare_ucode_reconciles_before_the_no_config_early_return(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
+        monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
+        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda *a, **k: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda *a, **k: False)
+        monkeypatch.setattr("ucode.cli.reconcile_global_settings", lambda m: seen.append(m))
+        result = runner.invoke(app, [])
+        assert result.exit_code == 0, result.output
+        assert seen == [None]
+
+
 class TestConfigureDeprecation:
     """`ucode configure` resolves the target workspace first, then short-circuits once a managed
     config exists for it, since the admin's wins anyway."""

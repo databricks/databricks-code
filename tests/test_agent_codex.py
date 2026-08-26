@@ -718,3 +718,54 @@ class TestCodexManagedConfig:
         state = {"workspace": WS, "codex_models": ["gpt-5"]}
         codex.write_tool_config(state)
         assert not managed_path.exists()
+
+
+class TestCodexManagedConfigLifecycle:
+    """Workspace A (global settings) -> B (none): the real capture+restore path, sudo mocked."""
+
+    def _patch(self, tmp_path, monkeypatch):
+        import ucode.managed_files as mf
+
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        managed_path = tmp_path / "etc-codex" / "managed_config.toml"
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "codex-ucode-config.backup.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+        monkeypatch.setattr(codex, "_managed_config_path", lambda: managed_path)
+        monkeypatch.setattr(mf, "managed_files_supported", lambda: True)
+
+        def _fake_replace(path, text):
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+
+        monkeypatch.setattr(mf, "_sudo_replace", _fake_replace)
+        monkeypatch.setattr(mf, "_sudo_remove", lambda path: Path(path).unlink())
+        return managed_path
+
+    def test_switch_away_restores_it_authored_file(self, tmp_path, monkeypatch):
+        import ucode.managed_files as mf
+
+        managed_path = self._patch(tmp_path, monkeypatch)
+        managed_path.parent.mkdir(parents=True, exist_ok=True)
+        managed_path.write_text('approval_policy = "on-request"\n', encoding="utf-8")
+
+        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
+        codex.write_tool_config(state)
+        doc = read_toml_safe(managed_path)
+        assert doc["approval_policy"] == "on-request"  # IT key preserved through the merge
+        assert doc["model"] == "gpt-5"  # ucode keys applied
+
+        assert mf.restore_managed_file(managed_path, display="Codex") == "restored"
+        assert managed_path.read_text(encoding="utf-8") == 'approval_policy = "on-request"\n'
+
+    def test_switch_away_removes_ucode_created_file(self, tmp_path, monkeypatch):
+        import ucode.managed_files as mf
+
+        managed_path = self._patch(tmp_path, monkeypatch)  # no file on disk before ucode
+        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
+        codex.write_tool_config(state)
+        assert managed_path.exists()
+        assert mf.restore_managed_file(managed_path, display="Codex") == "removed"
+        assert not managed_path.exists()

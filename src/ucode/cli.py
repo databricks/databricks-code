@@ -22,6 +22,7 @@ from ucode.agents import (
     install_tool_binary,
     normalize_tool,
     provider_permission_error,
+    reconcile_global_settings,
     resolve_launch_model,
     resolve_provider_models,
     validate_all_tools,
@@ -282,6 +283,7 @@ def _resolve_workspace_then_maybe_reject(
         managed, coding_agent_config_feature_disabled = refresh_managed_config(
             {"workspace": workspace, "profile": profile}
         )
+    reconcile_global_settings(managed)
     if not managed and not coding_agent_config_feature_disabled:
         _maybe_offer_admin_setup(workspace, profile)
     if not managed:
@@ -1910,6 +1912,8 @@ def _launch_tool(
                         f"which overrides `--model {model}` — Claude Code will launch on the pinned "
                         "model instead. Edit or remove that file to use --model."
                     )
+        if managed_agent_config_enabled():
+            reconcile_global_settings(managed)
         state = configure_tool(
             tool,
             state,
@@ -2091,6 +2095,7 @@ def _launch_managed_default(
     else:
         with spinner("Loading..."):
             managed, coding_agent_config_feature_disabled = refresh_managed_config(state)
+    reconcile_global_settings(managed)
     if not managed and not coding_agent_config_feature_disabled:
         _print_no_managed_config_guidance(current, state.get("profile"))
     if not managed:

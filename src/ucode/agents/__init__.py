@@ -25,6 +25,7 @@ from ucode.databricks import (
     map_claude_family_models,
     resolve_provider_service,
 )
+from ucode.managed_files import restore_managed_file
 from ucode.state import get_provider_service, load_state, save_state
 from ucode.telemetry import agent_version
 from ucode.ui import (
@@ -87,6 +88,32 @@ AITOOLS_AGENT_TOKENS = {
     "opencode": "opencode",
     "copilot": "copilot",
 }
+
+
+def _os_managed_file_path(tool: str):
+    if tool == "claude":
+        return claude._managed_settings_path()
+    if tool == "codex":
+        return codex._managed_config_path()
+    return None
+
+
+def reconcile_global_settings(managed: dict | None) -> None:
+    """Undo ucode's OS-managed-file write for each global-settings agent the current config no longer
+    marks global, so switching workspaces stops a prior one's settings applying to a bare agent.
+
+    Reconciles both agents, not just the launched one; an agent still marked global is left for its
+    writer to (re)write. Idempotent, drift-suppressed, and nonfatal. ``managed_use_as_global_settings``
+    is imported locally to avoid a cycle (managed_resolve imports ``GLOBAL_SETTINGS_AGENTS`` from here).
+    """
+    from ucode.managed_resolve import managed_use_as_global_settings
+
+    for tool in GLOBAL_SETTINGS_AGENTS:
+        if managed_use_as_global_settings(managed or {}, tool):
+            continue
+        path = _os_managed_file_path(tool)
+        if path is not None:
+            restore_managed_file(path, display=TOOL_SPECS[tool]["display"])
 
 
 def install_databricks_ai_tools_for_agents(tools: list[str], state: dict) -> None:
