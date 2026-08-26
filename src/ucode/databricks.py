@@ -1686,13 +1686,18 @@ def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[
     return [m for m in ids if "claude-" in m.lower()], None
 
 
-def _prefer_opus_4_8(models: dict[str, str], all_ids: list[str]) -> None:
-    """Swap the opus slot to claude-opus-4-8 when it's available.
+def _prefer_opus_4_8(
+    models: dict[str, str], all_ids: list[str], *, smart_routing_enabled: bool
+) -> None:
+    """Swap the opus slot to claude-opus-4-8 when it's available, for smart-routing users only.
 
-    Discovery picks the newest opus (opus-5) but smart routing's
-    CLAUDE_ROUTE_ARMS require claude-opus-4-8. Pin to 4-8 when both
-    exist so the routing availability check passes.
+    Discovery picks the newest opus (opus-5) but smart routing's CLAUDE_ROUTE_ARMS require
+    claude-opus-4-8. Pin to 4-8 when both exist and smart routing is on so the routing
+    availability check passes. Users who never enable smart routing keep the newest opus —
+    this pin is a routing-compatibility workaround, not a general default.
     """
+    if not smart_routing_enabled:
+        return
     opus = models.get("opus")
     if opus and "claude-opus-5" in opus:
         opus_48 = next((m for m in all_ids if "claude-opus-4-8" in m), None)
@@ -1701,7 +1706,7 @@ def _prefer_opus_4_8(models: dict[str, str], all_ids: list[str]) -> None:
 
 
 def discover_model_services(
-    workspace: str, token: str
+    workspace: str, token: str, *, smart_routing_enabled: bool = False
 ) -> tuple[dict[str, str], list[str], list[str], list[str], str | None]:
     """Discover models via UC model-services and bucket them by family name.
 
@@ -1735,7 +1740,8 @@ def discover_model_services(
     # routing availability check fail. Pin opus-4-8 when it's available so
     # routing works with the currently-deployed task_v1 router. Revert to
     # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
-    _prefer_opus_4_8(claude_models, ids)
+    # Only pinned for smart-routing users — everyone else keeps newest-wins (opus-5).
+    _prefer_opus_4_8(claude_models, ids, smart_routing_enabled=smart_routing_enabled)
 
     codex_models = sorted([m for m in ids if "gpt-" in m], key=model_version_sort_key)
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
@@ -2729,7 +2735,9 @@ def list_all_mcp_services(
     return sorted(names), None
 
 
-def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], str | None]:
+def discover_claude_models(
+    workspace: str, token: str, *, smart_routing_enabled: bool = False
+) -> tuple[dict[str, str], str | None]:
     """Discover Claude families on this workspace's AI Gateway.
 
     Returns (models_by_family, reason). reason is None on success; otherwise it
@@ -2757,7 +2765,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
         if candidates:
             result[family] = candidates[0]
     # Same opus-4-8 pin as discover_model_services — see comment there.
-    _prefer_opus_4_8(result, raw_ids)
+    _prefer_opus_4_8(result, raw_ids, smart_routing_enabled=smart_routing_enabled)
     if result:
         return result, None
     if not raw_ids:

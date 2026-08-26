@@ -458,6 +458,7 @@ def configure_shared_state(
     skip_preflight: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    smart_routing_enabled: bool | None = None,
 ) -> dict:
     """Log into Databricks, enforce AI Gateway v2, fetch model lists, persist state.
 
@@ -481,6 +482,11 @@ def configure_shared_state(
     ``ANTHROPIC_DEFAULT_FABLE_MODEL`` pin (default off). ``None`` means "inherit":
     a launch re-run keeps whatever the workspace was configured with; ``True``/
     ``False`` come from an explicit ``configure --enable-fable``/``--disable-fable``.
+    ``smart_routing_enabled`` is Claude's routing opt-in, which decides whether
+    discovery pins the opus slot to opus-4-8 (see ``_prefer_opus_4_8``). ``None``
+    means "inherit this workspace's persisted opt-in"; ``True`` comes from a
+    ``claude --enable-smart-routing`` launch, whose own persist happens after this
+    call and so cannot be read from state yet.
     """
     workspace = normalize_workspace_url(workspace)
     prior_state = load_state()
@@ -497,6 +503,12 @@ def configure_shared_state(
             and previous_workspace == workspace
         )
         databricks_ai_tools_enabled = not disabled
+    if smart_routing_enabled is None:
+        # Inherit this workspace's own opt-in only. Without the workspace check another
+        # workspace's routing choice would pin this one's opus slot to 4-8.
+        smart_routing_enabled = (
+            claude_agent.smart_routing_enabled(prior_state) and previous_workspace == workspace
+        )
     fetch_all = tools is None
 
     # Assemble the shared workspace state that doesn't depend on model discovery:
@@ -526,6 +538,12 @@ def configure_shared_state(
         state["fable_enabled"] = True
     else:
         state.pop("fable_enabled", None)
+    # `state` starts as the previous workspace's block, so a routing opt-in made elsewhere
+    # would otherwise be saved onto this workspace and read as its own next launch. Only drop
+    # the foreign key here — `enable_smart_routing` stays the sole writer, so a launch that
+    # fails a later guard (e.g. --enable-smart-routing with --provider) persists no opt-in.
+    if not smart_routing_enabled:
+        state.pop(claude_agent.SMART_ROUTING_STATE_KEY, None)
     state["databricks_ai_tools_enabled"] = databricks_ai_tools_enabled
     state["base_urls"] = build_shared_base_urls(workspace)
 
@@ -615,13 +633,18 @@ def configure_shared_state(
         # failed), fall back to the per-family AI Gateway listing for that
         # family only.
         with spinner("Fetching available models..."):
+            # The opus-4-8 pin inside discovery only matters for smart-routing users (their
+            # router requires it); everyone else keeps newest-wins (opus-5). The opt-in is
+            # resolved above from this workspace's state or the launch's own flag.
             ms_claude, ms_codex, ms_gemini, ms_oss, ms_reason = discover_model_services(
-                workspace, token
+                workspace, token, smart_routing_enabled=smart_routing_enabled
             )
             if want_claude:
                 claude_models, claude_reason = ms_claude, ms_reason
                 if not claude_models:
-                    claude_models, claude_reason = discover_claude_models(workspace, token)
+                    claude_models, claude_reason = discover_claude_models(
+                        workspace, token, smart_routing_enabled=smart_routing_enabled
+                    )
                 # Fable is opt-in (`configure --enable-fable`). Unless enabled,
                 # drop it from the discovered bundle entirely so it never becomes
                 # part of any agent's config — not claude's family pins, nor the
@@ -1757,12 +1780,17 @@ def _launch_tool(
         # tools like pi which read multiple model bundles never run on
         # stale state from before a tool added a new bundle). Under a provider
         # this heavy discovery is skipped (only a web-search model is fetched).
+        # `--enable-smart-routing` is persisted further down, after this call. Discovery must
+        # still see it now: the router only accepts opus-4-8, so a launch that discovers opus-5
+        # would enable routing and then fail its own availability check for the whole session.
+        # `None` keeps the inherit-from-state default; only claude's router needs the opus pin.
         state = configure_shared_state(
             state["workspace"],
             profile=state.get("profile"),
             tools=[tool],
             skip_model_discovery=bool(provider) or managed_models_known,
             skip_preflight=skip_preflight,
+            smart_routing_enabled=True if enable_smart_routing_flag and tool == "claude" else None,
         )
         # An admin-published managed config wins over the developer's own settings. Layered on after
         # `configure_shared_state`, whose returned state it overrides, and before the provider and
