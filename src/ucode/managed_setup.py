@@ -13,9 +13,10 @@ produces, so ``serialize`` then ``normalize`` round-trips to the input. The enum
 inverting that module's maps rather than restated, so a new agent or MCP type only has to be added
 once.
 
-Local persistence is not duplicated here: the authored manifest is saved to and loaded from the one
-local file, ``~/.ucode/managed-state.json``, via :func:`ucode.managed_config.save_managed_state` and
-:func:`ucode.managed_config.load_managed_state` — the same file the launch path pulls into.
+Local persistence is not duplicated here: the authored manifest is saved to and loaded from
+``~/.ucode/managed-state.json`` via :func:`ucode.managed_config.save_managed_state` and
+:func:`ucode.managed_config.load_managed_state`. Ordinary launches keep their published-config
+fallback in a separate cache, so they cannot overwrite unpublished edits.
 
 The interactive wizard that calls these helpers, and the publish step, live in
 :mod:`ucode.managed_wizard`.

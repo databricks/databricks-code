@@ -65,7 +65,7 @@ from ucode.managed_budget import (
 from ucode.managed_config import (
     MANAGED_CONFIG_ENV_VAR,
     get_model_recommendation,
-    load_managed_state,
+    load_managed_cache,
     managed_agent_config_enabled,
     refresh_managed_config,
 )
@@ -2087,7 +2087,7 @@ def _launch_managed_default(
     apply_pat_environment(state)
     # --dry-run avoids the fetch but still applies the last saved config.
     if dry_run:
-        managed = load_managed_state(current)
+        managed = load_managed_cache(current)
     else:
         with spinner("Loading..."):
             managed, coding_agent_config_feature_disabled = refresh_managed_config(state)

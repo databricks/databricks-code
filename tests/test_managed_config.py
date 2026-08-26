@@ -13,10 +13,12 @@ import ucode.databricks as db_mod
 import ucode.managed_config as mc_mod
 from ucode.managed_config import (
     get_managed_config,
+    load_managed_cache,
     load_managed_state,
     managed_state_workspace,
     normalize_managed_config,
     refresh_managed_config,
+    save_managed_cache,
     save_managed_state,
 )
 from ucode.managed_setup import serialize_managed_config
@@ -195,6 +197,10 @@ class TestPersistence:
     @pytest.fixture(autouse=True)
     def _managed_path(self, tmp_path, monkeypatch):
         path = tmp_path / ".ucode" / "managed-state.json"
+        monkeypatch.setattr(mc_mod, "MANAGED_CACHE_DIR", tmp_path / ".ucode" / "managed-cache")
+        monkeypatch.setattr(
+            mc_mod, "LEGACY_MANAGED_CACHE_PATH", tmp_path / ".ucode" / "managed-cache.json"
+        )
         monkeypatch.setattr(mc_mod, "MANAGED_STATE_PATH", path)
         return path
 
@@ -204,11 +210,74 @@ class TestPersistence:
         loaded = load_managed_state("https://ws.example.com")
         assert loaded == cfg
 
+    def test_schema_version_is_the_first_field(self, _managed_path):
+        save_managed_state("https://ws.example.com", {"default_agent": "claude"})
+        payload = json.loads(_managed_path.read_text(encoding="utf-8"))
+        assert list(payload) == ["schema_version", "workspace", "config"]
+        assert payload["schema_version"] == "1.0"
+
+    def test_v1_schema_is_read(self, _managed_path):
+        _managed_path.parent.mkdir(parents=True, exist_ok=True)
+        _managed_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "workspace": "https://ws.example.com",
+                    "config": {"default_agent": "claude"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert load_managed_state("https://ws.example.com") == {"default_agent": "claude"}
+
+    def test_unversioned_legacy_state_is_read_as_v1(self, _managed_path):
+        _managed_path.parent.mkdir(parents=True, exist_ok=True)
+        _managed_path.write_text(
+            json.dumps(
+                {
+                    "workspace": "https://ws.example.com",
+                    "config": {"default_agent": "claude"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert load_managed_state("https://ws.example.com") == {"default_agent": "claude"}
+
+    def test_unknown_future_schema_is_not_interpreted_as_v1(self, _managed_path):
+        _managed_path.parent.mkdir(parents=True, exist_ok=True)
+        _managed_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "2.0",
+                    "workspace": "https://ws.example.com",
+                    "config": {"default_agent": "claude"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert load_managed_state("https://ws.example.com") is None
+        assert managed_state_workspace() is None
+
     def test_saved_file_is_0600(self, _managed_path):
         save_managed_state("https://ws.example.com", {"default_agent": "claude"})
         mode = stat.S_IMODE(os.stat(_managed_path).st_mode)
         # Owner-only read/write; no group/other bits.
         assert mode == 0o600
+
+    def test_atomic_replace_failure_preserves_the_previous_draft(self, _managed_path, monkeypatch):
+        original = {"default_agent": "claude"}
+        save_managed_state("https://ws.example.com", original)
+
+        def fail_replace(*_args):
+            raise OSError
+
+        monkeypatch.setattr(mc_mod.os, "replace", fail_replace)
+
+        with pytest.raises(RuntimeError, match="Failed to write managed config file"):
+            save_managed_state("https://ws.example.com", {"default_agent": "codex"})
+
+        assert load_managed_state("https://ws.example.com") == original
+        assert list(_managed_path.parent.glob(f".{_managed_path.name}.*.tmp")) == []
 
     def test_load_ignores_other_workspace(self, _managed_path):
         save_managed_state("https://ws-a.example.com", {"default_agent": "claude"})
@@ -232,6 +301,59 @@ class TestPersistence:
         # file can still be found and attributed on disk.
         save_managed_state("https://ws.example.com", {"default_agent": "claude"})
         assert managed_state_workspace() == "https://ws.example.com"
+
+    def test_published_cache_is_separate_from_the_editable_draft(self, _managed_path):
+        draft = {"default_agent": "claude"}
+        published = {"default_agent": "codex"}
+        save_managed_state("https://ws.example.com", draft)
+        save_managed_cache("https://ws.example.com", published)
+
+        assert load_managed_state("https://ws.example.com") == draft
+        assert load_managed_cache("https://ws.example.com") == published
+
+    def test_workspace_caches_are_independent_and_include_provenance(self, _managed_path):
+        first_workspace = "https://first.example.com"
+        second_workspace = "https://second.example.com"
+        first = {"default_agent": "claude"}
+        second = {"default_agent": "codex"}
+
+        save_managed_cache(first_workspace, first)
+        save_managed_cache(second_workspace, second)
+
+        assert load_managed_cache(first_workspace) == first
+        assert load_managed_cache(second_workspace) == second
+        cache_files = sorted(mc_mod.MANAGED_CACHE_DIR.glob("*.json"))
+        assert len(cache_files) == 2
+        payload = json.loads(mc_mod._managed_cache_path(first_workspace).read_text())
+        assert payload["workspace"] == first_workspace
+        assert payload["metadata"]["source"] == "workspace"
+        assert payload["metadata"]["fetched_at"].endswith("Z")
+        assert payload["metadata"]["config_digest"] == mc_mod._config_digest(first)
+
+    def test_reads_the_legacy_single_workspace_cache(self, _managed_path):
+        mc_mod.LEGACY_MANAGED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        mc_mod.LEGACY_MANAGED_CACHE_PATH.write_text(
+            json.dumps(
+                {
+                    "schema_version": "1.0",
+                    "workspace": "https://ws.example.com",
+                    "config": {"default_agent": "claude"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert load_managed_cache("https://ws.example.com") == {"default_agent": "claude"}
+
+    def test_rejects_a_cache_whose_config_does_not_match_its_digest(self, _managed_path):
+        workspace = "https://ws.example.com"
+        save_managed_cache(workspace, {"default_agent": "claude"})
+        cache_path = mc_mod._managed_cache_path(workspace)
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        payload["config"]["default_agent"] = "codex"
+        cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert load_managed_cache(workspace) is None
 
     def test_workspace_is_none_when_absent(self, _managed_path):
         assert managed_state_workspace() is None
@@ -329,13 +451,27 @@ class TestRefreshManagedConfig:
     def test_persists_and_returns_the_manifest(self, monkeypatch):
         saved: list[tuple] = []
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (MANAGED, None))
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: saved.append((ws, cfg)))
+        monkeypatch.setattr(mc_mod, "save_managed_cache", lambda ws, cfg: saved.append((ws, cfg)))
         assert refresh_managed_config(_state()) == (MANAGED, False)
         assert saved == [(WORKSPACE, MANAGED)]
 
+    def test_refresh_never_overwrites_the_authored_draft(self, tmp_path, monkeypatch):
+        draft = {"default_agent": "codex", "enabled_agents": {"codex": {}}}
+        state_path = tmp_path / "managed-state.json"
+        cache_dir = tmp_path / "managed-cache"
+        monkeypatch.setattr(mc_mod, "MANAGED_STATE_PATH", state_path)
+        monkeypatch.setattr(mc_mod, "MANAGED_CACHE_DIR", cache_dir)
+        monkeypatch.setattr(mc_mod, "LEGACY_MANAGED_CACHE_PATH", tmp_path / "legacy-cache.json")
+        monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (MANAGED, None))
+        save_managed_state(WORKSPACE, draft)
+
+        assert refresh_managed_config(_state()) == (MANAGED, False)
+        assert load_managed_state(WORKSPACE) == draft
+        assert load_managed_cache(WORKSPACE) == MANAGED
+
     def test_no_managed_config_returns_none(self, monkeypatch):
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
+        monkeypatch.setattr(mc_mod, "save_managed_cache", lambda ws, cfg: None)
         result, _ = refresh_managed_config(_state())
         assert result is None
 
@@ -343,7 +479,7 @@ class TestRefreshManagedConfig:
         # The admin's last known policy beats no policy, so a failed fetch reuses what we saved.
         warnings: list[str] = []
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, "HTTP 500"))
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: MANAGED)
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: MANAGED)
         monkeypatch.setattr(mc_mod, "print_warning", lambda msg: warnings.append(msg))
         assert refresh_managed_config(_state()) == (MANAGED, False)
         assert "HTTP 500" in warnings[0]
@@ -353,7 +489,7 @@ class TestRefreshManagedConfig:
         # Nothing persisted means no managed config is in play, so an expired session shouldn't
         # produce a warning about a feature this developer doesn't use.
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, "HTTP 500"))
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: None)
         monkeypatch.setattr(
             mc_mod, "print_warning", lambda msg: pytest.fail(f"should not warn: {msg}")
         )
@@ -367,7 +503,7 @@ class TestRefreshManagedConfig:
             raise RuntimeError("no token")
 
         monkeypatch.setattr(mc_mod, "get_databricks_token", boom)
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: MANAGED)
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: MANAGED)
         monkeypatch.setattr(mc_mod, "print_warning", lambda msg: warnings.append(msg))
         assert refresh_managed_config(_state()) == (MANAGED, False)
         assert "no token" in warnings[0]
@@ -377,7 +513,7 @@ class TestRefreshManagedConfig:
             raise RuntimeError("no token")
 
         monkeypatch.setattr(mc_mod, "get_databricks_token", boom)
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: None)
         monkeypatch.setattr(
             mc_mod, "print_warning", lambda msg: pytest.fail(f"should not warn: {msg}")
         )
@@ -389,7 +525,7 @@ class TestRefreshManagedConfig:
         # config in play and warning would be a false positive.
         denied = 'HTTP 403 Forbidden: {"error_code":"PERMISSION_DENIED"}'
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, denied))
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: None)
         monkeypatch.setattr(
             mc_mod, "print_warning", lambda msg: pytest.fail(f"should not warn: {msg}")
         )
@@ -402,10 +538,10 @@ class TestRefreshManagedConfig:
         warnings: list[str] = []
         denied = 'HTTP 403 Forbidden: {"error_code":"PERMISSION_DENIED"}'
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, denied))
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: MANAGED)
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: MANAGED)
         monkeypatch.setattr(mc_mod, "print_warning", lambda msg: warnings.append(msg))
         monkeypatch.setattr(
-            mc_mod, "save_managed_state", lambda ws, cfg: pytest.fail("must not clear the cache")
+            mc_mod, "save_managed_cache", lambda ws, cfg: pytest.fail("must not clear the cache")
         )
         assert refresh_managed_config(_state()) == (MANAGED, False)
         assert "not readable by you" in warnings[0]
@@ -414,9 +550,9 @@ class TestRefreshManagedConfig:
         # A successful read saying "no config" means the admin removed it — that's authoritative,
         # so a previously persisted file must not resurrect the old policy.
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
+        monkeypatch.setattr(mc_mod, "save_managed_cache", lambda ws, cfg: None)
         monkeypatch.setattr(
-            mc_mod, "load_managed_state", lambda ws: pytest.fail("must not fall back")
+            mc_mod, "load_managed_cache", lambda ws: pytest.fail("must not fall back")
         )
         result, _ = refresh_managed_config(_state())
         assert result is None
@@ -426,8 +562,8 @@ class TestRefreshManagedConfig:
         # failed read would put a dead policy back into force.
         saved: list[tuple] = []
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: saved.append((ws, cfg)))
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
+        monkeypatch.setattr(mc_mod, "save_managed_cache", lambda ws, cfg: saved.append((ws, cfg)))
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: None)
         result, _ = refresh_managed_config(_state())
         assert result is None
         assert saved == [(WORKSPACE, {})]
@@ -436,7 +572,7 @@ class TestRefreshManagedConfig:
         # The empty marker means "no admin policy", so a later failed read falls through to the
         # developer's own settings rather than reporting a managed config.
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, "HTTP 500"))
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: {})
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: {})
         monkeypatch.setattr(
             mc_mod, "print_warning", lambda msg: pytest.fail(f"should not warn: {msg}")
         )
@@ -455,7 +591,7 @@ class TestRefreshManagedConfig:
         # publish anything yet. The flag lets callers suppress the setup recommendation.
         reason = 'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED"}'
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, reason))
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: None)
         monkeypatch.setattr(mc_mod, "print_warning", lambda msg: None)
         state = _state()
         result, flag = refresh_managed_config(state)
@@ -467,7 +603,7 @@ class TestRefreshManagedConfig:
         # feature-off flag is irrelevant and must not be set.
         reason = 'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED"}'
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, reason))
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: MANAGED)
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: MANAGED)
         monkeypatch.setattr(mc_mod, "print_warning", lambda msg: None)
         state = _state()
         result, flag = refresh_managed_config(state)
@@ -476,7 +612,7 @@ class TestRefreshManagedConfig:
 
     def test_transient_failure_does_not_set_the_flag(self, monkeypatch):
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, "HTTP 500"))
-        monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
+        monkeypatch.setattr(mc_mod, "load_managed_cache", lambda ws: None)
         monkeypatch.setattr(mc_mod, "print_warning", lambda msg: None)
         state = _state()
         result, flag = refresh_managed_config(state)
@@ -485,7 +621,7 @@ class TestRefreshManagedConfig:
 
     def test_successful_no_config_clears_the_flag(self, monkeypatch):
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
+        monkeypatch.setattr(mc_mod, "save_managed_cache", lambda ws, cfg: None)
         state = _state()
         result, flag = refresh_managed_config(state)
         assert result is None

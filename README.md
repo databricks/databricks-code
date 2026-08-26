@@ -339,7 +339,8 @@ their next ucode run.
 | `~/.copilot/.env` | GitHub Copilot CLI |
 | `~/.pi/agent/models.json` | Pi |
 | `~/.cursor/mcp.json` | Cursor Agent (MCP servers only) |
-| `~/.ucode/managed-state.json` | The managed config — authored by `ucode setup` (admins) and refreshed from the workspace on launch |
+| `~/.ucode/managed-state.json` | The editable managed-config draft authored by `ucode setup` |
+| `~/.ucode/managed-cache/<workspace-hash>.json` | Per-workspace published-config cache with fetch metadata |
 
 Existing files are backed up before being overwritten. `ucode revert` restores backups.
 

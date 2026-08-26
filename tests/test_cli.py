@@ -2505,7 +2505,7 @@ class TestFetchManagedConfig:
             monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
         else:
             monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", env_value)
-        for name in ("refresh_managed_config", "load_managed_state"):
+        for name in ("refresh_managed_config", "load_managed_cache"):
             monkeypatch.setattr(
                 f"ucode.cli.{name}",
                 lambda *a, called=name, **k: pytest.fail(f"{called} must not run when disabled"),
@@ -2538,7 +2538,7 @@ class TestManagedConfigDecidesDiscoveryFromFreshRead:
             "enabled_agents": {"claude": {"model_config": {"models": {"default_opus_model": "m"}}}}
         }
         fresh = {"enabled_agents": {"claude": {"model_config": {}}}}
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: stale_cache)
+        monkeypatch.setattr("ucode.cli.load_managed_cache", lambda ws: stale_cache)
         monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (fresh, False))
 
         state = dict(MINIMAL_STATE)
@@ -2594,7 +2594,7 @@ class TestConfigureDeprecation:
         monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         # Cold cache — a cache read would wrongly fall through to the local configure flow.
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        monkeypatch.setattr("ucode.cli.load_managed_cache", lambda ws: None)
         monkeypatch.setattr(
             "ucode.cli.refresh_managed_config",
             lambda state: ({"enabled_agents": {"claude": {}}}, False),
@@ -2722,7 +2722,7 @@ class TestConfigureDeprecation:
         else:
             monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", env_value)
         monkeypatch.setattr(
-            "ucode.cli.load_managed_state",
+            "ucode.cli.load_managed_cache",
             lambda ws: pytest.fail("must not read the config when disabled"),
         )
         monkeypatch.setattr(
@@ -2819,7 +2819,7 @@ class TestBareUcode:
         else:
             monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (managed, False))
 
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: cached)
+        monkeypatch.setattr("ucode.cli.load_managed_cache", lambda ws: cached)
         monkeypatch.setattr("ucode.cli.get_databricks_token", lambda *a, **k: "tok")
         monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda *a, **k: is_admin)
         monkeypatch.setattr(
@@ -2909,7 +2909,7 @@ class TestBareUcode:
             "ucode.cli.refresh_managed_config",
             lambda state: pytest.fail("--dry-run must not fetch"),
         )
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: self.MANAGED)
+        monkeypatch.setattr("ucode.cli.load_managed_cache", lambda ws: self.MANAGED)
         launched: list[tuple] = []
         monkeypatch.setattr(
             "ucode.cli._launch_tool", lambda tool, ctx, **kw: launched.append((tool, kw))

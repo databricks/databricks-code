@@ -1,20 +1,18 @@
-"""Admin-authored managed coding-agent config: fetch, normalize, and local persistence.
+"""Managed coding-agent config: fetch, normalize, and local persistence.
 
 An org admin authors a ``CodingAgentConfig`` through the Databricks AI Gateway; developers read it
-(non-admin) and ``ucode`` applies it locally. This module owns the fetch/normalize side and the one
-local file, ``~/.ucode/managed-state.json`` (0600), that both roles share:
+(non-admin) and ``ucode`` applies it locally. This module owns the fetch/normalize side and keeps
+the admin's local draft separate from the last published config fetched by a launch:
 
 - fetching the raw manifest (via :func:`ucode.databricks.fetch_managed_coding_agent_configs`),
 - normalizing the proto-JSON into a stable internal dict keyed by ucode's own tool names,
-- persisting it via :func:`save_managed_state` / :func:`load_managed_state` — the admin-write side
-  (``managed_setup`` / ``managed_wizard``) authors the manifest here, and the launch path pulls the
-  published copy back into the same file, and
-- re-reading it on each launch, falling back to the persisted copy when the read fails.
+- ``~/.ucode/managed-state.json`` is the editable draft authored by ``ucode setup`` and published by
+  ``ucode apply``;
+- ``~/.ucode/managed-cache/<workspace-hash>.json`` is launch-owned and contains only the last
+  workspace-published config plus provenance metadata, for outage fallback.
 
-There is deliberately one file, not a separate authored ``managed-settings.json``: the workspace is
-the source of truth, so an authored draft and the pulled copy are the same shape and coexist in
-``managed-state.json``. ``ucode setup`` authors the draft; ``ucode apply`` publishes it; a launch
-then pulls the published copy back into the same file.
+Keeping the files separate is important: an ordinary launch must never overwrite or accidentally
+apply an admin's unpublished edits. Only a launch with ``--local`` reads the authored draft.
 
 :func:`refresh_managed_config` is the launch path's entry point. It is called before model discovery,
 because the manifest decides whether that discovery is needed at all; the launch path then hands the
@@ -25,8 +23,11 @@ that logic stays pure and I/O-free.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -39,6 +40,11 @@ from ucode.databricks import (
 from ucode.ui import console, print_warning
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
+MANAGED_CACHE_DIR = config_io.APP_DIR / "managed-cache"
+# Read-only migration fallback for the single-cache layout used by earlier builds. New writes always
+# go to MANAGED_CACHE_DIR so switching workspaces cannot discard another workspace's fallback.
+LEGACY_MANAGED_CACHE_PATH = config_io.APP_DIR / "managed-cache.json"
+MANAGED_STATE_SCHEMA_VERSION = "1.0"
 
 # Opt-in switch while the feature is in bug bash: unset means launches ignore managed configs
 # entirely and behave exactly as they did before.
@@ -341,29 +347,89 @@ def _is_permission_denied(reason: str) -> bool:
     return "http 403" in lowered or "permission_denied" in lowered
 
 
-def save_managed_state(workspace: str, config: dict) -> None:
-    """Persist the normalized managed config to ``~/.ucode/managed-state.json`` at mode 0600.
+def _config_digest(config: dict) -> str:
+    canonical = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
-    The file is org-authored, not developer-editable — 0600 keeps it readable/writable only by the
-    user (a light guard; hard enforcement / sudo ownership is a separate concern). No-op in dry-run.
 
-    An empty ``config`` records "this workspace has no managed config", which matters because the
-    file doubles as the fallback when a later read fails: without it, removing a config server-side
-    would leave the old one on disk to be reapplied after a transient outage.
+def _managed_cache_path(workspace: str) -> Path:
+    """Return a stable, filesystem-safe cache path for one workspace."""
+    workspace_hash = hashlib.sha256(workspace.encode("utf-8")).hexdigest()
+    return MANAGED_CACHE_DIR / f"{workspace_hash}.json"
+
+
+def _save_managed_payload(
+    path: Path,
+    workspace: str,
+    config: dict,
+    *,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    """Atomically write one versioned managed-config envelope at mode 0600.
+
+    The temporary file is created beside the destination, flushed, and replaced into place. Readers
+    therefore observe either the complete old document or the complete new one, including when two
+    launches refresh the same cache concurrently.
     """
-    payload = {"workspace": workspace, "config": config}
+    # Dict insertion order is preserved by json.dumps: keep the format version first so humans and
+    # future readers can identify the file schema before interpreting any payload fields. Version
+    # 1.0 is the only managed-state schema this ucode release writes.
+    payload: dict[str, object] = {
+        "schema_version": MANAGED_STATE_SCHEMA_VERSION,
+        "workspace": workspace,
+    }
+    if metadata is not None:
+        payload["metadata"] = metadata
+    payload["config"] = config
     if config_io.is_dry_run():
         # Print rather than write, matching how the agent config writers behave under --dry-run.
-        console.print(
-            f"\n[bold]\\[dry run] {MANAGED_STATE_PATH}[/bold]\n{json.dumps(payload, indent=2)}\n"
-        )
+        console.print(f"\n[bold]\\[dry run] {path}[/bold]\n{json.dumps(payload, indent=2)}\n")
         return
-    config_io.ensure_parent_dir(MANAGED_STATE_PATH)
+    config_io.ensure_parent_dir(path)
+    serialized = json.dumps(payload, indent=2) + "\n"
+    temporary_path: Path | None = None
     try:
-        MANAGED_STATE_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(serialized)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        _restrict_permissions(temporary_path)
+        os.replace(temporary_path, path)
     except OSError as exc:
-        raise RuntimeError(f"Failed to write managed state file: {MANAGED_STATE_PATH}") from exc
-    _restrict_permissions(MANAGED_STATE_PATH)
+        raise RuntimeError(f"Failed to write managed config file: {path}") from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def save_managed_state(workspace: str, config: dict) -> None:
+    """Save the admin-authored draft to ``~/.ucode/managed-state.json``."""
+    _save_managed_payload(MANAGED_STATE_PATH, workspace, config)
+
+
+def save_managed_cache(workspace: str, config: dict) -> None:
+    """Save the last workspace-published config for launch fallback.
+
+    An empty config records an authoritative successful read of "no published config", preventing
+    an older cached policy from being resurrected after a later transient failure.
+    """
+    metadata: dict[str, object] = {
+        "source": "workspace",
+        "fetched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "config_digest": _config_digest(config),
+    }
+    _save_managed_payload(_managed_cache_path(workspace), workspace, config, metadata=metadata)
 
 
 def _restrict_permissions(path: Path) -> None:
@@ -375,45 +441,106 @@ def _restrict_permissions(path: Path) -> None:
         pass
 
 
+def _read_managed_state_v1(data: dict) -> tuple[str, dict] | None:
+    """Parse the v1.0 managed-state envelope.
+
+    Keeping this version-specific prevents a future schema from being accidentally interpreted as
+    v1 just because it happens to reuse a field name. New versions add a new reader and registry
+    entry rather than accumulating conditionals in the launch path.
+    """
+    workspace = data.get("workspace")
+    config = data.get("config")
+    if not isinstance(workspace, str) or not workspace or not isinstance(config, dict):
+        return None
+    return workspace, config
+
+
+_MANAGED_STATE_READERS = {"1.0": _read_managed_state_v1}
+
+
+def _read_managed_payload(
+    path: Path, *, require_cache_metadata: bool = False
+) -> tuple[str, dict] | None:
+    data = config_io.read_json_safe(path)
+    version = data.get("schema_version")
+    if version is None:
+        # Files written before schema_version was introduced already use the v1.0 envelope. Read
+        # them as v1 so upgrading ucode does not discard an otherwise valid cached config.
+        version = MANAGED_STATE_SCHEMA_VERSION
+    if not isinstance(version, str):
+        return None
+    reader = _MANAGED_STATE_READERS.get(version)
+    if reader is None:
+        # An older ucode must not guess how to interpret a future managed-state schema.
+        return None
+    payload = reader(data)
+    if payload is None or not require_cache_metadata:
+        return payload
+    _workspace, config = payload
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("source") != "workspace":
+        return None
+    if metadata.get("config_digest") != _config_digest(config):
+        return None
+    fetched_at = metadata.get("fetched_at")
+    if not isinstance(fetched_at, str) or not fetched_at:
+        return None
+    return payload
+
+
 def load_managed_state(workspace: str | None) -> dict | None:
-    """Load the persisted managed config for ``workspace``, or None if absent/mismatched.
+    """Load the admin-authored draft for ``workspace``, or None if absent/mismatched.
 
     Returns the normalized config dict (the ``config`` field), only when the stored file is for the
     same workspace — so a stale file from another workspace is ignored rather than misapplied.
 
-    This is the single local managed config: ``ucode setup`` authors it here, ``ucode apply``
-    publishes it, and a launch refreshes it from the workspace. The admin-authored draft and the
-    pulled copy share one file because the workspace is the source of truth — to keep a draft,
-    publish it with ``ucode apply``.
+    ``ucode setup`` authors this file, ``ucode <agent> --local`` tests it, and ``ucode apply``
+    publishes it. Ordinary launches never write or read it.
     """
     if not workspace:
         return None
-    data = config_io.read_json_safe(MANAGED_STATE_PATH)
-    if data.get("workspace") != workspace:
+    payload = _read_managed_payload(MANAGED_STATE_PATH)
+    if payload is None:
         return None
-    config = data.get("config")
-    return config if isinstance(config, dict) else None
+    stored_workspace, config = payload
+    return config if stored_workspace == workspace else None
+
+
+def load_managed_cache(workspace: str | None) -> dict | None:
+    """Load the last workspace-published config cached by an ordinary launch."""
+    if not workspace:
+        return None
+    cache_path = _managed_cache_path(workspace)
+    payload = _read_managed_payload(cache_path, require_cache_metadata=True)
+    if payload is None and not cache_path.exists():
+        payload = _read_managed_payload(LEGACY_MANAGED_CACHE_PATH)
+    if payload is None:
+        return None
+    stored_workspace, config = payload
+    return config if stored_workspace == workspace else None
 
 
 def managed_state_workspace() -> str | None:
-    """The workspace the on-disk managed config was authored/pulled for, or None when there is none.
+    """The workspace the on-disk draft was authored for, or None when there is none.
 
     Lets a caller that has no workspace in local ucode state (e.g. ``ucode setup --show`` before
     ``ucode configure``) still find the manifest on disk and report which workspace it belongs to.
     """
-    workspace = config_io.read_json_safe(MANAGED_STATE_PATH).get("workspace")
-    return workspace if isinstance(workspace, str) and workspace else None
+    payload = _read_managed_payload(MANAGED_STATE_PATH)
+    return payload[0] if payload is not None else None
 
 
 def refresh_managed_config(state: dict) -> tuple[dict | None, bool]:
-    """Fetch the workspace's managed config and persist it, returning ``(manifest, coding_agent_config_feature_disabled)``.
+    """Fetch and cache the workspace-published config.
 
     Runs on every launch so a developer picks up an admin's edits without re-running
     ``ucode configure``. The manifest is None when the workspace has no managed config — the normal
     case for a workspace whose admin hasn't published one.
 
     A failed fetch never blocks the launch: an unreachable control plane shouldn't stop someone from
-    coding. Instead it falls back to the last config persisted for this workspace, so the admin's
+    coding. Instead it falls back to the last published config cached for this workspace, so the admin's
     most recent known policy still applies; only when there is no persisted config either does the
     launch fall through to the developer's own settings.
 
@@ -438,9 +565,9 @@ def refresh_managed_config(state: dict) -> tuple[dict | None, bool]:
         # Record that this workspace has no config, rather than leaving an earlier one on disk:
         # the file doubles as the fallback above, so a removed policy would otherwise come back
         # into force after the next transient outage.
-        save_managed_state(workspace, {})
+        save_managed_cache(workspace, {})
         return None, False
-    save_managed_state(workspace, managed)
+    save_managed_cache(workspace, managed)
     return managed, False
 
 
@@ -459,7 +586,7 @@ def _persisted_fallback(workspace: str, reason: str, *, refused: bool = False) -
     """
     # An empty persisted config means the last successful read found none, so there is no admin
     # policy to fall back to — treat it the same as having no file at all.
-    persisted = load_managed_state(workspace)
+    persisted = load_managed_cache(workspace)
     if not persisted:
         return None
     summary = _summarize_read_failure(reason)
