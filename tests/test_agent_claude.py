@@ -666,7 +666,7 @@ class TestClaudeLaunch:
         assert os.environ["OAUTH_TOKEN"] == "token"
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
 
-    def test_runs_through_refresh_proxy(self, monkeypatch):
+    def test_gateway_discovery_uses_anthropic_proxy(self, monkeypatch):
         calls: list[tuple] = []
 
         class Server:
@@ -713,7 +713,11 @@ class TestClaudeLaunch:
         monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
-        monkeypatch.setattr(claude, "start_proxy", start_proxy)
+        monkeypatch.setattr(
+            claude,
+            "start_anthropic_model_discovery_proxy",
+            start_proxy,
+        )
         monkeypatch.setattr(claude.subprocess, "Popen", Process)
 
         with pytest.raises(SystemExit) as exc:
