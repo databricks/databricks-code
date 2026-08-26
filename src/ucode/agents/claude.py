@@ -1118,11 +1118,19 @@ def _launch_gateway(
     raise SystemExit(returncode)
 
 
+def recover_claude_model_snapshots(user_settings_path: Path) -> None:
+    """Repair model defaults left by interrupted Claude PTY launches."""
+    candidates = {smart_routing_v2.CLAUDE_MODEL_SNAPSHOT_PATH}
+    candidates.update(APP_DIR.glob("claude-default-model.*.snapshot.json"))
+    for path in sorted(candidates):
+        smart_routing_v2.restore_claude_model_snapshot(user_settings_path, path)
+
+
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     # Recover a prior switch interrupted before its surgical settings restore.
-    smart_routing_v2.recover_claude_model_snapshots(CLAUDE_USER_SETTINGS_PATH)
+    recover_claude_model_snapshots(CLAUDE_USER_SETTINGS_PATH)
     model_snapshot = smart_routing_v2.snapshot_claude_model_setting(CLAUDE_USER_SETTINGS_PATH)
     launch_model = _original_launch_model(model_snapshot, state)
     if state.get("claude_relayed"):

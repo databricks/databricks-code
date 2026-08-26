@@ -657,7 +657,7 @@ class TestClaudeLaunch:
     def test_smart_routing_on_windows_is_not_supported(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude.os, "name", "nt")
-        monkeypatch.setattr(v2, "recover_claude_model_snapshots", lambda _path: None)
+        monkeypatch.setattr(claude, "recover_claude_model_snapshots", lambda _path: None)
         monkeypatch.setattr(v2, "snapshot_claude_model_setting", lambda _path: {"present": False})
 
         with pytest.raises(
@@ -671,7 +671,7 @@ class TestClaudeLaunch:
         monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
         monkeypatch.setattr(
-            v2, "recover_claude_model_snapshots", lambda _path: None
+            claude, "recover_claude_model_snapshots", lambda _path: None
         )
         monkeypatch.setattr(
             v2, "snapshot_claude_model_setting", lambda _path: {"present": True, "value": "opus"}
@@ -689,7 +689,7 @@ class TestClaudeLaunch:
     def test_gateway_discovery_uses_anthropic_proxy(self, monkeypatch):
         calls: list[tuple] = []
 
-        monkeypatch.setattr(v2, "recover_claude_model_snapshots", lambda _path: None)
+        monkeypatch.setattr(claude, "recover_claude_model_snapshots", lambda _path: None)
         monkeypatch.setattr(v2, "snapshot_claude_model_setting", lambda _path: {"present": False})
 
         class Server:

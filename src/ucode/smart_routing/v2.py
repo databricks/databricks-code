@@ -76,14 +76,6 @@ def restore_claude_model_snapshot(
     return True
 
 
-def recover_claude_model_snapshots(user_settings_path: Path) -> None:
-    """Repair defaults left by interrupted Claude PTY launches."""
-    candidates = {CLAUDE_MODEL_SNAPSHOT_PATH}
-    candidates.update(APP_DIR.glob("claude-default-model.*.snapshot.json"))
-    for path in sorted(candidates):
-        restore_claude_model_snapshot(user_settings_path, path)
-
-
 def _loopback_websocket_url(port: int) -> str:
     return f"ws://{LOOPBACK_HOST}:{port}"
 
