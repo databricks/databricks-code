@@ -1044,6 +1044,7 @@ def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
         0,
         token_header=AUTHORIZATION_HEADER,
         force_refresh_near_expiry=True,
+        prefetch_models=True,
     )
     token = cache.token
     os.environ["OAUTH_TOKEN"] = token

@@ -69,6 +69,7 @@ def _handler(wfile, path="/v1/models", command="GET"):
     handler.path = path
     handler._headers_buffer = []
     handler.anthropic_model_aliases = anthropic_gateway_proxy._AnthropicModelAliases()
+    handler.model_cache = anthropic_gateway_proxy._ModelCache(handler.anthropic_model_aliases)
     return handler
 
 
@@ -151,6 +152,83 @@ class TestAnthropicModelAliases:
         assert aliases.prefix_model_ids(b"not-json") == b"not-json"
 
 
+class _DiscoveryResponse:
+    def __init__(self, payload: dict):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _DiscoveryClient:
+    def __init__(self, pages: list[dict]):
+        self._pages = iter(pages)
+        self.requests: list[tuple[str, dict[str, str], dict[str, str | int]]] = []
+
+    def get(self, path, *, headers, params):
+        self.requests.append((path, headers, params))
+        return _DiscoveryResponse(next(self._pages))
+
+
+class TestModelCache:
+    def test_prefetches_all_pages_and_serves_one_aliased_response(self):
+        aliases = anthropic_gateway_proxy._AnthropicModelAliases()
+        cache = anthropic_gateway_proxy._ModelCache(aliases)
+        client = _DiscoveryClient(
+            [
+                {
+                    "data": [{"id": "catalog.schema.one"}],
+                    "has_more": True,
+                    "first_id": "catalog.schema.one",
+                    "last_id": "catalog.schema.one",
+                },
+                {
+                    "data": [{"id": "system.ai.claude-sonnet"}],
+                    "has_more": False,
+                    "first_id": "system.ai.claude-sonnet",
+                    "last_id": "system.ai.claude-sonnet",
+                },
+            ]
+        )
+
+        cache.refresh(
+            client,
+            "token",
+            anthropic_gateway_proxy.AUTHORIZATION_HEADER,
+        )
+
+        payload = json.loads(cache.get("GET", "/v1/models?limit=1000"))
+        assert [model["id"] for model in payload["data"]] == [
+            "anthropic-aigw-catalog.schema.one",
+            "system.ai.claude-sonnet",
+        ]
+        assert payload["has_more"] is False
+        assert payload["last_id"] == "system.ai.claude-sonnet"
+        assert [request[2] for request in client.requests] == [
+            {"limit": 1000},
+            {"limit": 1000, "after_id": "catalog.schema.one"},
+        ]
+
+    def test_only_serves_first_page_get_requests(self):
+        cache = anthropic_gateway_proxy._ModelCache(
+            anthropic_gateway_proxy._AnthropicModelAliases()
+        )
+        cache.refresh(
+            _DiscoveryClient([{"data": [], "has_more": False}]),
+            "token",
+            anthropic_gateway_proxy.AUTHORIZATION_HEADER,
+        )
+
+        assert cache.get("GET", "/v1/models") is not None
+        assert cache.get("POST", "/v1/models") is None
+        assert cache.get("GET", "/v1/models?after_id=cursor") is None
+        assert cache.get("GET", "/v1/models?before_id=cursor") is None
+        assert cache.get("GET", "/v1/messages") is None
+
+
 class TestAnthropicGatewayHandler:
     def test_inherits_relayed_auth_and_prefixes_models(self):
         out = _Collect()
@@ -167,6 +245,24 @@ class TestAnthropicGatewayHandler:
         assert headers["Authorization"] == "Bearer subscription-token"
         assert headers["X-Databricks-AI-Gateway-Token"] == "Bearer databricks-token"
         assert b"anthropic-aigw-custom-model" in bytes(out.data)
+
+    def test_serves_cached_models_without_upstream_request(self):
+        out = _Collect()
+        handler = _handler(out)
+        handler.headers = {}
+        handler.rfile = io.BytesIO()
+        handler.cache = _FakeCache()
+        handler.client = _FakeClient(None)
+        handler.model_cache.refresh(
+            _DiscoveryClient([{"data": [{"id": "system.ai.claude"}], "has_more": False}]),
+            "token",
+            anthropic_gateway_proxy.AUTHORIZATION_HEADER,
+        )
+
+        handler._handle()
+
+        assert handler.client.request is None
+        assert b"system.ai.claude" in bytes(out.data)
 
     def test_prefixes_successful_model_response_and_drops_content_encoding(self):
         out = _Collect()
@@ -243,6 +339,7 @@ def test_start_proxy_uses_discovery_handler(monkeypatch):
             handler.anthropic_model_aliases,
             anthropic_gateway_proxy._AnthropicModelAliases,
         )
+        assert isinstance(handler.model_cache, anthropic_gateway_proxy._ModelCache)
         assert actual_cache is cache
     finally:
         server.server_close()

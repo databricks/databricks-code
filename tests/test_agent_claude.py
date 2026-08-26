@@ -695,7 +695,14 @@ class TestClaudeLaunch:
             def wait(self):
                 return 0
 
-        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+        def start_proxy(
+            workspace,
+            profile,
+            port,
+            token_header,
+            force_refresh_near_expiry,
+            prefetch_models,
+        ):
             calls.append(
                 (
                     "proxy",
@@ -704,6 +711,7 @@ class TestClaudeLaunch:
                     port,
                     token_header,
                     force_refresh_near_expiry,
+                    prefetch_models,
                 )
             )
             return Server(), Cache(), Client()
@@ -725,7 +733,7 @@ class TestClaudeLaunch:
         assert os.environ["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
         assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
         assert calls[:2] == [
-            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True),
+            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True, True),
             ("serve",),
         ]
         assert calls[2][0] == "popen"

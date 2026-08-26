@@ -186,6 +186,9 @@ class _TokenCache:
     def stop(self) -> None:
         self._stop.set()
 
+    def wait_until_stopped(self, timeout: float) -> bool:
+        return self._stop.wait(timeout)
+
 
 def _forwarded_request_headers(
     handler: BaseHTTPRequestHandler,
@@ -223,6 +226,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def _response_chunks(self, resp: httpx.Response) -> tuple[Iterable[bytes], frozenset[str]]:
         return resp.iter_raw(), frozenset()
 
+    def _handle_cached_response(self, diagnostic_id: str, started: float) -> bool:
+        return False
+
     def _handle(self) -> None:
         diagnostic_id = uuid.uuid4().hex[:12]
         started = time.monotonic()
@@ -235,6 +241,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             method=self.command,
             path=self.path.split("?", 1)[0],
         )
+        if self._handle_cached_response(diagnostic_id, started):
+            return
         try:
             # First attempt with the current token.
             headers = _forwarded_request_headers(self, self.cache.token, self.token_header)
@@ -386,6 +394,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 _MODEL_ALIAS_PREFIX = "anthropic-aigw-"
 _ANTHROPIC_MODELS_PATH = "/v1/models"
 _ANTHROPIC_MESSAGES_PATH = "/v1/messages"
+_MODEL_DISCOVERY_LIMIT = 1000
+_MODEL_CACHE_REFRESH_S = 600
 
 
 class _AnthropicModelAliases:
@@ -459,8 +469,82 @@ class _AnthropicModelAliases:
         return json.dumps(payload, separators=(",", ":")).encode()
 
 
+class _ModelCache:
+    """Caches the complete model list so Claude's discovery request is local."""
+
+    def __init__(self, aliases: _AnthropicModelAliases) -> None:
+        self._aliases = aliases
+        self._body: bytes | None = None
+        self._lock = threading.Lock()
+
+    def refresh(self, client: httpx.Client, token: str, token_header: str) -> None:
+        headers = {
+            token_header: f"Bearer {token}",
+            "anthropic-version": "2023-06-01",
+        }
+        models: list[object] = []
+        first_page: dict[str, object] | None = None
+        last_page: dict[str, object] | None = None
+        after_id: str | None = None
+        seen_cursors: set[str] = set()
+
+        while True:
+            params: dict[str, str | int] = {"limit": _MODEL_DISCOVERY_LIMIT}
+            if after_id is not None:
+                params["after_id"] = after_id
+            response = client.get("v1/models", headers=headers, params=params)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                raise ValueError("invalid model discovery response")
+            if first_page is None:
+                first_page = payload
+            last_page = payload
+            models.extend(payload["data"])
+            if not payload.get("has_more"):
+                break
+            after_id = payload.get("last_id")
+            if not isinstance(after_id, str) or after_id in seen_cursors:
+                raise ValueError("invalid model discovery cursor")
+            seen_cursors.add(after_id)
+
+        combined = dict(first_page or {})
+        combined["data"] = models
+        combined["has_more"] = False
+        if last_page is not None:
+            combined["last_id"] = last_page.get("last_id")
+        body = self._aliases.prefix_model_ids(json.dumps(combined, separators=(",", ":")).encode())
+        with self._lock:
+            self._body = body
+
+    def get(self, method: str, path: str) -> bytes | None:
+        parsed = urlsplit(path)
+        if method != "GET" or parsed.path != _ANTHROPIC_MODELS_PATH:
+            return None
+        if any(
+            key in {"after_id", "before_id"}
+            for key, _value in parse_qsl(parsed.query, keep_blank_values=True)
+        ):
+            return None
+        with self._lock:
+            return self._body
+
+    def run_refresher(
+        self,
+        client: httpx.Client,
+        token_cache: _TokenCache,
+        token_header: str,
+    ) -> None:
+        while not token_cache.wait_until_stopped(_MODEL_CACHE_REFRESH_S):
+            try:
+                self.refresh(client, token_cache.token, token_header)
+            except Exception:  # noqa: BLE001 - refresh failure must not kill the thread
+                continue
+
+
 class _AnthropicGatewayHandler(_ProxyHandler):
     anthropic_model_aliases: _AnthropicModelAliases
+    model_cache: _ModelCache
 
     def _transform_request(self, body: bytes | None) -> tuple[str, bytes | None]:
         body = self.anthropic_model_aliases.rewrite_body(self.path, body)
@@ -479,6 +563,27 @@ class _AnthropicGatewayHandler(_ProxyHandler):
         # resp.read() decodes compression; rewritten JSON is uncompressed.
         return (body,), frozenset({"content-encoding"})
 
+    def _handle_cached_response(self, diagnostic_id: str, started: float) -> bool:
+        cached_models = self.model_cache.get(self.command, self.path)
+        if cached_models is None:
+            return False
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(cached_models)))
+            self.end_headers()
+            self.wfile.write(cached_models)
+            self.wfile.flush()
+            _diagnostic_log(
+                "model_cache_hit",
+                request_id=diagnostic_id,
+                bytes=len(cached_models),
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return True
+
 
 def start_proxy(
     workspace: str,
@@ -486,10 +591,13 @@ def start_proxy(
     port: int,
     token_header: str,
     force_refresh_near_expiry: bool,
+    prefetch_models: bool = False,
 ) -> tuple[ThreadingHTTPServer, _TokenCache, httpx.Client]:
     """Start the Anthropic loopback proxy and token refresher."""
+    aliases = _AnthropicModelAliases()
+    model_cache = _ModelCache(aliases)
     upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
-    cache = _TokenCache(
+    token_cache = _TokenCache(
         workspace,
         profile,
         force_refresh_near_expiry=force_refresh_near_expiry,
@@ -501,10 +609,11 @@ def start_proxy(
             "BoundProxyHandler",
             (_AnthropicGatewayHandler,),
             {
-                "cache": cache,
+                "cache": token_cache,
                 "client": client,
                 "token_header": token_header,
-                "anthropic_model_aliases": _AnthropicModelAliases(),
+                "anthropic_model_aliases": aliases,
+                "model_cache": model_cache,
             },
         ),
     )
@@ -513,6 +622,20 @@ def start_proxy(
     except OSError:
         server = ThreadingHTTPServer((LOOPBACK_HOST, 0), handler)
 
-    refresher = threading.Thread(target=cache.run_refresher, daemon=True)
+    refresher = threading.Thread(target=token_cache.run_refresher, daemon=True)
     refresher.start()
-    return server, cache, client
+    if prefetch_models:
+        try:
+            model_cache.refresh(client, token_cache.token, token_header)
+        except (httpx.HTTPError, TypeError, ValueError) as exc:
+            sys.stderr.write(
+                "[ucode] Claude model prefetch failed "
+                f"({type(exc).__name__}); falling back to live discovery.\n"
+            )
+        model_refresher = threading.Thread(
+            target=model_cache.run_refresher,
+            args=(client, token_cache, token_header),
+            daemon=True,
+        )
+        model_refresher.start()
+    return server, token_cache, client
