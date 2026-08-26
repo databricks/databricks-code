@@ -2209,6 +2209,13 @@ def claude_cmd(
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
     workspace: WorkspaceOption = None,
+    enable_model_discovery: Annotated[
+        bool,
+        typer.Option(
+            "--enable-model-discovery",
+            help="Enable AI Gateway models in Claude Code's model picker.",
+        ),
+    ] = False,
     enable_smart_routing_flag: Annotated[
         bool,
         typer.Option(
@@ -2233,6 +2240,8 @@ def claude_cmd(
         claude_agent.disable_smart_routing(load_state())
         print_success("Claude Code smart routing disabled; ucode routing hooks removed")
         return
+    if enable_model_discovery:
+        os.environ[claude_agent.GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
     _launch_tool(
         "claude",
         ctx,

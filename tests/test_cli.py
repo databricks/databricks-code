@@ -220,6 +220,14 @@ class TestSubcommandRouting:
         assert mock_launch.call_args.kwargs["enable_smart_routing_flag"] is True
         assert mock_launch.call_args.args[1].args == []
 
+    def test_claude_enable_model_discovery_sets_ucode_env(self):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, ["claude", "--enable-model-discovery"])
+
+        assert result.exit_code == 0, result.output
+        assert os.environ["ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert mock_launch.call_args.args[1].args == []
+
     def test_codex_disable_removes_hooks_without_launching(self):
         with (
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
