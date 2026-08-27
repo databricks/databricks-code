@@ -81,6 +81,12 @@ def _route_claude_prompt(_prompt: str) -> str:
     return CLAUDE_TARGET_MODEL
 
 
+def _is_claude_target_model(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.removesuffix("[1m]") == CLAUDE_TARGET_MODEL.removesuffix("[1m]")
+
+
 def launch_claude(
     state: dict,
     tool_args: list[str],
@@ -125,9 +131,9 @@ def launch_claude(
         nonlocal model_before_switch
         model_before_switch = read_json_safe(user_settings_path)
 
-    def restore_model_setting() -> None:
+    def restore_model_setting(*, force: bool = False) -> None:
         nonlocal restored
-        if restored or model_before_switch is None:
+        if (restored and not force) or model_before_switch is None:
             return
         current = read_json_safe(user_settings_path)
         if "model" in model_before_switch:
@@ -136,6 +142,14 @@ def launch_claude(
             current.pop("model", None)
         write_json_file(user_settings_path, current)
         restored = True
+
+    def finalize_model_setting() -> None:
+        """Repair a late Claude write without overwriting a user's later choice."""
+        if model_before_switch is None:
+            return
+        current = read_json_safe(user_settings_path)
+        if _is_claude_target_model(current.get("model")):
+            restore_model_setting(force=True)
 
     print_note(
         "Smart routing v2: the first submitted prompt will select Claude Code's "
@@ -152,7 +166,7 @@ def launch_claude(
             log_path=CLAUDE_PTY_LOG,
         )
     finally:
-        restore_model_setting()
+        finalize_model_setting()
         settings_path.unlink(missing_ok=True)
         socket_path.unlink(missing_ok=True)
     sys.exit(returncode)

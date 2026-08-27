@@ -166,6 +166,36 @@ class TestV2Launch:
 
         assert json.loads(user_settings.read_text()) == {"model": "user-selected"}
 
+    def test_repairs_late_routed_model_write_on_exit(self, tmp_path, monkeypatch):
+        user_settings = tmp_path / "settings.json"
+        user_settings.write_text(json.dumps({"model": "haiku", "theme": "dark"}))
+        monkeypatch.setattr(v2, "APP_DIR", tmp_path)
+        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
+        monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
+
+        def fake_run(_argv, **kwargs):
+            kwargs["prepare_model_switch"]()
+            kwargs["restore_model_setting"]()
+            # Claude may persist the /model selection after the hook restores it.
+            user_settings.write_text(
+                json.dumps({"model": v2.CLAUDE_TARGET_MODEL, "theme": "dark"})
+            )
+            return 0
+
+        monkeypatch.setattr(claude_pty, "run_claude_pty", fake_run)
+        with pytest.raises(SystemExit):
+            v2.launch_claude(
+                {"workspace": "https://example.com"},
+                [],
+                binary="claude",
+                user_settings_path=user_settings,
+                launch_model=None,
+                compose_settings=lambda _args: ({}, []),
+                launch_model_args=claude._launch_model_args,
+            )
+
+        assert json.loads(user_settings.read_text()) == {"model": "haiku", "theme": "dark"}
+
 
 class TestPtyFlow:
     def test_direct_switch_restore_and_replay(self, tmp_path):
