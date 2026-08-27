@@ -35,6 +35,7 @@ from ucode.ui import (
     print_heading,
     print_note,
     print_warning,
+    prompt_yes_no_default,
     render_box_table,
     spinner,
     value,
@@ -727,6 +728,22 @@ def usage(warehouse_id: str | None = None) -> int:
     with spinner("Retrieving Databricks access token..."):
         token = get_databricks_token(workspace, profile)
 
+    # Budget spend comes from AI Gateway directly, so show the useful at-a-glance result before
+    # asking whether to start (and potentially wait for) a SQL warehouse for the detailed report.
+    with spinner("Checking budget spend..."):
+        budget_spend, _ = resolve_current_budget_spend(workspace, token)
+    budget_lines = render_budget_lines(budget_spend)
+    if budget_lines:
+        console.print("\n".join([heading("Usage Budget"), "", *budget_lines]))
+    else:
+        print_note("Budget spend and threshold are unavailable.")
+
+    if not prompt_yes_no_default(
+        "Show token usage and estimated cost details? This queries a SQL warehouse.",
+        default=False,
+    ):
+        return 0
+
     with spinner("Discovering SQL warehouse..."):
         candidates = discover_sql_warehouses(workspace, token, warehouse_id=warehouse_id)
 
@@ -735,10 +752,6 @@ def usage(warehouse_id: str | None = None) -> int:
     )
     records = parse_usage_rows(columns, rows)
     requester_name = find_requester_name(workspace, resolved_http_path, token, records)
-
-    # Opt-in per workspace: omit the lines rather than fail the report.
-    with spinner("Checking budget spend..."):
-        budget_spend, _ = resolve_current_budget_spend(workspace, token)
 
     # Per-model dollar cost is estimated from tokens × catalog prices; omit cost rather than fail
     # when the price catalog is unreachable.
@@ -756,7 +769,6 @@ def usage(warehouse_id: str | None = None) -> int:
             records,
             requester_name,
             configured_tool_displays,
-            budget_spend=budget_spend,
             price_lookup=price_lookup,
         )
     )
