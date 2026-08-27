@@ -93,7 +93,6 @@ class TestV2Launch:
         monkeypatch.setattr(claude, "CLAUDE_USER_SETTINGS_PATH", user_settings)
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
         monkeypatch.setattr(v2, "CLAUDE_PTY_LOG", tmp_path / "v2.log")
-        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
         captured: dict = {}
 
@@ -145,7 +144,6 @@ class TestV2Launch:
         user_settings = tmp_path / "settings.json"
         user_settings.write_text(json.dumps({"model": "opus"}))
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
-        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
 
         def fake_run(_argv, **_kwargs):
@@ -172,7 +170,6 @@ class TestV2Launch:
         user_settings = tmp_path / "settings.json"
         user_settings.write_text(json.dumps({"model": "haiku", "theme": "dark"}))
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
-        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
 
         def fake_run(_argv, **kwargs):

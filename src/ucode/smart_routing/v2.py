@@ -141,8 +141,6 @@ def launch_claude(
         raise RuntimeError(
             "Smart routing v2 needs a configured workspace; run `ucode configure claude` first."
         )
-    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, state.get("profile"))
-
     run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     socket_path = APP_DIR / f"claude-v2-{run_id}.sock"
     settings_path = APP_DIR / f"claude-v2-{run_id}.json"
