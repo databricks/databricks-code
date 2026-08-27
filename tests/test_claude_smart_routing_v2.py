@@ -206,57 +206,25 @@ class TestV2Launch:
         user_settings = tmp_path / "settings.json"
         user_settings.write_text(json.dumps({"model": "haiku"}))
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
-        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
-        monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
-
-        first_locked = threading.Event()
-        release_first = threading.Event()
+        first = v2._ClaudeModelSettingGuard(user_settings)
+        second = v2._ClaudeModelSettingGuard(user_settings)
         captured: list[str] = []
-        call_count = 0
-        call_count_lock = threading.Lock()
 
-        def fake_run(_argv, **kwargs):
-            nonlocal call_count
-            with call_count_lock:
-                call_count += 1
-                current_call = call_count
-            if current_call == 1:
-                kwargs["prepare_model_switch"]()
-                captured.append(json.loads(user_settings.read_text())["model"])
-                user_settings.write_text(json.dumps({"model": v2.CLAUDE_TARGET_MODEL}))
-                first_locked.set()
-                assert release_first.wait(5)
-            else:
-                assert first_locked.wait(5)
-                release_first.set()
-                kwargs["prepare_model_switch"]()
-                captured.append(json.loads(user_settings.read_text())["model"])
-                user_settings.write_text(json.dumps({"model": v2.CLAUDE_TARGET_MODEL}))
-            kwargs["restore_model_setting"]()
-            return 0
+        first.begin()
+        user_settings.write_text(json.dumps({"model": v2.CLAUDE_TARGET_MODEL}))
 
-        monkeypatch.setattr(claude_pty, "run_claude_pty", fake_run)
+        def run_second() -> None:
+            second.begin()
+            captured.append(json.loads(user_settings.read_text())["model"])
+            second.restore()
 
-        def launch() -> None:
-            with pytest.raises(SystemExit):
-                v2.launch_claude(
-                    {"workspace": "https://example.com"},
-                    [],
-                    binary="claude",
-                    user_settings_path=user_settings,
-                    launch_model=None,
-                    compose_settings=lambda _args: ({}, []),
-                    launch_model_args=claude._launch_model_args,
-                )
+        thread = threading.Thread(target=run_second)
+        thread.start()
+        first.restore()
+        thread.join(timeout=5)
 
-        threads = [threading.Thread(target=launch) for _ in range(2)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=10)
-
-        assert all(not thread.is_alive() for thread in threads)
-        assert captured == ["haiku", "haiku"]
+        assert not thread.is_alive()
+        assert captured == ["haiku"]
         assert json.loads(user_settings.read_text()) == {"model": "haiku"}
 
 

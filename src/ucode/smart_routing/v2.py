@@ -10,7 +10,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, TextIO
 
 import tomlkit
 
@@ -87,6 +87,43 @@ def _is_claude_target_model(value: object) -> bool:
     return value.removesuffix("[1m]") == CLAUDE_TARGET_MODEL.removesuffix("[1m]")
 
 
+class _ClaudeModelSettingGuard:
+    def __init__(self, settings_path: Path) -> None:
+        self.settings_path = settings_path
+        self._before: dict | None = None
+        self._lock: TextIO | None = None
+
+    def begin(self) -> None:
+        import fcntl
+
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        self._lock = open(APP_DIR / "claude-v2-model.lock", "a+", encoding="utf-8")
+        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        self._before = read_json_safe(self.settings_path)
+
+    def is_routed(self) -> bool:
+        return _is_claude_target_model(read_json_safe(self.settings_path).get("model"))
+
+    def restore(self) -> None:
+        import fcntl
+
+        if self._before is None:
+            return
+        try:
+            current = read_json_safe(self.settings_path)
+            if "model" in self._before:
+                current["model"] = self._before["model"]
+            else:
+                current.pop("model", None)
+            write_json_file(self.settings_path, current)
+            self._before = None
+        finally:
+            if self._lock is not None:
+                fcntl.flock(self._lock, fcntl.LOCK_UN)
+                self._lock.close()
+                self._lock = None
+
+
 def launch_claude(
     state: dict,
     tool_args: list[str],
@@ -124,41 +161,7 @@ def launch_claude(
     model_args = launch_model_args(remaining, launch_model)
     argv = [binary, "--settings", str(settings_path), *model_args, *remaining]
 
-    model_before_switch: dict | None = None
-    model_lock = None
-    restored = False
-
-    def prepare_model_switch() -> None:
-        nonlocal model_before_switch, model_lock
-        import fcntl
-
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        model_lock = open(APP_DIR / "claude-v2-model.lock", "a+", encoding="utf-8")
-        fcntl.flock(model_lock, fcntl.LOCK_EX)
-        model_before_switch = read_json_safe(user_settings_path)
-
-    def model_switch_persisted() -> bool:
-        return _is_claude_target_model(read_json_safe(user_settings_path).get("model"))
-
-    def restore_model_setting() -> None:
-        nonlocal restored, model_lock
-        import fcntl
-
-        if restored or model_before_switch is None:
-            return
-        try:
-            current = read_json_safe(user_settings_path)
-            if "model" in model_before_switch:
-                current["model"] = model_before_switch["model"]
-            else:
-                current.pop("model", None)
-            write_json_file(user_settings_path, current)
-            restored = True
-        finally:
-            if model_lock is not None:
-                fcntl.flock(model_lock, fcntl.LOCK_UN)
-                model_lock.close()
-                model_lock = None
+    model_setting = _ClaudeModelSettingGuard(user_settings_path)
 
     print_note(
         "Smart routing v2: the first submitted prompt will select Claude Code's "
@@ -170,13 +173,13 @@ def launch_claude(
             route_prompt=_route_claude_prompt,
             switch_message=claude_pty.switch_message(CLAUDE_TARGET_MODEL, STUBBED_SWITCH_REASON),
             socket_path=socket_path,
-            prepare_model_switch=prepare_model_switch,
-            model_switch_persisted=model_switch_persisted,
-            restore_model_setting=restore_model_setting,
+            prepare_model_switch=model_setting.begin,
+            model_switch_persisted=model_setting.is_routed,
+            restore_model_setting=model_setting.restore,
             log_path=CLAUDE_PTY_LOG,
         )
     finally:
-        restore_model_setting()
+        model_setting.restore()
         settings_path.unlink(missing_ok=True)
         socket_path.unlink(missing_ok=True)
     sys.exit(returncode)
