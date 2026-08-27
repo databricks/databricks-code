@@ -23,7 +23,6 @@ from ucode.ui import print_note
 
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
 
-CODEX_TARGET_MODEL = "system.ai.glm-5-2"  # TODO(lilly): replace with smart router.
 CODEX_INTERPOSER_LOG = APP_DIR / "codex-v2-interposer.log"
 STUBBED_SWITCH_REASON = "Low complexity, unclear intent, and no code reference."  # TODO(lilly): replace with smart router rationale.
 
@@ -211,6 +210,17 @@ def _codex_config_args(overlay: dict) -> list[str]:
     return args
 
 
+# TODO: Replace with /codex/v1/models once /codex/v1/models can send GPT models as well.
+def _cached_routing_models(state: dict) -> list[str]:
+    """Return the persisted UC model-service ids usable by Codex routing."""
+    models: list[str] = []
+    for key in ("codex_models", "oss_models"):
+        values = state.get(key)
+        if isinstance(values, list):
+            models.extend(value for value in values if isinstance(value, str) and value)
+    return list(dict.fromkeys(models))
+
+
 def launch_codex(
     state: dict,
     tool_args: list[str],
@@ -229,7 +239,14 @@ def launch_codex(
             "Smart routing v2 could not determine a starting Codex model for this workspace."
         )
 
-    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, state.get("profile"))
+    profile = state.get("profile")
+    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, profile)
+    available_models = _cached_routing_models(state)
+    if not available_models:
+        raise RuntimeError(
+            "Smart routing v2 has no cached Unity Catalog model services; "
+            "run `ucode configure codex` to refresh them."
+        )
     overlay = render_overlay(
         workspace,
         start_model,
@@ -258,8 +275,10 @@ def launch_codex(
         tui_port, stop_interposer = codex_interposer.start_interposer_thread(
             LOOPBACK_HOST,
             app_server_url,
-            CODEX_TARGET_MODEL,
-            switch_message=_switch_message(CODEX_TARGET_MODEL, STUBBED_SWITCH_REASON),
+            available_models=available_models,
+            workspace=workspace,
+            token_provider=lambda: get_databricks_token(workspace, profile),
+            switch_message_fn=_switch_message,
             log_path=CODEX_INTERPOSER_LOG,
         )
         tui_url = _loopback_websocket_url(tui_port)

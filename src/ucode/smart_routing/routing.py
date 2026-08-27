@@ -119,7 +119,7 @@ def select_route(
     workspace: str,
     token: str,
     task: str,
-    route_options: Iterable[tuple[str, str]],
+    route_options: Iterable[tuple[str, str | None]],
     resolve: Callable[[str], str | None],
     *,
     router_name: str = ROUTER_NAME,
@@ -135,7 +135,7 @@ def select_route(
     """
     body = {
         "route_options": [{"model": model, "harness": harness} for model, harness in route_options],
-        "task": {"prompt": task[:4000]},
+        "task": {"prompt": task},
         "route_selector": {"router_name": router_name},
     }
     request = urllib.request.Request(

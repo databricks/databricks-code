@@ -348,6 +348,22 @@ class _FakeCache:
         self._t = "Bearer-tok2"
 
 
+class _RefreshFailsCache:
+    """A cache whose forced refresh raises, mimicking a dead Databricks OAuth
+    session that can't be re-minted non-interactively."""
+
+    def __init__(self):
+        self.refreshed = 0
+
+    @property
+    def token(self):
+        return "tok1"
+
+    def refresh(self):
+        self.refreshed += 1
+        raise RuntimeError("mint failed")
+
+
 def _handle_handler(client, cache, wfile) -> gateway_proxy._ProxyHandler:
     h = object.__new__(gateway_proxy._ProxyHandler)
     h.client = client
@@ -406,6 +422,19 @@ class TestRetryOn401:
         assert cache.refreshed == 0
         assert client.sent_tokens == ["Bearer tok1"]
         assert b"hi" in bytes(out.data)
+
+    def test_failed_refresh_surfaces_reauth_hint(self, capsys):
+        # When the forced refresh itself fails (the Databricks OAuth session is
+        # dead, not just the access token), the user must be told to run
+        # `databricks auth login` rather than left with a bare 401 that reads as
+        # an Anthropic `/login` prompt. We still retry + relay whatever comes.
+        client = _FakeClient([_FakeResp(401, b"a"), _FakeResp(401, b"b")])
+        cache = _RefreshFailsCache()
+        out = _Collect()
+        _handle_handler(client, cache, out)._handle()
+        assert cache.refreshed == 1  # a refresh was attempted
+        assert "databricks auth login" in capsys.readouterr().err
+        assert b"401" in bytes(out.data)  # the response is still relayed
 
 
 class TestStartProxyPortFallback:
