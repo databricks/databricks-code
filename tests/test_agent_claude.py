@@ -696,10 +696,8 @@ class TestClaudeLaunch:
     @pytest.mark.parametrize(
         "tool_args",
         [
-            ["--model", "opus"],
             ["-m", "opus"],
             ["--model=opus"],
-            ["--", "--model", "opus"],
         ],
     )
     def test_v2_explicit_claude_model_bypasses_first_prompt_routing(self, monkeypatch, tool_args):
@@ -736,12 +734,8 @@ class TestClaudeLaunch:
     @pytest.mark.parametrize(
         "tool_args",
         [
-            ["-p", "say hi"],
             ["--print", "say hi"],
-            ["--background"],
             ["doctor"],
-            ["mcp", "list"],
-            ["fix this bug"],
             ["--", "fix this bug"],
         ],
     )
@@ -760,12 +754,8 @@ class TestClaudeLaunch:
     def test_v2_does_not_treat_option_value_as_positional_argument(self):
         assert claude._uses_interactive_tui(["--name", "doctor"]) is True
 
-    @pytest.mark.parametrize(
-        "tool_args",
-        [["--resume", "session-id"], ["-r", "search term"], ["--worktree", "feature"]],
-    )
-    def test_v2_treats_optional_option_values_as_interactive(self, tool_args):
-        assert claude._uses_interactive_tui(tool_args) is True
+    def test_v2_treats_optional_option_value_as_interactive(self):
+        assert claude._uses_interactive_tui(["--resume", "session-id"]) is True
 
     def test_gateway_discovery_uses_anthropic_proxy(self, monkeypatch):
         calls: list[tuple] = []

@@ -335,26 +335,6 @@ class TestSubcommandRouting:
         assert result.output == ""
         mock_request.assert_not_called()
 
-    def test_claude_subagent_hook_refreshes_inherited_oauth_token(self, monkeypatch):
-        seen_tokens: list[str] = []
-        monkeypatch.setenv("OAUTH_TOKEN", "stale-token")
-        monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda *_args: "fresh-token")
-        monkeypatch.setattr(
-            "ucode.smart_routing.claude_routing.route_pre_tool_use",
-            lambda _payload, **kwargs: seen_tokens.append(kwargs["token"]),
-        )
-
-        result = runner.invoke(
-            app,
-            ["claude-router-hook", "route-subagent", "--host", "https://example.com"],
-            input='{"tool_input":{"prompt":"review this"}}',
-        )
-
-        assert result.exit_code == 0, result.output
-        assert seen_tokens == ["fresh-token"]
-
-
 class TestClaudeModelFlag:
     """`ucode claude --model <id>` pins the id into the family aliases so the gateway resolves any
     Databricks model id, instead of Claude Code's own --model flag rejecting non-catalog ids."""

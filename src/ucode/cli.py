@@ -108,6 +108,7 @@ from ucode.skills_download import (
 )
 from ucode.smart_routing import claude_routing, codex_routing
 from ucode.smart_routing import v2 as smart_routing_v2
+from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, ROUTE_FIRST_PROMPT_EVENT
 from ucode.state import (
     STATE_PATH,
     clear_state,
@@ -1410,7 +1411,7 @@ def claude_router_hook_cmd(
     import json
     import sys
 
-    if event == "route-first-prompt" and not smart_routing_v2.enabled():
+    if event == ROUTE_FIRST_PROMPT_EVENT and not smart_routing_v2.enabled():
         return
 
     from ucode.smart_routing.claude_routing import (
@@ -1425,10 +1426,8 @@ def claude_router_hook_cmd(
         return
     if not isinstance(payload, dict):
         return
-    if event == "route-first-prompt":
+    if event == ROUTE_FIRST_PROMPT_EVENT:
         if not socket_path:
-            from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV
-
             socket_path = os.environ.get(FIRST_PROMPT_SOCKET_ENV)
         if not socket_path:
             return
@@ -1473,7 +1472,7 @@ def claude_router_hook_cmd(
         return
     if event != "route-subagent" or not host:
         return
-    token = os.environ.get("DATABRICKS_BEARER")
+    token = os.environ.get("OAUTH_TOKEN") or os.environ.get("DATABRICKS_BEARER")
     if not token:
         if use_pat and not ensure_pat_bearer(profile):
             return

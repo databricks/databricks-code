@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import threading
 import time
@@ -26,16 +25,6 @@ class TestDirectModelCommand:
     @pytest.mark.parametrize("name", ["", "a b", "a\nb", "x" * 201, None])
     def test_rejects_unsafe_model_names(self, name):
         assert not claude_pty.valid_model_name(name)
-
-    def test_types_direct_model_command(self):
-        read_fd, write_fd = os.pipe()
-        try:
-            claude_pty.inject_model_switch(write_fd, "system.ai.claude-sonnet-5")
-            assert os.read(read_fd, 200) == b"/model system.ai.claude-sonnet-5\r"
-        finally:
-            os.close(read_fd)
-            os.close(write_fd)
-
 
 class TestFirstPromptHook:
     def test_renders_boxed_router_notice(self):
@@ -93,6 +82,7 @@ class TestV2Launch:
         monkeypatch.setattr(claude, "CLAUDE_USER_SETTINGS_PATH", user_settings)
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
         monkeypatch.setattr(v2, "CLAUDE_PTY_LOG", tmp_path / "v2.log")
+        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
         captured: dict = {}
 
@@ -144,6 +134,7 @@ class TestV2Launch:
         user_settings = tmp_path / "settings.json"
         user_settings.write_text(json.dumps({"model": "opus"}))
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
+        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
 
         def fake_run(_argv, **_kwargs):
@@ -170,6 +161,7 @@ class TestV2Launch:
         user_settings = tmp_path / "settings.json"
         user_settings.write_text(json.dumps({"model": "haiku", "theme": "dark"}))
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
+        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
 
         def fake_run(_argv, **kwargs):

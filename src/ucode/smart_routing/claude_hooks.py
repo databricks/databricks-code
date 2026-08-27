@@ -15,7 +15,8 @@ from ucode.databricks import build_auth_token_argv
 from ucode.smart_routing import hooks
 
 ROUTING_HOOK_COMMAND_MARKER = "claude-router-hook"
-FIRST_PROMPT_HOOK_MARKER = "claude-router-hook route-first-prompt"
+ROUTE_FIRST_PROMPT_EVENT = "route-first-prompt"
+FIRST_PROMPT_HOOK_MARKER = f"{ROUTING_HOOK_COMMAND_MARKER} {ROUTE_FIRST_PROMPT_EVENT}"
 FIRST_PROMPT_SOCKET_ENV = "UCODE_CLAUDE_V2_SOCKET"
 
 
@@ -37,7 +38,7 @@ def sync_first_prompt_hook(doc: dict, executable: str) -> None:
             {
                 "hooks": [
                     _routing_command_hook(
-                        [executable, ROUTING_HOOK_COMMAND_MARKER, "route-first-prompt"],
+                        [executable, ROUTING_HOOK_COMMAND_MARKER, ROUTE_FIRST_PROMPT_EVENT],
                         status="Selecting a model with Smart Routing",
                     )
                 ]
