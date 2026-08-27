@@ -125,31 +125,40 @@ def launch_claude(
     argv = [binary, "--settings", str(settings_path), *model_args, *remaining]
 
     model_before_switch: dict | None = None
+    model_lock = None
     restored = False
 
     def prepare_model_switch() -> None:
-        nonlocal model_before_switch
+        nonlocal model_before_switch, model_lock
+        import fcntl
+
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        model_lock = open(APP_DIR / "claude-v2-model.lock", "a+", encoding="utf-8")
+        fcntl.flock(model_lock, fcntl.LOCK_EX)
         model_before_switch = read_json_safe(user_settings_path)
 
-    def restore_model_setting(*, force: bool = False) -> None:
-        nonlocal restored
-        if (restored and not force) or model_before_switch is None:
-            return
-        current = read_json_safe(user_settings_path)
-        if "model" in model_before_switch:
-            current["model"] = model_before_switch["model"]
-        else:
-            current.pop("model", None)
-        write_json_file(user_settings_path, current)
-        restored = True
+    def model_switch_persisted() -> bool:
+        return _is_claude_target_model(read_json_safe(user_settings_path).get("model"))
 
-    def finalize_model_setting() -> None:
-        """Repair a late Claude write without overwriting a user's later choice."""
-        if model_before_switch is None:
+    def restore_model_setting() -> None:
+        nonlocal restored, model_lock
+        import fcntl
+
+        if restored or model_before_switch is None:
             return
-        current = read_json_safe(user_settings_path)
-        if _is_claude_target_model(current.get("model")):
-            restore_model_setting(force=True)
+        try:
+            current = read_json_safe(user_settings_path)
+            if "model" in model_before_switch:
+                current["model"] = model_before_switch["model"]
+            else:
+                current.pop("model", None)
+            write_json_file(user_settings_path, current)
+            restored = True
+        finally:
+            if model_lock is not None:
+                fcntl.flock(model_lock, fcntl.LOCK_UN)
+                model_lock.close()
+                model_lock = None
 
     print_note(
         "Smart routing v2: the first submitted prompt will select Claude Code's "
@@ -162,11 +171,12 @@ def launch_claude(
             switch_message=claude_pty.switch_message(CLAUDE_TARGET_MODEL, STUBBED_SWITCH_REASON),
             socket_path=socket_path,
             prepare_model_switch=prepare_model_switch,
+            model_switch_persisted=model_switch_persisted,
             restore_model_setting=restore_model_setting,
             log_path=CLAUDE_PTY_LOG,
         )
     finally:
-        finalize_model_setting()
+        restore_model_setting()
         settings_path.unlink(missing_ok=True)
         socket_path.unlink(missing_ok=True)
     sys.exit(returncode)

@@ -694,15 +694,34 @@ class TestClaudeLaunch:
         v2.launch_claude.assert_not_called()
 
     @pytest.mark.parametrize(
+        "tool_args",
+        [
+            ["--model", "opus"],
+            ["-m", "opus"],
+            ["--model=opus"],
+            ["--", "--model", "opus"],
+        ],
+    )
+    def test_v2_explicit_claude_model_bypasses_first_prompt_routing(self, monkeypatch, tool_args):
+        calls: list[list[str]] = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(v2, "launch_claude", Mock())
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch({"workspace": WS}, tool_args)
+
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]]
+        v2.launch_claude.assert_not_called()
+
+    @pytest.mark.parametrize(
         "provider_state",
         [
             {"provider_services": {"claude": "main.default.anthropic"}},
             {"_claude_launch_provider": "main.default.anthropic"},
         ],
     )
-    def test_v2_provider_launch_bypasses_first_prompt_routing(
-        self, monkeypatch, provider_state
-    ):
+    def test_v2_provider_launch_bypasses_first_prompt_routing(self, monkeypatch, provider_state):
         calls: list[list[str]] = []
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(v2, "launch_claude", Mock())
@@ -726,9 +745,7 @@ class TestClaudeLaunch:
             ["--", "fix this bug"],
         ],
     )
-    def test_v2_noninteractive_launch_bypasses_first_prompt_routing(
-        self, monkeypatch, tool_args
-    ):
+    def test_v2_noninteractive_launch_bypasses_first_prompt_routing(self, monkeypatch, tool_args):
         calls: list[list[str]] = []
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(v2, "launch_claude", Mock())
@@ -737,13 +754,18 @@ class TestClaudeLaunch:
 
         claude.launch({"workspace": WS}, tool_args)
 
-        assert calls == [
-            ["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]
-        ]
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]]
         v2.launch_claude.assert_not_called()
 
     def test_v2_does_not_treat_option_value_as_positional_argument(self):
         assert claude._uses_interactive_tui(["--name", "doctor"]) is True
+
+    @pytest.mark.parametrize(
+        "tool_args",
+        [["--resume", "session-id"], ["-r", "search term"], ["--worktree", "feature"]],
+    )
+    def test_v2_treats_optional_option_values_as_interactive(self, tool_args):
+        assert claude._uses_interactive_tui(tool_args) is True
 
     def test_gateway_discovery_uses_anthropic_proxy(self, monkeypatch):
         calls: list[tuple] = []

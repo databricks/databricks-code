@@ -76,6 +76,20 @@ CLAUDE_ROUTING_HOOK_EVENTS = ("PreToolUse", "SessionStart", "SubagentStart")
 CLAUDE_NONINTERACTIVE_FLAGS = frozenset(
     {"-p", "--print", "--bg", "--background", "--cloud", "-h", "--help", "-v", "--version"}
 )
+CLAUDE_OPTIONAL_VALUE_OPTIONS = frozenset(
+    {
+        "-d",
+        "--debug",
+        "--from-pr",
+        "--prompt-suggestions",
+        "-r",
+        "--resume",
+        "--remote-control",
+        "--teleport",
+        "-w",
+        "--worktree",
+    }
+)
 
 
 def is_update_available() -> tuple[str, str] | None:
@@ -933,6 +947,12 @@ def _uses_interactive_tui(tool_args: list[str]) -> bool:
         if arg in CLAUDE_VALUE_OPTIONS:
             index += 2
             continue
+        if arg in CLAUDE_OPTIONAL_VALUE_OPTIONS:
+            if index + 1 < len(tool_args) and not tool_args[index + 1].startswith("-"):
+                index += 2
+            else:
+                index += 1
+            continue
         if arg.startswith("-"):
             index += 1
             continue
@@ -1147,6 +1167,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
         smart_routing_v2.enabled()
         and bool(workspace)
         and not _has_launch_model_override(state)
+        and not _has_explicit_model_arg(tool_args)
         and not _has_provider_launch(state)
         and _uses_interactive_tui(tool_args)
     )

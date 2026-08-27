@@ -166,7 +166,9 @@ class TestV2Launch:
 
         assert json.loads(user_settings.read_text()) == {"model": "user-selected"}
 
-    def test_repairs_late_routed_model_write_on_exit(self, tmp_path, monkeypatch):
+    def test_restores_after_routed_model_persists_and_preserves_later_choice(
+        self, tmp_path, monkeypatch
+    ):
         user_settings = tmp_path / "settings.json"
         user_settings.write_text(json.dumps({"model": "haiku", "theme": "dark"}))
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
@@ -175,11 +177,12 @@ class TestV2Launch:
 
         def fake_run(_argv, **kwargs):
             kwargs["prepare_model_switch"]()
+            user_settings.write_text(json.dumps({"model": v2.CLAUDE_TARGET_MODEL, "theme": "dark"}))
+            assert kwargs["model_switch_persisted"]() is True
             kwargs["restore_model_setting"]()
-            # Claude may persist the /model selection after the hook restores it.
-            user_settings.write_text(
-                json.dumps({"model": v2.CLAUDE_TARGET_MODEL, "theme": "dark"})
-            )
+            assert json.loads(user_settings.read_text()) == {"model": "haiku", "theme": "dark"}
+            # The same model chosen explicitly later in the session must survive.
+            user_settings.write_text(json.dumps({"model": v2.CLAUDE_TARGET_MODEL, "theme": "dark"}))
             return 0
 
         monkeypatch.setattr(claude_pty, "run_claude_pty", fake_run)
@@ -194,10 +197,95 @@ class TestV2Launch:
                 launch_model_args=claude._launch_model_args,
             )
 
-        assert json.loads(user_settings.read_text()) == {"model": "haiku", "theme": "dark"}
+        assert json.loads(user_settings.read_text()) == {
+            "model": v2.CLAUDE_TARGET_MODEL,
+            "theme": "dark",
+        }
+
+    def test_model_switch_lock_serializes_routed_sessions(self, tmp_path, monkeypatch):
+        user_settings = tmp_path / "settings.json"
+        user_settings.write_text(json.dumps({"model": "haiku"}))
+        monkeypatch.setattr(v2, "APP_DIR", tmp_path)
+        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
+        monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
+
+        first_locked = threading.Event()
+        release_first = threading.Event()
+        captured: list[str] = []
+        call_count = 0
+        call_count_lock = threading.Lock()
+
+        def fake_run(_argv, **kwargs):
+            nonlocal call_count
+            with call_count_lock:
+                call_count += 1
+                current_call = call_count
+            if current_call == 1:
+                kwargs["prepare_model_switch"]()
+                captured.append(json.loads(user_settings.read_text())["model"])
+                user_settings.write_text(json.dumps({"model": v2.CLAUDE_TARGET_MODEL}))
+                first_locked.set()
+                assert release_first.wait(5)
+            else:
+                assert first_locked.wait(5)
+                release_first.set()
+                kwargs["prepare_model_switch"]()
+                captured.append(json.loads(user_settings.read_text())["model"])
+                user_settings.write_text(json.dumps({"model": v2.CLAUDE_TARGET_MODEL}))
+            kwargs["restore_model_setting"]()
+            return 0
+
+        monkeypatch.setattr(claude_pty, "run_claude_pty", fake_run)
+
+        def launch() -> None:
+            with pytest.raises(SystemExit):
+                v2.launch_claude(
+                    {"workspace": "https://example.com"},
+                    [],
+                    binary="claude",
+                    user_settings_path=user_settings,
+                    launch_model=None,
+                    compose_settings=lambda _args: ({}, []),
+                    launch_model_args=claude._launch_model_args,
+                )
+
+        threads = [threading.Thread(target=launch) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert captured == ["haiku", "haiku"]
+        assert json.loads(user_settings.read_text()) == {"model": "haiku"}
 
 
 class TestPtyFlow:
+    def test_does_not_launch_when_socket_startup_fails(self, tmp_path, monkeypatch):
+        class StoppedThread:
+            @staticmethod
+            def is_alive():
+                return False
+
+        monkeypatch.setattr(
+            claude_pty,
+            "serve_first_prompt_socket",
+            lambda *_args, **_kwargs: StoppedThread(),
+        )
+        monkeypatch.setattr(
+            claude_pty.pty,
+            "fork",
+            lambda: pytest.fail("Claude must not launch without the routing socket"),
+        )
+
+        with pytest.raises(RuntimeError, match="Claude was not launched"):
+            claude_pty.run_claude_pty(
+                ["claude"],
+                route_prompt=lambda _prompt: "sonnet",
+                switch_message="router selected sonnet",
+                socket_path=tmp_path / "missing.sock",
+            )
+
     def test_direct_switch_restore_and_replay(self, tmp_path):
         fake_claude = tmp_path / "fake_claude.py"
         capture = tmp_path / "capture.json"

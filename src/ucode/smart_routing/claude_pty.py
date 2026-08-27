@@ -28,6 +28,7 @@ from pathlib import Path
 MAX_MODEL_NAME_LEN = 200
 CONFIRM_TIMEOUT_S = 3.0
 SWITCH_TIMEOUT_S = 6.0
+MODEL_PERSIST_TIMEOUT_S = 2.0
 READY_QUIET_S = 0.75
 SELECT_TIMEOUT_S = 0.2
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/\-\[\]]+$")
@@ -277,6 +278,7 @@ def run_claude_pty(
     switch_message: str,
     socket_path: Path,
     prepare_model_switch: Callable[[], None] = lambda: None,
+    model_switch_persisted: Callable[[], bool] = lambda: True,
     restore_model_setting: Callable[[], None] = lambda: None,
     log_path: Path | None = None,
 ) -> int:
@@ -292,18 +294,6 @@ def run_claude_pty(
             pass
 
     debug = os.environ.get("UCODE_CLAUDE_PTY_DEBUG") == "1"
-    gate_read, gate_write = os.pipe()
-    pid, master_fd = pty.fork()
-    if pid == 0:
-        os.close(gate_write)
-        try:
-            os.read(gate_read, 1)
-        finally:
-            os.close(gate_read)
-        os.execvp(argv[0], argv)
-        os._exit(127)
-    os.close(gate_read)
-
     confirm = ConfirmationState()
     stop = threading.Event()
     pending_lock = threading.Lock()
@@ -324,8 +314,15 @@ def run_claude_pty(
         time.sleep(0.01)
     if not socket_path.exists():
         log("[ERR] first-prompt socket was not ready before Claude launch")
-    os.write(gate_write, b"1")
-    os.close(gate_write)
+        stop.set()
+        raise RuntimeError(
+            "Smart routing could not start its local prompt-routing socket; Claude was not launched."
+        )
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        os.execvp(argv[0], argv)
+        os._exit(127)
 
     previous_winch = signal.getsignal(signal.SIGWINCH)
 
@@ -400,10 +397,22 @@ def run_claude_pty(
                     and switch_complete is not None
                     and switch_complete.triggered
                 ):
+                    phase = "waiting_persist"
+                    switch_started = now
+                elif phase == "waiting_persist" and model_switch_persisted():
                     restore_model_setting()
                     inject_prompt(master_fd, routed_prompt)
                     phase = "done"
                     log("[REPLAY] first prompt submitted")
+                elif phase == "waiting_persist" and now - switch_started >= MODEL_PERSIST_TIMEOUT_S:
+                    inject_note(
+                        1,
+                        "Smart Routing could not safely preserve your default model. "
+                        "Claude is exiting without submitting your prompt.",
+                    )
+                    os.kill(pid, signal.SIGTERM)
+                    phase = "failed"
+                    log("[ERR] routed model was not persisted before timeout")
                 elif phase == "switching" and now - switch_started >= SWITCH_TIMEOUT_S:
                     os.write(master_fd, b"\x1b")
                     restore_model_setting()
