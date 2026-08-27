@@ -140,6 +140,12 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
 
+    def test_enables_gateway_model_discovery_for_smart_routing_v2(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+
     def test_gateway_model_discovery_skipped_under_provider(self, monkeypatch):
         # A Model Provider Service routes every request to the external provider,
         # so a discovered gateway endpoint id would reach a provider that can't
