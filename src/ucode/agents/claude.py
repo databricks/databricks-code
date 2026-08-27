@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import cast
 
 from ucode.agent_updates import available_npm_package_update
+from ucode.anthropic_model_discovery_proxy import (
+    start_proxy as start_anthropic_model_discovery_proxy,
+)
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -24,10 +27,15 @@ from ucode.config_io import (
     read_json_safe,
     write_json_file,
 )
+from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import (
     build_auth_shell_command,
     build_tool_base_url,
     get_databricks_token,
+)
+from ucode.gateway_proxy import (
+    AI_GATEWAY_TOKEN_HEADER,
+    AUTHORIZATION_HEADER,
 )
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
@@ -40,10 +48,10 @@ from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_err, print_note, print_success, print_warning
 
-GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
+GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 
 SPEC: ToolSpec = {
     "binary": "claude",
@@ -213,10 +221,10 @@ def relayed_proxy_base_url(state: dict) -> str:
     port = state.get("relayed_proxy_port")
     if not isinstance(port, int):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
+            sock.bind((LOOPBACK_HOST, 0))
             port = sock.getsockname()[1]
         state["relayed_proxy_port"] = port
-    return f"http://127.0.0.1:{port}"
+    return f"http://{LOOPBACK_HOST}:{port}"
 
 
 def _web_search_mcp_entry(workspace: str, search_model: str, profile: str | None = None) -> dict:
@@ -875,7 +883,12 @@ def _merge_claude_settings(base: dict, overlay: dict) -> dict:
     return merged
 
 
-def _build_claude_argv(binary: str, tool_args: list[str], relayed: bool = False) -> list[str]:
+def _build_claude_argv(
+    binary: str,
+    tool_args: list[str],
+    relayed: bool = False,
+    settings_override: dict | None = None,
+) -> list[str]:
     """Build the ``claude`` argv, composing any caller ``--settings`` with
     ucode's managed settings.
 
@@ -898,7 +911,7 @@ def _build_claude_argv(binary: str, tool_args: list[str], relayed: bool = False)
     """
     source_args = ["--setting-sources", _RELAYED_SETTING_SOURCES] if relayed else []
     caller_values, remaining = _extract_caller_settings(tool_args)
-    if not caller_values:
+    if not caller_values and settings_override is None:
         # No caller --settings: hand Claude ucode's settings file directly (the
         # common path; behavior unchanged).
         return [binary, *source_args, "--settings", str(CLAUDE_SETTINGS_PATH), *tool_args]
@@ -908,6 +921,8 @@ def _build_claude_argv(binary: str, tool_args: list[str], relayed: bool = False)
     # ucode wins over the caller for conflicting keys (protects gateway auth);
     # hooks from both sides survive.
     merged = _merge_claude_settings(caller_settings, read_json_safe(CLAUDE_SETTINGS_PATH))
+    if settings_override is not None:
+        merged = _merge_claude_settings(merged, settings_override)
     return [
         binary,
         *source_args,
@@ -958,7 +973,7 @@ def _rewrite_relayed_port(state: dict, port: int) -> None:
     settings = read_json_safe(CLAUDE_SETTINGS_PATH)
     env = settings.get("env")
     if isinstance(env, dict):
-        env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{port}"
+        env["ANTHROPIC_BASE_URL"] = f"http://{LOOPBACK_HOST}:{port}"
         write_json_file(CLAUDE_SETTINGS_PATH, settings)
 
 
@@ -966,8 +981,6 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     """Relayed launch: sign into the Claude subscription, start the loopback
     refresh proxy, then run Claude Code alongside it (the proxy must outlive the
     exec, so we spawn-and-wait rather than replacing the process)."""
-    from ucode.gateway_proxy import start_proxy
-
     conflict = _managed_relayed_conflicts()
     if conflict is not None:
         managed_path, keys = conflict
@@ -993,7 +1006,13 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     if not isinstance(port, int):
         raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
 
-    server, cache, client = start_proxy(workspace, state.get("profile"), port)
+    server, cache, client = start_anthropic_model_discovery_proxy(
+        workspace,
+        state.get("profile"),
+        port,
+        token_header=AI_GATEWAY_TOKEN_HEADER,
+        force_refresh_near_expiry=False,
+    )
     # start_proxy falls back to an OS-assigned port when the cached one is taken
     # (stale proxy from a killed session). Reconcile settings + state to whatever
     # it actually bound, so Claude Code connects to the live port.
@@ -1017,11 +1036,49 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
+def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
+    workspace = state["workspace"]
+    server, cache, client = start_anthropic_model_discovery_proxy(
+        workspace,
+        state.get("profile"),
+        0,
+        token_header=AUTHORIZATION_HEADER,
+        force_refresh_near_expiry=True,
+    )
+    token = cache.token
+    os.environ["OAUTH_TOKEN"] = token
+    os.environ["ANTHROPIC_AUTH_TOKEN"] = token
+    os.environ["ANTHROPIC_BASE_URL"] = f"http://{LOOPBACK_HOST}:{server.server_address[1]}"
+    os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    settings_override = {
+        "env": {"ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"]},
+    }
+    proc = subprocess.Popen(
+        _build_claude_argv(binary, tool_args, settings_override=settings_override)
+    )
+    try:
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        proc.send_signal(signal.SIGINT)
+        returncode = proc.wait()
+    finally:
+        cache.stop()
+        server.shutdown()
+        client.close()
+    raise SystemExit(returncode)
+
+
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
+        return
+    if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
+        _launch_gateway(state, binary, tool_args)
         return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))

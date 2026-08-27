@@ -285,6 +285,34 @@ whole-manifest write — every field ucode authors is sent — but because `ucod
 other sections forward, a re-run no longer silently drops them. Developers pick the new config up on
 their next ucode run.
 
+### Exporting the config
+
+Any user (not only admins) can print the workspace's managed config as portable JSON with `ucode
+export`. The output leads with the source `workspace` URL and a `spec_version` (the export format
+version), followed by the canonical external config; credentials and server-assigned fields (the
+resource name, timestamps, user ids) are excluded. Without `--output` the JSON is written to stdout;
+with `--output`/`-o` the same bytes are written to a file (atomically, and the destination's parent
+directory must already exist) while stdout stays empty.
+
+```bash
+# Print the managed config as JSON.
+ucode export
+
+# Write it to a file; stdout stays empty.
+ucode export --output ./managed-config.json
+```
+
+The output looks like:
+
+```json
+{
+  "workspace": "https://<workspace-host>",
+  "spec_version": 1,
+  "default_agent": "CODING_AGENT_CLAUDE_CODE",
+  "enabled_agents": [ ... ]
+}
+```
+
 ---
 
 ## Other Commands
@@ -292,6 +320,7 @@ their next ucode run.
 | Command | Description |
 |---------|-------------|
 | `ucode status` | Show current workspace, base URLs, managed config files, and selected models |
+| `ucode export` | Print the workspace's managed config as portable JSON (`--output <file>` / `-o` to write a file) |
 | `ucode usage` | Show AI Gateway usage summary, plus your budget spend against its alert threshold when the workspace reports one |
 | `ucode usage --warehouse-id <id>` | Query a specific SQL warehouse instead of discovering one |
 | `ucode revert` | Clear saved state and restore backed-up config files |

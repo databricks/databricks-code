@@ -2209,6 +2209,14 @@ def claude_cmd(
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
     workspace: WorkspaceOption = None,
+    enable_model_discovery: Annotated[
+        bool,
+        typer.Option(
+            "--enable-model-discovery",
+            hidden=True,
+            help="Enable AI Gateway models in Claude Code's model picker.",
+        ),
+    ] = False,
     enable_smart_routing_flag: Annotated[
         bool,
         typer.Option(
@@ -2233,6 +2241,8 @@ def claude_cmd(
         claude_agent.disable_smart_routing(load_state())
         print_success("Claude Code smart routing disabled; ucode routing hooks removed")
         return
+    if enable_model_discovery:
+        os.environ[claude_agent.GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
     _launch_tool(
         "claude",
         ctx,
@@ -2921,6 +2931,35 @@ def apply_cmd(
         raise typer.Exit(130) from None
     if code:
         raise typer.Exit(code)
+
+
+@app.command("export")
+def export_cmd(
+    output: Annotated[
+        str | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Write the exported config JSON to this file (atomically) instead of stdout. "
+            "The parent directory must already exist.",
+        ),
+    ] = None,
+) -> None:
+    """Export this workspace's managed coding-agent config as portable JSON.
+
+    Serializes the local managed config to the external `CodingAgentConfig` format that
+    `ucode publish -f <path>` consumes, with credentials and server-owned fields (resource name,
+    workspace id, timestamps, user ids) excluded. Any user can run it; it makes no network calls
+    and mutates no workspace or local state. Without --output the JSON is printed to stdout;
+    diagnostics and errors go to stderr.
+    """
+    from ucode.managed_export import export_command
+
+    try:
+        export_command(output=output)
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
 
 
 @app.command("status")
