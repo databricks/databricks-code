@@ -654,30 +654,93 @@ class TestRegisterWebSearchMcp:
 
 
 class TestClaudeLaunch:
-    def test_sets_oauth_token_before_exec(self, monkeypatch):
-        exec_calls: list[tuple[str, list[str]]] = []
-
-        def fake_execvp(binary: str, args: list[str]) -> None:
-            exec_calls.append((binary, args))
-            raise RuntimeError("stop")
-
+    def test_default_launch_keeps_existing_auth_path(self, monkeypatch):
+        calls: list[list[str]] = []
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
-        monkeypatch.setattr(
-            claude, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
-        )
-        monkeypatch.setattr(os, "execvp", fake_execvp)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        try:
-            claude.launch({"workspace": WS}, ["--debug"])
-        except RuntimeError as exc:
-            assert str(exc) == "stop"
+        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
 
-        assert os.environ["OAUTH_TOKEN"] == "fresh-token"
-        assert exec_calls == [
-            (
-                "claude",
-                ["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"],
+        assert os.environ["OAUTH_TOKEN"] == "token"
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
+
+    def test_gateway_discovery_uses_anthropic_proxy(self, monkeypatch):
+        calls: list[tuple] = []
+
+        class Server:
+            server_address = ("127.0.0.1", 12345)
+
+            def serve_forever(self):
+                calls.append(("serve",))
+
+            def shutdown(self):
+                calls.append(("shutdown",))
+
+        class Cache:
+            token = "fresh-token"
+
+            def stop(self):
+                calls.append(("stop",))
+
+        class Client:
+            def close(self):
+                calls.append(("close",))
+
+        class Process:
+            def __init__(self, argv):
+                calls.append(("popen", argv))
+
+            def wait(self):
+                return 0
+
+        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+            calls.append(
+                (
+                    "proxy",
+                    workspace,
+                    profile,
+                    port,
+                    token_header,
+                    force_refresh_near_expiry,
+                )
             )
+            return Server(), Cache(), Client()
+
+        monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
+        monkeypatch.delenv("OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+        monkeypatch.setattr(
+            claude,
+            "start_anthropic_model_discovery_proxy",
+            start_proxy,
+        )
+        monkeypatch.setattr(claude.subprocess, "Popen", Process)
+
+        with pytest.raises(SystemExit) as exc:
+            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+
+        assert exc.value.code == 0
+        assert os.environ["OAUTH_TOKEN"] == "fresh-token"
+        assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "fresh-token"
+        assert os.environ["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
+        assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
+        assert calls[:2] == [
+            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True),
+            ("serve",),
+        ]
+        assert calls[2][0] == "popen"
+        argv = calls[2][1]
+        assert argv[:2] == ["claude", "--settings"]
+        assert json.loads(argv[2])["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
+        assert argv[3:] == ["--debug"]
+        assert calls[3:] == [
+            ("stop",),
+            ("shutdown",),
+            ("close",),
         ]
 
 
