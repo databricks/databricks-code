@@ -134,6 +134,7 @@ def launch_claude(
     launch_model_args: Callable[[list[str], str | None], list[str]],
 ) -> NoReturn:
     """Launch Claude in the first-prompt routing PTY wrapper."""
+    from ucode.agents.claude import GATEWAY_MODEL_DISCOVERY_ENV_VAR
     from ucode.smart_routing import claude_pty
 
     workspace = state.get("workspace")
@@ -142,6 +143,7 @@ def launch_claude(
             "Smart routing v2 needs a configured workspace; run `ucode configure claude` first."
         )
     os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, state.get("profile"))
+    os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
 
     run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     socket_path = APP_DIR / f"claude-v2-{run_id}.sock"
@@ -154,6 +156,7 @@ def launch_claude(
     env = settings.setdefault("env", {})
     if not isinstance(env, dict):
         raise RuntimeError("Claude settings 'env' must be an object for smart routing.")
+    env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     env[FIRST_PROMPT_SOCKET_ENV] = str(socket_path)
     sync_first_prompt_hook(settings, hook_executable)
     write_json_file(settings_path, settings)

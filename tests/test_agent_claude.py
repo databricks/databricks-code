@@ -842,6 +842,61 @@ class TestClaudeLaunch:
             ("close",),
         ]
 
+    def test_smart_routing_uses_anthropic_proxy(self, monkeypatch):
+        calls: list[tuple] = []
+        captured: dict = {}
+
+        class Server:
+            server_address = ("127.0.0.1", 12345)
+
+            def serve_forever(self):
+                calls.append(("serve",))
+
+            def shutdown(self):
+                calls.append(("shutdown",))
+
+        class Cache:
+            token = "fresh-token"
+
+            def stop(self):
+                calls.append(("stop",))
+
+        class Client:
+            def close(self):
+                calls.append(("close",))
+
+        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+            calls.append(
+                ("proxy", workspace, profile, port, token_header, force_refresh_near_expiry)
+            )
+            return Server(), Cache(), Client()
+
+        def launch_v2(state, tool_args, **kwargs):
+            captured["settings"] = kwargs["compose_settings"](["--debug"])
+            raise SystemExit(0)
+
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(claude, "start_anthropic_model_discovery_proxy", start_proxy)
+        monkeypatch.setattr(
+            claude,
+            "_compose_v2_settings",
+            lambda args: ({"env": {"ANTHROPIC_BASE_URL": "https://direct"}}, args),
+        )
+        monkeypatch.setattr(v2, "launch_claude", launch_v2)
+
+        with pytest.raises(SystemExit) as exc:
+            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+
+        assert exc.value.code == 0
+        assert calls[:2] == [
+            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True),
+            ("serve",),
+        ]
+        settings, remaining = captured["settings"]
+        assert settings["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
+        assert remaining == ["--debug"]
+        assert calls[2:] == [("stop",), ("shutdown",), ("close",)]
+
 
 class TestWriteToolConfigPrunesStaleModelEnv:
     """Stale ucode-managed model env keys (ANTHROPIC_MODEL, etc.) from earlier

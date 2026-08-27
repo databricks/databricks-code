@@ -1125,8 +1125,10 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
-def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
-    """Launch discovery-enabled Claude through a refreshing gateway proxy."""
+def _launch_claude_with_gateway_proxy(
+    state: dict, binary: str, tool_args: list[str], *, smart_routing: bool
+) -> None:
+    """Launch Claude through a refreshing gateway proxy."""
     workspace = state["workspace"]
     server, cache, client = start_anthropic_model_discovery_proxy(
         workspace,
@@ -1144,14 +1146,32 @@ def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     settings_override = {"env": {"ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"]}}
-    proc = subprocess.Popen(
-        _build_claude_argv(binary, tool_args, settings_override=settings_override)
-    )
     try:
-        returncode = proc.wait()
-    except KeyboardInterrupt:
-        proc.send_signal(signal.SIGINT)
-        returncode = proc.wait()
+        if smart_routing:
+
+            def compose_gateway_settings(args: list[str]) -> tuple[dict, list[str]]:
+                settings, remaining = _compose_v2_settings(args)
+                return _merge_claude_settings(settings, settings_override), remaining
+
+            smart_routing_v2.launch_claude(
+                state,
+                tool_args,
+                binary=binary,
+                user_settings_path=CLAUDE_USER_SETTINGS_PATH,
+                launch_model=_original_launch_model(state),
+                compose_settings=compose_gateway_settings,
+                launch_model_args=_launch_model_args,
+            )
+            return
+
+        proc = subprocess.Popen(
+            _build_claude_argv(binary, tool_args, settings_override=settings_override)
+        )
+        try:
+            returncode = proc.wait()
+        except KeyboardInterrupt:
+            proc.send_signal(signal.SIGINT)
+            returncode = proc.wait()
     finally:
         cache.stop()
         server.shutdown()
@@ -1180,18 +1200,10 @@ def launch(state: dict, tool_args: list[str]) -> None:
             "Please use Codex or disable smart routing."
         )
     if first_prompt_routing:
-        smart_routing_v2.launch_claude(
-            state,
-            tool_args,
-            binary=binary,
-            user_settings_path=CLAUDE_USER_SETTINGS_PATH,
-            launch_model=_original_launch_model(state),
-            compose_settings=_compose_v2_settings,
-            launch_model_args=_launch_model_args,
-        )
+        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=True)
         return
     if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
-        _launch_gateway(state, binary, tool_args)
+        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=False)
         return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
