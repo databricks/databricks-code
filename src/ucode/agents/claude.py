@@ -918,7 +918,6 @@ def _build_claude_argv(
     binary: str,
     tool_args: list[str],
     relayed: bool = False,
-    launch_model: str | None = None,
     settings_override: dict | None = None,
 ) -> list[str]:
     """Build the ``claude`` argv, composing any caller ``--settings`` with
@@ -942,19 +941,11 @@ def _build_claude_argv(
     filter through and shadow the subscription OAuth.
     """
     source_args = ["--setting-sources", _RELAYED_SETTING_SOURCES] if relayed else []
-    model_args = _launch_model_args(tool_args, launch_model)
     caller_values, remaining = _extract_caller_settings(tool_args)
     if not caller_values and settings_override is None:
         # No caller --settings: hand Claude ucode's settings file directly (the
         # common path; behavior unchanged).
-        return [
-            binary,
-            *source_args,
-            "--settings",
-            str(CLAUDE_SETTINGS_PATH),
-            *model_args,
-            *tool_args,
-        ]
+        return [binary, *source_args, "--settings", str(CLAUDE_SETTINGS_PATH), *tool_args]
     caller_settings: dict = {}
     for value in caller_values:
         caller_settings = _merge_claude_settings(caller_settings, _load_caller_settings(value))
@@ -968,7 +959,6 @@ def _build_claude_argv(
         *source_args,
         "--settings",
         json.dumps(merged, separators=(",", ":")),
-        *model_args,
         *remaining,
     ]
 
@@ -1077,9 +1067,7 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
-def _launch_gateway(
-    state: dict, binary: str, tool_args: list[str], launch_model: str | None
-) -> None:
+def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
     """Launch discovery-enabled Claude through a refreshing gateway proxy."""
     workspace = state["workspace"]
     server, cache, client = start_anthropic_model_discovery_proxy(
@@ -1099,12 +1087,7 @@ def _launch_gateway(
     server_thread.start()
     settings_override = {"env": {"ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"]}}
     proc = subprocess.Popen(
-        _build_claude_argv(
-            binary,
-            tool_args,
-            launch_model=launch_model,
-            settings_override=settings_override,
-        )
+        _build_claude_argv(binary, tool_args, settings_override=settings_override)
     )
     try:
         returncode = proc.wait()
@@ -1119,20 +1102,22 @@ def _launch_gateway(
 
 
 def recover_claude_model_snapshots(user_settings_path: Path) -> None:
-    """Repair model defaults left by interrupted Claude PTY launches."""
+    """Repair the user model default left by an interrupted Claude PTY launch."""
     candidates = {smart_routing_v2.CLAUDE_MODEL_SNAPSHOT_PATH}
     candidates.update(APP_DIR.glob("claude-default-model.*.snapshot.json"))
     for path in sorted(candidates):
         smart_routing_v2.restore_claude_model_snapshot(user_settings_path, path)
 
 
+def snapshot_claude_model_setting(user_settings_path: Path) -> dict:
+    """Capture Claude Code's persisted user ``model`` setting."""
+    settings = read_json_safe(user_settings_path)
+    return {"present": "model" in settings, "value": settings.get("model")}
+
+
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
-    # Recover a prior switch interrupted before its surgical settings restore.
-    recover_claude_model_snapshots(CLAUDE_USER_SETTINGS_PATH)
-    model_snapshot = smart_routing_v2.snapshot_claude_model_setting(CLAUDE_USER_SETTINGS_PATH)
-    launch_model = _original_launch_model(model_snapshot, state)
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
         return
@@ -1143,23 +1128,27 @@ def launch(state: dict, tool_args: list[str]) -> None:
             "Please use Codex or disable smart routing."
         )
     if smart_routing_v2.enabled() and workspace:
+        # `--settings` loads ucode-settings.json as an overlay; `/model` updates
+        # Claude Code's settings.json instead. Preserve that durable user default.
+        recover_claude_model_snapshots(CLAUDE_USER_SETTINGS_PATH)
+        model_snapshot = snapshot_claude_model_setting(CLAUDE_USER_SETTINGS_PATH)
         smart_routing_v2.launch_claude(
             state,
             tool_args,
             binary=binary,
             user_settings_path=CLAUDE_USER_SETTINGS_PATH,
             model_snapshot=model_snapshot,
-            launch_model=launch_model,
+            launch_model=_original_launch_model(model_snapshot, state),
             compose_settings=_compose_v2_settings,
             launch_model_args=_launch_model_args,
         )
         return
     if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
-        _launch_gateway(state, binary, tool_args, launch_model)
+        _launch_gateway(state, binary, tool_args)
         return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
-    exec_or_spawn(_build_claude_argv(binary, tool_args, launch_model=launch_model))
+    exec_or_spawn(_build_claude_argv(binary, tool_args))
 
 
 def validate_cmd(binary: str) -> list[str]:

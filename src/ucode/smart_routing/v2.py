@@ -17,7 +17,7 @@ import tomlkit
 from ucode.config_io import APP_DIR, read_json_safe, write_json_file
 from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import build_auth_token_argv, get_databricks_token
-from ucode.smart_routing import claude_pty, codex_interposer
+from ucode.smart_routing import codex_interposer
 from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, sync_first_prompt_hook
 from ucode.ui import print_note
 
@@ -40,12 +40,6 @@ HEALTH_POLL_INTERVAL_SECONDS = 0.25
 
 def enabled() -> bool:
     return os.environ.get(ENV_VAR) == "1"
-
-
-def snapshot_claude_model_setting(user_settings_path: Path) -> dict:
-    """Capture only Claude's user-level ``model`` setting."""
-    settings = read_json_safe(user_settings_path)
-    return {"present": "model" in settings, "value": settings.get("model")}
 
 
 def _save_claude_model_snapshot(snapshot: dict, snapshot_path: Path) -> None:
@@ -128,6 +122,8 @@ def launch_claude(
     launch_model_args: Callable[[list[str], str | None], list[str]],
 ) -> NoReturn:
     """Launch Claude in the first-prompt routing PTY wrapper."""
+    from ucode.smart_routing import claude_pty
+
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError(
@@ -174,9 +170,7 @@ def launch_claude(
         returncode = claude_pty.run_claude_pty(
             argv,
             route_prompt=_route_claude_prompt,
-            switch_message=claude_pty.switch_message(
-                CLAUDE_TARGET_MODEL, STUBBED_SWITCH_REASON
-            ),
+            switch_message=claude_pty.switch_message(CLAUDE_TARGET_MODEL, STUBBED_SWITCH_REASON),
             socket_path=socket_path,
             log_path=CLAUDE_PTY_LOG,
         )

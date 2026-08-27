@@ -41,9 +41,7 @@ class TestFirstPromptHook:
     def test_renders_boxed_router_notice(self):
         model = "system.ai.claude-sonnet-4-6[1m]"
         reason = "Low complexity, unclear intent, and no code reference."
-        result = claude_pty.first_prompt_hook_output(
-            {"action": "block", "model": model}
-        )
+        result = claude_pty.first_prompt_hook_output({"action": "block", "model": model})
 
         assert result == {"decision": "block", "reason": v2._switch_message(model, reason)}
         assert claude_pty.switch_message(model, reason) == v2._switch_message(model, reason)
@@ -108,7 +106,7 @@ class TestV2Launch:
             return 0
 
         monkeypatch.setattr(claude_pty, "run_claude_pty", fake_run)
-        snapshot = v2.snapshot_claude_model_setting(user_settings)
+        snapshot = claude.snapshot_claude_model_setting(user_settings)
         with pytest.raises(SystemExit) as exc:
             v2.launch_claude(
                 {"workspace": "https://example.com"},
@@ -138,7 +136,7 @@ class TestModelRecovery:
         user = tmp_path / "settings.json"
         snapshot_path = tmp_path / "model-snapshot.json"
         user.write_text(json.dumps({"model": "opus", "theme": "dark"}))
-        original = v2.snapshot_claude_model_setting(user)
+        original = claude.snapshot_claude_model_setting(user)
         v2._save_claude_model_snapshot(original, snapshot_path)
 
         user.write_text(json.dumps({"model": "routed", "theme": "light", "new": True}))
@@ -154,7 +152,7 @@ class TestModelRecovery:
         user = tmp_path / "settings.json"
         snapshot_path = tmp_path / "model-snapshot.json"
         user.write_text(json.dumps({"theme": "dark"}))
-        v2._save_claude_model_snapshot(v2.snapshot_claude_model_setting(user), snapshot_path)
+        v2._save_claude_model_snapshot(claude.snapshot_claude_model_setting(user), snapshot_path)
         user.write_text(json.dumps({"model": "routed", "theme": "light"}))
 
         v2.restore_claude_model_snapshot(user, snapshot_path)

@@ -1410,6 +1410,9 @@ def claude_router_hook_cmd(
     import json
     import sys
 
+    if event == "route-first-prompt" and not smart_routing_v2.enabled():
+        return
+
     from ucode.smart_routing.claude_routing import (
         record_session_start,
         record_subagent_start,
@@ -1982,8 +1985,8 @@ def _launch_tool(
         if managed is not None and not is_dry_run():
             _register_managed_mcp_servers(managed, tool, state)
             _apply_managed_skills(managed, tool, state)
-        if tool == "claude":
-            # Transient launch precedence for claude.py's universal --model flag.
+        if tool == "claude" and smart_routing_v2.enabled():
+            # Transient launch precedence for the v2 PTY's initial --model flag.
             # An explicit choice wins, followed by a routed/managed root pick;
             # neither value is persisted into workspace state.
             launch_model = model or route_root_model

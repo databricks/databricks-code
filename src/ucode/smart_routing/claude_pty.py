@@ -64,9 +64,7 @@ def switch_message(model: str, reason: str) -> str:
     ]
     width = max(len(line) for line in lines)
     border = "─" * (width + 2)
-    return "\n".join(
-        [f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"]
-    )
+    return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
 
 
 class ConfirmationState:
@@ -168,11 +166,10 @@ def first_prompt_hook_output(response: dict | None) -> dict | None:
     model = response.get("model")
     if not valid_model_name(model):
         return None
+    assert isinstance(model, str)
     return {
         "decision": "block",
-        "reason": switch_message(
-            model, "Low complexity, unclear intent, and no code reference."
-        ),
+        "reason": switch_message(model, "Low complexity, unclear intent, and no code reference."),
     }
 
 

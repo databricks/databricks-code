@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -658,7 +659,9 @@ class TestClaudeLaunch:
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude.os, "name", "nt")
         monkeypatch.setattr(claude, "recover_claude_model_snapshots", lambda _path: None)
-        monkeypatch.setattr(v2, "snapshot_claude_model_setting", lambda _path: {"present": False})
+        monkeypatch.setattr(
+            claude, "snapshot_claude_model_setting", lambda _path: {"present": False}
+        )
 
         with pytest.raises(
             RuntimeError,
@@ -668,29 +671,27 @@ class TestClaudeLaunch:
 
     def test_default_launch_keeps_existing_auth_path(self, monkeypatch):
         calls: list[list[str]] = []
+        monkeypatch.delenv(v2.ENV_VAR, raising=False)
         monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
-        monkeypatch.setattr(
-            claude, "recover_claude_model_snapshots", lambda _path: None
-        )
-        monkeypatch.setattr(
-            v2, "snapshot_claude_model_setting", lambda _path: {"present": True, "value": "opus"}
-        )
+        monkeypatch.setattr(claude, "recover_claude_model_snapshots", Mock())
+        monkeypatch.setattr(claude, "snapshot_claude_model_setting", Mock())
         monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
         claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
 
         assert os.environ["OAUTH_TOKEN"] == "token"
-        assert calls == [
-            ["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--model", "opus", "--debug"]
-        ]
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
+        claude.recover_claude_model_snapshots.assert_not_called()
+        claude.snapshot_claude_model_setting.assert_not_called()
 
     def test_gateway_discovery_uses_anthropic_proxy(self, monkeypatch):
         calls: list[tuple] = []
 
-        monkeypatch.setattr(claude, "recover_claude_model_snapshots", lambda _path: None)
-        monkeypatch.setattr(v2, "snapshot_claude_model_setting", lambda _path: {"present": False})
+        monkeypatch.delenv(v2.ENV_VAR, raising=False)
+        monkeypatch.setattr(claude, "recover_claude_model_snapshots", Mock())
+        monkeypatch.setattr(claude, "snapshot_claude_model_setting", Mock())
 
         class Server:
             server_address = ("127.0.0.1", 12345)
@@ -765,6 +766,8 @@ class TestClaudeLaunch:
             ("shutdown",),
             ("close",),
         ]
+        claude.recover_claude_model_snapshots.assert_not_called()
+        claude.snapshot_claude_model_setting.assert_not_called()
 
 
 class TestWriteToolConfigPrunesStaleModelEnv:
