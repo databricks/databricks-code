@@ -366,12 +366,52 @@ class TestClaudeModelFlag:
         assert mock_configure.call_args.kwargs["route_root_model"] is None
         assert "_claude_launch_model" not in mock_launch.call_args.args[1]
 
+    def test_v2_model_sets_transient_launch_override(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
+        state = {**MINIMAL_STATE, "claude_models": {"opus": "system.ai.claude-opus-4-8"}}
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.resolve_launch_model", return_value=(state, "system.ai.opus")),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["claude", "--model", "system.ai.glm-5-2"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.args[1]["_claude_launch_model"] == "system.ai.glm-5-2"
+
     def test_model_and_provider_are_mutually_exclusive(self):
         result = runner.invoke(
             app, ["claude", "--model", "cat.schema.m", "--provider", "cat.schema.svc"]
         )
         assert result.exit_code == 1
         assert "Use either --model or --provider" in result.output
+
+    def test_provider_sets_transient_claude_launch_marker(self):
+        state = dict(MINIMAL_STATE)
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.resolve_provider_models", return_value=(None, None, False)),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(
+                app, ["claude", "--provider", "main.default.anthropic"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            mock_launch.call_args.args[1]["_claude_launch_provider"]
+            == "main.default.anthropic"
+        )
 
     def test_warns_when_enterprise_settings_pin_the_model(self):
         # Claude Code's enterprise managed-settings scope outranks the --settings file ucode writes,

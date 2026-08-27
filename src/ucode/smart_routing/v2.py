@@ -29,7 +29,6 @@ STUBBED_SWITCH_REASON = "Low complexity, unclear intent, and no code reference."
 
 CLAUDE_TARGET_MODEL = "system.ai.claude-sonnet-4-6[1m]"  # TODO(lilly): replace with smart router.
 CLAUDE_PTY_LOG = APP_DIR / "claude-v2-pty.log"
-CLAUDE_MODEL_SNAPSHOT_PATH = APP_DIR / "claude-default-model.snapshot.json"
 
 APP_SERVER_READY_TIMEOUT_SECONDS = 30
 PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 5
@@ -40,34 +39,6 @@ HEALTH_POLL_INTERVAL_SECONDS = 0.25
 
 def enabled() -> bool:
     return os.environ.get(ENV_VAR) == "1"
-
-
-def _save_claude_model_snapshot(snapshot: dict, snapshot_path: Path) -> None:
-    """Journal the pre-switch model so the next launch can recover after a crash."""
-    write_json_file(snapshot_path, snapshot)
-
-
-def restore_claude_model_snapshot(
-    user_settings_path: Path,
-    snapshot_path: Path | None = None,
-    snapshot: dict | None = None,
-) -> bool:
-    """Restore only the journaled ``model`` field, preserving every sibling setting."""
-    snapshot_path = snapshot_path or CLAUDE_MODEL_SNAPSHOT_PATH
-    if snapshot is None and not snapshot_path.exists():
-        return False
-    snapshot = snapshot if snapshot is not None else read_json_safe(snapshot_path)
-    present = snapshot.get("present")
-    if not isinstance(present, bool):
-        raise RuntimeError(f"Claude model recovery snapshot is invalid: {snapshot_path}")
-    settings = read_json_safe(user_settings_path)
-    if present:
-        settings["model"] = snapshot.get("value")
-    else:
-        settings.pop("model", None)
-    write_json_file(user_settings_path, settings)
-    snapshot_path.unlink(missing_ok=True)
-    return True
 
 
 def _loopback_websocket_url(port: int) -> str:
@@ -116,7 +87,6 @@ def launch_claude(
     *,
     binary: str,
     user_settings_path: Path,
-    model_snapshot: dict,
     launch_model: str | None,
     compose_settings: Callable[[list[str]], tuple[dict, list[str]]],
     launch_model_args: Callable[[list[str], str | None], list[str]],
@@ -134,7 +104,6 @@ def launch_claude(
     run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     socket_path = APP_DIR / f"claude-v2-{run_id}.sock"
     settings_path = APP_DIR / f"claude-v2-{run_id}.json"
-    model_snapshot_path = APP_DIR / f"claude-default-model.{run_id}.snapshot.json"
 
     settings, remaining = compose_settings(tool_args)
     hook_executable = build_auth_token_argv(
@@ -149,18 +118,24 @@ def launch_claude(
     model_args = launch_model_args(remaining, launch_model)
     argv = [binary, "--settings", str(settings_path), *model_args, *remaining]
 
-    _save_claude_model_snapshot(model_snapshot, model_snapshot_path)
+    model_before_switch: dict | None = None
     restored = False
 
-    def restore_default_model() -> bool:
+    def prepare_model_switch() -> None:
+        nonlocal model_before_switch
+        model_before_switch = read_json_safe(user_settings_path)
+
+    def restore_model_setting() -> None:
         nonlocal restored
-        if restored:
-            return False
-        result = restore_claude_model_snapshot(
-            user_settings_path, model_snapshot_path, model_snapshot
-        )
+        if restored or model_before_switch is None:
+            return
+        current = read_json_safe(user_settings_path)
+        if "model" in model_before_switch:
+            current["model"] = model_before_switch["model"]
+        else:
+            current.pop("model", None)
+        write_json_file(user_settings_path, current)
         restored = True
-        return result
 
     print_note(
         "Smart routing v2: the first submitted prompt will select Claude Code's "
@@ -172,10 +147,12 @@ def launch_claude(
             route_prompt=_route_claude_prompt,
             switch_message=claude_pty.switch_message(CLAUDE_TARGET_MODEL, STUBBED_SWITCH_REASON),
             socket_path=socket_path,
+            prepare_model_switch=prepare_model_switch,
+            restore_model_setting=restore_model_setting,
             log_path=CLAUDE_PTY_LOG,
         )
     finally:
-        restore_default_model()
+        restore_model_setting()
         settings_path.unlink(missing_ok=True)
         socket_path.unlink(missing_ok=True)
     sys.exit(returncode)

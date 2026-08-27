@@ -1985,13 +1985,16 @@ def _launch_tool(
         if managed is not None and not is_dry_run():
             _register_managed_mcp_servers(managed, tool, state)
             _apply_managed_skills(managed, tool, state)
-        if tool == "claude" and smart_routing_v2.enabled():
-            # Transient launch precedence for the v2 PTY's initial --model flag.
-            # An explicit choice wins, followed by a routed/managed root pick;
-            # neither value is persisted into workspace state.
-            launch_model = model or route_root_model
-            if launch_model:
-                state["_claude_launch_model"] = launch_model
+        if tool == "claude":
+            if smart_routing_v2.enabled():
+                # Transient launch precedence for the v2 PTY's initial --model flag.
+                # An explicit choice wins, followed by a routed/managed root pick;
+                # neither value is persisted into workspace state.
+                launch_model = model or route_root_model
+                if launch_model:
+                    state["_claude_launch_model"] = launch_model
+            if provider:
+                state["_claude_launch_provider"] = provider
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
     except RuntimeError as exc:

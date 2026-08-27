@@ -276,6 +276,8 @@ def run_claude_pty(
     route_prompt: Callable[[str], str],
     switch_message: str,
     socket_path: Path,
+    prepare_model_switch: Callable[[], None] = lambda: None,
+    restore_model_setting: Callable[[], None] = lambda: None,
     log_path: Path | None = None,
 ) -> int:
     """Run Claude in a PTY, switch its model, and replay the first prompt."""
@@ -386,6 +388,7 @@ def run_claude_pty(
                 idle = last_output > 0.0 and now - last_output >= READY_QUIET_S
                 if phase == "waiting_to_switch" and idle:
                     inject_note(1, switch_message)
+                    prepare_model_switch()
                     inject_model_switch(master_fd, routed_model)
                     confirm.arm(now + CONFIRM_TIMEOUT_S)
                     switch_complete = OutputMarkerDetector(("Set model to", "Model set to"))
@@ -397,11 +400,13 @@ def run_claude_pty(
                     and switch_complete is not None
                     and switch_complete.triggered
                 ):
+                    restore_model_setting()
                     inject_prompt(master_fd, routed_prompt)
                     phase = "done"
                     log("[REPLAY] first prompt submitted")
                 elif phase == "switching" and now - switch_started >= SWITCH_TIMEOUT_S:
                     os.write(master_fd, b"\x1b")
+                    restore_model_setting()
                     inject_note(
                         1,
                         "Smart Routing could not confirm the model switch. "

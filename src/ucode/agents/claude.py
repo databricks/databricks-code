@@ -44,7 +44,8 @@ from ucode.smart_routing.claude_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
 )
-from ucode.state import mark_tool_managed, save_state
+from ucode.smart_routing.claude_routing import CLAUDE_VALUE_OPTIONS
+from ucode.state import get_provider_service, mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_err, print_note, print_success, print_warning
@@ -72,6 +73,9 @@ SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 # Claude Code settings.json hook events ucode manages when routing is enabled;
 # marked managed so they're tracked/reverted with the rest of ucode's config.
 CLAUDE_ROUTING_HOOK_EVENTS = ("PreToolUse", "SessionStart", "SubagentStart")
+CLAUDE_NONINTERACTIVE_FLAGS = frozenset(
+    {"-p", "--print", "--bg", "--background", "--cloud", "-h", "--help", "-v", "--version"}
+)
 
 
 def is_update_available() -> tuple[str, str] | None:
@@ -895,14 +899,45 @@ def _compose_v2_settings(tool_args: list[str]) -> tuple[dict, list[str]]:
     return _merge_claude_settings(settings, read_json_safe(CLAUDE_SETTINGS_PATH)), remaining
 
 
-def _original_launch_model(snapshot: dict, state: dict) -> str | None:
+def _original_launch_model(state: dict) -> str | None:
     override = state.get("_claude_launch_model")
     if isinstance(override, str) and override.strip():
         return override.strip()
-    value = snapshot.get("value") if snapshot.get("present") is True else None
+    value = read_json_safe(CLAUDE_USER_SETTINGS_PATH).get("model")
     if isinstance(value, str) and value.strip():
         return value.strip()
     return default_model(state)
+
+
+def _has_launch_model_override(state: dict) -> bool:
+    override = state.get("_claude_launch_model")
+    return isinstance(override, str) and bool(override.strip())
+
+
+def _has_provider_launch(state: dict) -> bool:
+    transient = state.get("_claude_launch_provider")
+    return (isinstance(transient, str) and bool(transient.strip())) or bool(
+        get_provider_service(state, "claude")
+    )
+
+
+def _uses_interactive_tui(tool_args: list[str]) -> bool:
+    if any(arg in CLAUDE_NONINTERACTIVE_FLAGS for arg in tool_args):
+        return False
+
+    index = 0
+    while index < len(tool_args):
+        arg = tool_args[index]
+        if arg == "--":
+            return index == len(tool_args) - 1
+        if arg in CLAUDE_VALUE_OPTIONS:
+            index += 2
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return False
+    return True
 
 
 def _has_explicit_model_arg(tool_args: list[str]) -> bool:
@@ -1102,44 +1137,32 @@ def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
-def recover_claude_model_snapshots(user_settings_path: Path) -> None:
-    """Repair the user model default left by an interrupted Claude PTY launch."""
-    candidates = {smart_routing_v2.CLAUDE_MODEL_SNAPSHOT_PATH}
-    candidates.update(APP_DIR.glob("claude-default-model.*.snapshot.json"))
-    for path in sorted(candidates):
-        smart_routing_v2.restore_claude_model_snapshot(user_settings_path, path)
-
-
-def snapshot_claude_model_setting(user_settings_path: Path) -> dict:
-    """Capture Claude Code's persisted user ``model`` setting."""
-    settings = read_json_safe(user_settings_path)
-    return {"present": "model" in settings, "value": settings.get("model")}
-
-
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
         return
+    first_prompt_routing = (
+        smart_routing_v2.enabled()
+        and bool(workspace)
+        and not _has_launch_model_override(state)
+        and not _has_provider_launch(state)
+        and _uses_interactive_tui(tool_args)
+    )
     # Smart routing v2 needs Unix PTY support, which Windows does not provide.
-    if smart_routing_v2.enabled() and os.name == "nt":
+    if first_prompt_routing and os.name == "nt":
         raise RuntimeError(
             "Smart routing in Claude Code is currently not supported on Windows. "
             "Please use Codex or disable smart routing."
         )
-    if smart_routing_v2.enabled() and workspace:
-        # `--settings` loads ucode-settings.json as an overlay; `/model` updates
-        # Claude Code's settings.json instead. Preserve that durable user default.
-        recover_claude_model_snapshots(CLAUDE_USER_SETTINGS_PATH)
-        model_snapshot = snapshot_claude_model_setting(CLAUDE_USER_SETTINGS_PATH)
+    if first_prompt_routing:
         smart_routing_v2.launch_claude(
             state,
             tool_args,
             binary=binary,
             user_settings_path=CLAUDE_USER_SETTINGS_PATH,
-            model_snapshot=model_snapshot,
-            launch_model=_original_launch_model(model_snapshot, state),
+            launch_model=_original_launch_model(state),
             compose_settings=_compose_v2_settings,
             launch_model_args=_launch_model_args,
         )

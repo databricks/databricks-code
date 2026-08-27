@@ -83,7 +83,7 @@ class TestFirstPromptHook:
 
 
 class TestV2Launch:
-    def test_saves_default_passes_model_and_restores_only_model(self, tmp_path, monkeypatch):
+    def test_restores_model_captured_immediately_before_switch(self, tmp_path, monkeypatch):
         ucode_settings = tmp_path / "ucode-settings.json"
         user_settings = tmp_path / "settings.json"
         ucode_settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gw"}}))
@@ -101,19 +101,26 @@ class TestV2Launch:
             captured["argv"] = argv
             generated = Path(argv[argv.index("--settings") + 1])
             captured["settings"] = json.loads(generated.read_text())
+            # A user-selected model before the first prompt becomes the value to restore.
+            user_settings.write_text(json.dumps({"model": "haiku", "theme": "dark"}))
+            kwargs["prepare_model_switch"]()
             # Simulate `/model` changing the user file, plus an unrelated concurrent edit.
             user_settings.write_text(json.dumps({"model": "routed", "theme": "light", "new": True}))
+            kwargs["restore_model_setting"]()
+            captured["restored_during_run"] = json.loads(user_settings.read_text())
+            # A later user choice must survive session exit.
+            user_settings.write_text(
+                json.dumps({"model": "user-selected", "theme": "light", "new": True})
+            )
             return 0
 
         monkeypatch.setattr(claude_pty, "run_claude_pty", fake_run)
-        snapshot = claude.snapshot_claude_model_setting(user_settings)
         with pytest.raises(SystemExit) as exc:
             v2.launch_claude(
                 {"workspace": "https://example.com"},
                 ["--debug"],
                 binary="claude",
                 user_settings_path=user_settings,
-                model_snapshot=snapshot,
                 launch_model="opus",
                 compose_settings=claude._compose_v2_settings,
                 launch_model_args=claude._launch_model_args,
@@ -123,46 +130,48 @@ class TestV2Launch:
         assert captured["argv"][-3:] == ["--model", "opus", "--debug"]
         assert claude_hooks.FIRST_PROMPT_SOCKET_ENV in captured["settings"]["env"]
         assert "modelPicker" not in captured["settings"]
+        assert captured["restored_during_run"] == {
+            "model": "haiku",
+            "theme": "light",
+            "new": True,
+        }
         assert json.loads(user_settings.read_text()) == {
-            "model": "opus",
+            "model": "user-selected",
             "theme": "light",
             "new": True,
         }
-        assert not list(tmp_path.glob("claude-default-model.*.snapshot.json"))
 
+    def test_does_not_restore_when_wrapper_never_switches(self, tmp_path, monkeypatch):
+        user_settings = tmp_path / "settings.json"
+        user_settings.write_text(json.dumps({"model": "opus"}))
+        monkeypatch.setattr(v2, "APP_DIR", tmp_path)
+        monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
+        monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
 
-class TestModelRecovery:
-    def test_restore_changes_only_model_field(self, tmp_path):
-        user = tmp_path / "settings.json"
-        snapshot_path = tmp_path / "model-snapshot.json"
-        user.write_text(json.dumps({"model": "opus", "theme": "dark"}))
-        original = claude.snapshot_claude_model_setting(user)
-        v2._save_claude_model_snapshot(original, snapshot_path)
+        def fake_run(_argv, **_kwargs):
+            user_settings.write_text(json.dumps({"model": "user-selected"}))
+            return 0
 
-        user.write_text(json.dumps({"model": "routed", "theme": "light", "new": True}))
-        assert v2.restore_claude_model_snapshot(user, snapshot_path) is True
-        assert json.loads(user.read_text()) == {
-            "model": "opus",
-            "theme": "light",
-            "new": True,
-        }
-        assert v2.restore_claude_model_snapshot(user, snapshot_path) is False
+        monkeypatch.setattr(claude_pty, "run_claude_pty", fake_run)
+        with pytest.raises(SystemExit):
+            v2.launch_claude(
+                {"workspace": "https://example.com"},
+                [],
+                binary="claude",
+                user_settings_path=user_settings,
+                launch_model="opus",
+                compose_settings=lambda _args: ({}, []),
+                launch_model_args=claude._launch_model_args,
+            )
 
-    def test_restore_removes_model_when_original_was_absent(self, tmp_path):
-        user = tmp_path / "settings.json"
-        snapshot_path = tmp_path / "model-snapshot.json"
-        user.write_text(json.dumps({"theme": "dark"}))
-        v2._save_claude_model_snapshot(claude.snapshot_claude_model_setting(user), snapshot_path)
-        user.write_text(json.dumps({"model": "routed", "theme": "light"}))
-
-        v2.restore_claude_model_snapshot(user, snapshot_path)
-        assert json.loads(user.read_text()) == {"theme": "light"}
+        assert json.loads(user_settings.read_text()) == {"model": "user-selected"}
 
 
 class TestPtyFlow:
     def test_direct_switch_restore_and_replay(self, tmp_path):
         fake_claude = tmp_path / "fake_claude.py"
         capture = tmp_path / "capture.json"
+        restored = tmp_path / "restored"
         socket_path = tmp_path / "first.sock"
         fake_claude.write_text(
             """
@@ -175,6 +184,7 @@ from pathlib import Path
 
 socket_path = sys.argv[1]
 capture_path = Path(sys.argv[2])
+restored_path = Path(sys.argv[3])
 client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 client.connect(socket_path)
 client.sendall((json.dumps({
@@ -200,18 +210,27 @@ replayed = read_until(b"\\x1b[201~\\r")
 capture_path.write_text(json.dumps({
     "command": model_command.decode(),
     "replayed": replayed.decode(),
+    "restored_before_replay": restored_path.exists(),
 }))
 """.lstrip()
         )
         result = claude_pty.run_claude_pty(
-            [sys.executable, str(fake_claude), str(socket_path), str(capture)],
+            [
+                sys.executable,
+                str(fake_claude),
+                str(socket_path),
+                str(capture),
+                str(restored),
+            ],
             route_prompt=lambda _prompt: "system.ai.claude-sonnet-5",
             switch_message="router selected sonnet",
             socket_path=socket_path,
+            restore_model_setting=lambda: restored.write_text("restored"),
         )
 
         assert result == 0
         assert json.loads(capture.read_text()) == {
             "command": "/model system.ai.claude-sonnet-5\r",
             "replayed": "\x1b[200~fix\nthe parser\x1b[201~\r",
+            "restored_before_replay": True,
         }
