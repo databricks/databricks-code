@@ -335,6 +335,7 @@ class TestSubcommandRouting:
         assert result.output == ""
         mock_request.assert_not_called()
 
+
 class TestClaudeModelFlag:
     """`ucode claude --model <id>` pins the id into the family aliases so the gateway resolves any
     Databricks model id, instead of Claude Code's own --model flag rejecting non-catalog ids."""
@@ -402,15 +403,10 @@ class TestClaudeModelFlag:
             patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch("ucode.cli.launch_agent") as mock_launch,
         ):
-            result = runner.invoke(
-                app, ["claude", "--provider", "main.default.anthropic"]
-            )
+            result = runner.invoke(app, ["claude", "--provider", "main.default.anthropic"])
 
         assert result.exit_code == 0, result.output
-        assert (
-            mock_launch.call_args.args[1]["_claude_launch_provider"]
-            == "main.default.anthropic"
-        )
+        assert mock_launch.call_args.args[1]["_claude_launch_provider"] == "main.default.anthropic"
 
     def test_warns_when_enterprise_settings_pin_the_model(self):
         # Claude Code's enterprise managed-settings scope outranks the --settings file ucode writes,

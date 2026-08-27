@@ -26,6 +26,7 @@ class TestDirectModelCommand:
     def test_rejects_unsafe_model_names(self, name):
         assert not claude_pty.valid_model_name(name)
 
+
 class TestFirstPromptHook:
     def test_renders_boxed_router_notice(self):
         model = "system.ai.claude-sonnet-4-6[1m]"
