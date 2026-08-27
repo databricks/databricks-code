@@ -170,7 +170,6 @@ def launch_claude(
         returncode = claude_pty.run_claude_pty(
             argv,
             route_prompt=_route_claude_prompt,
-            switch_message=claude_pty.switch_message(CLAUDE_TARGET_MODEL, STUBBED_SWITCH_REASON),
             socket_path=socket_path,
             prepare_model_switch=model_setting.begin,
             model_switch_persisted=model_setting.is_routed,

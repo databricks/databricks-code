@@ -239,7 +239,6 @@ class TestPtyFlow:
             claude_pty.run_claude_pty(
                 ["claude"],
                 route_prompt=lambda _prompt: "sonnet",
-                switch_message="router selected sonnet",
                 socket_path=tmp_path / "missing.sock",
             )
 
@@ -298,7 +297,6 @@ capture_path.write_text(json.dumps({
                 str(restored),
             ],
             route_prompt=lambda _prompt: "system.ai.claude-sonnet-5",
-            switch_message="router selected sonnet",
             socket_path=socket_path,
             restore_model_setting=lambda: restored.write_text("restored"),
         )

@@ -275,7 +275,6 @@ def run_claude_pty(
     argv: list[str],
     *,
     route_prompt: Callable[[str], str],
-    switch_message: str,
     socket_path: Path,
     prepare_model_switch: Callable[[], None] = lambda: None,
     model_switch_persisted: Callable[[], bool] = lambda: True,
@@ -384,7 +383,6 @@ def run_claude_pty(
                 now = time.monotonic()
                 idle = last_output > 0.0 and now - last_output >= READY_QUIET_S
                 if phase == "waiting_to_switch" and idle:
-                    inject_note(1, switch_message)
                     prepare_model_switch()
                     inject_model_switch(master_fd, routed_model)
                     confirm.arm(now + CONFIRM_TIMEOUT_S)
