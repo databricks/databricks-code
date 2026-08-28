@@ -19,7 +19,7 @@ from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import build_auth_token_argv, get_databricks_token
 from ucode.smart_routing import codex_interposer
 from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, sync_first_prompt_hook
-from ucode.smart_routing.codex_hooks import merge_pre_tool_use_hooks
+from ucode.smart_routing.codex_hooks import merge_pre_tool_use_hooks, routing_models
 from ucode.ui import print_note
 
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
@@ -221,12 +221,7 @@ def _codex_config_args(overlay: dict) -> list[str]:
 # TODO: Replace with /codex/v1/models once /codex/v1/models can send GPT models as well.
 def _cached_routing_models(state: dict) -> list[str]:
     """Return the persisted UC model-service ids usable by Codex routing."""
-    models: list[str] = []
-    for key in ("codex_models", "oss_models"):
-        values = state.get(key)
-        if isinstance(values, list):
-            models.extend(value for value in values if isinstance(value, str) and value)
-    return list(dict.fromkeys(models))
+    return routing_models(state)
 
 
 def _codex_home_config_path() -> Path:

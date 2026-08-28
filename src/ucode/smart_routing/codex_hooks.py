@@ -12,6 +12,16 @@ from ucode.smart_routing import hooks
 ROUTING_HOOK_COMMAND_MARKER = "codex-router-hook"
 
 
+def routing_models(state: dict) -> list[str]:
+    """Return the configured model services compatible with Codex routing."""
+    models: list[str] = []
+    for key in ("codex_models", "oss_models"):
+        values = state.get(key)
+        if isinstance(values, list):
+            models.extend(value for value in values if isinstance(value, str) and value)
+    return list(dict.fromkeys(models))
+
+
 def sync_smart_routing_hooks(doc: dict, state: dict, *, enabled: bool) -> None:
     """Synchronize ucode-managed routing hooks in a Codex config document."""
     groups = _routing_hook_groups(state) if enabled else {}
@@ -86,7 +96,7 @@ def _routing_hook_argv(
         argv += ["--profile", profile]
     if state.get("use_pat"):
         argv.append("--use-pat")
-    models = available_models if available_models is not None else state.get("codex_models") or []
+    models = available_models if available_models is not None else routing_models(state)
     for model in models:
         if isinstance(model, str) and model:
             argv += ["--model", model]

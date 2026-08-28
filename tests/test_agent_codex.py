@@ -242,6 +242,7 @@ class TestCodexWriteConfig:
                 "workspace": WS,
                 "profile": "prod",
                 "codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"],
+                "oss_models": ["system.ai.glm-5-2"],
                 codex.SMART_ROUTING_STATE_KEY: True,
             }
         )
@@ -259,6 +260,7 @@ class TestCodexWriteConfig:
         assert "--host https://example.databricks.com" in route_command
         assert "--profile prod" in route_command
         assert "--model databricks-gpt-5-5" in route_command
+        assert "--model system.ai.glm-5-2" in route_command
 
     def test_provider_launch_removes_routing_hooks(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
