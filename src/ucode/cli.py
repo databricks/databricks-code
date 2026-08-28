@@ -253,7 +253,7 @@ def _print_managed_summary_abridged(managed: dict, state: dict, tool: str | None
     )
 
 
-def _confirm_managed_config_in_force(managed: dict, workspace: str) -> None:
+def _confirm_managed_config_applied(managed: dict, workspace: str) -> None:
     print_success("A managed config is published for your workspace — you're all set.")
     _print_managed_summary(managed, {"workspace": workspace}, tool=None)
     print_note("Run `ucode` to launch with your managed settings.")
@@ -313,7 +313,7 @@ def _resolve_workspace_then_maybe_reject(
             is_admin = is_workspace_admin(workspace, token)
     if is_admin:
         _run_setup_and_exit(workspace, profile, token)
-    _confirm_managed_config_in_force(managed, workspace)
+    _confirm_managed_config_applied(managed, workspace)
     raise typer.Exit(0)
 
 

@@ -319,7 +319,7 @@ class TestExistingConfigHandling:
         with (
             patch.object(wizard, "get_managed_config", return_value=(existing, None)),
             patch.object(wizard, "prompt_for_selection", return_value="adopt"),
-            patch("ucode.cli._confirm_managed_config_in_force") as confirm,
+            patch("ucode.cli._confirm_managed_config_applied") as confirm,
         ):
             # Adopting just confirms the config is in force (the launch path applies it) and stops
             # the wizard — no re-authoring, no local writes.

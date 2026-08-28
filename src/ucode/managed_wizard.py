@@ -1316,9 +1316,9 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
     if choice is None:
         raise KeyboardInterrupt
     if choice == "adopt":
-        from ucode.cli import _confirm_managed_config_in_force
+        from ucode.cli import _confirm_managed_config_applied
 
-        _confirm_managed_config_in_force(existing, workspace)
+        _confirm_managed_config_applied(existing, workspace)
         return False, existing
     if choice == "create":
         # The agent/model half is re-authored here; the other sections carry forward from `existing`
