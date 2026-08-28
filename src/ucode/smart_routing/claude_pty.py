@@ -276,7 +276,7 @@ def run_claude_pty(
     *,
     route_prompt: Callable[[str], str],
     socket_path: Path,
-    prepare_model_switch: Callable[[], None] = lambda: None,
+    prepare_model_switch: Callable[[str], None] = lambda _model: None,
     model_switch_persisted: Callable[[], bool] = lambda: True,
     restore_model_setting: Callable[[], None] = lambda: None,
     log_path: Path | None = None,
@@ -383,7 +383,7 @@ def run_claude_pty(
                 now = time.monotonic()
                 idle = last_output > 0.0 and now - last_output >= READY_QUIET_S
                 if phase == "waiting_to_switch" and idle:
-                    prepare_model_switch()
+                    prepare_model_switch(routed_model)
                     inject_model_switch(master_fd, routed_model)
                     confirm.arm(now + CONFIRM_TIMEOUT_S)
                     switch_complete = OutputMarkerDetector(("Set model to", "Model set to"))

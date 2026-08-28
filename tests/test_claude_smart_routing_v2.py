@@ -85,15 +85,24 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "CLAUDE_PTY_LOG", tmp_path / "v2.log")
         monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
+        monkeypatch.setattr(
+            v2,
+            "_route_claude_prompt",
+            lambda *_args: v2.routing.RoutingDecision(
+                model="system.ai.claude-sonnet-5",
+                raw_model="claude-sonnet-5",
+            ),
+        )
         captured: dict = {}
 
         def fake_run(argv, **kwargs):
             captured["argv"] = argv
+            captured["routed_model"] = kwargs["route_prompt"]("fix the parser")
             generated = Path(argv[argv.index("--settings") + 1])
             captured["settings"] = json.loads(generated.read_text())
             # A user-selected model before the first prompt becomes the value to restore.
             user_settings.write_text(json.dumps({"model": "haiku", "theme": "dark"}))
-            kwargs["prepare_model_switch"]()
+            kwargs["prepare_model_switch"]("system.ai.claude-sonnet-5")
             # Simulate `/model` changing the user file, plus an unrelated concurrent edit.
             user_settings.write_text(json.dumps({"model": "routed", "theme": "light", "new": True}))
             kwargs["restore_model_setting"]()
@@ -118,6 +127,7 @@ class TestV2Launch:
 
         assert exc.value.code == 0
         assert captured["argv"][-3:] == ["--model", "opus", "--debug"]
+        assert captured["routed_model"] == "system.ai.claude-sonnet-5"
         assert claude_hooks.FIRST_PROMPT_SOCKET_ENV in captured["settings"]["env"]
         assert "modelPicker" not in captured["settings"]
         assert captured["restored_during_run"] == {
@@ -166,8 +176,9 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
 
         def fake_run(_argv, **kwargs):
-            kwargs["prepare_model_switch"]()
-            user_settings.write_text(json.dumps({"model": v2.CLAUDE_TARGET_MODEL, "theme": "dark"}))
+            routed_model = "system.ai.claude-opus-4-8"
+            kwargs["prepare_model_switch"](routed_model)
+            user_settings.write_text(json.dumps({"model": routed_model, "theme": "dark"}))
             assert kwargs["model_switch_persisted"]() is True
             kwargs["restore_model_setting"]()
             assert json.loads(user_settings.read_text()) == {"model": "haiku", "theme": "dark"}
@@ -200,11 +211,11 @@ class TestV2Launch:
         second = v2._ClaudeModelSettingGuard(user_settings)
         captured: list[str] = []
 
-        first.begin()
-        user_settings.write_text(json.dumps({"model": v2.CLAUDE_TARGET_MODEL}))
+        first.begin("system.ai.claude-opus-4-8")
+        user_settings.write_text(json.dumps({"model": "system.ai.claude-opus-4-8"}))
 
         def run_second() -> None:
-            second.begin()
+            second.begin("system.ai.claude-sonnet-5")
             captured.append(json.loads(user_settings.read_text())["model"])
             second.restore()
 

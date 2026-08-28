@@ -126,18 +126,21 @@ class _ClaudeModelSettingGuard:
     def __init__(self, settings_path: Path) -> None:
         self.settings_path = settings_path
         self._before: dict | None = None
+        self._routed_model: str | None = None
         self._lock: TextIO | None = None
 
-    def begin(self) -> None:
+    def begin(self, routed_model: str) -> None:
         import fcntl
 
         APP_DIR.mkdir(parents=True, exist_ok=True)
         self._lock = open(APP_DIR / "claude-v2-model.lock", "a+", encoding="utf-8")
         fcntl.flock(self._lock, fcntl.LOCK_EX)
         self._before = read_json_safe(self.settings_path)
+        self._routed_model = routed_model
 
     def is_routed(self) -> bool:
-        return _is_claude_target_model(read_json_safe(self.settings_path).get("model"))
+        value = read_json_safe(self.settings_path).get("model")
+        return isinstance(value, str) and value == self._routed_model
 
     def restore(self) -> None:
         import fcntl
@@ -152,6 +155,7 @@ class _ClaudeModelSettingGuard:
                 current.pop("model", None)
             write_json_file(self.settings_path, current)
             self._before = None
+            self._routed_model = None
         finally:
             if self._lock is not None:
                 fcntl.flock(self._lock, fcntl.LOCK_UN)
@@ -204,12 +208,12 @@ def launch_claude(
 
     print_note(
         "Smart routing v2: the first submitted prompt will select Claude Code's "
-        f"model ({CLAUDE_TARGET_MODEL}); log: {CLAUDE_PTY_LOG}."
+        f"model; log: {CLAUDE_PTY_LOG}."
     )
     try:
         returncode = claude_pty.run_claude_pty(
             argv,
-            route_prompt=lambda prompt: _route_claude_prompt(state, token, prompt),
+            route_prompt=lambda prompt: _route_claude_prompt(state, token, prompt).model,
             socket_path=socket_path,
             prepare_model_switch=model_setting.begin,
             model_switch_persisted=model_setting.is_routed,
