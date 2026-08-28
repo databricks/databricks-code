@@ -145,11 +145,20 @@ class TestLaunchCodex:
             'model="gpt-start"',
             "--config",
         ]
-        assert processes[0].argv[8:] == [
+        assert processes[0].argv[7].startswith("model_providers.ucode-databricks={")
+        assert processes[0].argv[8] == "--config"
+        hook_override = processes[0].argv[9]
+        assert hook_override.startswith("hooks.PreToolUse=[{")
+        assert 'matcher = "Agent|.*spawn_agent$"' in hook_override
+        assert "codex-router-hook route-subagent" in hook_override
+        assert f"--host {WS}" in hook_override
+        assert "--profile myprof" in hook_override
+        assert "--model system.ai.gpt-5-6-sol" in hook_override
+        assert "--model system.ai.glm-5-2" in hook_override
+        assert processes[0].argv[10:] == [
             "--listen",
             "ws://127.0.0.1:41001",
         ]
-        assert processes[0].argv[7].startswith("model_providers.ucode-databricks={")
         assert processes[0].kwargs["env"][v2.OAUTH_TOKEN_ENV_VAR] == "token-1"
         assert processes[0].kwargs["env"]["CODEX_HOME"] == "/user/codex-home"
         assert processes[1].argv == [
@@ -172,6 +181,28 @@ class TestLaunchCodex:
         assert interposer_args["kwargs"]["switch_message_fn"] is v2._switch_message
         assert stopped == [True]
         assert processes[0].terminated is True
+
+    def test_v2_pre_tool_hook_preserves_user_hooks(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            "[[hooks.PreToolUse]]\n"
+            'matcher = "Bash"\n'
+            "[[hooks.PreToolUse.hooks]]\n"
+            'type = "command"\n'
+            'command = "user-policy"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        configured = v2._v2_pre_tool_use_hooks(
+            {"workspace": WS, "profile": "myprof"},
+            ["system.ai.gpt-5-6-sol"],
+        )
+
+        assert configured[0]["hooks"][0]["command"] == "user-policy"
+        assert configured[1]["matcher"] == "Agent|.*spawn_agent$"
+        assert "--model system.ai.gpt-5-6-sol" in configured[1]["hooks"][0]["command"]
 
     def test_missing_cached_models_blocks_launch(self, monkeypatch):
         monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")

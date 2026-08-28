@@ -14,11 +14,12 @@ from typing import NoReturn, TextIO
 
 import tomlkit
 
-from ucode.config_io import APP_DIR, read_json_safe, write_json_file
+from ucode.config_io import APP_DIR, read_json_safe, read_toml_safe, write_json_file
 from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import build_auth_token_argv, get_databricks_token
 from ucode.smart_routing import codex_interposer
 from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, sync_first_prompt_hook
+from ucode.smart_routing.codex_hooks import merge_pre_tool_use_hooks
 from ucode.ui import print_note
 
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
@@ -191,6 +192,11 @@ def _toml_value(value: str | int | float | bool | list[object] | dict[str, objec
         item = tomlkit.inline_table()
         item.update(value)
         return item.as_string()
+    if isinstance(value, list) and any(isinstance(entry, dict) for entry in value):
+        wrapper = tomlkit.inline_table()
+        wrapper["value"] = value
+        rendered = wrapper.as_string()
+        return rendered.removeprefix("{value = ").removesuffix("}")
     return tomlkit.item(value).as_string()
 
 
@@ -199,12 +205,12 @@ def _codex_config_args(overlay: dict) -> list[str]:
     for key, value in overlay.items():
         # This is Codex's AI Gateway transport definition, not Unity Catalog
         # Model Provider Service support; smart routing still cannot use --provider.
-        if key == "model_providers" and isinstance(value, dict):
+        if key in {"hooks", "model_providers"} and isinstance(value, dict):
             for provider_name, provider_config in value.items():
                 args.extend(
                     [
                         "--config",
-                        f"model_providers.{provider_name}={_toml_value(provider_config)}",
+                        f"{key}.{provider_name}={_toml_value(provider_config)}",
                     ]
                 )
         else:
@@ -221,6 +227,24 @@ def _cached_routing_models(state: dict) -> list[str]:
         if isinstance(values, list):
             models.extend(value for value in values if isinstance(value, str) and value)
     return list(dict.fromkeys(models))
+
+
+def _codex_home_config_path() -> Path:
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).expanduser() / "config.toml"
+    return Path.home() / ".codex" / "config.toml"
+
+
+def _v2_pre_tool_use_hooks(state: dict, available_models: list[str]) -> list[dict]:
+    doc = read_toml_safe(_codex_home_config_path())
+    configured_hooks = doc.get("hooks")
+    existing = configured_hooks.get("PreToolUse") if isinstance(configured_hooks, dict) else None
+    return merge_pre_tool_use_hooks(
+        existing if isinstance(existing, list) else [],
+        state,
+        available_models=available_models,
+    )
 
 
 def launch_codex(
@@ -255,6 +279,9 @@ def launch_codex(
         state.get("profile"),
         use_pat=bool(state.get("use_pat")),
     )
+    overlay["hooks"] = {
+        "PreToolUse": _v2_pre_tool_use_hooks(state, available_models),
+    }
     config_args = _codex_config_args(overlay)
     app_port = _free_port()
     app_server_url = _loopback_websocket_url(app_port)
