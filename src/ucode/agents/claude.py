@@ -582,10 +582,12 @@ def write_tool_config(
             state["workspace"], web_search_model, state.get("profile")
         )
         if not _web_search_mcp_is_current(state, web_search_entry):
-            if _register_web_search_mcp(state["workspace"], web_search_model, state.get("profile")):
+            # Registration runs multiple `claude mcp` subprocesses and can take several seconds.
+            registration_success = _register_web_search_mcp(
+                state["workspace"], web_search_model, state.get("profile")
+            )
+            if registration_success:
                 state[WEB_SEARCH_MCP_STATE_KEY] = web_search_entry
-        else:
-            state[WEB_SEARCH_MCP_STATE_KEY] = web_search_entry
     else:
         state.pop(WEB_SEARCH_MCP_STATE_KEY, None)
 

@@ -990,7 +990,20 @@ class TestAutoConfigureOnFirstRun:
         mock_auto.assert_not_called()
 
 
-class TestLocalAgentConfigPredicate:
+@pytest.mark.parametrize(
+    ("tool", "expected"),
+    [
+        ("claude", "Launching Claude Code with Unity Gateway"),
+        ("codex", "Launching Codex with Unity Gateway"),
+    ],
+)
+def test_launch_title(tool, expected):
+    from ucode.cli import _launch_title
+
+    assert _launch_title(tool) == expected
+
+
+class TestCachedConfigPredicate:
     @staticmethod
     def _kwargs(**overrides):
         kwargs = {
@@ -998,7 +1011,6 @@ class TestLocalAgentConfigPredicate:
             "model": None,
             "explicit_provider": None,
             "enable_smart_routing_flag": False,
-            "skip_preflight": False,
             "workspace": None,
             "needs_auto_configure": False,
         }
@@ -1013,7 +1025,7 @@ class TestLocalAgentConfigPredicate:
             patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
         ):
             assert (
-                cli_mod._can_use_local_agent_config("codex", MINIMAL_STATE, **self._kwargs())
+                cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
                 is True
             )
 
@@ -1023,7 +1035,6 @@ class TestLocalAgentConfigPredicate:
             {"refresh": True},
             {"explicit_provider": "catalog.schema.provider"},
             {"enable_smart_routing_flag": True},
-            {"skip_preflight": True},
             {"workspace": "https://other.databricks.com"},
         ],
     )
@@ -1035,7 +1046,7 @@ class TestLocalAgentConfigPredicate:
             patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
         ):
             assert (
-                cli_mod._can_use_local_agent_config(
+                cli_mod._can_launch_from_cached_config(
                     "codex", MINIMAL_STATE, **self._kwargs(**override)
                 )
                 is False
@@ -2488,6 +2499,7 @@ class TestSkipPreflightFlag:
             patch("ucode.cli._auto_configure_tool"),
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
             patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
             patch("ucode.cli.configure_shared_state", cfg),
             patch("ucode.cli.codex_agent.has_ucode_config", return_value=False),
             patch(
