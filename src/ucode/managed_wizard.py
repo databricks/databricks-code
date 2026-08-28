@@ -1305,7 +1305,10 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
     choice = prompt_for_selection(
         "What would you like to do?",
         [
-            ("adopt", "Adopt the published config as your current settings. To invoke, run `ucode`."),
+            (
+                "adopt",
+                "Adopt the published config as your current settings. To invoke, run `ucode`.",
+            ),
             ("create", "Author a new config (replaces the existing one when you publish)"),
             ("delete", "Delete the existing config (removes it from the workspace, leaves none)"),
         ],
