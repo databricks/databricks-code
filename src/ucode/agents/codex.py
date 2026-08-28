@@ -111,6 +111,21 @@ def _use_legacy_layout() -> bool:
     return parsed < MINIMUM_CODEX_VERSION
 
 
+def has_ucode_config() -> bool:
+    """Return whether ucode has already written a Codex configuration."""
+    if CODEX_CONFIG_PATH.exists():
+        return True
+    if not LEGACY_CODEX_CONFIG_PATH.exists():
+        return False
+    doc = read_toml_safe(LEGACY_CODEX_CONFIG_PATH)
+    profiles = doc.get("profiles")
+    return (
+        doc.get("profile") == CODEX_PROFILE_NAME
+        and isinstance(profiles, dict)
+        and isinstance(profiles.get(CODEX_PROFILE_NAME), dict)
+    )
+
+
 def _provider_block(
     workspace: str,
     databricks_profile: str | None,

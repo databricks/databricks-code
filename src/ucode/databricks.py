@@ -52,6 +52,7 @@ WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
 AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
+ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
@@ -377,7 +378,7 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
         return None, f"network error: {exc.reason}"
 
 
-# Workspace group whose members are workspace admins. `ucode setup` / `ucode apply` are restricted
+# Workspace group whose members are workspace admins. `ucode setup` / `ucode publish` are restricted
 # to this group because the coding-agent-config CRUD API enforces the same check server-side.
 WORKSPACE_ADMIN_GROUP = "admins"
 
@@ -1847,6 +1848,7 @@ def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict],
 # currently populated, is what lets a re-run *clear* a field the admin removed: the server merges
 # per path, so an omitted path leaves the old value in place.
 MANAGED_CONFIG_UPDATE_MASK_PATHS: tuple[str, ...] = (
+    "spec_version",
     "display_name",
     "default_agent",
     "enabled_agents",
@@ -2737,7 +2739,7 @@ def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | 
     validation.
     """
     hostname = workspace_hostname(workspace)
-    payload, reason = _http_get_json(f"https://{hostname}/ai-gateway/anthropic/v1/models", token)
+    payload, reason = _http_get_json(f"https://{hostname}{ANTHROPIC_MODELS_PATH}", token)
     if payload is None:
         return [], reason
 
@@ -2764,7 +2766,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     matching the expected naming convention).
     """
     hostname = workspace_hostname(workspace)
-    payload, reason = _http_get_json(f"https://{hostname}/ai-gateway/anthropic/v1/models", token)
+    payload, reason = _http_get_json(f"https://{hostname}{ANTHROPIC_MODELS_PATH}", token)
     if payload is None:
         return {}, reason
 

@@ -290,7 +290,7 @@ def serialize_managed_config(manifest: dict) -> dict:
     build doesn't recognize are dropped, mirroring the read side.
 
     Output-only proto fields (``workspace_id``, timestamps, user ids) are never emitted. ``name`` is
-    carried through when present so an update path can address an existing resource; ``ucode apply``
+    carried through when present so an update path can address an existing resource; ``ucode publish``
     omits it on create and lets the server assign one.
     """
     payload: dict = {}

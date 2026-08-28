@@ -53,9 +53,11 @@ from ucode.ui import print_err, print_note, print_success, print_warning
 GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
+CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
 # The default model is stored in Claude's default user settings, not the ucode settings.
 CLAUDE_USER_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
+WEB_SEARCH_MCP_STATE_KEY = "claude_web_search_mcp"
 
 SPEC: ToolSpec = {
     "binary": "claude",
@@ -116,7 +118,7 @@ WEB_SEARCH_MCP_NAME = "web_search"
 # Matches both the AI Gateway form (`databricks-claude-opus-4-8`) and the UC
 # model-services form (`system.ai.claude-opus-4-8`).
 _CLAUDE_MODEL_RE = re.compile(
-    r"^(?:system\.ai\.)?(?:databricks-)?claude-(opus|sonnet)-(\d+)-(\d+)(.*)$"
+    r"^(?:system\.ai\.)?(?:databricks-)?claude-(opus|sonnet)-(\d+)(?:-(\d+))?(.*)$"
 )
 
 # Env keys the MLflow Stop hook reads to route traces. Written into the
@@ -436,7 +438,7 @@ def _maybe_add_1m_suffix(model: str) -> str:
 
     family, major_raw, minor_raw, _ = match.groups()
     major = int(major_raw)
-    minor = int(minor_raw)
+    minor = int(minor_raw or 0)
     should_suffix = (family == "opus" and (major, minor) >= (4, 6)) or (
         family == "sonnet" and (major, minor) >= (4, 6)
     )
@@ -471,6 +473,20 @@ def _register_web_search_mcp(workspace: str, search_model: str, profile: str | N
         print_warning(f"{exc} Web search will be unavailable; re-run `ucode claude` to retry.")
         return False
     return True
+
+
+def _web_search_mcp_is_current(state: dict, entry: dict) -> bool:
+    """Return whether the desired web-search entry is already registered.
+
+    The persisted entry acts as a cheap fingerprint, while reading Claude's config repairs a
+    registration removed or edited outside ucode. Avoiding the Claude CLI here matters: each
+    ``claude mcp`` subprocess takes roughly 0.8 seconds during a launch.
+    """
+    if state.get(WEB_SEARCH_MCP_STATE_KEY) != entry:
+        return False
+    config = read_json_safe(CLAUDE_MCP_CONFIG_PATH)
+    servers = config.get("mcpServers")
+    return isinstance(servers, dict) and servers.get(WEB_SEARCH_MCP_NAME) == entry
 
 
 def _unregister_web_search_mcp() -> None:
@@ -600,7 +616,18 @@ def write_tool_config(
         _write_managed_settings(_compose, relayed)
 
     if web_search_model:
-        _register_web_search_mcp(state["workspace"], web_search_model, state.get("profile"))
+        web_search_entry = _web_search_mcp_entry(
+            state["workspace"], web_search_model, state.get("profile")
+        )
+        if not _web_search_mcp_is_current(state, web_search_entry):
+            # Registration runs multiple `claude mcp` subprocesses and can take several seconds.
+            registration_success = _register_web_search_mcp(
+                state["workspace"], web_search_model, state.get("profile")
+            )
+            if registration_success:
+                state[WEB_SEARCH_MCP_STATE_KEY] = web_search_entry
+    else:
+        state.pop(WEB_SEARCH_MCP_STATE_KEY, None)
 
     # Persist relayed mode + proxy port so launch() wires the refresh proxy and
     # subscription login; cleared on a non-relayed launch.
@@ -1161,6 +1188,7 @@ def _launch_claude_with_gateway_proxy(
                 launch_model=_original_launch_model(state),
                 compose_settings=compose_gateway_settings,
                 launch_model_args=_launch_model_args,
+                model_name=_maybe_add_1m_suffix,
             )
             return
 

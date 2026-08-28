@@ -27,6 +27,11 @@ class TestClaudeSpec:
 
 
 class TestRenderOverlay:
+    def test_long_context_suffix_supports_major_only_claude_versions(self):
+        assert claude._maybe_add_1m_suffix("system.ai.claude-sonnet-5") == (
+            "system.ai.claude-sonnet-5[1m]"
+        )
+
     def test_does_not_set_anthropic_model_env(self):
         # We deliberately don't pin ANTHROPIC_MODEL: when set, Claude Code's
         # /model picker surfaces a duplicate catalog row on top of the family
@@ -573,6 +578,22 @@ class TestWriteToolConfigManagedSettings:
 
 
 class TestRegisterWebSearchMcp:
+    def test_skips_registration_when_entry_is_current(self, monkeypatch):
+        entry = claude._web_search_mcp_entry(WS, "m", "profile")
+        state = {claude.WEB_SEARCH_MCP_STATE_KEY: entry}
+        monkeypatch.setattr(
+            claude,
+            "read_json_safe",
+            lambda path: {"mcpServers": {claude.WEB_SEARCH_MCP_NAME: entry}},
+        )
+        assert claude._web_search_mcp_is_current(state, entry) is True
+
+    def test_detects_registration_drift(self, monkeypatch):
+        entry = claude._web_search_mcp_entry(WS, "m", "profile")
+        state = {claude.WEB_SEARCH_MCP_STATE_KEY: entry}
+        monkeypatch.setattr(claude, "read_json_safe", lambda path: {"mcpServers": {}})
+        assert claude._web_search_mcp_is_current(state, entry) is False
+
     def test_clears_existing_then_adds(self, monkeypatch):
         import ucode.mcp as mcp_mod
 
