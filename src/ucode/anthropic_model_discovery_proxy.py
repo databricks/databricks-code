@@ -32,7 +32,6 @@ from ucode.gateway_proxy import (
     forwarded_request_headers,
     log_proxy_diagnostic,
     log_token_refresh_failure,
-    passthrough_request_headers,
 )
 
 
@@ -76,7 +75,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             # verbatim. Relayed mode still injects its separately refreshed swap
             # token while preserving the caller's Anthropic subscription OAuth.
             if self.cache is None or self.token_header is None:
-                headers = passthrough_request_headers(self)
+                headers = {
+                    key: value
+                    for key, value in self.headers.items()
+                    if key.lower() not in HOP_BY_HOP_HEADERS
+                }
             else:
                 headers = forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:

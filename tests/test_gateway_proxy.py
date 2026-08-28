@@ -47,6 +47,13 @@ class TestForwardedRequestHeaders:
         out = gateway_proxy.forwarded_request_headers(handler, "fresh")
         assert out["X-Databricks-AI-Gateway-Token"] == "Bearer fresh"
 
+    def test_overwrites_authorization_header(self):
+        handler = _FakeHandler({"Authorization": "Bearer stale"})
+        out = gateway_proxy.forwarded_request_headers(
+            handler, "fresh", gateway_proxy.AUTHORIZATION_HEADER
+        )
+        assert out["Authorization"] == "Bearer fresh"
+
     def test_strips_hop_by_hop_headers(self):
         handler = _FakeHandler(
             {"Host": "localhost:9", "Content-Length": "5", "Connection": "keep-alive"}

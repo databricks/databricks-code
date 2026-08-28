@@ -1,9 +1,11 @@
-"""Loopback refresh proxy for relayed Claude gateway requests.
+"""Loopback refresh proxy for Claude gateway requests.
 
 A relayed Model Provider Service authenticates the caller's own Anthropic
 subscription OAuth (which Claude Code owns in the `Authorization` header) and
 carries a Databricks credential in the `X-Databricks-AI-Gateway-Token` swap
-header. The proxy refreshes that header and streams responses back verbatim.
+header. Native gateway discovery instead carries the Databricks credential in
+`Authorization`. The proxy refreshes the applicable header and streams responses
+back verbatim.
 
 Security invariants (mirroring `databricks.py` token handling):
   - Binds 127.0.0.1 only; never exposed off-host.
@@ -31,6 +33,7 @@ from ucode.databricks import get_databricks_token
 # Header we overwrite with the freshly-minted Databricks credential. Any
 # client-supplied value is replaced, so a stale settings.json value can't leak.
 AI_GATEWAY_TOKEN_HEADER = "X-Databricks-AI-Gateway-Token"
+AUTHORIZATION_HEADER = "Authorization"
 # Hop-by-hop headers must not be forwarded across a proxy.
 HOP_BY_HOP_HEADERS = frozenset(
     h.lower()
@@ -179,24 +182,14 @@ class TokenCache:
         self._stop.set()
 
 
-def passthrough_request_headers(handler: BaseHTTPRequestHandler) -> dict[str, str]:
-    """Copy end-to-end client headers without forwarding hop-by-hop framing."""
-    return {
-        key: value
-        for key, value in handler.headers.items()
-        if key.lower() not in HOP_BY_HOP_HEADERS
-    }
-
-
 def forwarded_request_headers(
     handler: BaseHTTPRequestHandler,
     token: str,
     token_header: str = AI_GATEWAY_TOKEN_HEADER,
 ) -> dict[str, str]:
+    strip_on_forward = HOP_BY_HOP_HEADERS | {token_header.lower()}
     headers = {
-        key: value
-        for key, value in passthrough_request_headers(handler).items()
-        if key.lower() != token_header.lower()
+        key: value for key, value in handler.headers.items() if key.lower() not in strip_on_forward
     }
     headers[token_header] = f"Bearer {token}"
     return headers
