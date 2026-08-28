@@ -1305,7 +1305,7 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
     choice = prompt_for_selection(
         "What would you like to do?",
         [
-            ("adopt", "Adopt the published config as-is (it applies when you run `ucode`)"),
+            ("adopt", "Adopt the published config as your current settings. To invoke, run `ucode`."),
             ("create", "Author a new config (replaces the existing one when you publish)"),
             ("delete", "Delete the existing config (removes it from the workspace, leaves none)"),
         ],
@@ -1566,9 +1566,9 @@ def setup_command(
     launching setup after its admin offer. When ``workspace`` is None the flow prompts as usual.
 
     ``command_label`` brands the section headers to the invoking command: `ucode configure` passes
-    "ucode configure" so a user who never typed `ucode setup` isn't jarred by it (the standalone
-    `ucode setup` command keeps the default). References to specific sub-commands (`ucode setup
-    mcps`, `ucode apply`, …) stay verbatim — those are real command names, not branding.
+    "Configure Unity Gateway" so a user who never typed `ucode setup` isn't jarred by it (the
+    standalone `ucode setup` command keeps the default). References to specific sub-commands (`ucode
+    setup mcps`, `ucode apply`, …) stay verbatim — those are real command names, not branding.
 
     ``token`` lets a caller that already authenticated and admin-checked the workspace (e.g.
     `ucode configure`) hand its token in, so setup's admin gate uses the *same* token as the routing
@@ -1591,7 +1591,7 @@ def setup_command(
     print_note("Developers pull it automatically when they run ucode.")
 
     if workspace is None:
-        workspace, profile = _prompt_for_configuration(title="ucode setup")
+        workspace, profile = _prompt_for_configuration()
     # `configure_shared_state` below authenticates too and prints its own success line, so this one
     # stays quiet rather than reporting the same thing twice. It still has to run first: the admin
     # gate and the existing-config check both need a token before discovery. A token handed in by
@@ -2040,7 +2040,7 @@ def publish_command(*, file_path: str | None = None, yes: bool = False) -> int:
     workspace = state.get("workspace")
     profile = state.get("profile")
     if not workspace:
-        workspace, profile = _prompt_for_configuration(title="ucode setup")
+        workspace, profile = _prompt_for_configuration()
 
     manifest, api_payload = parse_publish_payload(load_publish_payload(file_path), workspace)
 

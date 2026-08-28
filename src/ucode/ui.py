@@ -344,8 +344,6 @@ def normalize_workspace_url(workspace: str) -> str:
 def prompt_for_workspace(
     description: str,
     profiles: list[tuple[str, str]] | None = None,
-    *,
-    title: str = "ucode setup",
 ) -> tuple[str, str | None]:
     """Ask the user for a workspace URL, offering profiles as quick-select.
 
@@ -354,10 +352,9 @@ def prompt_for_workspace(
     profiles pointing at the same workspace) are shown separately; the picker
     returns the exact (host, profile_name) the user selected. Returns
     ``(url, profile_name)``; profile_name is ``None`` when the user typed a
-    URL manually. ``title`` names the invoking command in the panel header.
+    URL manually.
     """
     console.print()
-    console.print(Panel(description, title=title, style="bold blue", expand=False))
 
     if profiles:
         name_header = "Profile Name"

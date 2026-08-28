@@ -2704,7 +2704,7 @@ class TestConfigureDeprecation:
         assert exc.value.exit_code == 0
         out = capsys.readouterr().out
         assert "you're all set" in out
-        assert "run `ucode`" in out
+        assert "Run `ucode`" in out
 
     def test_fetches_the_config_rather_than_reading_a_cold_cache(self, monkeypatch):
         # The gap this guards: on a fresh machine the local cache is empty until the first launch,
@@ -2745,7 +2745,7 @@ class TestConfigureDeprecation:
             {
                 "workspace": "https://w",
                 "profile": None,
-                "command_label": "ucode configure",
+                "command_label": "Configure Unity Gateway",
                 "token": "tok",
             }
         ]
@@ -2852,7 +2852,7 @@ class TestConfigureDeprecation:
             {
                 "workspace": "https://w",
                 "profile": None,
-                "command_label": "ucode configure",
+                "command_label": "Configure Unity Gateway",
                 "token": "tok",
             }
         ]

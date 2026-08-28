@@ -254,15 +254,9 @@ def _print_managed_summary_abridged(managed: dict, state: dict, tool: str | None
 
 
 def _confirm_managed_config_in_force(managed: dict, workspace: str) -> None:
-    """Confirm the workspace's managed config is already in force, and show what it holds.
-
-    There is nothing to write locally: the launch path applies the config (agents, MCP servers, and
-    skills) on every ``ucode`` run. So both the non-admin ``configure`` path and setup's "Adopt"
-    choice land here — show the admin's config and point the user at ``ucode``.
-    """
     print_success("A managed config is published for your workspace — you're all set.")
     _print_managed_summary(managed, {"workspace": workspace}, tool=None)
-    print_note("Configuration is complete. Just run `ucode` to launch with it applied.")
+    print_note("Run `ucode` to launch with your managed settings.")
 
 
 def _resolve_workspace_then_maybe_reject(
@@ -270,10 +264,15 @@ def _resolve_workspace_then_maybe_reject(
 ) -> list[tuple[str, str | None]] | None:
     """Resolve the workspace ``ucode configure`` targets, then branch on role + managed config.
 
+    Enablement is both client- and server-side: the client-side ``ENABLE_MANAGED_AGENT_CONFIG`` env
+    var must be set for ``ucode`` to run any of this (the opt-in bug-bash gate below), and the
+    workspace's gateway must not report the feature disabled (``FEATURE_DISABLED``) — a config only
+    exists to adopt when the server side is on too.
+
     When managed coding-agent configs are enabled, ``ucode configure`` must still let a developer
     switch workspaces — so resolve the target workspace up front (prompting when the interactive
     path gave no ``--workspaces``/``--profiles``) and make it current *before* deciding what to do.
-    Then, gated entirely by ``ENABLE_MANAGED_AGENT_CONFIG``, the four role/config paths are:
+    Then, gated by the client-side ``ENABLE_MANAGED_AGENT_CONFIG``, the four role/config paths are:
 
     * **No managed config** → a workspace admin is dropped straight into the ``ucode setup``
       authoring flow (``configure`` is replacing ``setup``) and the command exits with its code; a
@@ -284,7 +283,7 @@ def _resolve_workspace_then_maybe_reject(
     * **Managed config, admin** → drop into the setup flow, whose existing-config menu lets them
       adopt it (the same "you're all set" confirmation), re-author it, or delete it; the command exits.
 
-    Without the feature enabled it returns ``workspace_entries`` unchanged and prompts nothing.
+    Without the client-side flag set it returns ``workspace_entries`` unchanged and prompts nothing.
     """
     if not managed_agent_config_enabled():
         return workspace_entries
@@ -355,10 +354,14 @@ def _run_setup_and_exit(workspace: str, profile: str | None, token: str | None =
     mapped to clean exit codes rather than bubbling up as unhandled errors.
     """
     try:
-        # Brand the flow as `ucode configure`: it was reached through configure, not a bare
-        # `ucode setup`, so its section headers should say so.
+        # Brand the flow as "Configure Unity Gateway": it was reached through `ucode configure`,
+        # not a bare `ucode setup`, so its section headers use the product name rather than the
+        # bare command.
         code = setup_command(
-            workspace=workspace, profile=profile, command_label="ucode configure", token=token
+            workspace=workspace,
+            profile=profile,
+            command_label="Configure Unity Gateway",
+            token=token,
         )
     except RuntimeError as exc:
         print_err(str(exc))
@@ -391,18 +394,14 @@ def _print_discovery_diagnostics(state: dict) -> None:
     print_note("Re-run with `UCODE_DEBUG=1` to log raw discovery responses to ~/.ucode/debug.log.")
 
 
-def _prompt_for_configuration(
-    tool: str | None = None, *, title: str = "ucode configure"
-) -> tuple[str, str | None]:
-    # Defaults to "ucode configure" since every caller in this module is part of the configure
-    # command; the setup flow (managed_wizard) passes title="ucode setup".
+def _prompt_for_configuration(tool: str | None = None) -> tuple[str, str | None]:
     if tool is None:
         desc = "Configure your Databricks workspace"
     else:
         desc = f"Configure {TOOL_SPECS[tool]['display']} to use your Databricks endpoint."
     with spinner("Loading Databricks workspaces and profiles..."):
         profiles = get_databricks_profiles()
-    return prompt_for_workspace(desc, profiles, title=title)
+    return prompt_for_workspace(desc, profiles)
 
 
 def _parse_agents_option(agents: str) -> list[str]:
