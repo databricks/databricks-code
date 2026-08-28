@@ -2730,6 +2730,33 @@ def list_all_mcp_services(
     return sorted(names), None
 
 
+def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """List every model id advertised by AI Gateway's Anthropic endpoint.
+
+    Claude Code's native gateway discovery consumes this same catalog, so callers
+    using that mode must not apply ucode's legacy ``databricks-claude-*`` family
+    validation.
+    """
+    hostname = workspace_hostname(workspace)
+    payload, reason = _http_get_json(f"https://{hostname}/ai-gateway/anthropic/v1/models", token)
+    if payload is None:
+        return [], reason
+
+    data = cast(dict, payload) if isinstance(payload, dict) else {}
+    model_ids: list[str] = []
+    seen: set[str] = set()
+    for model in data.get("data", []):
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if isinstance(model_id, str) and model_id and model_id not in seen:
+            seen.add(model_id)
+            model_ids.append(model_id)
+    if model_ids:
+        return model_ids, None
+    return [], "AI Gateway returned no Anthropic model ids"
+
+
 def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], str | None]:
     """Discover Claude families on this workspace's AI Gateway.
 

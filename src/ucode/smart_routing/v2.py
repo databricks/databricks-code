@@ -16,8 +16,12 @@ import tomlkit
 
 from ucode.config_io import APP_DIR, read_json_safe, write_json_file
 from ucode.constants import LOOPBACK_HOST
-from ucode.databricks import build_auth_token_argv, get_databricks_token
-from ucode.smart_routing import codex_interposer
+from ucode.databricks import (
+    build_auth_token_argv,
+    get_databricks_token,
+    list_anthropic_models,
+)
+from ucode.smart_routing import codex_interposer, routing
 from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, sync_first_prompt_hook
 from ucode.ui import print_note
 
@@ -34,6 +38,7 @@ PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 5
 OAUTH_TOKEN_ENV_VAR = "OAUTH_TOKEN"
 HEALTH_REQUEST_TIMEOUT_SECONDS = 1
 HEALTH_POLL_INTERVAL_SECONDS = 0.25
+CLAUDE_ROUTE_SELECTION_TIMEOUT_S = 20.0
 
 
 def enabled() -> bool:
@@ -76,8 +81,39 @@ def _switch_message(model: str, reason: str) -> str:
     return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
 
 
-def _route_claude_prompt(_prompt: str) -> str:
-    return CLAUDE_TARGET_MODEL
+def _canonical_claude_model_id(model: str) -> str:
+    """Use the system.ai id when Anthropic discovery returns a legacy alias."""
+    prefix = "databricks-claude-"
+    if model.startswith(prefix):
+        return f"system.ai.claude-{model[len(prefix) :]}"
+    return model
+
+
+def _route_claude_prompt(state: dict, token: str, prompt: str) -> routing.RoutingDecision:
+    workspace = state.get("workspace")
+    if not isinstance(workspace, str):
+        raise RuntimeError("workspace metadata is unavailable")
+
+    model_ids, discovery_error = list_anthropic_models(workspace, token)
+    if not model_ids:
+        raise RuntimeError(discovery_error or "Anthropic models endpoint returned no Claude models")
+
+    available: dict[str, str] = {}
+    for model in model_ids:
+        if isinstance(model, str) and model:
+            canonical = _canonical_claude_model_id(model)
+            available.setdefault(routing.normalize_model(canonical), canonical)
+    decision, error = routing.select_route(
+        workspace,
+        token,
+        prompt,
+        [(model, "claude") for model in available],
+        lambda selected: available.get(routing.normalize_model(selected)),
+        timeout=CLAUDE_ROUTE_SELECTION_TIMEOUT_S,
+    )
+    if decision is None:
+        raise RuntimeError(error or "router returned no Claude model selection")
+    return decision
 
 
 def _is_claude_target_model(value: object) -> bool:
@@ -90,18 +126,21 @@ class _ClaudeModelSettingGuard:
     def __init__(self, settings_path: Path) -> None:
         self.settings_path = settings_path
         self._before: dict | None = None
+        self._routed_model: str | None = None
         self._lock: TextIO | None = None
 
-    def begin(self) -> None:
+    def begin(self, routed_model: str) -> None:
         import fcntl
 
         APP_DIR.mkdir(parents=True, exist_ok=True)
         self._lock = open(APP_DIR / "claude-v2-model.lock", "a+", encoding="utf-8")
         fcntl.flock(self._lock, fcntl.LOCK_EX)
         self._before = read_json_safe(self.settings_path)
+        self._routed_model = routed_model
 
     def is_routed(self) -> bool:
-        return _is_claude_target_model(read_json_safe(self.settings_path).get("model"))
+        value = read_json_safe(self.settings_path).get("model")
+        return isinstance(value, str) and value == self._routed_model
 
     def restore(self) -> None:
         import fcntl
@@ -116,6 +155,7 @@ class _ClaudeModelSettingGuard:
                 current.pop("model", None)
             write_json_file(self.settings_path, current)
             self._before = None
+            self._routed_model = None
         finally:
             if self._lock is not None:
                 fcntl.flock(self._lock, fcntl.LOCK_UN)
@@ -142,7 +182,8 @@ def launch_claude(
         raise RuntimeError(
             "Smart routing v2 needs a configured workspace; run `ucode configure claude` first."
         )
-    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, state.get("profile"))
+    token = get_databricks_token(workspace, state.get("profile"))
+    os.environ[OAUTH_TOKEN_ENV_VAR] = token
     os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
 
     run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -167,12 +208,12 @@ def launch_claude(
 
     print_note(
         "Smart routing v2: the first submitted prompt will select Claude Code's "
-        f"model ({CLAUDE_TARGET_MODEL}); log: {CLAUDE_PTY_LOG}."
+        f"model; log: {CLAUDE_PTY_LOG}."
     )
     try:
         returncode = claude_pty.run_claude_pty(
             argv,
-            route_prompt=_route_claude_prompt,
+            route_prompt=lambda prompt: _route_claude_prompt(state, token, prompt).model,
             socket_path=socket_path,
             prepare_model_switch=model_setting.begin,
             model_switch_persisted=model_setting.is_routed,
