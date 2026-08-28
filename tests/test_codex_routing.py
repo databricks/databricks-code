@@ -6,8 +6,22 @@ import json
 import urllib.error
 
 from ucode.smart_routing import codex_routing
+from ucode.smart_routing.codex_hooks import routing_models
 
 WS = "https://example.databricks.com"
+
+
+def test_routing_models_combines_and_deduplicates_codex_and_oss_models():
+    assert routing_models(
+        {
+            "codex_models": ["system.ai.gpt-5-6-sol", "system.ai.gpt-oss-120b"],
+            "oss_models": ["system.ai.gpt-oss-120b", "system.ai.glm-5-2"],
+        }
+    ) == [
+        "system.ai.gpt-5-6-sol",
+        "system.ai.gpt-oss-120b",
+        "system.ai.glm-5-2",
+    ]
 
 
 class _Response:

@@ -29,6 +29,7 @@ from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
+    routing_models,
     sync_smart_routing_hooks,
 )
 from ucode.state import mark_tool_managed, save_state
@@ -432,9 +433,9 @@ def default_model(state: dict) -> str | None:
     """
     if isinstance(state.get("codex_default_model"), str):
         return state.get("codex_default_model")
-    codex_models = state.get("codex_models") or []
+    models = routing_models(state)
     parsed: list[tuple[str, tuple[int, int | None, int | None, str]]] = [
-        (mid, gpt) for mid in codex_models if (gpt := _parse_gpt(mid)) is not None
+        (mid, gpt) for mid in models if (gpt := _parse_gpt(mid)) is not None
     ]
     if parsed:
 
@@ -449,7 +450,7 @@ def default_model(state: dict) -> str | None:
     # after stripping the system.ai. prefix). gpt-oss-* models are confirmed
     # routable through the responses API; non-GPT ids (e.g. moonshotai/kimi-k2.5)
     # would be rejected by the gateway, so they stay excluded.
-    gpt_family = [m for m in codex_models if _is_gpt_family(m)]
+    gpt_family = [m for m in models if _is_gpt_family(m)]
     return gpt_family[0] if gpt_family else None
 
 

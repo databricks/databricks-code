@@ -18,6 +18,7 @@ from typing import Any
 from ucode.config_io import APP_DIR
 from ucode.databricks import get_databricks_token
 from ucode.smart_routing import routing
+from ucode.smart_routing.codex_hooks import routing_models
 from ucode.smart_routing.routing import RoutingDecision
 
 ROUTER_NAME = routing.ROUTER_NAME
@@ -50,8 +51,8 @@ def route_launch_model(state: dict, tool_args: list[str]):
     if task is None:
         return None, None
     workspace = state.get("workspace")
-    models = state.get("codex_models")
-    if not isinstance(workspace, str) or not isinstance(models, list):
+    models = routing_models(state)
+    if not isinstance(workspace, str) or not models:
         return None, "workspace model metadata is unavailable"
     try:
         token = get_databricks_token(workspace, state.get("profile"))

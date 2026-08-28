@@ -411,6 +411,27 @@ class TestCodexSmartRouting:
         assert decision is None
         assert error is None
 
+    def test_route_launch_model_includes_codex_and_oss_models(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(codex_routing, "get_databricks_token", lambda *args: "token")
+
+        def request(workspace, token, task, models):
+            captured["models"] = models
+            return None, "expected test stop"
+
+        monkeypatch.setattr(codex_routing, "request_routing_decision", request)
+
+        codex_routing.route_launch_model(
+            {
+                "workspace": WS,
+                "codex_models": ["system.ai.gpt-5-6-sol"],
+                "oss_models": ["system.ai.glm-5-2"],
+            },
+            ["Fix the parser"],
+        )
+
+        assert captured["models"] == ["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"]
+
 
 class TestCodexRemoveLegacyProfile:
     def test_drops_provider_block_on_modern_path(self, tmp_path, monkeypatch):
@@ -538,6 +559,14 @@ class TestCodexDefaultModel:
         # returns None for them (no semantic version to rank).
         models = ["system.ai.gpt-oss-120b", "system.ai.gpt-oss-20b"]
         assert codex.default_model({"codex_models": models}) == "system.ai.gpt-oss-120b"
+
+    def test_default_model_includes_oss_models(self):
+        state = {
+            "codex_models": [],
+            "oss_models": ["system.ai.kimi-k3", "system.ai.gpt-oss-120b"],
+        }
+
+        assert codex.default_model(state) == "system.ai.gpt-oss-120b"
 
     def test_default_model_prefers_versioned_gpt_over_oss(self):
         # When both versioned and OSS models are present, the versioned one wins.

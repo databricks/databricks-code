@@ -339,6 +339,30 @@ class TestInterposerSession:
         assert json.loads(output)["params"]["model"] == "claude-opus-4-8"
         assert "Task classified as bugfix." in sess.switch_message
 
+    def test_routes_first_prompt_to_oss_model(self):
+        def select(_prompt):
+            return (
+                codex_interposer.routing.RoutingDecision(
+                    model="system.ai.glm-5-2",
+                    raw_model="glm-5-2",
+                    rationale="Short isolated task.",
+                ),
+                None,
+            )
+
+        sess = codex_interposer._Session(
+            None,
+            log=lambda _m: None,
+            available_models=["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"],
+            route_decision=select,
+            switch_message_fn=v2._switch_message,
+        )
+
+        output = sess.on_tui_frame(self._turn_start("system.ai.gpt-5-6-sol"))
+
+        assert json.loads(output)["params"]["model"] == "system.ai.glm-5-2"
+        assert "Selected Model : system.ai.glm-5-2" in sess.switch_message
+
     def test_router_failure_keeps_original_model(self):
         sess = codex_interposer._Session(
             None,
