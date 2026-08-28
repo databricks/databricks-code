@@ -137,6 +137,10 @@ class TestV2Launch:
         assert captured["argv"][-3:] == ["--model", "opus", "--debug"]
         assert captured["routed_model"] == "system.ai.claude-sonnet-5"
         assert claude_hooks.FIRST_PROMPT_SOCKET_ENV in captured["settings"]["env"]
+        first_prompt_command = captured["settings"]["hooks"]["UserPromptSubmit"][0]["hooks"][0][
+            "command"
+        ]
+        assert first_prompt_command == "ucode claude-router-hook route-first-prompt"
         route_commands = [
             hook["command"]
             for group in captured["settings"]["hooks"]["PreToolUse"]
