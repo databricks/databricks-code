@@ -118,6 +118,15 @@ class TestNormalize:
         assert cfg["budget_policy"]["budget_id"] == "c6563b45-df9a-4b19-afb2-d42dc2b52576"
         assert cfg["budget_policy"]["tiers"][1]["default_agent"] == "opencode"
 
+    def test_reads_top_level_display_name(self):
+        cfg = normalize_managed_config({**RAW_MANIFEST, "display_name": "paved-path"})
+        assert cfg["display_name"] == "paved-path"
+
+    def test_display_name_survives_the_serialize_round_trip(self):
+        manifest = normalize_managed_config({**RAW_MANIFEST, "display_name": "paved-path"})
+        assert serialize_managed_config(manifest)["display_name"] == "paved-path"
+        assert normalize_managed_config(serialize_managed_config(manifest)) == manifest
+
     @pytest.mark.parametrize("agent_enum", ["CODING_AGENT_FUTURE", "CODING_AGENT_UNSPECIFIED"])
     def test_unrecognized_agent_enum_dropped(self, agent_enum):
         raw = {"enabled_agents": [{"agent": agent_enum, "config": {}}]}
@@ -252,7 +261,7 @@ class TestPersistence:
         assert managed_state_workspace() is None
 
     def test_loaded_config_serializes_to_a_json_encodable_payload(self, _managed_path):
-        # `ucode apply` POSTs the serialized config, so a manifest that survives a disk round-trip
+        # `ucode publish` POSTs the serialized config, so a manifest that survives a disk round-trip
         # must still serialize to something json.dumps accepts with no custom encoder.
         cfg = normalize_managed_config(RAW_MANIFEST)
         save_managed_state("https://ws.example.com", cfg)

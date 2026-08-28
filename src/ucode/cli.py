@@ -82,7 +82,7 @@ from ucode.managed_resolve import (
     resolve_state,
 )
 from ucode.managed_wizard import (
-    apply_command,
+    publish_command,
     setup_budget_policy_command,
     setup_command,
     setup_help_command,
@@ -1542,6 +1542,7 @@ def _auto_configure_tool(tool: str) -> None:
 # function names via their agent module and their routing module.
 _ROUTING_AGENTS = {"codex": codex_agent, "claude": claude_agent}
 _ROUTING_MODULES = {"codex": codex_routing, "claude": claude_routing}
+CAN_USE_CACHED_CONFIG_AGENTS = frozenset({"claude", "codex"})
 
 
 def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
@@ -1620,6 +1621,10 @@ def _fetch_budget_recommendation(state: dict, managed: dict | None) -> dict | No
     return recommendation
 
 
+def _launch_title(tool: str) -> str:
+    return f"Launching {TOOL_SPECS[tool]['display'].title()} with Unity Gateway"
+
+
 def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = None) -> None:
     """Show the workspace budget this launch spends against, when one is configured."""
     agent = recommendation.get("agent")
@@ -1631,7 +1636,7 @@ def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = 
     line = recommendation_line(display_agent, recommendation.get("model"), percent)
     panel = render_budget_panel(
         recommendation,
-        title=f"ucode with {TOOL_SPECS[tool]['display']}",
+        title=_launch_title(tool),
         extra_lines=[line] if line else None,
         managed=managed,
     )
@@ -1732,10 +1737,49 @@ def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
     _download_managed_skills(managed, state)
 
 
+def _can_launch_from_cached_config(
+    tool: str,
+    state: dict,
+    *,
+    refresh: bool,
+    model: str | None,
+    explicit_provider: str | None,
+    enable_smart_routing_flag: bool,
+    workspace: str | None,
+    needs_auto_configure: bool,
+) -> bool:
+    """Return whether a normal Claude/Codex launch can use its cached config."""
+    if tool not in CAN_USE_CACHED_CONFIG_AGENTS:
+        return False
+
+    if refresh or model or explicit_provider is not None:
+        return False
+
+    smart_routing_enabled = _ROUTING_AGENTS[tool].smart_routing_enabled(state)
+    legacy_smart_routing_enabled = enable_smart_routing_flag or smart_routing_enabled
+
+    # Legacy smart routing overwrites the model into ucode-settings.json and so cannot use the
+    # cached state. Smart routing v2 will use PTY so can use the fast path.
+    if legacy_smart_routing_enabled:
+        return False
+
+    # If managed agent config is enabled, we cannot use the cached state in case the config changed.
+    if managed_agent_config_enabled():
+        return False
+
+    if not (needs_auto_configure or workspace is None):
+        return False
+
+    if tool == "claude":
+        return claude_agent.CLAUDE_SETTINGS_PATH.exists()
+    return codex_agent.has_ucode_config()
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
     provider: str | None = None,
+    refresh: bool = False,
     skip_preflight: bool = False,
     workspace: str | None = None,
     enable_smart_routing_flag: bool = False,
@@ -1773,6 +1817,20 @@ def _launch_tool(
         # back to whatever `ucode configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
         routing_agent = _ROUTING_AGENTS.get(tool)
+        if _can_launch_from_cached_config(
+            tool,
+            state,
+            refresh=refresh,
+            model=model,
+            explicit_provider=explicit_provider,
+            enable_smart_routing_flag=enable_smart_routing_flag,
+            workspace=workspace,
+            needs_auto_configure=needs_auto_configure,
+        ):
+            print_section(_launch_title(tool))
+            print_success(f"Starting {TOOL_SPECS[tool]['display']}")
+            launch_agent(tool, state, ctx.args)
+            return
         # Fetched before `configure_shared_state` because it decides whether this agent may launch
         # at all and whether the model discovery below can be skipped.
         # Bare `ucode` already fetched one to choose the agent; refetching would double the
@@ -1956,7 +2014,7 @@ def _launch_tool(
             route_root_model=route_root_model,
             custom_model=model if tool == "claude" else None,
         )
-        print_section(f"ucode with {TOOL_SPECS[tool]['display']}")
+        print_section(_launch_title(tool))
         if managed is not None:
             print_kv("Config", "workspace-managed")
         if provider:
@@ -2026,6 +2084,11 @@ SkipPreflightOption = Annotated[
         "prior `ucode configure`.",
     ),
 ]
+
+REFRESH_HELP = (
+    "Refresh Databricks auth, gateway, models, managed config, and agent configuration before "
+    "launching."
+)
 
 # Ignore the workspace's managed coding-agent config for this one command, on both
 # `ucode configure` and the launchers. Accepted (and no-op) even when the managed-config
@@ -2178,7 +2241,7 @@ def _print_no_managed_config_guidance(workspace: str, profile: str | None) -> No
         print_note("Ask a workspace admin to set one up with `ucode setup`.")
     else:
         # None means the admin check itself failed; point at setup rather than a dead end.
-        print_note("Run `ucode setup` to configure one for your workspace, then `ucode apply`.")
+        print_note("Run `ucode setup` to configure one for your workspace, then `ucode publish`.")
 
 
 @app.command("codex", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -2193,6 +2256,13 @@ def codex_cmd(
             "before any `--` separator.",
         ),
     ] = None,
+    refresh: Annotated[
+        bool,
+        typer.Option(
+            "--refresh",
+            help=REFRESH_HELP,
+        ),
+    ] = False,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
     workspace: WorkspaceOption = None,
@@ -2224,6 +2294,7 @@ def codex_cmd(
         "codex",
         ctx,
         provider=provider,
+        refresh=refresh,
         skip_preflight=skip_preflight,
         workspace=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
@@ -2252,6 +2323,13 @@ def claude_cmd(
             "Pass before any `--` separator; not usable with --provider.",
         ),
     ] = None,
+    refresh: Annotated[
+        bool,
+        typer.Option(
+            "--refresh",
+            help=REFRESH_HELP,
+        ),
+    ] = False,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
     workspace: WorkspaceOption = None,
@@ -2294,6 +2372,7 @@ def claude_cmd(
         ctx,
         provider=provider,
         model=model,
+        refresh=refresh,
         skip_preflight=skip_preflight,
         workspace=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
@@ -2463,7 +2542,7 @@ def configure(
         typer.Option(
             "--enable-databricks-ai-tools/--disable-databricks-ai-tools",
             help="Install Databricks AI Tools (skills + plugins that teach agents to use "
-            "Databricks) for the configured agents. Installed by default; pass "
+            "Databricks) for the configured agents. Installation is configure-only; pass "
             "--disable-databricks-ai-tools to opt out.",
         ),
     ] = None,
@@ -2941,7 +3020,7 @@ def setup_help_cmd() -> None:
 
 @setup_app.command("show")
 def setup_show_cmd() -> None:
-    """Print the authored managed config and the payload `ucode apply` would publish."""
+    """Print the authored managed config and the payload `ucode publish` would publish."""
     try:
         code = show_command()
     except RuntimeError as exc:
@@ -2951,8 +3030,17 @@ def setup_show_cmd() -> None:
         raise typer.Exit(code)
 
 
-@app.command("apply")
-def apply_cmd(
+@app.command("publish")
+def publish_cmd(
+    file_path: Annotated[
+        str | None,
+        typer.Option(
+            "--file",
+            "-f",
+            help="Publish a config file exported with `ucode export` instead of the locally "
+            "authored config. Its `workspace` must match the configured workspace.",
+        ),
+    ] = None,
     yes: Annotated[
         bool,
         typer.Option("--yes", "-y", help="Publish without the confirmation prompt."),
@@ -2968,7 +3056,7 @@ def apply_cmd(
     # the try block or the handler below would report a successful exit as an error.
     try:
         install_databricks_cli()
-        code = apply_command(yes=yes)
+        code = publish_command(file_path=file_path, yes=yes)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
@@ -2981,11 +3069,11 @@ def apply_cmd(
 
 @app.command("export")
 def export_cmd(
-    output: Annotated[
+    file_path: Annotated[
         str | None,
         typer.Option(
-            "--output",
-            "-o",
+            "--file",
+            "-f",
             help="Write the exported config JSON to this file (atomically) instead of stdout. "
             "The parent directory must already exist.",
         ),
@@ -2996,13 +3084,13 @@ def export_cmd(
     Serializes the local managed config to the external `CodingAgentConfig` format that
     `ucode publish -f <path>` consumes, with credentials and server-owned fields (resource name,
     workspace id, timestamps, user ids) excluded. Any user can run it; it makes no network calls
-    and mutates no workspace or local state. Without --output the JSON is printed to stdout;
+    and mutates no workspace or local state. Without --file the JSON is printed to stdout;
     diagnostics and errors go to stderr.
     """
     from ucode.managed_export import export_command
 
     try:
-        export_command(output=output)
+        export_command(file_path=file_path)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
