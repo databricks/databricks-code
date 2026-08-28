@@ -319,12 +319,6 @@ def resolve_provider_models(
     # model selection server-side for that tier, so there's nothing to reconcile.
     if relayed:
         return None, None, relayed
-    # Pin the declared targets by family so the client sends exactly the ids the MPS
-    # allows. Bedrock always needed this (its slugs aren't Claude Code's canonical
-    # names); an API-key Anthropic service needs it too, else the client sends
-    # canonical names that may miss the declared targets and the gateway 403s with
-    # "not in the allowed models list". map_claude_family_models maps both Bedrock
-    # slugs and canonical Anthropic ids, and yields nothing for a non-Claude service.
     return map_claude_family_models(service.get("targets") or []) or None, None, relayed
 
 
