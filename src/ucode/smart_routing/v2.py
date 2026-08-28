@@ -80,7 +80,7 @@ def _wait_for_app_server(port: int, timeout: float) -> bool:
     return False
 
 
-def _switch_message(model: str, reason: str | None, *, title: str | None = None) -> str:
+def format_routing_notice(model: str, reason: str | None, *, title: str | None = None) -> str:
     lines = [
         *([title] if title else []),
         "Using Unity Gateway Smart Router.",
@@ -240,7 +240,7 @@ def route_claude_pre_tool_use(
             route.decision,
             route.routed_model,
         )
-    routing_message = _switch_message(
+    routing_message = format_routing_notice(
         route.routed_model,
         route.decision.rationale,
         title="Subagent Smart Routing",
@@ -476,7 +476,7 @@ def launch_codex(
             available_models=available_models,
             workspace=workspace,
             token_provider=lambda: get_databricks_token(workspace, profile),
-            switch_message_fn=_switch_message,
+            switch_message_fn=format_routing_notice,
             log_path=CODEX_INTERPOSER_LOG,
         )
         tui_url = _loopback_websocket_url(tui_port)

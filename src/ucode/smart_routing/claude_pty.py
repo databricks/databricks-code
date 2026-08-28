@@ -150,7 +150,7 @@ def request_first_prompt_route(path: Path, payload: dict, *, timeout: float = 5.
 
 def first_prompt_hook_output(response: dict | None) -> dict | None:
     """Translate the wrapper response into Claude hook output."""
-    from ucode.smart_routing.v2 import _switch_message
+    from ucode.smart_routing.v2 import format_routing_notice
 
     if not isinstance(response, dict) or response.get("action") != "block":
         return None
@@ -161,7 +161,9 @@ def first_prompt_hook_output(response: dict | None) -> dict | None:
     rationale = response.get("rationale")
     return {
         "decision": "block",
-        "reason": _switch_message(model, rationale if isinstance(rationale, str) else None),
+        "reason": format_routing_notice(
+            model, rationale if isinstance(rationale, str) else None
+        ),
     }
 
 

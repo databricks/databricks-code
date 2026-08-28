@@ -35,7 +35,10 @@ class TestFirstPromptHook:
             {"action": "block", "model": model, "rationale": reason}
         )
 
-        assert result == {"decision": "block", "reason": v2._switch_message(model, reason)}
+        assert result == {
+            "decision": "block",
+            "reason": v2.format_routing_notice(model, reason),
+        }
 
     def test_omits_reason_when_router_returns_none(self):
         result = claude_pty.first_prompt_hook_output(
@@ -300,7 +303,7 @@ class TestSubagentRouting:
         assert updated_input["subagent_type"] == v2._routed_claude_agent_name(
             "system.ai.claude-opus-4-8"
         )
-        expected_message = v2._switch_message(
+        expected_message = v2.format_routing_notice(
             "system.ai.claude-opus-4-8",
             "",
             title="Subagent Smart Routing",
