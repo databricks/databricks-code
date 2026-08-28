@@ -39,19 +39,23 @@ from ucode.gateway_proxy import (
 )
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
+from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.claude_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
 )
-from ucode.state import mark_tool_managed, save_state
+from ucode.smart_routing.claude_routing import CLAUDE_VALUE_OPTIONS
+from ucode.state import get_provider_service, mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_err, print_note, print_success, print_warning
 
+GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
+# The default model is stored in Claude's default user settings, not the ucode settings.
+CLAUDE_USER_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
-GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 
 SPEC: ToolSpec = {
     "binary": "claude",
@@ -69,6 +73,23 @@ SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 # Claude Code settings.json hook events ucode manages when routing is enabled;
 # marked managed so they're tracked/reverted with the rest of ucode's config.
 CLAUDE_ROUTING_HOOK_EVENTS = ("PreToolUse", "SessionStart", "SubagentStart")
+CLAUDE_NONINTERACTIVE_FLAGS = frozenset(
+    {"-p", "--print", "--bg", "--background", "--cloud", "-h", "--help", "-v", "--version"}
+)
+CLAUDE_OPTIONAL_VALUE_OPTIONS = frozenset(
+    {
+        "-d",
+        "--debug",
+        "--from-pr",
+        "--prompt-suggestions",
+        "-r",
+        "--resume",
+        "--remote-control",
+        "--teleport",
+        "-w",
+        "--worktree",
+    }
+)
 
 
 def is_update_available() -> tuple[str, str] | None:
@@ -314,7 +335,9 @@ def render_overlay(
     # Native /model discovery: picker lists every gateway Messages-API endpoint,
     # not just the family aliases. Skipped under a provider (its routing header
     # would send a discovered gateway id to a provider that can't resolve it).
-    discovery_enabled = os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1"
+    discovery_enabled = (
+        os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1" or smart_routing_v2.enabled()
+    )
     if discovery_enabled and not provider:
         env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     # Intentionally NOT setting ANTHROPIC_MODEL by default. Setting it produces a
@@ -883,6 +906,72 @@ def _merge_claude_settings(base: dict, overlay: dict) -> dict:
     return merged
 
 
+def _compose_v2_settings(tool_args: list[str]) -> tuple[dict, list[str]]:
+    """Compose caller settings with ucode's Claude settings for a v2 launch."""
+    caller_values, remaining = _extract_caller_settings(tool_args)
+    settings: dict = {}
+    for value in caller_values:
+        settings = _merge_claude_settings(settings, _load_caller_settings(value))
+    return _merge_claude_settings(settings, read_json_safe(CLAUDE_SETTINGS_PATH)), remaining
+
+
+def _original_launch_model(state: dict) -> str | None:
+    override = state.get("_claude_launch_model")
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+    value = read_json_safe(CLAUDE_USER_SETTINGS_PATH).get("model")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default_model(state)
+
+
+def _has_launch_model_override(state: dict) -> bool:
+    override = state.get("_claude_launch_model")
+    return isinstance(override, str) and bool(override.strip())
+
+
+def _has_provider_launch(state: dict) -> bool:
+    transient = state.get("_claude_launch_provider")
+    return (isinstance(transient, str) and bool(transient.strip())) or bool(
+        get_provider_service(state, "claude")
+    )
+
+
+def _uses_interactive_tui(tool_args: list[str]) -> bool:
+    if any(arg in CLAUDE_NONINTERACTIVE_FLAGS for arg in tool_args):
+        return False
+
+    index = 0
+    while index < len(tool_args):
+        arg = tool_args[index]
+        if arg == "--":
+            return index == len(tool_args) - 1
+        if arg in CLAUDE_VALUE_OPTIONS:
+            index += 2
+            continue
+        if arg in CLAUDE_OPTIONAL_VALUE_OPTIONS:
+            if index + 1 < len(tool_args) and not tool_args[index + 1].startswith("-"):
+                index += 2
+            else:
+                index += 1
+            continue
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return False
+    return True
+
+
+def _has_explicit_model_arg(tool_args: list[str]) -> bool:
+    return any(arg in {"--model", "-m"} or arg.startswith("--model=") for arg in tool_args)
+
+
+def _launch_model_args(tool_args: list[str], launch_model: str | None) -> list[str]:
+    if not launch_model or _has_explicit_model_arg(tool_args):
+        return []
+    return ["--model", launch_model]
+
+
 def _build_claude_argv(
     binary: str,
     tool_args: list[str],
@@ -1036,7 +1125,10 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
-def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
+def _launch_claude_with_gateway_proxy(
+    state: dict, binary: str, tool_args: list[str], *, smart_routing: bool
+) -> None:
+    """Launch Claude through a refreshing gateway proxy."""
     workspace = state["workspace"]
     server, cache, client = start_anthropic_model_discovery_proxy(
         workspace,
@@ -1053,17 +1145,33 @@ def _launch_gateway(state: dict, binary: str, tool_args: list[str]) -> None:
 
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-    settings_override = {
-        "env": {"ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"]},
-    }
-    proc = subprocess.Popen(
-        _build_claude_argv(binary, tool_args, settings_override=settings_override)
-    )
+    settings_override = {"env": {"ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"]}}
     try:
-        returncode = proc.wait()
-    except KeyboardInterrupt:
-        proc.send_signal(signal.SIGINT)
-        returncode = proc.wait()
+        if smart_routing:
+
+            def compose_gateway_settings(args: list[str]) -> tuple[dict, list[str]]:
+                settings, remaining = _compose_v2_settings(args)
+                return _merge_claude_settings(settings, settings_override), remaining
+
+            smart_routing_v2.launch_claude(
+                state,
+                tool_args,
+                binary=binary,
+                user_settings_path=CLAUDE_USER_SETTINGS_PATH,
+                launch_model=_original_launch_model(state),
+                compose_settings=compose_gateway_settings,
+                launch_model_args=_launch_model_args,
+            )
+            return
+
+        proc = subprocess.Popen(
+            _build_claude_argv(binary, tool_args, settings_override=settings_override)
+        )
+        try:
+            returncode = proc.wait()
+        except KeyboardInterrupt:
+            proc.send_signal(signal.SIGINT)
+            returncode = proc.wait()
     finally:
         cache.stop()
         server.shutdown()
@@ -1077,8 +1185,25 @@ def launch(state: dict, tool_args: list[str]) -> None:
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
         return
+    first_prompt_routing = (
+        smart_routing_v2.enabled()
+        and bool(workspace)
+        and not _has_launch_model_override(state)
+        and not _has_explicit_model_arg(tool_args)
+        and not _has_provider_launch(state)
+        and _uses_interactive_tui(tool_args)
+    )
+    # Smart routing v2 needs Unix PTY support, which Windows does not provide.
+    if first_prompt_routing and os.name == "nt":
+        raise RuntimeError(
+            "Smart routing in Claude Code is currently not supported on Windows. "
+            "Please use Codex or disable smart routing."
+        )
+    if first_prompt_routing:
+        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=True)
+        return
     if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
-        _launch_gateway(state, binary, tool_args)
+        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=False)
         return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))

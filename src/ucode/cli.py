@@ -107,6 +107,8 @@ from ucode.skills_download import (
     download_managed_skills_on_launch,
 )
 from ucode.smart_routing import claude_routing, codex_routing
+from ucode.smart_routing import v2 as smart_routing_v2
+from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, ROUTE_FIRST_PROMPT_EVENT
 from ucode.state import (
     STATE_PATH,
     clear_state,
@@ -1403,10 +1405,14 @@ def claude_router_hook_cmd(
     profile: Annotated[str | None, typer.Option("--profile")] = None,
     use_pat: Annotated[bool, typer.Option("--use-pat")] = False,
     model: Annotated[list[str] | None, typer.Option("--model")] = None,
+    socket_path: Annotated[str | None, typer.Option("--socket")] = None,
 ) -> None:
     """Run a Claude Code smart-routing lifecycle hook."""
     import json
     import sys
+
+    if event == ROUTE_FIRST_PROMPT_EVENT and not smart_routing_v2.enabled():
+        return
 
     from ucode.smart_routing.claude_routing import (
         record_session_start,
@@ -1419,6 +1425,22 @@ def claude_router_hook_cmd(
     except ValueError:
         return
     if not isinstance(payload, dict):
+        return
+    if event == ROUTE_FIRST_PROMPT_EVENT:
+        if not socket_path:
+            socket_path = os.environ.get(FIRST_PROMPT_SOCKET_ENV)
+        if not socket_path:
+            return
+        from pathlib import Path
+
+        from ucode.smart_routing.claude_pty import (
+            first_prompt_hook_output,
+            request_first_prompt_route,
+        )
+
+        output = first_prompt_hook_output(request_first_prompt_route(Path(socket_path), payload))
+        if output is not None:
+            sys.stdout.write(json.dumps(output))
         return
     if event == "session-start":
         record_session_start(payload)
@@ -1862,7 +1884,12 @@ def _launch_tool(
                 managed_launch_model(managed, recommendation, tool) if managed is not None else None
             )
             state, resolved_model = resolve_launch_model(tool, state, managed_model)
-            if routing_agent is not None and routing_agent.smart_routing_enabled(state):
+            first_prompt_routes_claude = tool == "claude" and smart_routing_v2.enabled()
+            if (
+                routing_agent is not None
+                and routing_agent.smart_routing_enabled(state)
+                and not first_prompt_routes_claude
+            ):
                 display = TOOL_SPECS[tool]["display"]
                 with spinner(f"Selecting a {display} model with smart routing..."):
                     decision, routing_error = _ROUTING_MODULES[tool].route_launch_model(
@@ -1957,6 +1984,16 @@ def _launch_tool(
         if managed is not None and not is_dry_run():
             _register_managed_mcp_servers(managed, tool, state)
             _apply_managed_skills(managed, tool, state)
+        if tool == "claude":
+            if smart_routing_v2.enabled():
+                # Transient launch precedence for the v2 PTY's initial --model flag.
+                # An explicit choice wins, followed by a routed/managed root pick;
+                # neither value is persisted into workspace state.
+                launch_model = model or route_root_model
+                if launch_model:
+                    state["_claude_launch_model"] = launch_model
+            if provider:
+                state["_claude_launch_provider"] = provider
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
     except RuntimeError as exc:
