@@ -1171,8 +1171,7 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
         token_header=AI_GATEWAY_TOKEN_HEADER,
         force_refresh_near_expiry=False,
     )
-    if cache is None:  # defensive: relayed mode always requests swap-token refresh
-        raise RuntimeError("Relayed proxy did not initialize its token cache.")
+    assert cache is not None
     # start_proxy falls back to an OS-assigned port when the cached one is taken
     # (stale proxy from a killed session). Reconcile settings + state to whatever
     # it actually bound, so Claude Code connects to the live port.
@@ -1196,12 +1195,12 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
-def _launch_claude_with_model_discovery_proxy(
+def _launch_claude_with_gateway_proxy(
     state: dict, binary: str, tool_args: list[str], *, smart_routing: bool
 ) -> None:
-    """Launch Claude through the model-alias proxy using apiKeyHelper auth."""
+    """Launch Claude through the gateway model-alias proxy."""
     workspace = state["workspace"]
-    server, cache, client = start_anthropic_model_discovery_proxy(
+    server, _cache, client = start_anthropic_model_discovery_proxy(
         workspace,
         state.get("profile"),
         0,
@@ -1243,8 +1242,6 @@ def _launch_claude_with_model_discovery_proxy(
             proc.send_signal(signal.SIGINT)
             returncode = proc.wait()
     finally:
-        if cache is not None:
-            cache.stop()
         server.shutdown()
         client.close()
     raise SystemExit(returncode)
@@ -1271,10 +1268,10 @@ def launch(state: dict, tool_args: list[str]) -> None:
             "Please use Codex or disable smart routing."
         )
     if first_prompt_routing:
-        _launch_claude_with_model_discovery_proxy(state, binary, tool_args, smart_routing=True)
+        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=True)
         return
     if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
-        _launch_claude_with_model_discovery_proxy(state, binary, tool_args, smart_routing=False)
+        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=False)
         return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))

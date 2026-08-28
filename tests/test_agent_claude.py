@@ -906,7 +906,6 @@ class TestClaudeLaunch:
 
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "fresh-token")
         monkeypatch.setattr(claude, "start_anthropic_model_discovery_proxy", start_proxy)
         monkeypatch.setattr(
             claude,
