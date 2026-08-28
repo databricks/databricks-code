@@ -26,6 +26,7 @@ class _Response:
 
 def test_routes_with_task_v1_codex_menu(monkeypatch):
     captured = {}
+    task = "Refactor the parser" + "x" * 5000
 
     def fake_urlopen(request, timeout):
         captured["url"] = request.full_url
@@ -44,7 +45,7 @@ def test_routes_with_task_v1_codex_menu(monkeypatch):
     decision, error = codex_routing.request_routing_decision(
         WS,
         "token",
-        "Refactor the parser",
+        task,
         ["system.ai.gpt-5-6-luna", "system.ai.gpt-5-6-sol"],
     )
 
@@ -62,7 +63,7 @@ def test_routes_with_task_v1_codex_menu(monkeypatch):
             {"model": "gpt-5-6-sol", "harness": "codex"},
             {"model": "gpt-5-6-luna", "harness": "codex"},
         ],
-        "task": {"prompt": "Refactor the parser"},
+        "task": {"prompt": task},
         "route_selector": {"router_name": "task_v1"},
     }
 
