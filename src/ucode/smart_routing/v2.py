@@ -120,19 +120,23 @@ def _routed_claude_agent_name(model: str) -> str:
     return f"{CLAUDE_ROUTED_AGENT_PREFIX}{slug[:36]}-{digest}"
 
 
-def _routed_claude_agent_definitions(model_ids: list[str]) -> dict[str, dict[str, str]]:
+def _routed_claude_agent_definitions(
+    model_ids: list[str], model_name: Callable[[str], str]
+) -> dict[str, dict[str, str]]:
     return {
         _routed_claude_agent_name(model): {
             "description": f"Smart-routed coding agent using {model}",
             "prompt": CLAUDE_ROUTED_AGENT_PROMPT,
-            "model": model,
+            "model": model_name(model),
         }
         for model in _canonical_claude_models(model_ids)
     }
 
 
-def _with_routed_claude_agents(tool_args: list[str], model_ids: list[str]) -> list[str]:
-    definitions = _routed_claude_agent_definitions(model_ids)
+def _with_routed_claude_agents(
+    tool_args: list[str], model_ids: list[str], model_name: Callable[[str], str]
+) -> list[str]:
+    definitions = _routed_claude_agent_definitions(model_ids, model_name)
     caller_definitions: dict = {}
     remaining: list[str] = []
     index = 0
@@ -314,6 +318,7 @@ def launch_claude(
     launch_model: str | None,
     compose_settings: Callable[[list[str]], tuple[dict, list[str]]],
     launch_model_args: Callable[[list[str], str | None], list[str]],
+    model_name: Callable[[str], str],
 ) -> NoReturn:
     """Launch Claude in the first-prompt routing PTY wrapper."""
     from ucode.agents.claude import GATEWAY_MODEL_DISCOVERY_ENV_VAR
@@ -352,14 +357,14 @@ def launch_claude(
     sync_first_prompt_hook(settings, hook_executable)
     write_json_file(settings_path, settings)
     model_args = launch_model_args(remaining, launch_model)
-    routed_agent_args = _with_routed_claude_agents(remaining, model_ids)
+    routed_agent_args = _with_routed_claude_agents(remaining, model_ids, model_name)
     argv = [binary, "--settings", str(settings_path), *model_args, *routed_agent_args]
 
     model_setting = _ClaudeModelSettingGuard(user_settings_path)
 
     def route_prompt(prompt: str) -> tuple[str, str]:
         decision = _route_claude_prompt(state, token, prompt, model_ids)
-        return decision.model, decision.rationale
+        return model_name(decision.model), decision.rationale
 
     print_note(
         "Smart routing v2: the first submitted prompt will select Claude Code's "

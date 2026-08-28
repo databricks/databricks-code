@@ -149,18 +149,19 @@ class TestV2Launch:
                 launch_model="opus",
                 compose_settings=claude._compose_v2_settings,
                 launch_model_args=claude._launch_model_args,
+                model_name=claude._maybe_add_1m_suffix,
             )
 
         assert exc.value.code == 0
         assert captured["argv"][3:5] == ["--model", "opus"]
         assert captured["argv"][-1] == "--debug"
         assert captured["routed_model"] == (
-            "system.ai.claude-sonnet-5",
+            "system.ai.claude-sonnet-5[1m]",
             "Selected for the parser task.",
         )
         assert {definition["model"] for definition in captured["agents"].values()} == {
-            "system.ai.claude-opus-4-8",
-            "system.ai.claude-sonnet-5",
+            "system.ai.claude-opus-4-8[1m]",
+            "system.ai.claude-sonnet-5[1m]",
         }
         assert claude_hooks.FIRST_PROMPT_SOCKET_ENV in captured["settings"]["env"]
         first_prompt_command = captured["settings"]["hooks"]["UserPromptSubmit"][0]["hooks"][0][
@@ -210,6 +211,7 @@ class TestV2Launch:
                 launch_model="opus",
                 compose_settings=lambda _args: ({}, []),
                 launch_model_args=claude._launch_model_args,
+                model_name=claude._maybe_add_1m_suffix,
             )
 
         assert json.loads(user_settings.read_text()) == {"model": "user-selected"}
@@ -245,6 +247,7 @@ class TestV2Launch:
                 launch_model=None,
                 compose_settings=lambda _args: ({}, []),
                 launch_model_args=claude._launch_model_args,
+                model_name=claude._maybe_add_1m_suffix,
             )
 
         assert json.loads(user_settings.read_text()) == {
@@ -328,14 +331,22 @@ class TestSubagentRouting:
                 "--debug",
             ],
             ["databricks-claude-opus-4-8"],
+            claude._maybe_add_1m_suffix,
         )
 
         assert args[0] == "--agents"
         definitions = json.loads(args[1])
         assert definitions["reviewer"]["prompt"] == "Review the requested code."
         routed = definitions[v2._routed_claude_agent_name("system.ai.claude-opus-4-8")]
-        assert routed["model"] == "system.ai.claude-opus-4-8"
+        assert routed["model"] == "system.ai.claude-opus-4-8[1m]"
         assert args[2:] == ["--debug"]
+
+    def test_leaves_non_claude_custom_agent_model_unchanged(self):
+        definitions = v2._routed_claude_agent_definitions(
+            ["catalog.schema.gpt-5"], claude._maybe_add_1m_suffix
+        )
+
+        assert next(iter(definitions.values()))["model"] == "catalog.schema.gpt-5"
 
     def test_model_switch_lock_serializes_routed_sessions(self, tmp_path, monkeypatch):
         user_settings = tmp_path / "settings.json"
