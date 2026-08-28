@@ -161,9 +161,7 @@ def first_prompt_hook_output(response: dict | None) -> dict | None:
     rationale = response.get("rationale")
     return {
         "decision": "block",
-        "reason": format_routing_notice(
-            model, rationale if isinstance(rationale, str) else None
-        ),
+        "reason": format_routing_notice(model, rationale if isinstance(rationale, str) else None),
     }
 
 
