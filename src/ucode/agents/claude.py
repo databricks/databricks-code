@@ -15,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
+from ucode import gateway_proxy
 from ucode.agent_updates import available_npm_package_update
 from ucode.anthropic_model_discovery_proxy import (
     start_proxy as start_anthropic_model_discovery_proxy,
@@ -33,7 +34,6 @@ from ucode.databricks import (
     build_tool_base_url,
     get_databricks_token,
 )
-from ucode.gateway_proxy import AI_GATEWAY_TOKEN_HEADER
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing import v2 as smart_routing_v2
@@ -1164,14 +1164,13 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     if not isinstance(port, int):
         raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
 
-    server, cache, client = start_anthropic_model_discovery_proxy(
+    server, cache, client = gateway_proxy.start_proxy(
         workspace,
         state.get("profile"),
         port,
-        token_header=AI_GATEWAY_TOKEN_HEADER,
+        token_header=gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
         force_refresh_near_expiry=False,
     )
-    assert cache is not None
     # start_proxy falls back to an OS-assigned port when the cached one is taken
     # (stale proxy from a killed session). Reconcile settings + state to whatever
     # it actually bound, so Claude Code connects to the live port.
@@ -1200,15 +1199,7 @@ def _launch_claude_with_gateway_proxy(
 ) -> None:
     """Launch Claude through the gateway model-alias proxy."""
     workspace = state["workspace"]
-    server, _cache, client = start_anthropic_model_discovery_proxy(
-        workspace,
-        state.get("profile"),
-        0,
-        token_header=None,
-        force_refresh_near_expiry=False,
-    )
-    if not smart_routing:
-        os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
+    server, client = start_anthropic_model_discovery_proxy(workspace, 0)
     os.environ["ANTHROPIC_BASE_URL"] = f"http://{LOOPBACK_HOST}:{server.server_address[1]}"
     os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
 

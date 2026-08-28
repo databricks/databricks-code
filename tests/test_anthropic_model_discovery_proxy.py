@@ -41,13 +41,6 @@ class _FakeClient:
         return self.response
 
 
-class _FakeCache:
-    token = "databricks-token"
-
-    def refresh(self):
-        return None
-
-
 class _Collect(io.RawIOBase):
     def __init__(self):
         self.data = bytearray()
@@ -157,8 +150,6 @@ class TestAnthropicModelDiscoveryHandler:
         handler = _handler(out)
         handler.headers = {"X-Api-Key": "api-key-helper-token"}
         handler.rfile = io.BytesIO()
-        handler.cache = None
-        handler.token_header = None
         handler.client = _FakeClient(_FakeResponse(200, {}, b'{"data":[]}'))
 
         handler._handle()
@@ -168,20 +159,22 @@ class TestAnthropicModelDiscoveryHandler:
         assert "Authorization" not in headers
         assert "X-Databricks-AI-Gateway-Token" not in headers
 
-    def test_inherits_relayed_auth_and_prefixes_models(self):
+    def test_prefixes_models_and_strips_hop_by_hop_headers(self):
         out = _Collect()
         handler = _handler(out)
-        handler.headers = {"Authorization": "Bearer subscription-token"}
+        handler.headers = {
+            "X-Api-Key": "api-key-helper-token",
+            "Connection": "keep-alive",
+            "Host": "127.0.0.1",
+        }
         handler.rfile = io.BytesIO()
-        handler.cache = _FakeCache()
         handler.client = _FakeClient(_FakeResponse(200, {}, b'{"data":[{"id":"custom-model"}]}'))
 
         handler._handle()
 
         method, url, headers, body = handler.client.request
         assert (method, url, body) == ("GET", "v1/models", None)
-        assert headers["Authorization"] == "Bearer subscription-token"
-        assert headers["X-Databricks-AI-Gateway-Token"] == "Bearer databricks-token"
+        assert headers == {"X-Api-Key": "api-key-helper-token"}
         assert b"anthropic-aigw-custom-model" in bytes(out.data)
 
     def test_prefixes_successful_model_response_and_drops_content_encoding(self):
@@ -210,20 +203,18 @@ class TestAnthropicModelDiscoveryHandler:
         assert response.read_calls == 0
         assert response.iter_raw_calls == 1
 
-    def test_streams_relayed_inference_response_without_buffering(self):
+    def test_streams_inference_response_without_buffering(self):
         out = _Collect()
         handler = _handler(out, path="/v1/messages", command="POST")
-        handler.headers = {"Authorization": "Bearer subscription-token", "Content-Length": "2"}
+        handler.headers = {"X-Api-Key": "api-key-helper-token", "Content-Length": "2"}
         handler.rfile = io.BytesIO(b"{}")
-        handler.cache = _FakeCache()
         response = _FakeResponse(200, {"Content-Type": "text/event-stream"}, b"data: event\n\n")
         handler.client = _FakeClient(response)
 
         handler._handle()
 
         _method, _url, headers, _body = handler.client.request
-        assert headers["Authorization"] == "Bearer subscription-token"
-        assert headers["X-Databricks-AI-Gateway-Token"] == "Bearer databricks-token"
+        assert headers == {"X-Api-Key": "api-key-helper-token"}
         assert response.read_calls == 0
         assert response.iter_raw_calls == 1
         assert b"data: event\n\n" in bytes(out.data)
@@ -240,51 +231,18 @@ class TestAnthropicModelDiscoveryHandler:
         assert json.loads(body) == {"model": "catalog.schema.custom"}
 
 
-def test_start_proxy_uses_discovery_handler(monkeypatch):
-    class _StubCache:
-        def run_refresher(self):
-            return None
-
-    cache = _StubCache()
-    monkeypatch.setattr(
-        anthropic_model_discovery_proxy,
-        "TokenCache",
-        lambda *_args, **_kwargs: cache,
-    )
-
-    server, actual_cache, client = anthropic_model_discovery_proxy.start_proxy(
-        "https://workspace.example.com", "profile", 0, "header", False
-    )
+def test_start_proxy_uses_discovery_handler():
+    server, client = anthropic_model_discovery_proxy.start_proxy("https://workspace.example.com", 0)
     try:
         handler = server.RequestHandlerClass
         assert issubclass(
             handler,
             anthropic_model_discovery_proxy._AnthropicModelDiscoveryHandler,
         )
-        assert handler.cache is cache
         assert isinstance(
             handler.anthropic_model_aliases,
             anthropic_model_discovery_proxy._AnthropicModelAliases,
         )
-        assert actual_cache is cache
-    finally:
-        server.server_close()
-        client.close()
-
-
-def test_start_proxy_skips_token_cache_without_refresh_header(monkeypatch):
-    def unexpected_cache(*_args, **_kwargs):
-        raise AssertionError("passthrough proxy must not create a token cache")
-
-    monkeypatch.setattr(anthropic_model_discovery_proxy, "TokenCache", unexpected_cache)
-
-    server, cache, client = anthropic_model_discovery_proxy.start_proxy(
-        "https://workspace.example.com", "profile", 0, None, False
-    )
-    try:
-        assert cache is None
-        assert server.RequestHandlerClass.cache is None
-        assert server.RequestHandlerClass.token_header is None
     finally:
         server.server_close()
         client.close()
