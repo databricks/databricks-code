@@ -366,9 +366,7 @@ class TestInterposerSession:
             codex_interposer.ITEM_STARTED,
             codex_interposer.ITEM_COMPLETED,
         ]
-        assert "Selected Model : system.ai.gpt-5-6-luna" in (
-            injected[0]["params"]["item"]["text"]
-        )
+        assert "Selected Model : system.ai.gpt-5-6-luna" in (injected[0]["params"]["item"]["text"])
 
     def test_routes_first_prompt_to_oss_model(self):
         def select(_prompt):

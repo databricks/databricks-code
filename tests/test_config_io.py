@@ -271,7 +271,6 @@ class TestParseDotenv:
         p.write_text("URL=http://example.com?a=1\n", encoding="utf-8")
         assert parse_dotenv(p) == {"URL": "http://example.com?a=1"}
 
-
     def test_preserves_trailing_spaces_in_value(self, tmp_path):
         p = tmp_path / ".env"
         p.write_text("TOKEN=abc123 \n", encoding="utf-8")
@@ -284,6 +283,7 @@ class TestParseDotenv:
         # Leading whitespace after "=" is still trimmed, trailing spaces survive.
         p.write_text("TOKEN = abc123   \n", encoding="utf-8")
         assert parse_dotenv(p) == {"TOKEN": "abc123   "}
+
 
 # ---------------------------------------------------------------------------
 # deep_merge_dict
