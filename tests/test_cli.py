@@ -289,10 +289,10 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert mock_configure.call_args.args[2] == "databricks-gpt-5-5"
         # The launch notice surfaces both the routed model and the rationale.
-        assert (
-            "Using Smart Routing. Routing to databricks-gpt-5-5. Cross-cutting refactor."
-            in _strip_ansi(result.output)
-        )
+        output = _strip_ansi(result.output)
+        assert "Using Unity Gateway Smart Router." in output
+        assert "Selected Model : databricks-gpt-5-5" in output
+        assert "Reason : Cross-cutting refactor." in output
 
     def test_claude_v2_skips_legacy_prelaunch_routing(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
@@ -2148,6 +2148,29 @@ class TestConfigureSharedStateUsePat:
         assert state["codex_models"] == ["system.ai.gpt-5"]
         assert legacy_called == []
         assert "uc_enabled" not in state
+
+    def test_codex_only_configure_persists_discovered_oss_models(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: (
+                {},
+                ["system.ai.gpt-5-6-sol"],
+                [],
+                ["system.ai.glm-5-2"],
+                None,
+            ),
+        )
+
+        state = cli_mod.configure_shared_state(
+            self.WS,
+            profile="DEFAULT",
+            tools=["codex"],
+        )
+
+        assert state["codex_models"] == ["system.ai.gpt-5-6-sol"]
+        assert state["oss_models"] == ["system.ai.glm-5-2"]
 
     def _stub_with_fable(self, monkeypatch):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")

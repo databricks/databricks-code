@@ -588,7 +588,9 @@ def configure_shared_state(
     )
     want_gemini = fetch_all or "gemini" in tools or "opencode" in tools or "pi" in tools
     want_codex = fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools
-    want_oss = fetch_all or "opencode" in tools
+    # Codex smart routing can select OSS models such as GLM, so a Codex-only
+    # configure must persist that discovered family too.
+    want_oss = fetch_all or "opencode" in tools or "codex" in tools
 
     claude_reason: str | None = None
     gemini_reason: str | None = None

@@ -29,13 +29,27 @@ SUBAGENT_ROUTING_DISCLAIMER = (
 
 
 def format_switch_message(model: str, reason: str) -> str:
-    """Format the routed-model notice shared by Codex and Claude Code."""
+    """Format the first-prompt routed-model notice."""
     lines = [
         "Using Unity Gateway Smart Router.",
         f"Selected Model : {model}",
         f"Reason : {reason}",
         SUBAGENT_ROUTING_DISCLAIMER,
     ]
+    return _format_box(lines)
+
+
+def format_subagent_message(model: str, reason: str) -> str:
+    """Format a routed-subagent notice without the first-prompt disclaimer."""
+    lines = [
+        "Using Unity Gateway Smart Router - Subagent",
+        f"Selected Model : {model}",
+        f"Reason : {reason}",
+    ]
+    return _format_box(lines)
+
+
+def _format_box(lines: list[str]) -> str:
     width = max(len(line) for line in lines)
     border = "─" * (width + 2)
     return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
@@ -49,18 +63,16 @@ class RoutingDecision:
     raw_model: str
     rationale: str = ""
 
-    def display_message(self, model_label: str | None = None) -> str:
-        """User-facing "Using Smart Routing" line, with the router's rationale.
+    def display_message(self, model_label: str | None = None, *, subagent: bool = False) -> str:
+        """Return the boxed smart-routing notice with the router's rationale.
 
         Used by both the launch-time notice and the subagent-routing hook so the
         "what" (model) and the "why" (rationale) are surfaced consistently.
         ``model_label`` overrides the shown model id (e.g. a harness-translated
-        id); defaults to ``model``. The rationale is appended when present.
+        id); defaults to ``model``.
         """
-        message = f"Using Smart Routing. Routing to {model_label or self.model}."
-        if self.rationale:
-            message += f" {self.rationale}"
-        return message
+        formatter = format_subagent_message if subagent else format_switch_message
+        return formatter(model_label or self.model, self.rationale)
 
 
 def normalize_model(model: str) -> str:
@@ -243,7 +255,7 @@ def route_spawn_tool(
     # Surface the router's rationale in BOTH the systemMessage (the line the
     # harness shows the user) and permissionDecisionReason — the "why", not just
     # the "what". The shown model is the harness-translated id (routed_model).
-    routing_message = decision.display_message(model_label=routed_model)
+    routing_message = decision.display_message(model_label=routed_model, subagent=True)
     output: dict[str, Any] = {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",

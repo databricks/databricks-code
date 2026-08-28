@@ -63,6 +63,7 @@ class _Session:
         self.settings: dict | None = None
         self.first_turn_seen = False
         self.switch_pending = False
+        self.notice_pending = False
         self.injected = False
 
     def on_tui_frame(self, raw: str) -> str:
@@ -92,6 +93,7 @@ class _Session:
                 self.target = decision.model
                 if self.switch_message_fn is not None:
                     self.switch_message = self.switch_message_fn(decision.model, decision.rationale)
+                self.notice_pending = self.switch_message is not None
                 self.log(f"[ROUTE] selected {decision.model!r}; rationale={decision.rationale!r}")
             old = params.get("model")
             if self.target is not None and old != self.target:
@@ -121,20 +123,24 @@ class _Session:
         if (
             msg.get("method") == TURN_STARTED
             and not self.injected
-            and self.switch_pending
+            and (self.switch_pending or self.notice_pending)
             and self.thread_id
         ):
             self.injected = True
+            switch_pending = self.switch_pending
             self.switch_pending = False
-            settings = dict(self.settings) if isinstance(self.settings, dict) else {}
-            settings["model"] = self.target
-            self.log(f"[INJECT] {SETTINGS_UPDATED}: model -> {self.target!r} (flip TUI chip)")
-            injected: list[dict] = [
-                {
-                    "method": SETTINGS_UPDATED,
-                    "params": {"threadId": self.thread_id, "threadSettings": settings},
-                }
-            ]
+            self.notice_pending = False
+            injected: list[dict] = []
+            if switch_pending:
+                settings = dict(self.settings) if isinstance(self.settings, dict) else {}
+                settings["model"] = self.target
+                self.log(f"[INJECT] {SETTINGS_UPDATED}: model -> {self.target!r} (flip TUI chip)")
+                injected.append(
+                    {
+                        "method": SETTINGS_UPDATED,
+                        "params": {"threadId": self.thread_id, "threadSettings": settings},
+                    }
+                )
             if self.switch_message:
                 turn = params.get("turn")
                 turn_id = turn.get("id") if isinstance(turn, dict) else None

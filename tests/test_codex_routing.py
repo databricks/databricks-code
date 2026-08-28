@@ -159,9 +159,12 @@ def test_spawn_rewrite_preserves_original_input(monkeypatch):
     hook = output["hookSpecificOutput"]
     # The rationale is surfaced in BOTH the systemMessage (shown to the user) and
     # permissionDecisionReason, so the "why" is visible, not just the "what".
-    assert output["systemMessage"] == (
-        "Using Smart Routing. Routing to gpt-5.5. Review needs deeper reasoning."
+    expected_message = codex_routing.routing.format_subagent_message(
+        "gpt-5.5", "Review needs deeper reasoning."
     )
+    assert output["systemMessage"] == expected_message
+    assert "Using Unity Gateway Smart Router - Subagent" in expected_message
+    assert codex_routing.routing.SUBAGENT_ROUTING_DISCLAIMER not in expected_message
     assert hook["permissionDecision"] == "allow"
     assert hook["updatedInput"] == {
         "task_name": "reviewer",
@@ -169,9 +172,7 @@ def test_spawn_rewrite_preserves_original_input(monkeypatch):
         "fork": False,
         "model": "gpt-5.5",
     }
-    assert hook["permissionDecisionReason"] == (
-        "Using Smart Routing. Routing to gpt-5.5. Review needs deeper reasoning."
-    )
+    assert hook["permissionDecisionReason"] == expected_message
 
 
 def test_spawn_rewrite_uses_codex_model_id_for_uc_endpoint(monkeypatch):
@@ -197,7 +198,9 @@ def test_spawn_rewrite_uses_codex_model_id_for_uc_endpoint(monkeypatch):
         available_models=["system.ai.gpt-5-6-luna"],
     )
 
-    assert output["systemMessage"] == "Using Smart Routing. Routing to gpt-5.6-luna."
+    assert output["systemMessage"] == codex_routing.routing.format_subagent_message(
+        "gpt-5.6-luna", ""
+    )
     assert output["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-5.6-luna"
 
 
@@ -231,7 +234,7 @@ def test_spawn_glm_decision_applies_glm_model(monkeypatch):
     )
 
     assert output["hookSpecificOutput"]["updatedInput"]["model"] == "system.ai.glm-5-2"
-    assert "Using Smart Routing. Routing to system.ai.glm-5-2." in output["systemMessage"]
+    assert "Selected Model : system.ai.glm-5-2" in output["systemMessage"]
 
 
 def test_non_spawn_tool_has_no_opinion():
