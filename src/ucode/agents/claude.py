@@ -33,10 +33,7 @@ from ucode.databricks import (
     build_tool_base_url,
     get_databricks_token,
 )
-from ucode.gateway_proxy import (
-    AI_GATEWAY_TOKEN_HEADER,
-    AUTHORIZATION_HEADER,
-)
+from ucode.gateway_proxy import AI_GATEWAY_TOKEN_HEADER
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing import v2 as smart_routing_v2
@@ -58,6 +55,8 @@ CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
 CLAUDE_USER_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
 WEB_SEARCH_MCP_STATE_KEY = "claude_web_search_mcp"
+MINIMUM_CLAUDE_VERSION = (2, 1, 248)
+MINIMUM_CLAUDE_VERSION_TEXT = "2.1.248"
 
 SPEC: ToolSpec = {
     "binary": "claude",
@@ -96,6 +95,49 @@ CLAUDE_OPTIONAL_VALUE_OPTIONS = frozenset(
 
 def is_update_available() -> tuple[str, str] | None:
     return available_npm_package_update(SPEC["package"])
+
+
+def _parse_version(value: str) -> tuple[int, int, int] | None:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
+    if not match:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
+def _installed_version_status() -> tuple[str, bool] | None:
+    version = agent_version(SPEC["binary"])
+    parsed = _parse_version(version)
+    if parsed is None:
+        return None
+    return version, parsed < MINIMUM_CLAUDE_VERSION
+
+
+def minimum_version_error() -> str | None:
+    status = _installed_version_status()
+    if status is None:
+        return None
+    version, is_too_old = status
+    if not is_too_old:
+        return None
+    return (
+        f"Claude Code {version} is too old for gateway model discovery. "
+        f"Claude Code must be updated to {MINIMUM_CLAUDE_VERSION_TEXT} or newer; "
+        f"run `npm install -g {SPEC['package']}` or `ucode configure`."
+    )
+
+
+def required_update_message() -> str | None:
+    status = _installed_version_status()
+    if status is None:
+        return None
+    version, is_too_old = status
+    if not is_too_old:
+        return None
+    return (
+        f"Claude Code {version} is older than required {MINIMUM_CLAUDE_VERSION_TEXT}; "
+        "updating Claude Code is required for gateway model discovery."
+    )
 
 
 def _resolve_web_search_model(state: dict) -> str | None:
@@ -1129,6 +1171,8 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
         token_header=AI_GATEWAY_TOKEN_HEADER,
         force_refresh_near_expiry=False,
     )
+    if cache is None:  # defensive: relayed mode always requests swap-token refresh
+        raise RuntimeError("Relayed proxy did not initialize its token cache.")
     # start_proxy falls back to an OS-assigned port when the cached one is taken
     # (stale proxy from a killed session). Reconcile settings + state to whatever
     # it actually bound, so Claude Code connects to the live port.
@@ -1152,21 +1196,20 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
-def _launch_claude_with_gateway_proxy(
+def _launch_claude_with_model_discovery_proxy(
     state: dict, binary: str, tool_args: list[str], *, smart_routing: bool
 ) -> None:
-    """Launch Claude through a refreshing gateway proxy."""
+    """Launch Claude through the model-alias proxy using apiKeyHelper auth."""
     workspace = state["workspace"]
     server, cache, client = start_anthropic_model_discovery_proxy(
         workspace,
         state.get("profile"),
         0,
-        token_header=AUTHORIZATION_HEADER,
-        force_refresh_near_expiry=True,
+        token_header=None,
+        force_refresh_near_expiry=False,
     )
-    token = cache.token
-    os.environ["OAUTH_TOKEN"] = token
-    os.environ["ANTHROPIC_AUTH_TOKEN"] = token
+    if not smart_routing:
+        os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     os.environ["ANTHROPIC_BASE_URL"] = f"http://{LOOPBACK_HOST}:{server.server_address[1]}"
     os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
 
@@ -1200,7 +1243,8 @@ def _launch_claude_with_gateway_proxy(
             proc.send_signal(signal.SIGINT)
             returncode = proc.wait()
     finally:
-        cache.stop()
+        if cache is not None:
+            cache.stop()
         server.shutdown()
         client.close()
     raise SystemExit(returncode)
@@ -1227,10 +1271,10 @@ def launch(state: dict, tool_args: list[str]) -> None:
             "Please use Codex or disable smart routing."
         )
     if first_prompt_routing:
-        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=True)
+        _launch_claude_with_model_discovery_proxy(state, binary, tool_args, smart_routing=True)
         return
     if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
-        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=False)
+        _launch_claude_with_model_discovery_proxy(state, binary, tool_args, smart_routing=False)
         return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))

@@ -152,6 +152,22 @@ class TestAnthropicModelAliases:
 
 
 class TestAnthropicModelDiscoveryHandler:
+    def test_forwards_api_key_helper_credential_without_refresh_auth(self):
+        out = _Collect()
+        handler = _handler(out)
+        handler.headers = {"X-Api-Key": "api-key-helper-token"}
+        handler.rfile = io.BytesIO()
+        handler.cache = None
+        handler.token_header = None
+        handler.client = _FakeClient(_FakeResponse(200, {}, b'{"data":[]}'))
+
+        handler._handle()
+
+        _method, _url, headers, _body = handler.client.request
+        assert headers["X-Api-Key"] == "api-key-helper-token"
+        assert "Authorization" not in headers
+        assert "X-Databricks-AI-Gateway-Token" not in headers
+
     def test_inherits_relayed_auth_and_prefixes_models(self):
         out = _Collect()
         handler = _handler(out)
@@ -251,6 +267,24 @@ def test_start_proxy_uses_discovery_handler(monkeypatch):
             anthropic_model_discovery_proxy._AnthropicModelAliases,
         )
         assert actual_cache is cache
+    finally:
+        server.server_close()
+        client.close()
+
+
+def test_start_proxy_skips_token_cache_without_refresh_header(monkeypatch):
+    def unexpected_cache(*_args, **_kwargs):
+        raise AssertionError("passthrough proxy must not create a token cache")
+
+    monkeypatch.setattr(anthropic_model_discovery_proxy, "TokenCache", unexpected_cache)
+
+    server, cache, client = anthropic_model_discovery_proxy.start_proxy(
+        "https://workspace.example.com", "profile", 0, None, False
+    )
+    try:
+        assert cache is None
+        assert server.RequestHandlerClass.cache is None
+        assert server.RequestHandlerClass.token_header is None
     finally:
         server.server_close()
         client.close()

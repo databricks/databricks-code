@@ -32,14 +32,15 @@ from ucode.gateway_proxy import (
     forwarded_request_headers,
     log_proxy_diagnostic,
     log_token_refresh_failure,
+    passthrough_request_headers,
 )
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
     # Set by the server factory.
-    cache: TokenCache
+    cache: TokenCache | None
     client: httpx.Client
-    token_header = AI_GATEWAY_TOKEN_HEADER
+    token_header: str | None = AI_GATEWAY_TOKEN_HEADER
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -71,8 +72,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             path=self.path.split("?", 1)[0],
         )
         try:
-            # First attempt with the current token.
-            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
+            # Native gateway discovery uses Claude Code's apiKeyHelper credential
+            # verbatim. Relayed mode still injects its separately refreshed swap
+            # token while preserving the caller's Anthropic subscription OAuth.
+            if self.cache is None or self.token_header is None:
+                headers = passthrough_request_headers(self)
+            else:
+                headers = forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
                     "model_discovery_upstream_headers",
@@ -81,7 +87,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     status=resp.status_code,
                     elapsed_ms=round((time.monotonic() - started) * 1000),
                 )
-                if resp.status_code not in (401, 403):
+                if resp.status_code not in (401, 403) or self.cache is None:
                     self._relay_response(resp, diagnostic_id=diagnostic_id, started=started)
                     return
                 # Auth rejected. Drain the (small) error body so the pooled
@@ -93,6 +99,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 # Still retry with the existing token after reporting the failure.
                 log_token_refresh_failure(exc)
+            assert self.token_header is not None
             headers = forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
@@ -310,15 +317,19 @@ def start_proxy(
     workspace: str,
     profile: str | None,
     port: int,
-    token_header: str,
+    token_header: str | None,
     force_refresh_near_expiry: bool,
-) -> tuple[ThreadingHTTPServer, TokenCache, httpx.Client]:
-    """Start the Anthropic model discovery proxy and token refresher."""
+) -> tuple[ThreadingHTTPServer, TokenCache | None, httpx.Client]:
+    """Start the Anthropic model discovery proxy and optional token refresher."""
     upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
-    cache = TokenCache(
-        workspace,
-        profile,
-        force_refresh_near_expiry=force_refresh_near_expiry,
+    cache = (
+        TokenCache(
+            workspace,
+            profile,
+            force_refresh_near_expiry=force_refresh_near_expiry,
+        )
+        if token_header is not None
+        else None
     )
     client = httpx.Client(base_url=upstream_base, timeout=UPSTREAM_TIMEOUT, follow_redirects=False)
     handler = cast(
@@ -339,6 +350,7 @@ def start_proxy(
     except OSError:
         server = ThreadingHTTPServer((LOOPBACK_HOST, 0), handler)
 
-    refresher = threading.Thread(target=cache.run_refresher, daemon=True)
-    refresher.start()
+    if cache is not None:
+        refresher = threading.Thread(target=cache.run_refresher, daemon=True)
+        refresher.start()
     return server, cache, client
