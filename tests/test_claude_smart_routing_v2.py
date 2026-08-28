@@ -163,6 +163,10 @@ class TestV2Launch:
             "system.ai.claude-opus-4-8",
             "system.ai.claude-sonnet-5",
         }
+        assert captured["settings"]["modelOverrides"] == {
+            "claude-opus-4-8": "system.ai.claude-opus-4-8",
+            "claude-sonnet-5": "system.ai.claude-sonnet-5",
+        }
         assert claude_hooks.FIRST_PROMPT_SOCKET_ENV in captured["settings"]["env"]
         first_prompt_command = captured["settings"]["hooks"]["UserPromptSubmit"][0]["hooks"][0][
             "command"
@@ -344,6 +348,18 @@ class TestSubagentRouting:
         definitions = v2._routed_claude_agent_definitions(["catalog.schema.gpt-5"])
 
         assert next(iter(definitions.values()))["model"] == "catalog.schema.gpt-5"
+
+    def test_maps_gateway_claude_ids_to_known_model_metadata(self):
+        assert v2._claude_model_overrides(
+            [
+                "system.ai.claude-opus-4-8",
+                "databricks-claude-sonnet-5",
+                "catalog.schema.gpt-5",
+            ]
+        ) == {
+            "claude-opus-4-8": "system.ai.claude-opus-4-8",
+            "claude-sonnet-5": "system.ai.claude-sonnet-5",
+        }
 
     def test_model_switch_lock_serializes_routed_sessions(self, tmp_path, monkeypatch):
         user_settings = tmp_path / "settings.json"

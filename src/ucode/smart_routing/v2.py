@@ -111,6 +111,15 @@ def _canonical_claude_models(model_ids: list[str]) -> list[str]:
     )
 
 
+def _claude_model_overrides(model_ids: list[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    prefix = "system.ai."
+    for model in _canonical_claude_models(model_ids):
+        if model.startswith(f"{prefix}claude-"):
+            overrides[model[len(prefix) :]] = model
+    return overrides
+
+
 def _routed_claude_agent_name(model: str) -> str:
     canonical = _canonical_claude_model_id(model)
     normalized = routing.normalize_model(canonical)
@@ -345,6 +354,10 @@ def launch_claude(
         raise RuntimeError("Claude settings 'env' must be an object for smart routing.")
     env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     env[FIRST_PROMPT_SOCKET_ENV] = str(socket_path)
+    model_overrides = settings.setdefault("modelOverrides", {})
+    if not isinstance(model_overrides, dict):
+        raise RuntimeError("Claude settings 'modelOverrides' must be an object for smart routing.")
+    model_overrides.update(_claude_model_overrides(model_ids))
     routing_state = {
         **state,
         "claude_models": {str(index): model for index, model in enumerate(model_ids)},
