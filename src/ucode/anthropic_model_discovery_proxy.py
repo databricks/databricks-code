@@ -24,6 +24,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from ucode.constants import LOOPBACK_HOST
+from ucode.databricks import (
+    _ANTHROPIC_MODEL_DISCOVERY_MAX_RETRIES,
+    _http_get_retry_delay,
+)
 from ucode.gateway_proxy import (
     AI_GATEWAY_TOKEN_HEADER,
     HOP_BY_HOP_HEADERS,
@@ -58,6 +62,48 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def _response_chunks(self, resp: httpx.Response) -> tuple[Iterable[bytes], frozenset[str]]:
         return resp.iter_raw(), frozenset()
 
+    def _should_retry_model_discovery(self, resp: httpx.Response) -> bool:
+        return (
+            self.command == "GET"
+            and urlsplit(self.path).path == _ANTHROPIC_MODELS_PATH
+            and resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+        )
+
+    def _retry_model_discovery(
+        self,
+        url: str,
+        body: bytes | None,
+        diagnostic_id: str,
+        started: float,
+        retry_after: str | None,
+    ) -> None:
+        for retry_index in range(_ANTHROPIC_MODEL_DISCOVERY_MAX_RETRIES):
+            delay = _http_get_retry_delay(retry_after, retry_index)
+            log_proxy_diagnostic(
+                "model_discovery_retry_scheduled",
+                request_id=diagnostic_id,
+                attempt=retry_index + 2,
+                delay_ms=round(delay * 1000),
+            )
+            time.sleep(delay)
+            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
+            with self.client.stream(self.command, url, headers=headers, content=body) as resp:
+                log_proxy_diagnostic(
+                    "model_discovery_upstream_headers",
+                    request_id=diagnostic_id,
+                    attempt=retry_index + 2,
+                    status=resp.status_code,
+                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                )
+                if (
+                    not self._should_retry_model_discovery(resp)
+                    or retry_index == _ANTHROPIC_MODEL_DISCOVERY_MAX_RETRIES - 1
+                ):
+                    self._relay_response(resp, diagnostic_id=diagnostic_id, started=started)
+                    return
+                retry_after = resp.headers.get("Retry-After")
+                resp.read()
+
     def _handle(self) -> None:
         diagnostic_id = uuid.uuid4().hex[:12]
         started = time.monotonic()
@@ -81,6 +127,17 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                     status=resp.status_code,
                     elapsed_ms=round((time.monotonic() - started) * 1000),
                 )
+                if self._should_retry_model_discovery(resp):
+                    retry_after = resp.headers.get("Retry-After")
+                    resp.read()
+                    self._retry_model_discovery(
+                        url,
+                        body,
+                        diagnostic_id,
+                        started,
+                        retry_after,
+                    )
+                    return
                 if resp.status_code not in (401, 403):
                     self._relay_response(resp, diagnostic_id=diagnostic_id, started=started)
                     return
