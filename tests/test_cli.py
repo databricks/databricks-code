@@ -1167,6 +1167,10 @@ class TestAutoConfigureOnFirstRun:
     [
         ("claude", "Launching Claude Code with Unity Gateway"),
         ("codex", "Launching Codex with Unity Gateway"),
+        ("gemini", "Launching Gemini CLI with Unity Gateway"),
+        ("opencode", "Launching OpenCode with Unity Gateway"),
+        ("copilot", "Launching GitHub Copilot CLI with Unity Gateway"),
+        ("pi", "Launching Pi with Unity Gateway"),
     ],
 )
 def test_launch_title(tool, expected):
