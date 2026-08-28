@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import signal
 import socket
@@ -21,14 +23,17 @@ from ucode.databricks import (
     get_databricks_token,
     list_anthropic_models,
 )
-from ucode.smart_routing import codex_interposer, routing
-from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, sync_first_prompt_hook
+from ucode.smart_routing import claude_routing, codex_interposer, routing
+from ucode.smart_routing.claude_hooks import (
+    FIRST_PROMPT_SOCKET_ENV,
+    sync_first_prompt_hook,
+    sync_smart_routing_hooks,
+)
 from ucode.ui import print_note
 
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
 
 CODEX_INTERPOSER_LOG = APP_DIR / "codex-v2-interposer.log"
-STUBBED_SWITCH_REASON = "Low complexity, unclear intent, and no code reference."  # TODO(lilly): replace with smart router rationale.
 
 CLAUDE_TARGET_MODEL = "system.ai.claude-sonnet-4-6[1m]"  # TODO(lilly): replace with smart router.
 CLAUDE_PTY_LOG = APP_DIR / "claude-v2-pty.log"
@@ -39,6 +44,11 @@ OAUTH_TOKEN_ENV_VAR = "OAUTH_TOKEN"
 HEALTH_REQUEST_TIMEOUT_SECONDS = 1
 HEALTH_POLL_INTERVAL_SECONDS = 0.25
 CLAUDE_ROUTE_SELECTION_TIMEOUT_S = 20.0
+CLAUDE_ROUTED_AGENT_PREFIX = "ucode-route-"
+CLAUDE_ROUTED_AGENT_PROMPT = (
+    "Complete the delegated task exactly as requested. Follow the parent agent's instructions and "
+    "return a concise report of your findings or changes."
+)
 
 
 def enabled() -> bool:
@@ -70,13 +80,15 @@ def _wait_for_app_server(port: int, timeout: float) -> bool:
     return False
 
 
-def _switch_message(model: str, reason: str) -> str:
+def format_routing_notice(model: str, reason: str | None, *, title: str | None = None) -> str:
     lines = [
+        *([title] if title else []),
         "Using Unity Gateway Smart Router.",
         f"Selected Model : {model}",
-        f"Reason : {reason}",
     ]
-    width = max(len(line) for line in lines)
+    if reason:
+        lines.append(f"Reason : {reason}")
+    width = max(map(len, lines))
     border = "─" * (width + 2)
     return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
 
@@ -89,21 +101,95 @@ def _canonical_claude_model_id(model: str) -> str:
     return model
 
 
-def _route_claude_prompt(state: dict, token: str, prompt: str) -> routing.RoutingDecision:
-    workspace = state.get("workspace")
-    if not isinstance(workspace, str):
-        raise RuntimeError("workspace metadata is unavailable")
+def _canonical_claude_models(model_ids: list[str]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            _canonical_claude_model_id(model)
+            for model in model_ids
+            if isinstance(model, str) and model
+        )
+    )
 
-    model_ids, discovery_error = list_anthropic_models(workspace, token)
-    if not model_ids:
-        raise RuntimeError(discovery_error or "Anthropic models endpoint returned no Claude models")
 
+def _claude_model_overrides(model_ids: list[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    prefix = "system.ai."
+    for model in _canonical_claude_models(model_ids):
+        if model.startswith(f"{prefix}claude-"):
+            overrides[model[len(prefix) :]] = model
+    return overrides
+
+
+def _routed_claude_agent_name(model: str) -> str:
+    canonical = _canonical_claude_model_id(model)
+    normalized = routing.normalize_model(canonical)
+    safe = "".join(character if character.isalnum() else "-" for character in normalized)
+    slug = "-".join(part for part in safe.split("-") if part)
+    digest = hashlib.sha256(canonical.encode()).hexdigest()[:8]
+    return f"{CLAUDE_ROUTED_AGENT_PREFIX}{slug[:36]}-{digest}"
+
+
+def _routed_claude_agent_definitions(model_ids: list[str]) -> dict[str, dict[str, str]]:
+    return {
+        _routed_claude_agent_name(model): {
+            "description": f"Smart-routed coding agent using {model}",
+            "prompt": CLAUDE_ROUTED_AGENT_PROMPT,
+            "model": model,
+        }
+        for model in _canonical_claude_models(model_ids)
+    }
+
+
+def _with_routed_claude_agents(tool_args: list[str], model_ids: list[str]) -> list[str]:
+    definitions = _routed_claude_agent_definitions(model_ids)
+    caller_definitions: dict = {}
+    remaining: list[str] = []
+    index = 0
+    while index < len(tool_args):
+        arg = tool_args[index]
+        if arg == "--":
+            remaining.extend(tool_args[index:])
+            break
+        if arg == "--agents":
+            if index + 1 >= len(tool_args):
+                raise RuntimeError("Claude's --agents option requires a JSON object.")
+            raw = tool_args[index + 1]
+            index += 2
+        elif arg.startswith("--agents="):
+            raw = arg.partition("=")[2]
+            index += 1
+        else:
+            remaining.append(arg)
+            index += 1
+            continue
+        try:
+            parsed = json.loads(raw)
+        except ValueError as exc:
+            raise RuntimeError("Claude's --agents option must contain valid JSON.") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Claude's --agents option must contain a JSON object.")
+        caller_definitions.update(parsed)
+
+    collisions = definitions.keys() & caller_definitions.keys()
+    if collisions:
+        names = ", ".join(sorted(collisions))
+        raise RuntimeError(f"Claude --agents names conflict with smart routing: {names}.")
+    combined = {**caller_definitions, **definitions}
+    return ["--agents", json.dumps(combined, separators=(",", ":")), *remaining]
+
+
+def _request_claude_routing_decision(
+    workspace: str,
+    token: str,
+    prompt: str,
+    model_ids: list[str],
+) -> tuple[routing.RoutingDecision | None, str | None]:
     available: dict[str, str] = {}
-    for model in model_ids:
-        if isinstance(model, str) and model:
-            canonical = _canonical_claude_model_id(model)
-            available.setdefault(routing.normalize_model(canonical), canonical)
-    decision, error = routing.select_route(
+    for model in _canonical_claude_models(model_ids):
+        available.setdefault(routing.normalize_model(model), model)
+    if not available:
+        return None, "Anthropic models endpoint returned no Claude models"
+    return routing.select_route(
         workspace,
         token,
         prompt,
@@ -111,9 +197,74 @@ def _route_claude_prompt(state: dict, token: str, prompt: str) -> routing.Routin
         lambda selected: available.get(routing.normalize_model(selected)),
         timeout=CLAUDE_ROUTE_SELECTION_TIMEOUT_S,
     )
+
+
+def _route_claude_prompt(
+    state: dict,
+    token: str,
+    prompt: str,
+    model_ids: list[str] | None = None,
+) -> routing.RoutingDecision:
+    workspace = state.get("workspace")
+    if not isinstance(workspace, str):
+        raise RuntimeError("workspace metadata is unavailable")
+
+    if model_ids is None:
+        model_ids, discovery_error = list_anthropic_models(workspace, token)
+        if not model_ids:
+            raise RuntimeError(
+                discovery_error or "Anthropic models endpoint returned no Claude models"
+            )
+    decision, error = _request_claude_routing_decision(workspace, token, prompt, model_ids)
     if decision is None:
         raise RuntimeError(error or "router returned no Claude model selection")
     return decision
+
+
+def route_claude_pre_tool_use(
+    payload: dict,
+    *,
+    workspace: str,
+    token: str,
+    available_models: list[str],
+    audit_decision: bool = False,
+) -> dict | None:
+    """Route a Claude Agent call through a transient exact-model agent definition."""
+    route = routing.resolve_spawn_route(
+        payload,
+        is_spawn_agent=claude_routing.is_spawn_agent_tool,
+        decision_fn=lambda task: _request_claude_routing_decision(
+            workspace, token, task, available_models
+        ),
+        default_task_label="Claude Code subagent task",
+        model_id_mapper=lambda model: model,
+    )
+    if route is None:
+        return None
+    if audit_decision:
+        routing.write_decision_record(
+            claude_routing.DECISIONS_PATH,
+            payload,
+            route.task,
+            route.decision,
+            route.routed_model,
+        )
+    routing_message = format_routing_notice(
+        route.routed_model,
+        route.decision.rationale,
+        title="Subagent Smart Routing",
+    )
+    updated_input = {
+        **{key: value for key, value in route.tool_input.items() if key != "model"},
+        "subagent_type": _routed_claude_agent_name(route.routed_model),
+    }
+    hook_output = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "updatedInput": updated_input,
+        "permissionDecisionReason": routing_message,
+    }
+    return {"systemMessage": routing_message, "hookSpecificOutput": hook_output}
 
 
 def _is_claude_target_model(value: object) -> bool:
@@ -172,6 +323,7 @@ def launch_claude(
     launch_model: str | None,
     compose_settings: Callable[[list[str]], tuple[dict, list[str]]],
     launch_model_args: Callable[[list[str], str | None], list[str]],
+    model_name: Callable[[str], str],
 ) -> NoReturn:
     """Launch Claude in the first-prompt routing PTY wrapper."""
     from ucode.agents.claude import GATEWAY_MODEL_DISCOVERY_ENV_VAR
@@ -185,6 +337,9 @@ def launch_claude(
     token = get_databricks_token(workspace, state.get("profile"))
     os.environ[OAUTH_TOKEN_ENV_VAR] = token
     os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
+    model_ids, discovery_error = list_anthropic_models(workspace, token)
+    if not model_ids:
+        raise RuntimeError(discovery_error or "Anthropic models endpoint returned no Claude models")
 
     run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     socket_path = APP_DIR / f"claude-v2-{run_id}.sock"
@@ -199,12 +354,26 @@ def launch_claude(
         raise RuntimeError("Claude settings 'env' must be an object for smart routing.")
     env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     env[FIRST_PROMPT_SOCKET_ENV] = str(socket_path)
+    model_overrides = settings.setdefault("modelOverrides", {})
+    if not isinstance(model_overrides, dict):
+        raise RuntimeError("Claude settings 'modelOverrides' must be an object for smart routing.")
+    model_overrides.update(_claude_model_overrides(model_ids))
+    routing_state = {
+        **state,
+        "claude_models": {str(index): model for index, model in enumerate(model_ids)},
+    }
+    sync_smart_routing_hooks(settings, routing_state, enabled=True)
     sync_first_prompt_hook(settings, hook_executable)
     write_json_file(settings_path, settings)
     model_args = launch_model_args(remaining, launch_model)
-    argv = [binary, "--settings", str(settings_path), *model_args, *remaining]
+    routed_agent_args = _with_routed_claude_agents(remaining, model_ids)
+    argv = [binary, "--settings", str(settings_path), *model_args, *routed_agent_args]
 
     model_setting = _ClaudeModelSettingGuard(user_settings_path)
+
+    def route_prompt(prompt: str) -> tuple[str, str]:
+        decision = _route_claude_prompt(state, token, prompt, model_ids)
+        return model_name(decision.model), decision.rationale
 
     print_note(
         "Smart routing v2: the first submitted prompt will select Claude Code's "
@@ -213,7 +382,7 @@ def launch_claude(
     try:
         returncode = claude_pty.run_claude_pty(
             argv,
-            route_prompt=lambda prompt: _route_claude_prompt(state, token, prompt).model,
+            route_prompt=route_prompt,
             socket_path=socket_path,
             prepare_model_switch=model_setting.begin,
             model_switch_persisted=model_setting.is_routed,
@@ -321,7 +490,7 @@ def launch_codex(
             available_models=available_models,
             workspace=workspace,
             token_provider=lambda: get_databricks_token(workspace, profile),
-            switch_message_fn=_switch_message,
+            switch_message_fn=format_routing_notice,
             log_path=CODEX_INTERPOSER_LOG,
         )
         tui_url = _loopback_websocket_url(tui_port)

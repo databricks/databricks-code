@@ -36,7 +36,7 @@ class TestCodexConfigArgs:
 
 
 def test_smart_routing_switch_message_is_boxed():
-    message = v2._switch_message("model-x", "Because X.")
+    message = v2.format_routing_notice("model-x", "Because X.")
 
     assert message == (
         "┌───────────────────────────────────┐\n"
@@ -169,7 +169,7 @@ class TestLaunchCodex:
         assert token_calls == [(WS, "myprof")]
         assert interposer_args["kwargs"]["token_provider"]() == "token-2"
         assert token_calls == [(WS, "myprof"), (WS, "myprof")]
-        assert interposer_args["kwargs"]["switch_message_fn"] is v2._switch_message
+        assert interposer_args["kwargs"]["switch_message_fn"] is v2.format_routing_notice
         assert stopped == [True]
         assert processes[0].terminated is True
 
@@ -299,7 +299,7 @@ class TestInterposerSession:
             log=lambda _m: None,
             available_models=["claude-opus-4-8", "gpt-5.5"],
             route_decision=select,
-            switch_message_fn=v2._switch_message,
+            switch_message_fn=v2.format_routing_notice,
         )
 
         output = sess.on_tui_frame(self._turn_start("gpt-5.5", prompt="Fix issue #42"))

@@ -1534,13 +1534,22 @@ def claude_router_hook_cmd(
             token = get_databricks_token(host, profile)
         except RuntimeError:
             return
-    output = route_pre_tool_use(
-        payload,
-        workspace=host,
-        token=token,
-        available_models=model or [],
-        audit_decision=True,
-    )
+    if smart_routing_v2.enabled():
+        output = smart_routing_v2.route_claude_pre_tool_use(
+            payload,
+            workspace=host,
+            token=token,
+            available_models=model or [],
+            audit_decision=True,
+        )
+    else:
+        output = route_pre_tool_use(
+            payload,
+            workspace=host,
+            token=token,
+            available_models=model or [],
+            audit_decision=True,
+        )
     if output is not None:
         sys.stdout.write(json.dumps(output))
 
@@ -1667,7 +1676,7 @@ def _fetch_budget_recommendation(state: dict, managed: dict | None) -> dict | No
 
 
 def _launch_title(tool: str) -> str:
-    return f"Launching {TOOL_SPECS[tool]['display'].title()} with Unity Gateway"
+    return f"Launching {TOOL_SPECS[tool]['display']} with Unity Gateway"
 
 
 def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = None) -> None:

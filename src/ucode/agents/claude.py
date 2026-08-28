@@ -160,7 +160,7 @@ WEB_SEARCH_MCP_NAME = "web_search"
 # Matches both the AI Gateway form (`databricks-claude-opus-4-8`) and the UC
 # model-services form (`system.ai.claude-opus-4-8`).
 _CLAUDE_MODEL_RE = re.compile(
-    r"^(?:system\.ai\.)?(?:databricks-)?claude-(opus|sonnet)-(\d+)-(\d+)(.*)$"
+    r"^(?:system\.ai\.)?(?:databricks-)?claude-(opus|sonnet)-(\d+)(?:-(\d+))?(.*)$"
 )
 
 # Env keys the MLflow Stop hook reads to route traces. Written into the
@@ -480,7 +480,7 @@ def _maybe_add_1m_suffix(model: str) -> str:
 
     family, major_raw, minor_raw, _ = match.groups()
     major = int(major_raw)
-    minor = int(minor_raw)
+    minor = int(minor_raw or 0)
     should_suffix = (family == "opus" and (major, minor) >= (4, 6)) or (
         family == "sonnet" and (major, minor) >= (4, 6)
     )
@@ -1221,6 +1221,7 @@ def _launch_claude_with_gateway_proxy(
                 launch_model=_original_launch_model(state),
                 compose_settings=compose_gateway_settings,
                 launch_model_args=_launch_model_args,
+                model_name=_maybe_add_1m_suffix,
             )
             return
 

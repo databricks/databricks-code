@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 from unittest.mock import MagicMock, patch
@@ -341,6 +342,41 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert result.output == ""
         mock_request.assert_not_called()
+
+    def test_claude_v2_subagent_hook_uses_v2_router(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
+        routed = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": {"prompt": "fix it", "model": "opus"},
+            }
+        }
+        with (
+            patch(
+                "ucode.cli.smart_routing_v2.route_claude_pre_tool_use",
+                return_value=routed,
+            ) as mock_v2_route,
+            patch("ucode.cli.claude_routing.route_pre_tool_use") as mock_legacy_route,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "claude-router-hook",
+                    "route-subagent",
+                    "--host",
+                    "https://example.com",
+                    "--model",
+                    "system.ai.claude-opus-4-8",
+                ],
+                input='{"tool_name":"Agent","tool_input":{"prompt":"fix it"}}',
+                env={"OAUTH_TOKEN": "token"},
+            )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == routed
+        mock_v2_route.assert_called_once()
+        mock_legacy_route.assert_not_called()
 
 
 class TestClaudeModelFlag:
@@ -1131,6 +1167,10 @@ class TestAutoConfigureOnFirstRun:
     [
         ("claude", "Launching Claude Code with Unity Gateway"),
         ("codex", "Launching Codex with Unity Gateway"),
+        ("gemini", "Launching Gemini CLI with Unity Gateway"),
+        ("opencode", "Launching OpenCode with Unity Gateway"),
+        ("copilot", "Launching GitHub Copilot CLI with Unity Gateway"),
+        ("pi", "Launching Pi with Unity Gateway"),
     ],
 )
 def test_launch_title(tool, expected):

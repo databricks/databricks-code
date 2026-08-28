@@ -55,6 +55,11 @@ class TestMinimumVersion:
 
 
 class TestRenderOverlay:
+    def test_long_context_suffix_supports_major_only_claude_versions(self):
+        assert claude._maybe_add_1m_suffix("system.ai.claude-sonnet-5") == (
+            "system.ai.claude-sonnet-5[1m]"
+        )
+
     def test_does_not_set_anthropic_model_env(self):
         # We deliberately don't pin ANTHROPIC_MODEL: when set, Claude Code's
         # /model picker surfaces a duplicate catalog row on top of the family
