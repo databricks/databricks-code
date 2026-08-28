@@ -24,10 +24,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from ucode.constants import LOOPBACK_HOST
-from ucode.databricks import (
-    _ANTHROPIC_MODEL_DISCOVERY_MAX_RETRIES,
-    _http_get_retry_delay,
-)
+from ucode.databricks import _http_get_retry_delay
 from ucode.gateway_proxy import (
     AI_GATEWAY_TOKEN_HEADER,
     HOP_BY_HOP_HEADERS,
@@ -37,6 +34,10 @@ from ucode.gateway_proxy import (
     log_proxy_diagnostic,
     log_token_refresh_failure,
 )
+
+# Claude Code abandons model discovery after roughly three seconds. One retry
+# leaves enough time for the normal one-second backoff and the upstream request.
+_ANTHROPIC_MODEL_DISCOVERY_MAX_RETRIES = 1
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):

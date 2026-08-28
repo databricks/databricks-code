@@ -63,11 +63,11 @@ TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 # raced — so we retry rather than treat them as an expired session.
 _TOKEN_CACHE_LOCK_MARKERS = ("cache update", "exit status 45")
 _TOKEN_FETCH_MAX_ATTEMPTS = 4
-_HTTP_GET_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+_HTTP_GET_RETRYABLE_STATUS_CODES = frozenset({429})
 _HTTP_GET_RETRY_BASE_SECONDS = 1.0
 _HTTP_GET_RETRY_MAX_SECONDS = 5.0
 _HTTP_GET_RETRY_AFTER_JITTER_SECONDS = 0.25
-_ANTHROPIC_MODEL_DISCOVERY_MAX_RETRIES = 2
+_ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES = 2
 
 
 def _debug_enabled() -> bool:
@@ -247,9 +247,9 @@ def _http_get_json(
 ) -> tuple[dict | list | None, str | None]:
     """GET a JSON endpoint. Returns (payload, None) on success, (None, reason) on failure.
 
-    ``max_retries`` opts individual callers into bounded retries for rate limits,
-    transient server errors, and network failures. Other callers retain the
-    original single-attempt behavior.
+    ``max_retries`` opts individual callers into bounded retries for rate limits
+    and network failures. Other callers retain the original single-attempt
+    behavior.
 
     Honors UCODE_DEBUG=1 to append status + truncated body to ~/.ucode/debug.log.
     """
@@ -2789,7 +2789,7 @@ def _get_anthropic_models_json(workspace: str, token: str) -> tuple[dict | list 
     return _http_get_json(
         f"https://{hostname}{ANTHROPIC_MODELS_PATH}",
         token,
-        max_retries=_ANTHROPIC_MODEL_DISCOVERY_MAX_RETRIES,
+        max_retries=_ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES,
     )
 
 

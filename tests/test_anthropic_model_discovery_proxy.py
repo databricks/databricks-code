@@ -194,16 +194,15 @@ class TestAnthropicModelDiscoveryHandler:
         handler.headers = {"Authorization": "Bearer subscription-token"}
         handler.rfile = io.BytesIO()
         handler.cache = _FakeCache()
-        responses = [_FakeResponse(429, {"Retry-After": "0"}, b"rate limited") for _ in range(3)]
+        responses = [_FakeResponse(429, {"Retry-After": "0"}, b"rate limited") for _ in range(2)]
         handler.client = _FakeClient(responses)
         monkeypatch.setattr(anthropic_model_discovery_proxy.time, "sleep", lambda _delay: None)
 
         handler._handle()
 
-        assert len(handler.client.requests) == 3
+        assert len(handler.client.requests) == 2
         assert responses[0].read_calls == 1
-        assert responses[1].read_calls == 1
-        assert responses[2].read_calls == 0
+        assert responses[1].read_calls == 0
         assert b"429 Too Many Requests" in bytes(out.data)
         assert b"rate limited" in bytes(out.data)
 

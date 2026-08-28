@@ -2084,7 +2084,7 @@ class TestHttpGetJsonRetries:
 
         def fake_urlopen(request, timeout=None):
             calls.append(request)
-            raise self._http_error(503, "Service Unavailable")
+            raise self._http_error(429, "Too Many Requests")
 
         monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
         monkeypatch.setattr(db_mod.random, "uniform", lambda low, high: high)
@@ -2093,16 +2093,16 @@ class TestHttpGetJsonRetries:
         payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
 
         assert payload is None
-        assert reason == "HTTP 503 Service Unavailable"
+        assert reason == "HTTP 429 Too Many Requests"
         assert len(calls) == 3
         assert sleeps == [1.25, 2.5]
 
-    def test_does_not_retry_non_transient_http_error(self, monkeypatch):
+    def test_does_not_retry_other_http_error(self, monkeypatch):
         calls = []
 
         def fake_urlopen(request, timeout=None):
             calls.append(request)
-            raise self._http_error(400, "Bad Request")
+            raise self._http_error(503, "Service Unavailable")
 
         monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
         monkeypatch.setattr(
@@ -2114,7 +2114,7 @@ class TestHttpGetJsonRetries:
         payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
 
         assert payload is None
-        assert reason == "HTTP 400 Bad Request"
+        assert reason == "HTTP 503 Service Unavailable"
         assert len(calls) == 1
 
 
