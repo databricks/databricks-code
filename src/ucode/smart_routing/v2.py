@@ -80,14 +80,15 @@ def _wait_for_app_server(port: int, timeout: float) -> bool:
     return False
 
 
-def _switch_message(model: str, reason: str, *, title: str | None = None) -> str:
+def _switch_message(model: str, reason: str | None, *, title: str | None = None) -> str:
     lines = [
         *([title] if title else []),
         "Using Unity Gateway Smart Router.",
         f"Selected Model : {model}",
-        f"Reason : {reason}",
     ]
-    width = max(len(line) for line in lines)
+    if reason:
+        lines.append(f"Reason : {reason}")
+    width = max(map(len, lines))
     border = "─" * (width + 2)
     return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
 
@@ -100,6 +101,16 @@ def _canonical_claude_model_id(model: str) -> str:
     return model
 
 
+def _canonical_claude_models(model_ids: list[str]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            _canonical_claude_model_id(model)
+            for model in model_ids
+            if isinstance(model, str) and model
+        )
+    )
+
+
 def _routed_claude_agent_name(model: str) -> str:
     canonical = _canonical_claude_model_id(model)
     normalized = routing.normalize_model(canonical)
@@ -110,17 +121,14 @@ def _routed_claude_agent_name(model: str) -> str:
 
 
 def _routed_claude_agent_definitions(model_ids: list[str]) -> dict[str, dict[str, str]]:
-    definitions: dict[str, dict[str, str]] = {}
-    for model in model_ids:
-        if not isinstance(model, str) or not model:
-            continue
-        canonical = _canonical_claude_model_id(model)
-        definitions[_routed_claude_agent_name(canonical)] = {
-            "description": f"Smart-routed coding agent using {canonical}",
+    return {
+        _routed_claude_agent_name(model): {
+            "description": f"Smart-routed coding agent using {model}",
             "prompt": CLAUDE_ROUTED_AGENT_PROMPT,
-            "model": canonical,
+            "model": model,
         }
-    return definitions
+        for model in _canonical_claude_models(model_ids)
+    }
 
 
 def _with_routed_claude_agents(tool_args: list[str], model_ids: list[str]) -> list[str]:
@@ -168,10 +176,8 @@ def _request_claude_routing_decision(
     model_ids: list[str],
 ) -> tuple[routing.RoutingDecision | None, str | None]:
     available: dict[str, str] = {}
-    for model in model_ids:
-        if isinstance(model, str) and model:
-            canonical = _canonical_claude_model_id(model)
-            available.setdefault(routing.normalize_model(canonical), canonical)
+    for model in _canonical_claude_models(model_ids):
+        available.setdefault(routing.normalize_model(model), model)
     if not available:
         return None, "Anthropic models endpoint returned no Claude models"
     return routing.select_route(
@@ -215,35 +221,34 @@ def route_claude_pre_tool_use(
     audit_decision: bool = False,
 ) -> dict | None:
     """Route a Claude Agent call through a transient exact-model agent definition."""
-    if not claude_routing.is_spawn_agent_tool(payload.get("tool_name")):
-        return None
-    tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return None
-    task = next(
-        (
-            value
-            for field in ("prompt", "description", "message", "task_name", "agent_name")
-            if isinstance(value := tool_input.get(field), str) and value
+    route = routing.resolve_spawn_route(
+        payload,
+        is_spawn_agent=claude_routing.is_spawn_agent_tool,
+        decision_fn=lambda task: _request_claude_routing_decision(
+            workspace, token, task, available_models
         ),
-        "Claude Code subagent task",
+        default_task_label="Claude Code subagent task",
+        model_id_mapper=lambda model: model,
     )
-    decision, _ = _request_claude_routing_decision(workspace, token, task, available_models)
-    if decision is None:
+    if route is None:
         return None
-
-    exact_model = decision.model
     if audit_decision:
         routing.write_decision_record(
-            claude_routing.DECISIONS_PATH, payload, task, decision, exact_model
+            claude_routing.DECISIONS_PATH,
+            payload,
+            route.task,
+            route.decision,
+            route.routed_model,
         )
     routing_message = _switch_message(
-        exact_model,
-        decision.rationale,
+        route.routed_model,
+        route.decision.rationale,
         title="Subagent Smart Routing",
     )
-    updated_input = {key: value for key, value in tool_input.items() if key != "model"}
-    updated_input["subagent_type"] = _routed_claude_agent_name(exact_model)
+    updated_input = {
+        **{key: value for key, value in route.tool_input.items() if key != "model"},
+        "subagent_type": _routed_claude_agent_name(route.routed_model),
+    }
     hook_output = {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",

@@ -56,19 +56,6 @@ def valid_model_name(name: object) -> bool:
     )
 
 
-def switch_message(model: str, rationale: str | None) -> str:
-    """Format the routed-model notice shown in Claude Code."""
-    lines = [
-        "Using Unity Gateway Smart Router.",
-        f"Selected Model : {model}",
-    ]
-    if rationale:
-        lines.append(f"Reason : {rationale}")
-    width = max(len(line) for line in lines)
-    border = "─" * (width + 2)
-    return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
-
-
 class ConfirmationState:
     """Detect and accept Claude's optional cache-cost confirmation dialog."""
 
@@ -163,6 +150,8 @@ def request_first_prompt_route(path: Path, payload: dict, *, timeout: float = 5.
 
 def first_prompt_hook_output(response: dict | None) -> dict | None:
     """Translate the wrapper response into Claude hook output."""
+    from ucode.smart_routing.v2 import _switch_message
+
     if not isinstance(response, dict) or response.get("action") != "block":
         return None
     model = response.get("model")
@@ -172,7 +161,7 @@ def first_prompt_hook_output(response: dict | None) -> dict | None:
     rationale = response.get("rationale")
     return {
         "decision": "block",
-        "reason": switch_message(model, rationale if isinstance(rationale, str) else None),
+        "reason": _switch_message(model, rationale if isinstance(rationale, str) else None),
     }
 
 

@@ -36,7 +36,6 @@ class TestFirstPromptHook:
         )
 
         assert result == {"decision": "block", "reason": v2._switch_message(model, reason)}
-        assert claude_pty.switch_message(model, reason) == v2._switch_message(model, reason)
 
     def test_omits_reason_when_router_returns_none(self):
         result = claude_pty.first_prompt_hook_output(
