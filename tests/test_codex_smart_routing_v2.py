@@ -5,7 +5,7 @@ import json
 import pytest
 
 from ucode.agents import codex
-from ucode.smart_routing import codex_interposer, v2
+from ucode.smart_routing import codex_interposer, codex_routing, v2
 
 WS = "https://example.databricks.com"
 
@@ -379,12 +379,13 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
     captured = {}
     logged = []
 
-    def select_route(workspace, token, task, route_options, resolve):
+    def select_route(workspace, token, task, route_options, resolve, *, timeout):
         captured.update(
             workspace=workspace,
             token=token,
             task=task,
             route_options=list(route_options),
+            timeout=timeout,
         )
         return (
             codex_interposer.routing.RoutingDecision(
@@ -395,9 +396,9 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
             None,
         )
 
-    monkeypatch.setattr(codex_interposer.routing, "select_route", select_route)
+    monkeypatch.setattr(codex_routing.routing, "select_route", select_route)
 
-    decision, reason = codex_interposer._request_routing_decision(
+    decision, reason = codex_routing.request_routing_decision(
         WS,
         "same-oauth-token",
         "Fix the parser",
@@ -407,7 +408,7 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
             "system.ai.gpt-5-6-luna",
             "system.ai.glm-5-2",
         ],
-        logged.append,
+        log=logged.append,
     )
 
     assert reason is None
@@ -416,6 +417,7 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
         "workspace": WS,
         "token": "same-oauth-token",
         "task": "Fix the parser",
+        "timeout": codex_routing.REQUEST_TIMEOUT_S,
         "route_options": [
             ("kimi-k3-neo", "codex"),
             ("gpt-5-6-sol", "codex"),

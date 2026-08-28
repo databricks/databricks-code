@@ -12,7 +12,7 @@ from pathlib import Path
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
-from ucode.smart_routing import routing
+from ucode.smart_routing import codex_routing, routing
 
 SETTINGS_UPDATED = "thread/settings/updated"
 ITEM_STARTED = "item/started"
@@ -41,36 +41,6 @@ def _prompt_from_turn(params: dict) -> str | None:
             parts.append(item["text"])
     prompt = "\n".join(part for part in parts if part.strip())
     return prompt or None
-
-
-def _request_routing_decision(
-    workspace: str,
-    token: str,
-    prompt: str,
-    available_models: list[str],
-    log: Callable[[str], None] | None = None,
-) -> tuple[routing.RoutingDecision | None, str | None]:
-    available = {routing.normalize_model(model): model for model in available_models}
-    route_options = [(model, "codex") for model in available]
-    if not route_options:
-        return None, "no cached model services are available"
-    if log is not None:
-        payload = {
-            "route_options": [
-                {"model": model, "harness": harness} for model, harness in route_options
-            ],
-            "task": {"prompt": prompt},
-            "route_selector": {"router_name": routing.ROUTER_NAME},
-        }
-        url = workspace.rstrip("/") + routing.ROUTING_PATH
-        log(f"[ROUTE] request POST {url}: {json.dumps(payload, separators=(',', ':'))}")
-    return routing.select_route(
-        workspace,
-        token,
-        prompt,
-        route_options,
-        lambda selected: available.get(routing.normalize_model(selected)),
-    )
 
 
 class _Session:
@@ -226,12 +196,12 @@ async def _handle_tui(
                 token = token_provider()
             except RuntimeError as exc:
                 return None, f"could not refresh workspace auth: {exc}"
-            return _request_routing_decision(
+            return codex_routing.request_routing_decision(
                 workspace,
                 token,
                 prompt,
                 list(available_models or []),
-                log,
+                log=log,
             )
 
     sess = _Session(

@@ -38,7 +38,7 @@ class _Response:
         return json.dumps(self.payload).encode("utf-8")
 
 
-def test_routes_with_task_v1_codex_menu(monkeypatch):
+def test_routes_with_models_from_stored_state(monkeypatch):
     captured = {}
     task = "Refactor the parser" + "x" * 5000
 
@@ -73,9 +73,8 @@ def test_routes_with_task_v1_codex_menu(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer token"
     assert captured["body"] == {
         "route_options": [
-            {"model": "glm-5-2", "harness": "codex"},
-            {"model": "gpt-5-6-sol", "harness": "codex"},
             {"model": "gpt-5-6-luna", "harness": "codex"},
+            {"model": "gpt-5-6-sol", "harness": "codex"},
         ],
         "task": {"prompt": task},
         "route_selector": {"router_name": "task_v1"},
@@ -94,7 +93,7 @@ def test_router_model_is_not_substituted_when_exact_model_is_unavailable():
 def test_glm_maps_to_databricks_gateway_model():
     model = codex_routing.resolve_routed_model(
         "glm-5-2",
-        ["system.ai.gpt-5-6-luna", "system.ai.gpt-5-6-sol"],
+        ["system.ai.gpt-5-6-luna", "system.ai.gpt-5-6-sol", "system.ai.glm-5-2"],
     )
 
     assert model == "system.ai.glm-5-2"
@@ -224,7 +223,11 @@ def test_spawn_glm_decision_applies_glm_model(monkeypatch):
         },
         workspace=WS,
         token="token",
-        available_models=["system.ai.gpt-5-6-luna", "system.ai.gpt-5-6-sol"],
+        available_models=[
+            "system.ai.gpt-5-6-luna",
+            "system.ai.gpt-5-6-sol",
+            "system.ai.glm-5-2",
+        ],
     )
 
     assert output["hookSpecificOutput"]["updatedInput"]["model"] == "system.ai.glm-5-2"
