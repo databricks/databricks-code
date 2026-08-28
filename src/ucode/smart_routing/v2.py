@@ -120,23 +120,19 @@ def _routed_claude_agent_name(model: str) -> str:
     return f"{CLAUDE_ROUTED_AGENT_PREFIX}{slug[:36]}-{digest}"
 
 
-def _routed_claude_agent_definitions(
-    model_ids: list[str], model_name: Callable[[str], str]
-) -> dict[str, dict[str, str]]:
+def _routed_claude_agent_definitions(model_ids: list[str]) -> dict[str, dict[str, str]]:
     return {
         _routed_claude_agent_name(model): {
             "description": f"Smart-routed coding agent using {model}",
             "prompt": CLAUDE_ROUTED_AGENT_PROMPT,
-            "model": model_name(model),
+            "model": model,
         }
         for model in _canonical_claude_models(model_ids)
     }
 
 
-def _with_routed_claude_agents(
-    tool_args: list[str], model_ids: list[str], model_name: Callable[[str], str]
-) -> list[str]:
-    definitions = _routed_claude_agent_definitions(model_ids, model_name)
+def _with_routed_claude_agents(tool_args: list[str], model_ids: list[str]) -> list[str]:
+    definitions = _routed_claude_agent_definitions(model_ids)
     caller_definitions: dict = {}
     remaining: list[str] = []
     index = 0
@@ -357,7 +353,7 @@ def launch_claude(
     sync_first_prompt_hook(settings, hook_executable)
     write_json_file(settings_path, settings)
     model_args = launch_model_args(remaining, launch_model)
-    routed_agent_args = _with_routed_claude_agents(remaining, model_ids, model_name)
+    routed_agent_args = _with_routed_claude_agents(remaining, model_ids)
     argv = [binary, "--settings", str(settings_path), *model_args, *routed_agent_args]
 
     model_setting = _ClaudeModelSettingGuard(user_settings_path)

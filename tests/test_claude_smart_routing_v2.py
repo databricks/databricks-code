@@ -160,8 +160,8 @@ class TestV2Launch:
             "Selected for the parser task.",
         )
         assert {definition["model"] for definition in captured["agents"].values()} == {
-            "system.ai.claude-opus-4-8[1m]",
-            "system.ai.claude-sonnet-5[1m]",
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-sonnet-5",
         }
         assert claude_hooks.FIRST_PROMPT_SOCKET_ENV in captured["settings"]["env"]
         first_prompt_command = captured["settings"]["hooks"]["UserPromptSubmit"][0]["hooks"][0][
@@ -331,20 +331,17 @@ class TestSubagentRouting:
                 "--debug",
             ],
             ["databricks-claude-opus-4-8"],
-            claude._maybe_add_1m_suffix,
         )
 
         assert args[0] == "--agents"
         definitions = json.loads(args[1])
         assert definitions["reviewer"]["prompt"] == "Review the requested code."
         routed = definitions[v2._routed_claude_agent_name("system.ai.claude-opus-4-8")]
-        assert routed["model"] == "system.ai.claude-opus-4-8[1m]"
+        assert routed["model"] == "system.ai.claude-opus-4-8"
         assert args[2:] == ["--debug"]
 
     def test_leaves_non_claude_custom_agent_model_unchanged(self):
-        definitions = v2._routed_claude_agent_definitions(
-            ["catalog.schema.gpt-5"], claude._maybe_add_1m_suffix
-        )
+        definitions = v2._routed_claude_agent_definitions(["catalog.schema.gpt-5"])
 
         assert next(iter(definitions.values()))["model"] == "catalog.schema.gpt-5"
 
