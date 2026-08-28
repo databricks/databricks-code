@@ -161,6 +161,37 @@ class TestBuildSkillsMcpUrl:
 
 
 class TestDiscoverClaudeModels:
+    def test_lists_all_anthropic_model_ids_without_legacy_validation(self, monkeypatch):
+        captured = {}
+        payload = {
+            "data": [
+                {"id": "system.ai.claude-opus-5"},
+                {"id": "databricks-claude-sonnet-5"},
+                {"id": "opaque-model-id"},
+                {"id": "opaque-model-id"},
+                {"id": ""},
+            ]
+        }
+
+        def fake_get(url, token):
+            captured["request"] = (url, token)
+            return payload, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        models, reason = db_mod.list_anthropic_models(WS, "token")
+
+        assert reason is None
+        assert models == [
+            "system.ai.claude-opus-5",
+            "databricks-claude-sonnet-5",
+            "opaque-model-id",
+        ]
+        assert captured["request"] == (
+            f"{WS}/ai-gateway/anthropic/v1/models",
+            "token",
+        )
+
     def test_selects_opus_4_8_when_advertised(self, monkeypatch):
         payload = {
             "data": [
