@@ -173,8 +173,8 @@ class TestDiscoverClaudeModels:
             ]
         }
 
-        def fake_get(url, token):
-            captured["request"] = (url, token)
+        def fake_get(url, token, **kwargs):
+            captured["request"] = (url, token, kwargs)
             return payload, None
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
@@ -190,6 +190,7 @@ class TestDiscoverClaudeModels:
         assert captured["request"] == (
             f"{WS}/ai-gateway/anthropic/v1/models",
             "token",
+            {"max_retries": 2},
         )
 
     def test_selects_opus_4_8_when_advertised(self, monkeypatch):
@@ -200,7 +201,7 @@ class TestDiscoverClaudeModels:
                 {"id": "databricks-claude-sonnet-4-6"},
             ]
         }
-        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token, **kwargs: (payload, None))
 
         models, reason = db_mod.discover_claude_models(WS, "token")
 
@@ -214,7 +215,7 @@ class TestDiscoverClaudeModels:
                 {"id": "databricks-claude-opus-4-8"},
             ]
         }
-        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token, **kwargs: (payload, None))
 
         models, reason = db_mod.discover_claude_models(WS, "token")
 
@@ -2018,6 +2019,103 @@ class TestHttpGetJsonReason:
             payload, reason = _http_get_json("https://x/y", "tok")
         assert payload is None
         assert reason == "HTTP 404 Not Found"
+
+
+class TestHttpGetJsonRetries:
+    @staticmethod
+    def _http_error(code: int, message: str, headers: dict[str, str] | None = None):
+        from urllib.error import HTTPError
+
+        return HTTPError(url="", code=code, msg=message, hdrs=headers or {}, fp=None)
+
+    def test_retries_429_after_retry_after_delay(self, monkeypatch):
+        outcomes = iter(
+            [
+                self._http_error(429, "Too Many Requests", {"Retry-After": "1"}),
+                _FakeResponse({"data": []}),
+            ]
+        )
+        calls = []
+        sleeps = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(db_mod.random, "uniform", lambda low, high: high)
+        monkeypatch.setattr(db_mod.time, "sleep", sleeps.append)
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload == {"data": []}
+        assert reason is None
+        assert len(calls) == 2
+        assert sleeps == [1.25]
+
+    def test_retries_network_error_with_exponential_backoff(self, monkeypatch):
+        from urllib.error import URLError
+
+        outcomes = iter([URLError("connection reset"), _FakeResponse({"ok": True})])
+        sleeps = []
+
+        def fake_urlopen(request, timeout=None):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(db_mod.random, "uniform", lambda low, high: high)
+        monkeypatch.setattr(db_mod.time, "sleep", sleeps.append)
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload == {"ok": True}
+        assert reason is None
+        assert sleeps == [1.25]
+
+    def test_stops_after_configured_retries(self, monkeypatch):
+        calls = []
+        sleeps = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            raise self._http_error(503, "Service Unavailable")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(db_mod.random, "uniform", lambda low, high: high)
+        monkeypatch.setattr(db_mod.time, "sleep", sleeps.append)
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload is None
+        assert reason == "HTTP 503 Service Unavailable"
+        assert len(calls) == 3
+        assert sleeps == [1.25, 2.5]
+
+    def test_does_not_retry_non_transient_http_error(self, monkeypatch):
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            raise self._http_error(400, "Bad Request")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(
+            db_mod.time,
+            "sleep",
+            lambda delay: pytest.fail(f"unexpected retry delay: {delay}"),
+        )
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload is None
+        assert reason == "HTTP 400 Bad Request"
+        assert len(calls) == 1
 
 
 class TestParseDatabricksCliVersion:
