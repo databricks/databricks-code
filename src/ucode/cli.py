@@ -1480,13 +1480,22 @@ def claude_router_hook_cmd(
             token = get_databricks_token(host, profile)
         except RuntimeError:
             return
-    output = route_pre_tool_use(
-        payload,
-        workspace=host,
-        token=token,
-        available_models=model or [],
-        audit_decision=True,
-    )
+    if smart_routing_v2.enabled():
+        output = smart_routing_v2.route_claude_pre_tool_use(
+            payload,
+            workspace=host,
+            token=token,
+            available_models=model or [],
+            audit_decision=True,
+        )
+    else:
+        output = route_pre_tool_use(
+            payload,
+            workspace=host,
+            token=token,
+            available_models=model or [],
+            audit_decision=True,
+        )
     if output is not None:
         sys.stdout.write(json.dumps(output))
 

@@ -21,8 +21,12 @@ from ucode.databricks import (
     get_databricks_token,
     list_anthropic_models,
 )
-from ucode.smart_routing import codex_interposer, routing
-from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, sync_first_prompt_hook
+from ucode.smart_routing import claude_routing, codex_interposer, routing
+from ucode.smart_routing.claude_hooks import (
+    FIRST_PROMPT_SOCKET_ENV,
+    sync_first_prompt_hook,
+    sync_smart_routing_hooks,
+)
 from ucode.ui import print_note
 
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
@@ -89,21 +93,20 @@ def _canonical_claude_model_id(model: str) -> str:
     return model
 
 
-def _route_claude_prompt(state: dict, token: str, prompt: str) -> routing.RoutingDecision:
-    workspace = state.get("workspace")
-    if not isinstance(workspace, str):
-        raise RuntimeError("workspace metadata is unavailable")
-
-    model_ids, discovery_error = list_anthropic_models(workspace, token)
-    if not model_ids:
-        raise RuntimeError(discovery_error or "Anthropic models endpoint returned no Claude models")
-
+def _request_claude_routing_decision(
+    workspace: str,
+    token: str,
+    prompt: str,
+    model_ids: list[str],
+) -> tuple[routing.RoutingDecision | None, str | None]:
     available: dict[str, str] = {}
     for model in model_ids:
         if isinstance(model, str) and model:
             canonical = _canonical_claude_model_id(model)
             available.setdefault(routing.normalize_model(canonical), canonical)
-    decision, error = routing.select_route(
+    if not available:
+        return None, "Anthropic models endpoint returned no Claude models"
+    return routing.select_route(
         workspace,
         token,
         prompt,
@@ -111,9 +114,57 @@ def _route_claude_prompt(state: dict, token: str, prompt: str) -> routing.Routin
         lambda selected: available.get(routing.normalize_model(selected)),
         timeout=CLAUDE_ROUTE_SELECTION_TIMEOUT_S,
     )
+
+
+def _route_claude_prompt(
+    state: dict,
+    token: str,
+    prompt: str,
+    model_ids: list[str] | None = None,
+) -> routing.RoutingDecision:
+    workspace = state.get("workspace")
+    if not isinstance(workspace, str):
+        raise RuntimeError("workspace metadata is unavailable")
+
+    if model_ids is None:
+        model_ids, discovery_error = list_anthropic_models(workspace, token)
+        if not model_ids:
+            raise RuntimeError(
+                discovery_error or "Anthropic models endpoint returned no Claude models"
+            )
+    decision, error = _request_claude_routing_decision(workspace, token, prompt, model_ids)
     if decision is None:
         raise RuntimeError(error or "router returned no Claude model selection")
     return decision
+
+
+def route_claude_pre_tool_use(
+    payload: dict,
+    *,
+    workspace: str,
+    token: str,
+    available_models: list[str],
+    audit_decision: bool = False,
+) -> dict | None:
+    """Route a Claude Code Agent call using the V2 Anthropic model menu."""
+    record = None
+    if audit_decision:
+
+        def record(payload, task, decision, requested):
+            routing.write_decision_record(
+                claude_routing.DECISIONS_PATH, payload, task, decision, requested
+            )
+
+    return routing.route_spawn_tool(
+        payload,
+        is_spawn_agent=claude_routing.is_spawn_agent_tool,
+        decision_fn=lambda task: _request_claude_routing_decision(
+            workspace, token, task, available_models
+        ),
+        default_task_label="Claude Code subagent task",
+        model_id_mapper=claude_routing._claude_model_id,
+        record_decision=record,
+    )
 
 
 def _is_claude_target_model(value: object) -> bool:
@@ -185,6 +236,9 @@ def launch_claude(
     token = get_databricks_token(workspace, state.get("profile"))
     os.environ[OAUTH_TOKEN_ENV_VAR] = token
     os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
+    model_ids, discovery_error = list_anthropic_models(workspace, token)
+    if not model_ids:
+        raise RuntimeError(discovery_error or "Anthropic models endpoint returned no Claude models")
 
     run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     socket_path = APP_DIR / f"claude-v2-{run_id}.sock"
@@ -199,6 +253,11 @@ def launch_claude(
         raise RuntimeError("Claude settings 'env' must be an object for smart routing.")
     env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     env[FIRST_PROMPT_SOCKET_ENV] = str(socket_path)
+    routing_state = {
+        **state,
+        "claude_models": {str(index): model for index, model in enumerate(model_ids)},
+    }
+    sync_smart_routing_hooks(settings, routing_state, enabled=True)
     sync_first_prompt_hook(settings, hook_executable)
     write_json_file(settings_path, settings)
     model_args = launch_model_args(remaining, launch_model)
@@ -213,7 +272,7 @@ def launch_claude(
     try:
         returncode = claude_pty.run_claude_pty(
             argv,
-            route_prompt=lambda prompt: _route_claude_prompt(state, token, prompt).model,
+            route_prompt=lambda prompt: _route_claude_prompt(state, token, prompt, model_ids).model,
             socket_path=socket_path,
             prepare_model_switch=model_setting.begin,
             model_switch_persisted=model_setting.is_routed,

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from ucode.agents import claude
-from ucode.smart_routing import claude_hooks, claude_pty, v2
+from ucode.smart_routing import claude_hooks, claude_pty, routing, v2
 
 
 class TestDirectModelCommand:
@@ -87,6 +87,14 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
         monkeypatch.setattr(
             v2,
+            "list_anthropic_models",
+            lambda *_args: (
+                ["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
+                None,
+            ),
+        )
+        monkeypatch.setattr(
+            v2,
             "_route_claude_prompt",
             lambda *_args: v2.routing.RoutingDecision(
                 model="system.ai.claude-sonnet-5",
@@ -129,6 +137,15 @@ class TestV2Launch:
         assert captured["argv"][-3:] == ["--model", "opus", "--debug"]
         assert captured["routed_model"] == "system.ai.claude-sonnet-5"
         assert claude_hooks.FIRST_PROMPT_SOCKET_ENV in captured["settings"]["env"]
+        route_commands = [
+            hook["command"]
+            for group in captured["settings"]["hooks"]["PreToolUse"]
+            for hook in group["hooks"]
+            if "route-subagent" in hook["command"]
+        ]
+        assert len(route_commands) == 1
+        assert "--model system.ai.claude-opus-4-8" in route_commands[0]
+        assert "--model system.ai.claude-sonnet-5" in route_commands[0]
         assert "modelPicker" not in captured["settings"]
         assert captured["restored_during_run"] == {
             "model": "haiku",
@@ -147,6 +164,7 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
         monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
+        monkeypatch.setattr(v2, "list_anthropic_models", lambda *_args: (["opus"], None))
 
         def fake_run(_argv, **_kwargs):
             user_settings.write_text(json.dumps({"model": "user-selected"}))
@@ -174,6 +192,7 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
         monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
+        monkeypatch.setattr(v2, "list_anthropic_models", lambda *_args: (["opus"], None))
 
         def fake_run(_argv, **kwargs):
             routed_model = "system.ai.claude-opus-4-8"
@@ -202,6 +221,51 @@ class TestV2Launch:
             "model": v2.CLAUDE_TARGET_MODEL,
             "theme": "dark",
         }
+
+
+class TestSubagentRouting:
+    def test_routes_agent_prompt_with_initialized_model_menu(self, monkeypatch):
+        captured = {}
+
+        def fake_select(workspace, token, task, route_options, resolve, **kwargs):
+            captured.update(
+                workspace=workspace,
+                token=token,
+                task=task,
+                route_options=list(route_options),
+            )
+            return (
+                routing.RoutingDecision(
+                    model=resolve("claude-opus-4-8"),
+                    raw_model="claude-opus-4-8",
+                ),
+                None,
+            )
+
+        monkeypatch.setattr(routing, "select_route", fake_select)
+        output = v2.route_claude_pre_tool_use(
+            {
+                "tool_name": "Agent",
+                "tool_input": {"prompt": "inspect the parser", "model": "sonnet"},
+            },
+            workspace="https://example.com",
+            token="token",
+            available_models=[
+                "system.ai.claude-opus-4-8",
+                "databricks-claude-sonnet-5",
+            ],
+        )
+
+        assert captured == {
+            "workspace": "https://example.com",
+            "token": "token",
+            "task": "inspect the parser",
+            "route_options": [
+                ("claude-opus-4-8", "claude"),
+                ("claude-sonnet-5", "claude"),
+            ],
+        }
+        assert output["hookSpecificOutput"]["updatedInput"]["model"] == "opus"
 
     def test_model_switch_lock_serializes_routed_sessions(self, tmp_path, monkeypatch):
         user_settings = tmp_path / "settings.json"
