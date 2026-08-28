@@ -573,6 +573,22 @@ class TestWriteToolConfigManagedSettings:
 
 
 class TestRegisterWebSearchMcp:
+    def test_skips_registration_when_entry_is_current(self, monkeypatch):
+        entry = claude._web_search_mcp_entry(WS, "m", "profile")
+        state = {claude.WEB_SEARCH_MCP_STATE_KEY: entry}
+        monkeypatch.setattr(
+            claude,
+            "read_json_safe",
+            lambda path: {"mcpServers": {claude.WEB_SEARCH_MCP_NAME: entry}},
+        )
+        assert claude._web_search_mcp_is_current(state, entry) is True
+
+    def test_detects_registration_drift(self, monkeypatch):
+        entry = claude._web_search_mcp_entry(WS, "m", "profile")
+        state = {claude.WEB_SEARCH_MCP_STATE_KEY: entry}
+        monkeypatch.setattr(claude, "read_json_safe", lambda path: {"mcpServers": {}})
+        assert claude._web_search_mcp_is_current(state, entry) is False
+
     def test_clears_existing_then_adds(self, monkeypatch):
         import ucode.mcp as mcp_mod
 

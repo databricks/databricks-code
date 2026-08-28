@@ -220,6 +220,13 @@ class TestSubcommandRouting:
         assert mock_launch.call_args.kwargs["enable_smart_routing_flag"] is True
         assert mock_launch.call_args.args[1].args == []
 
+    def test_codex_refresh_is_consumed_by_ucode(self):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, ["codex", "--refresh"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.kwargs["refresh"] is True
+
     def test_claude_enable_model_discovery_sets_ucode_env(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
             result = runner.invoke(app, ["claude", "--enable-model-discovery"])
@@ -345,6 +352,12 @@ class TestClaudeModelFlag:
             result = runner.invoke(app, ["claude", "--model", "cat.schema.claude-opus-5"])
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.kwargs["model"] == "cat.schema.claude-opus-5"
+
+    def test_refresh_threads_through_to_launch(self):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, ["claude", "--refresh"])
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.kwargs["refresh"] is True
 
     def test_model_threads_to_claude_as_custom_model(self, monkeypatch):
         monkeypatch.delenv("ENABLE_SMART_ROUTING_V2", raising=False)
@@ -998,6 +1011,46 @@ class TestRevert:
 
 
 class TestAutoConfigureOnFirstRun:
+    def test_uses_existing_claude_settings_without_preflight(self, tmp_path):
+        from pathlib import Path
+
+        settings_path = tmp_path / "ucode-settings.json"
+        settings_path.write_text("{}", encoding="utf-8")
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state") as mock_preflight,
+            patch("ucode.cli.configure_tool") as mock_configure,
+            patch("ucode.cli.claude_agent.CLAUDE_SETTINGS_PATH", Path(settings_path)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["claude"])
+
+        assert result.exit_code == 0, result.output
+        mock_preflight.assert_not_called()
+        mock_configure.assert_not_called()
+        mock_launch.assert_called_once()
+
+    def test_uses_existing_codex_config_without_preflight(self):
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state") as mock_preflight,
+            patch("ucode.cli.configure_tool") as mock_configure,
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.install_databricks_ai_tools_for_agents") as mock_ai_tools,
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["codex"])
+
+        assert result.exit_code == 0, result.output
+        mock_preflight.assert_not_called()
+        mock_configure.assert_not_called()
+        mock_ai_tools.assert_not_called()
+        mock_launch.assert_called_once()
+
     def test_triggers_when_no_workspace(self):
         """Auto-configure runs when state has no workspace."""
         empty_state = {}
@@ -1071,6 +1124,69 @@ class TestAutoConfigureOnFirstRun:
             runner.invoke(app, ["claude"])
         mock_bootstrap.assert_called_once_with("claude", update_existing=False)
         mock_auto.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("tool", "expected"),
+    [
+        ("claude", "Launching Claude Code with Unity Gateway"),
+        ("codex", "Launching Codex with Unity Gateway"),
+    ],
+)
+def test_launch_title(tool, expected):
+    from ucode.cli import _launch_title
+
+    assert _launch_title(tool) == expected
+
+
+class TestCachedConfigPredicate:
+    @staticmethod
+    def _kwargs(**overrides):
+        kwargs = {
+            "refresh": False,
+            "model": None,
+            "explicit_provider": None,
+            "enable_smart_routing_flag": False,
+            "workspace": None,
+            "needs_auto_configure": False,
+        }
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_accepts_configured_codex_launch(self):
+        import ucode.cli as cli_mod
+
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
+                is True
+            )
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"refresh": True},
+            {"explicit_provider": "catalog.schema.provider"},
+            {"enable_smart_routing_flag": True},
+            {"workspace": "https://other.databricks.com"},
+        ],
+    )
+    def test_rejects_dynamic_launch_overrides(self, override):
+        import ucode.cli as cli_mod
+
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config(
+                    "codex", MINIMAL_STATE, **self._kwargs(**override)
+                )
+                is False
+            )
 
 
 class TestPassthroughArgs:
@@ -2519,7 +2635,9 @@ class TestSkipPreflightFlag:
             patch("ucode.cli._auto_configure_tool"),
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
             patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
             patch("ucode.cli.configure_shared_state", cfg),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=False),
             patch(
                 "ucode.cli.resolve_launch_model",
                 return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),

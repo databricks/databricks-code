@@ -25,6 +25,29 @@ class TestCodexSpec:
         assert codex.SPEC["display"] == "Codex"
 
 
+class TestHasUcodeConfig:
+    def test_detects_profile_config(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "ucode.config.toml"
+        legacy_path = tmp_path / "config.toml"
+        legacy_path.write_text(
+            'profile = "ucode"\n\n[profiles.ucode]\nmodel_provider = "ucode-databricks"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
+
+        assert codex.has_ucode_config() is True
+
+    def test_ignores_unrelated_legacy_config(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "ucode.config.toml"
+        legacy_path = tmp_path / "config.toml"
+        legacy_path.write_text('profile = "default"\n', encoding="utf-8")
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
+
+        assert codex.has_ucode_config() is False
+
+
 class TestRenderOverlay:
     def test_uses_profile_file_shape_without_legacy_profiles(self):
         overlay = codex.render_overlay(WS)

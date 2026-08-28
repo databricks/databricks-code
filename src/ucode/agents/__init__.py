@@ -89,11 +89,15 @@ AITOOLS_AGENT_TOKENS = {
 
 
 def install_databricks_ai_tools_for_agents(tools: list[str], state: dict) -> None:
-    """Install Databricks AI Tools for the coding agents that support them
-    (gemini/pi have no ``aitools`` support and are dropped)."""
+    """Install Databricks AI Tools for supported agents.
+
+    Gemini and Pi have no ``aitools`` support and are dropped.
+    """
     if state.get("databricks_ai_tools_enabled", True) is False:
         return
     agents = [AITOOLS_AGENT_TOKENS[tool] for tool in tools if tool in AITOOLS_AGENT_TOKENS]
+    if not agents:
+        return
     install_ai_tools(agents, state.get("profile"))
 
 

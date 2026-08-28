@@ -73,7 +73,7 @@ class TestInstallAiToolsForAgents:
 
     def test_maps_supported_tools_and_drops_others(self, monkeypatch):
         captured = self._capture(monkeypatch)
-        # gemini and pi aren't supported by `databricks aitools`, so they drop.
+        # Gemini and Pi aren't supported by `databricks aitools`, so they drop.
         install_databricks_ai_tools_for_agents(
             ["claude", "codex", "gemini", "pi"], {"profile": "prof"}
         )
