@@ -30,11 +30,20 @@ class TestDirectModelCommand:
 class TestFirstPromptHook:
     def test_renders_boxed_router_notice(self):
         model = "system.ai.claude-sonnet-4-6[1m]"
-        reason = "Low complexity, unclear intent, and no code reference."
-        result = claude_pty.first_prompt_hook_output({"action": "block", "model": model})
+        reason = "Routed to Sonnet because the task is narrowly scoped."
+        result = claude_pty.first_prompt_hook_output(
+            {"action": "block", "model": model, "rationale": reason}
+        )
 
         assert result == {"decision": "block", "reason": v2._switch_message(model, reason)}
         assert claude_pty.switch_message(model, reason) == v2._switch_message(model, reason)
+
+    def test_omits_reason_when_router_returns_none(self):
+        result = claude_pty.first_prompt_hook_output(
+            {"action": "block", "model": "system.ai.claude-sonnet-5"}
+        )
+
+        assert "Reason" not in result["reason"]
 
     def test_blocks_once_then_allows_replay(self, tmp_path):
         socket_path = tmp_path / "first.sock"
@@ -42,7 +51,7 @@ class TestFirstPromptHook:
         stop = threading.Event()
         claude_pty.serve_first_prompt_socket(
             socket_path,
-            lambda _prompt: "sonnet",
+            lambda _prompt: ("sonnet", "Selected for a narrow task."),
             lambda prompt, model: blocked.append((prompt, model)),
             stop,
         )
@@ -56,7 +65,11 @@ class TestFirstPromptHook:
             replay = claude_pty.request_first_prompt_route(
                 socket_path, {"session_id": "s1", "prompt": "fix the parser"}
             )
-            assert first == {"action": "block", "model": "sonnet"}
+            assert first == {
+                "action": "block",
+                "model": "sonnet",
+                "rationale": "Selected for a narrow task.",
+            }
             assert replay == {"action": "allow"}
             assert blocked == [("fix the parser", "sonnet")]
         finally:
@@ -99,12 +112,15 @@ class TestV2Launch:
             lambda *_args: v2.routing.RoutingDecision(
                 model="system.ai.claude-sonnet-5",
                 raw_model="claude-sonnet-5",
+                rationale="Selected for the parser task.",
             ),
         )
         captured: dict = {}
 
         def fake_run(argv, **kwargs):
             captured["argv"] = argv
+            agents_index = argv.index("--agents")
+            captured["agents"] = json.loads(argv[agents_index + 1])
             captured["routed_model"] = kwargs["route_prompt"]("fix the parser")
             generated = Path(argv[argv.index("--settings") + 1])
             captured["settings"] = json.loads(generated.read_text())
@@ -134,8 +150,16 @@ class TestV2Launch:
             )
 
         assert exc.value.code == 0
-        assert captured["argv"][-3:] == ["--model", "opus", "--debug"]
-        assert captured["routed_model"] == "system.ai.claude-sonnet-5"
+        assert captured["argv"][3:5] == ["--model", "opus"]
+        assert captured["argv"][-1] == "--debug"
+        assert captured["routed_model"] == (
+            "system.ai.claude-sonnet-5",
+            "Selected for the parser task.",
+        )
+        assert {definition["model"] for definition in captured["agents"].values()} == {
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-sonnet-5",
+        }
         assert claude_hooks.FIRST_PROMPT_SOCKET_ENV in captured["settings"]["env"]
         first_prompt_command = captured["settings"]["hooks"]["UserPromptSubmit"][0]["hooks"][0][
             "command"
@@ -228,8 +252,10 @@ class TestV2Launch:
 
 
 class TestSubagentRouting:
-    def test_routes_agent_prompt_with_initialized_model_menu(self, monkeypatch):
+    def test_routes_agent_prompt_with_initialized_model_menu(self, tmp_path, monkeypatch):
         captured = {}
+        decisions_path = tmp_path / "decisions.jsonl"
+        monkeypatch.setattr(v2.claude_routing, "DECISIONS_PATH", decisions_path)
 
         def fake_select(workspace, token, task, route_options, resolve, **kwargs):
             captured.update(
@@ -258,6 +284,7 @@ class TestSubagentRouting:
                 "system.ai.claude-opus-4-8",
                 "databricks-claude-sonnet-5",
             ],
+            audit_decision=True,
         )
 
         assert captured == {
@@ -269,7 +296,44 @@ class TestSubagentRouting:
                 ("claude-sonnet-5", "claude"),
             ],
         }
-        assert output["hookSpecificOutput"]["updatedInput"]["model"] == "opus"
+        updated_input = output["hookSpecificOutput"]["updatedInput"]
+        assert "model" not in updated_input
+        assert updated_input["subagent_type"] == v2._routed_claude_agent_name(
+            "system.ai.claude-opus-4-8"
+        )
+        expected_message = v2._switch_message(
+            "system.ai.claude-opus-4-8",
+            "",
+            title="Subagent Smart Routing",
+        )
+        assert output["systemMessage"] == expected_message
+        assert output["hookSpecificOutput"]["permissionDecisionReason"] == expected_message
+        decision_record = json.loads(decisions_path.read_text())
+        assert decision_record["requested_model"] == "system.ai.claude-opus-4-8"
+
+    def test_merges_caller_agents_with_transient_routed_agents(self):
+        args = v2._with_routed_claude_agents(
+            [
+                "--agents",
+                json.dumps(
+                    {
+                        "reviewer": {
+                            "description": "Reviews code",
+                            "prompt": "Review the requested code.",
+                        }
+                    }
+                ),
+                "--debug",
+            ],
+            ["databricks-claude-opus-4-8"],
+        )
+
+        assert args[0] == "--agents"
+        definitions = json.loads(args[1])
+        assert definitions["reviewer"]["prompt"] == "Review the requested code."
+        routed = definitions[v2._routed_claude_agent_name("system.ai.claude-opus-4-8")]
+        assert routed["model"] == "system.ai.claude-opus-4-8"
+        assert args[2:] == ["--debug"]
 
     def test_model_switch_lock_serializes_routed_sessions(self, tmp_path, monkeypatch):
         user_settings = tmp_path / "settings.json"
@@ -318,7 +382,7 @@ class TestPtyFlow:
         with pytest.raises(RuntimeError, match="Claude was not launched"):
             claude_pty.run_claude_pty(
                 ["claude"],
-                route_prompt=lambda _prompt: "sonnet",
+                route_prompt=lambda _prompt: ("sonnet", ""),
                 socket_path=tmp_path / "missing.sock",
             )
 
@@ -376,7 +440,7 @@ capture_path.write_text(json.dumps({
                 str(capture),
                 str(restored),
             ],
-            route_prompt=lambda _prompt: "system.ai.claude-sonnet-5",
+            route_prompt=lambda _prompt: ("system.ai.claude-sonnet-5", ""),
             socket_path=socket_path,
             restore_model_setting=lambda: restored.write_text("restored"),
         )

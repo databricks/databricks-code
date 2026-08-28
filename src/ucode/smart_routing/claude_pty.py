@@ -56,13 +56,14 @@ def valid_model_name(name: object) -> bool:
     )
 
 
-def switch_message(model: str, reason: str) -> str:
+def switch_message(model: str, rationale: str | None) -> str:
     """Format the routed-model notice shown in Claude Code."""
     lines = [
         "Using Unity Gateway Smart Router.",
         f"Selected Model : {model}",
-        f"Reason : {reason}",
     ]
+    if rationale:
+        lines.append(f"Reason : {rationale}")
     width = max(len(line) for line in lines)
     border = "─" * (width + 2)
     return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
@@ -168,15 +169,16 @@ def first_prompt_hook_output(response: dict | None) -> dict | None:
     if not valid_model_name(model):
         return None
     assert isinstance(model, str)
+    rationale = response.get("rationale")
     return {
         "decision": "block",
-        "reason": switch_message(model, "Low complexity, unclear intent, and no code reference."),
+        "reason": switch_message(model, rationale if isinstance(rationale, str) else None),
     }
 
 
 def serve_first_prompt_socket(
     path: Path,
-    route_prompt: Callable[[str], str],
+    route_prompt: Callable[[str], tuple[str, str]],
     on_blocked_prompt: Callable[[str, str], None],
     stop: threading.Event,
     *,
@@ -223,10 +225,14 @@ def serve_first_prompt_socket(
                             and prompt.strip()
                             and not is_command
                         ):
-                            model = route_prompt(prompt)
+                            model, rationale = route_prompt(prompt)
                             if valid_model_name(model):
                                 claimed = True
-                                response = {"action": "block", "model": model}
+                                response = {
+                                    "action": "block",
+                                    "model": model,
+                                    "rationale": rationale,
+                                }
                                 blocked = (prompt, model)
                     except Exception as exc:  # noqa: BLE001 - hooks must fail open
                         log(f"[ERR] first-prompt request: {exc!r}")
@@ -274,7 +280,7 @@ def sync_winsize(master_fd: int, stdin_fd: int = 0) -> None:
 def run_claude_pty(
     argv: list[str],
     *,
-    route_prompt: Callable[[str], str],
+    route_prompt: Callable[[str], tuple[str, str]],
     socket_path: Path,
     prepare_model_switch: Callable[[str], None] = lambda _model: None,
     model_switch_persisted: Callable[[], bool] = lambda: True,
