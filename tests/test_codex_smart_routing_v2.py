@@ -39,11 +39,12 @@ def test_smart_routing_switch_message_is_boxed():
     message = v2._switch_message("model-x", "Because X.")
 
     assert message == (
-        "┌───────────────────────────────────┐\n"
-        "│ Using Unity Gateway Smart Router. │\n"
-        "│ Selected Model : model-x          │\n"
-        "│ Reason : Because X.               │\n"
-        "└───────────────────────────────────┘"
+        "┌───────────────────────────────────────────────────────────────────────────┐\n"
+        "│ Using Unity Gateway Smart Router.                                         │\n"
+        "│ Selected Model : model-x                                                  │\n"
+        "│ Reason : Because X.                                                       │\n"
+        "│ Spawned subagents are routed independently based on their own complexity. │\n"
+        "└───────────────────────────────────────────────────────────────────────────┘"
     )
 
 

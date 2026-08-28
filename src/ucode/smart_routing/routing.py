@@ -23,6 +23,22 @@ from typing import Any
 ROUTER_NAME = "task_v1"
 ROUTING_PATH = "/ai-gateway/routing/v1/routes:select"
 REQUEST_TIMEOUT_S = 30.0
+SUBAGENT_ROUTING_DISCLAIMER = (
+    "Spawned subagents are routed independently based on their own complexity."
+)
+
+
+def format_switch_message(model: str, reason: str) -> str:
+    """Format the routed-model notice shared by Codex and Claude Code."""
+    lines = [
+        "Using Unity Gateway Smart Router.",
+        f"Selected Model : {model}",
+        f"Reason : {reason}",
+        SUBAGENT_ROUTING_DISCLAIMER,
+    ]
+    width = max(len(line) for line in lines)
+    border = "─" * (width + 2)
+    return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
 
 
 @dataclass(frozen=True)

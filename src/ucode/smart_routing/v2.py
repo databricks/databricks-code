@@ -17,7 +17,7 @@ import tomlkit
 from ucode.config_io import APP_DIR, read_json_safe, read_toml_safe, write_json_file
 from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import build_auth_token_argv, get_databricks_token
-from ucode.smart_routing import codex_interposer
+from ucode.smart_routing import codex_interposer, routing
 from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, sync_first_prompt_hook
 from ucode.smart_routing.codex_hooks import merge_pre_tool_use_hooks, routing_models
 from ucode.ui import print_note
@@ -67,14 +67,7 @@ def _wait_for_app_server(port: int, timeout: float) -> bool:
 
 
 def _switch_message(model: str, reason: str) -> str:
-    lines = [
-        "Using Unity Gateway Smart Router.",
-        f"Selected Model : {model}",
-        f"Reason : {reason}",
-    ]
-    width = max(len(line) for line in lines)
-    border = "─" * (width + 2)
-    return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
+    return routing.format_switch_message(model, reason)
 
 
 def _route_claude_prompt(_prompt: str) -> str:

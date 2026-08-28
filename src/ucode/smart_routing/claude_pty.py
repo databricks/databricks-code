@@ -25,6 +25,8 @@ import tty
 from collections.abc import Callable
 from pathlib import Path
 
+from ucode.smart_routing import routing
+
 MAX_MODEL_NAME_LEN = 200
 CONFIRM_TIMEOUT_S = 3.0
 SWITCH_TIMEOUT_S = 6.0
@@ -58,14 +60,7 @@ def valid_model_name(name: object) -> bool:
 
 def switch_message(model: str, reason: str) -> str:
     """Format the routed-model notice shown in Claude Code."""
-    lines = [
-        "Using Unity Gateway Smart Router.",
-        f"Selected Model : {model}",
-        f"Reason : {reason}",
-    ]
-    width = max(len(line) for line in lines)
-    border = "─" * (width + 2)
-    return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
+    return routing.format_switch_message(model, reason)
 
 
 class ConfirmationState:
