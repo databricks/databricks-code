@@ -314,6 +314,20 @@ class TestExistingConfigHandling:
             assert keep_going is False
         delete.assert_called_once_with(WORKSPACE, "token", "cfg/1")
 
+    def test_choosing_adopt_confirms_and_stops(self):
+        existing = {"name": "cfg/1", "enabled_agents": {"claude": {}}}
+        with (
+            patch.object(wizard, "get_managed_config", return_value=(existing, None)),
+            patch.object(wizard, "prompt_for_selection", return_value="adopt"),
+            patch("ucode.cli._confirm_managed_config_applied") as confirm,
+        ):
+            # Adopting just confirms the config is in force (the launch path applies it) and stops
+            # the wizard — no re-authoring, no local writes.
+            keep_going, published = wizard._handle_existing_config(WORKSPACE, "token")
+            assert keep_going is False
+            assert published == existing
+        confirm.assert_called_once_with(existing, WORKSPACE)
+
     def test_delete_declined_leaves_config_intact(self):
         with (
             patch.object(
@@ -355,6 +369,63 @@ class TestExistingConfigHandling:
             pytest.raises(KeyboardInterrupt),
         ):
             wizard._handle_existing_config(WORKSPACE, "token")
+
+
+class TestStepBanner:
+    """The step headers brand themselves to the invoking command, so a `ucode configure` run
+    doesn't show `ucode setup` headers."""
+
+    def test_defaults_to_ucode_setup(self):
+        with patch.object(wizard, "print_section") as section:
+            wizard._step_banner(1, "Agents")
+        assert section.call_args.args[0].startswith("ucode setup · step 1 of ")
+
+    def test_uses_the_command_label_when_given(self):
+        with patch.object(wizard, "print_section") as section:
+            wizard._step_banner(2, "Models", "ucode configure")
+        assert section.call_args.args[0].startswith("ucode configure · step 2 of ")
+
+
+class TestSetupCommandToken:
+    """A caller (e.g. `ucode configure`) can hand setup a token so its admin gate uses the same
+    identity as the routing decision, instead of fetching a second time."""
+
+    def test_reuses_a_passed_token_and_skips_a_second_fetch(self):
+        seen: list[tuple[str, str]] = []
+        with (
+            patch.object(
+                wizard,
+                "get_databricks_token",
+                side_effect=AssertionError("must not fetch a token when one was passed"),
+            ),
+            patch.object(
+                wizard,
+                "ensure_databricks_auth",
+                side_effect=AssertionError("must not re-authenticate when a token was passed"),
+            ),
+            patch.object(
+                wizard, "_require_admin", side_effect=lambda ws, tok: seen.append((ws, tok))
+            ),
+            # Stop right after the admin gate so the heavy discovery/picker path doesn't run.
+            patch.object(wizard, "_handle_existing_config", return_value=(False, None)),
+        ):
+            code = wizard.setup_command(workspace="https://w", profile=None, token="tok")
+        assert code == 0
+        assert seen == [("https://w", "tok")]
+
+    def test_fetches_its_own_token_when_none_passed(self):
+        seen: list[tuple[str, str]] = []
+        with (
+            patch.object(wizard, "ensure_databricks_auth", return_value=None),
+            patch.object(wizard, "get_databricks_token", return_value="fetched"),
+            patch.object(
+                wizard, "_require_admin", side_effect=lambda ws, tok: seen.append((ws, tok))
+            ),
+            patch.object(wizard, "_handle_existing_config", return_value=(False, None)),
+        ):
+            code = wizard.setup_command(workspace="https://w", profile=None)
+        assert code == 0
+        assert seen == [("https://w", "fetched")]
 
 
 class TestModelPrompting:

@@ -1305,12 +1305,21 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
     choice = prompt_for_selection(
         "What would you like to do?",
         [
+            (
+                "adopt",
+                "Adopt the published config as your current settings. To invoke, run `ucode`.",
+            ),
             ("create", "Author a new config (replaces the existing one when you publish)"),
             ("delete", "Delete the existing config (removes it from the workspace, leaves none)"),
         ],
     )
     if choice is None:
         raise KeyboardInterrupt
+    if choice == "adopt":
+        from ucode.cli import _confirm_managed_config_applied
+
+        _confirm_managed_config_applied(existing, workspace)
+        return False, existing
     if choice == "create":
         # The agent/model half is re-authored here; the other sections carry forward from `existing`
         # (see `_carry_forward_sections`), so no need to warn the admin to re-enter them.
@@ -1411,9 +1420,9 @@ def _command_line(command: str, description: str, *, marker: str = " ", width: i
 SETUP_STEP_TITLES = ["Coding agents", "Models & settings", "Default agent"]
 
 
-def _step_banner(index: int, title: str) -> None:
-    """Announce one phase of `ucode setup` as `step N of M`."""
-    print_section(f"ucode setup · step {index} of {len(SETUP_STEP_TITLES)} · {title}")
+def _step_banner(index: int, title: str, command_label: str = "ucode setup") -> None:
+    """Announce one phase of the flow as `step N of M`, branded to the invoking command."""
+    print_section(f"{command_label} · step {index} of {len(SETUP_STEP_TITLES)} · {title}")
 
 
 def _selected_recap(workspace: str, enabled_agents: dict, default_agent: str | None) -> None:
@@ -1545,6 +1554,8 @@ def setup_command(
     *,
     workspace: str | None = None,
     profile: str | None = None,
+    command_label: str = "ucode setup",
+    token: str | None = None,
 ) -> int:
     """Author the agents and models half of the workspace's managed coding config interactively.
 
@@ -1557,6 +1568,17 @@ def setup_command(
     workspace hand it in so the admin isn't prompted to pick one again — e.g. `ucode configure`
     launching setup after its admin offer. When ``workspace`` is None the flow prompts as usual.
 
+    ``command_label`` brands the section headers to the invoking command: `ucode configure` passes
+    "Configure Unity Gateway" so a user who never typed `ucode setup` isn't jarred by it (the
+    standalone `ucode setup` command keeps the default). References to specific sub-commands (`ucode
+    setup mcps`, `ucode apply`, …) stay verbatim — those are real command names, not branding.
+
+    ``token`` lets a caller that already authenticated and admin-checked the workspace (e.g.
+    `ucode configure`) hand its token in, so setup's admin gate uses the *same* token as the routing
+    decision — a second fetch here could resolve a different identity right after a credential
+    switch and reject a caller configure just treated as an admin. When None, setup authenticates
+    and fetches its own token as usual.
+
     Returns a process exit code. Raises RuntimeError for actionable failures (not an admin, no
     agents available) and KeyboardInterrupt when the admin aborts a picker; the CLI maps both.
     """
@@ -1567,7 +1589,7 @@ def setup_command(
     # would be circular.
     from ucode.cli import _prompt_for_configuration, configure_shared_state
 
-    print_section("ucode setup")
+    print_section(command_label)
     print_note("Choose the coding agents and models for this workspace's managed config.")
     print_note("Developers pull it automatically when they run ucode.")
 
@@ -1575,9 +1597,11 @@ def setup_command(
         workspace, profile = _prompt_for_configuration()
     # `configure_shared_state` below authenticates too and prints its own success line, so this one
     # stays quiet rather than reporting the same thing twice. It still has to run first: the admin
-    # gate and the existing-config check both need a token before discovery.
-    ensure_databricks_auth(workspace, profile, quiet=True)
-    token = get_databricks_token(workspace, profile)
+    # gate and the existing-config check both need a token before discovery. A token handed in by
+    # the caller is reused as-is (see the docstring); otherwise fetch one here.
+    if token is None:
+        ensure_databricks_auth(workspace, profile, quiet=True)
+        token = get_databricks_token(workspace, profile)
 
     _require_admin(workspace, token)
     keep_going, published = _handle_existing_config(workspace, token)
@@ -1607,7 +1631,7 @@ def setup_command(
     previously_enabled = [
         tool for tool in (previous.get("enabled_agents") or {}) if tool in available
     ]
-    _step_banner(1, SETUP_STEP_TITLES[0])
+    _step_banner(1, SETUP_STEP_TITLES[0], command_label)
     picked = prompt_for_tools(
         [(tool, TOOL_SPECS[tool]["display"]) for tool in available],
         preselected=previously_enabled or None,
@@ -1616,7 +1640,7 @@ def setup_command(
         print_note("No coding agents selected — nothing to configure.")
         return 0
 
-    _step_banner(2, SETUP_STEP_TITLES[1])
+    _step_banner(2, SETUP_STEP_TITLES[1], command_label)
     enabled_agents: dict[str, dict] = {}
     for index, tool in enumerate(picked, start=1):
         print_heading(f"{TOOL_SPECS[tool]['display']}  ({index} of {len(picked)})")
@@ -1642,7 +1666,7 @@ def setup_command(
     # Pick the default after configuring each agent, not before: by now the admin has seen every
     # agent's models go by, so "which is the default?" is a choice among things they've just set up
     # rather than a bare list up front. The recap reprints those picks so the choice is informed.
-    _step_banner(3, SETUP_STEP_TITLES[2])
+    _step_banner(3, SETUP_STEP_TITLES[2], command_label)
     default_agent = picked[0]
     if len(picked) > 1:
         _selected_recap(workspace, enabled_agents, default_agent=None)
