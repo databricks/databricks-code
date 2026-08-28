@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from ucode.agents import claude
-from ucode.smart_routing import claude_routing
+from ucode.smart_routing import claude_routing, v2
 
 WS = "https://example.databricks.com"
 
@@ -126,6 +127,32 @@ class TestRenderOverlay:
     def test_enables_use_gateway(self):
         overlay, _ = claude.render_overlay(WS, "s4")
         assert overlay["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
+
+    @pytest.mark.parametrize("env_value", [None, "", "0", "true", "yes"])
+    def test_gateway_model_discovery_disabled_unless_opted_in(self, monkeypatch, env_value):
+        if env_value is not None:
+            monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", env_value)
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
+
+    def test_enables_gateway_model_discovery(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", "1")
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+
+    def test_enables_gateway_model_discovery_for_smart_routing_v2(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+
+    def test_gateway_model_discovery_skipped_under_provider(self, monkeypatch):
+        # A Model Provider Service routes every request to the external provider,
+        # so a discovered gateway endpoint id would reach a provider that can't
+        # resolve it — discovery must be off in that mode.
+        monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", "1")
+        overlay, _ = claude.render_overlay(WS, "s4", provider="main.x.claude-svc")
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
     def test_sets_api_key_helper(self):
         overlay, _ = claude.render_overlay(WS, "s4")
@@ -650,31 +677,241 @@ class TestRegisterWebSearchMcp:
 
 
 class TestClaudeLaunch:
-    def test_sets_oauth_token_before_exec(self, monkeypatch):
-        exec_calls: list[tuple[str, list[str]]] = []
+    def test_smart_routing_on_windows_is_not_supported(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(claude.os, "name", "nt")
 
-        def fake_execvp(binary: str, args: list[str]) -> None:
-            exec_calls.append((binary, args))
-            raise RuntimeError("stop")
+        with pytest.raises(
+            RuntimeError,
+            match="Smart routing in Claude Code is currently not supported on Windows",
+        ):
+            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
 
+    def test_default_launch_keeps_existing_auth_path(self, monkeypatch):
+        calls: list[list[str]] = []
+        monkeypatch.delenv(v2.ENV_VAR, raising=False)
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
-        monkeypatch.setattr(
-            claude, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+
+        assert os.environ["OAUTH_TOKEN"] == "token"
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
+
+    def test_v2_launch_override_bypasses_first_prompt_routing(self, monkeypatch):
+        calls: list[list[str]] = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(v2, "launch_claude", Mock())
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch(
+            {"workspace": WS, "_claude_launch_model": "system.ai.glm-5-2"},
+            ["--debug"],
         )
-        monkeypatch.setattr(os, "execvp", fake_execvp)
 
-        try:
-            claude.launch({"workspace": WS}, ["--debug"])
-        except RuntimeError as exc:
-            assert str(exc) == "stop"
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
+        v2.launch_claude.assert_not_called()
 
-        assert os.environ["OAUTH_TOKEN"] == "fresh-token"
-        assert exec_calls == [
-            (
-                "claude",
-                ["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"],
+    @pytest.mark.parametrize(
+        "tool_args",
+        [
+            ["-m", "opus"],
+            ["--model=opus"],
+        ],
+    )
+    def test_v2_explicit_claude_model_bypasses_first_prompt_routing(self, monkeypatch, tool_args):
+        calls: list[list[str]] = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(v2, "launch_claude", Mock())
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch({"workspace": WS}, tool_args)
+
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]]
+        v2.launch_claude.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "provider_state",
+        [
+            {"provider_services": {"claude": "main.default.anthropic"}},
+            {"_claude_launch_provider": "main.default.anthropic"},
+        ],
+    )
+    def test_v2_provider_launch_bypasses_first_prompt_routing(self, monkeypatch, provider_state):
+        calls: list[list[str]] = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(v2, "launch_claude", Mock())
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch({"workspace": WS, **provider_state}, ["--debug"])
+
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
+        v2.launch_claude.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "tool_args",
+        [
+            ["--print", "say hi"],
+            ["doctor"],
+            ["--", "fix this bug"],
+        ],
+    )
+    def test_v2_noninteractive_launch_bypasses_first_prompt_routing(self, monkeypatch, tool_args):
+        calls: list[list[str]] = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(v2, "launch_claude", Mock())
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch({"workspace": WS}, tool_args)
+
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]]
+        v2.launch_claude.assert_not_called()
+
+    def test_v2_does_not_treat_option_value_as_positional_argument(self):
+        assert claude._uses_interactive_tui(["--name", "doctor"]) is True
+
+    def test_v2_treats_optional_option_value_as_interactive(self):
+        assert claude._uses_interactive_tui(["--resume", "session-id"]) is True
+
+    def test_gateway_discovery_uses_anthropic_proxy(self, monkeypatch):
+        calls: list[tuple] = []
+
+        monkeypatch.delenv(v2.ENV_VAR, raising=False)
+
+        class Server:
+            server_address = ("127.0.0.1", 12345)
+
+            def serve_forever(self):
+                calls.append(("serve",))
+
+            def shutdown(self):
+                calls.append(("shutdown",))
+
+        class Cache:
+            token = "fresh-token"
+
+            def stop(self):
+                calls.append(("stop",))
+
+        class Client:
+            def close(self):
+                calls.append(("close",))
+
+        class Process:
+            def __init__(self, argv):
+                calls.append(("popen", argv))
+
+            def wait(self):
+                return 0
+
+        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+            calls.append(
+                (
+                    "proxy",
+                    workspace,
+                    profile,
+                    port,
+                    token_header,
+                    force_refresh_near_expiry,
+                )
             )
+            return Server(), Cache(), Client()
+
+        monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
+        monkeypatch.delenv("OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+        monkeypatch.setattr(
+            claude,
+            "start_anthropic_model_discovery_proxy",
+            start_proxy,
+        )
+        monkeypatch.setattr(claude.subprocess, "Popen", Process)
+
+        with pytest.raises(SystemExit) as exc:
+            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+
+        assert exc.value.code == 0
+        assert os.environ["OAUTH_TOKEN"] == "fresh-token"
+        assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "fresh-token"
+        assert os.environ["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
+        assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
+        assert calls[:2] == [
+            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True),
+            ("serve",),
         ]
+        assert calls[2][0] == "popen"
+        argv = calls[2][1]
+        assert argv[:2] == ["claude", "--settings"]
+        assert json.loads(argv[2])["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
+        assert argv[3:] == ["--debug"]
+        assert calls[3:] == [
+            ("stop",),
+            ("shutdown",),
+            ("close",),
+        ]
+
+    def test_smart_routing_uses_anthropic_proxy(self, monkeypatch):
+        calls: list[tuple] = []
+        captured: dict = {}
+
+        class Server:
+            server_address = ("127.0.0.1", 12345)
+
+            def serve_forever(self):
+                calls.append(("serve",))
+
+            def shutdown(self):
+                calls.append(("shutdown",))
+
+        class Cache:
+            token = "fresh-token"
+
+            def stop(self):
+                calls.append(("stop",))
+
+        class Client:
+            def close(self):
+                calls.append(("close",))
+
+        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+            calls.append(
+                ("proxy", workspace, profile, port, token_header, force_refresh_near_expiry)
+            )
+            return Server(), Cache(), Client()
+
+        def launch_v2(state, tool_args, **kwargs):
+            captured["settings"] = kwargs["compose_settings"](["--debug"])
+            raise SystemExit(0)
+
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(claude, "start_anthropic_model_discovery_proxy", start_proxy)
+        monkeypatch.setattr(
+            claude,
+            "_compose_v2_settings",
+            lambda args: ({"env": {"ANTHROPIC_BASE_URL": "https://direct"}}, args),
+        )
+        monkeypatch.setattr(v2, "launch_claude", launch_v2)
+
+        with pytest.raises(SystemExit) as exc:
+            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+
+        assert exc.value.code == 0
+        assert calls[:2] == [
+            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True),
+            ("serve",),
+        ]
+        settings, remaining = captured["settings"]
+        assert settings["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
+        assert remaining == ["--debug"]
+        assert calls[2:] == [("stop",), ("shutdown",), ("close",)]
 
 
 class TestWriteToolConfigPrunesStaleModelEnv:

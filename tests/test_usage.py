@@ -661,6 +661,7 @@ class TestUsageCommand:
         monkeypatch.setattr(
             usage_mod, "resolve_current_budget_spend", lambda *args, **kwargs: (None, "disabled")
         )
+        monkeypatch.setattr(usage_mod, "prompt_yes_no_default", lambda *args, **kwargs: True)
         monkeypatch.setattr(
             usage_mod, "fetch_external_model_prices", lambda *args, **kwargs: ([], "disabled")
         )
@@ -675,6 +676,7 @@ class TestUsageCommand:
         assert "Claude Code · Last 7 Days" in headings
         assert all("Gemini" not in heading for heading in headings)
         assert notes == [
+            "Budget spend and threshold are unavailable.",
             "Using SQL warehouse `wh` (RUNNING).",
             f"No usage for Claude Code in the last {USAGE_BREAKDOWN_DAYS} days.",
         ]
@@ -685,6 +687,47 @@ class TestUsageCommand:
         assert rendered_tables[0][0][2] == "80"
         assert "gemini" not in "\n".join(printed).lower()
         assert "900" not in "\n".join(printed)
+
+    def test_shows_budget_before_prompt_and_skips_sql_when_declined(self, monkeypatch):
+        events: list[str] = []
+
+        class DummyConsole:
+            def print(self, output):
+                events.append(str(output))
+
+        monkeypatch.setattr(
+            usage_mod,
+            "load_state",
+            lambda: {"workspace": "https://workspace", "available_tools": ["codex"]},
+        )
+        monkeypatch.setattr(usage_mod, "ensure_databricks_auth", lambda *args, **kwargs: None)
+        monkeypatch.setattr(usage_mod, "get_databricks_token", lambda *args, **kwargs: "token")
+        monkeypatch.setattr(
+            usage_mod,
+            "resolve_current_budget_spend",
+            lambda *args, **kwargs: ((Decimal("12.34"), Decimal("100")), None),
+        )
+        monkeypatch.setattr(usage_mod, "console", DummyConsole())
+
+        def decline(prompt, *, default):
+            assert "$12.34 of $100.00" in "\n".join(events)
+            assert "SQL warehouse" in prompt
+            assert default is False
+            return False
+
+        monkeypatch.setattr(usage_mod, "prompt_yes_no_default", decline)
+        monkeypatch.setattr(
+            usage_mod,
+            "discover_sql_warehouses",
+            lambda *args, **kwargs: pytest.fail("SQL discovery should not run"),
+        )
+        monkeypatch.setattr(
+            usage_mod,
+            "fetch_external_model_prices",
+            lambda *args, **kwargs: pytest.fail("price lookup should not run"),
+        )
+
+        assert usage() == 0
 
 
 class TestRunQueryOnFirstWorkingWarehouse:
@@ -763,6 +806,7 @@ class TestUsageWarehouseIdPassthrough:
         monkeypatch.setattr(
             usage_mod, "resolve_current_budget_spend", lambda *a, **k: (None, "disabled")
         )
+        monkeypatch.setattr(usage_mod, "prompt_yes_no_default", lambda *a, **k: True)
         monkeypatch.setattr(
             usage_mod, "fetch_external_model_prices", lambda *a, **k: ([], "disabled")
         )

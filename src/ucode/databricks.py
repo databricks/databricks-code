@@ -377,7 +377,7 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
         return None, f"network error: {exc.reason}"
 
 
-# Workspace group whose members are workspace admins. `ucode setup` / `ucode apply` are restricted
+# Workspace group whose members are workspace admins. `ucode setup` / `ucode publish` are restricted
 # to this group because the coding-agent-config CRUD API enforces the same check server-side.
 WORKSPACE_ADMIN_GROUP = "admins"
 
@@ -1847,6 +1847,7 @@ def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict],
 # currently populated, is what lets a re-run *clear* a field the admin removed: the server merges
 # per path, so an omitted path leaves the old value in place.
 MANAGED_CONFIG_UPDATE_MASK_PATHS: tuple[str, ...] = (
+    "spec_version",
     "display_name",
     "default_agent",
     "enabled_agents",
@@ -2727,6 +2728,33 @@ def list_all_mcp_services(
             return [], "deadline exceeded while listing MCP services"
         return [], "no MCP services found"
     return sorted(names), None
+
+
+def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """List every model id advertised by AI Gateway's Anthropic endpoint.
+
+    Claude Code's native gateway discovery consumes this same catalog, so callers
+    using that mode must not apply ucode's legacy ``databricks-claude-*`` family
+    validation.
+    """
+    hostname = workspace_hostname(workspace)
+    payload, reason = _http_get_json(f"https://{hostname}/ai-gateway/anthropic/v1/models", token)
+    if payload is None:
+        return [], reason
+
+    data = cast(dict, payload) if isinstance(payload, dict) else {}
+    model_ids: list[str] = []
+    seen: set[str] = set()
+    for model in data.get("data", []):
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if isinstance(model_id, str) and model_id and model_id not in seen:
+            seen.add(model_id)
+            model_ids.append(model_id)
+    if model_ids:
+        return model_ids, None
+    return [], "AI Gateway returned no Anthropic model ids"
 
 
 def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], str | None]:

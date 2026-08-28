@@ -227,6 +227,20 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.kwargs["refresh"] is True
 
+    def test_claude_enable_model_discovery_sets_ucode_env(self):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, ["claude", "--enable-model-discovery"])
+
+        assert result.exit_code == 0, result.output
+        assert os.environ["ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert mock_launch.call_args.args[1].args == []
+
+    def test_claude_enable_model_discovery_is_hidden_from_help(self):
+        result = runner.invoke(app, ["claude", "--help"])
+
+        assert result.exit_code == 0, result.output
+        assert "--enable-model-discovery" not in result.output
+
     def test_codex_disable_removes_hooks_without_launching(self):
         with (
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
@@ -287,6 +301,47 @@ class TestSubcommandRouting:
             in _strip_ansi(result.output)
         )
 
+    def test_claude_v2_skips_legacy_prelaunch_routing(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
+        state = {
+            **MINIMAL_STATE,
+            "smart_routing_enabled": True,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+        }
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(state, "system.ai.claude-opus-4-8"),
+            ),
+            patch("ucode.cli.claude_routing.route_launch_model") as mock_route,
+            patch("ucode.cli.configure_tool", return_value=state) as mock_configure,
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["claude"])
+
+        assert result.exit_code == 0, result.output
+        mock_route.assert_not_called()
+        assert mock_configure.call_args.kwargs["route_root_model"] is None
+        assert "_claude_launch_model" not in mock_launch.call_args.args[1]
+
+    def test_claude_v2_first_prompt_hook_is_disabled_without_flag(self, monkeypatch):
+        monkeypatch.delenv("ENABLE_SMART_ROUTING_V2", raising=False)
+        with patch("ucode.smart_routing.claude_pty.request_first_prompt_route") as mock_request:
+            result = runner.invoke(
+                app,
+                ["claude-router-hook", "route-first-prompt", "--socket", "/tmp/v2.sock"],
+                input='{"prompt":"fix the parser"}',
+            )
+
+        assert result.exit_code == 0, result.output
+        assert result.output == ""
+        mock_request.assert_not_called()
+
 
 class TestClaudeModelFlag:
     """`ucode claude --model <id>` pins the id into the family aliases so the gateway resolves any
@@ -304,7 +359,8 @@ class TestClaudeModelFlag:
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.kwargs["refresh"] is True
 
-    def test_model_threads_to_claude_as_custom_model(self):
+    def test_model_threads_to_claude_as_custom_model(self, monkeypatch):
+        monkeypatch.delenv("ENABLE_SMART_ROUTING_V2", raising=False)
         with (
             patch("ucode.cli.ensure_bootstrap_dependencies"),
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
@@ -313,7 +369,7 @@ class TestClaudeModelFlag:
             patch("ucode.cli.resolve_launch_model", return_value=(MINIMAL_STATE, "system.ai.opus")),
             patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE) as mock_configure,
             patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
-            patch("ucode.cli.launch_agent"),
+            patch("ucode.cli.launch_agent") as mock_launch,
         ):
             result = runner.invoke(app, ["claude", "--model", "cat.schema.claude-opus-5"])
         assert result.exit_code == 0, result.output
@@ -321,6 +377,25 @@ class TestClaudeModelFlag:
         # NOT as ANTHROPIC_MODEL — Claude Code validates that value and rejects a raw id.
         assert mock_configure.call_args.kwargs["custom_model"] == "cat.schema.claude-opus-5"
         assert mock_configure.call_args.kwargs["route_root_model"] is None
+        assert "_claude_launch_model" not in mock_launch.call_args.args[1]
+
+    def test_v2_model_sets_transient_launch_override(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
+        state = {**MINIMAL_STATE, "claude_models": {"opus": "system.ai.claude-opus-4-8"}}
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.resolve_launch_model", return_value=(state, "system.ai.opus")),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["claude", "--model", "system.ai.glm-5-2"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.args[1]["_claude_launch_model"] == "system.ai.glm-5-2"
 
     def test_model_and_provider_are_mutually_exclusive(self):
         result = runner.invoke(
@@ -328,6 +403,23 @@ class TestClaudeModelFlag:
         )
         assert result.exit_code == 1
         assert "Use either --model or --provider" in result.output
+
+    def test_provider_sets_transient_claude_launch_marker(self):
+        state = dict(MINIMAL_STATE)
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.resolve_provider_models", return_value=(None, None, False)),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["claude", "--provider", "main.default.anthropic"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.args[1]["_claude_launch_provider"] == "main.default.anthropic"
 
     def test_warns_when_enterprise_settings_pin_the_model(self):
         # Claude Code's enterprise managed-settings scope outranks the --settings file ucode writes,
@@ -565,6 +657,50 @@ class TestStatus:
         assert "gemini mcp list" not in result.output
         assert "https://example.databricks.com/ai-gateway/anthropic" not in result.output
         assert "https://example.databricks.com/ai-gateway/gemini" not in result.output
+
+    def test_status_shows_managed_config_box_when_present_and_enabled(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        managed = {
+            "enabled_agents": {"claude": {}, "codex": {}},
+            "mcp_servers": [{"name": "github-mcp", "type": "external"}],
+            "skills": {"names": ["debug-ci"]},
+        }
+        with (
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.load_managed_state", return_value=managed),
+        ):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "Workspace-managed config" in result.output
+        assert "Enabled agents:" in result.output
+        assert "github-mcp" in result.output
+        assert "debug-ci" in result.output
+
+    def test_status_hides_managed_config_box_when_feature_disabled(self, monkeypatch):
+        monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
+        managed = {"enabled_agents": {"claude": {}}}
+        with (
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.load_managed_state", return_value=managed) as load_managed,
+        ):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "Workspace-managed config" not in result.output
+        # Feature off: the managed cache is never consulted.
+        load_managed.assert_not_called()
+
+    def test_status_hides_managed_config_box_when_none_present(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        with (
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.load_managed_state", return_value=None),
+        ):
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "Workspace-managed config" not in result.output
 
 
 class TestConfigureSkillsCommand:
@@ -2915,6 +3051,36 @@ class TestBareUcode:
         result, launched = self._run(monkeypatch, managed=managed)
         assert result.exit_code == 0, result.output
         assert launched[0][0] == "opencode"
+
+    def test_launch_banner_is_abridged_not_the_full_box(self, monkeypatch):
+        managed = {
+            "default_agent": "claude",
+            "enabled_agents": {"claude": {"model_config": {"default_model": "system.ai.opus"}}},
+            "mcp_servers": [{"name": "system.ai.slack", "type": "mcp-service"}],
+            "skills": {"names": ["main.default.my_skill"]},
+        }
+        result, _ = self._run(monkeypatch, managed=managed)
+        assert result.exit_code == 0, result.output
+        # One-line banner: the agent it launches, and the model.
+        assert "launching Claude Code as the default agent" in result.output
+        assert "system.ai.opus" in result.output
+        # The full box's per-config enumeration is left to `ucode status`.
+        assert "Enabled agents:" not in result.output
+        assert "system.ai.slack" not in result.output
+        assert "main.default.my_skill" not in result.output
+
+    def test_launch_banner_omits_default_agent_when_a_tier_overrides(self, monkeypatch):
+        # A budget tier can launch a different agent than the config's default; the banner must not
+        # then call it "the default agent" (the tier note in _launch_tool explains the swap).
+        managed = {"default_agent": "claude", "enabled_agents": {"claude": {}, "opencode": {}}}
+        monkeypatch.setattr(
+            "ucode.cli._fetch_budget_recommendation", lambda state, m: {"agent": "opencode"}
+        )
+        result, launched = self._run(monkeypatch, managed=managed)
+        assert result.exit_code == 0, result.output
+        assert launched[0][0] == "opencode"
+        assert "launching OpenCode" in result.output
+        assert "as the default agent" not in result.output
 
     def test_admin_without_a_config_is_pointed_at_setup(self, monkeypatch):
         result, launched = self._run(monkeypatch, managed=None, is_admin=True)

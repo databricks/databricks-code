@@ -18,7 +18,6 @@ import subprocess
 
 from ucode.config_io import ToolSpec
 from ucode.databricks import (
-    BEDROCK_PROVIDER_TYPES,
     get_databricks_token,
     install_ai_tools,
     install_databricks_cli,
@@ -300,17 +299,18 @@ def resolve_provider_models(
     """Validate ``provider`` for ``tool`` and return the model ids to pin.
 
     Returns ``(provider_models, error, relayed)``. ``provider_models`` is a ``{family: model_id}``
-    dict for a Bedrock-backed claude service (whose provider-side ids must be pinned explicitly), or
-    None for an Anthropic/canonical service or when ``provider`` is None. ``relayed`` is True for a
-    credential-less Anthropic subscription relay, which the launch path wires with the relayed
-    overlay + refresh proxy. A non-None ``error`` means the provider is invalid for the tool and the
-    caller should not launch.
+    dict re-derived from the service's live targets for a non-relayed claude service — both Bedrock
+    (provider-side slugs) and API-key Anthropic (canonical ids) — so the client sends exactly the ids
+    the MPS allows rather than Claude Code's defaults, which may not match the declared targets. It is
+    None when ``provider`` is None, for a relayed subscription (see below), or for a non-Claude (e.g.
+    codex) service. ``relayed`` is True for a credential-less Anthropic subscription relay, which the
+    launch path wires with the relayed overlay + refresh proxy. A non-None ``error`` means the
+    provider is invalid for the tool and the caller should not launch.
 
-    This is the *developer-configured* path (``ucode configure`` then ``ucode claude``) and its
-    behaviour is deliberately unchanged: only Bedrock pins, re-derived from the service's live
-    targets. The *managed* path pins from the admin's authored manifest slots instead — see
-    ``managed_resolve.managed_provider_family_models`` and its launch call site — so an admin's
-    chosen versions win rather than being re-derived here.
+    This is the *developer-configured* path (``ucode configure`` then ``ucode claude``). The *managed*
+    path pins from the admin's authored manifest slots instead — see
+    ``managed_resolve.managed_provider_family_models`` and its launch call site — so an admin's chosen
+    versions win rather than being re-derived here.
     """
     if not provider:
         return None, None, False
@@ -319,9 +319,11 @@ def resolve_provider_models(
     if error or service is None:
         return None, error, False
     relayed = bool(service.get("relayed"))
-    if service["provider_type"] in BEDROCK_PROVIDER_TYPES:
-        return map_claude_family_models(service.get("targets") or []), None, relayed
-    return None, None, relayed
+    # Relayed (Claude Max/Enterprise subscription) is exempt: the gateway disables
+    # model selection server-side for that tier, so there's nothing to reconcile.
+    if relayed:
+        return None, None, relayed
+    return map_claude_family_models(service.get("targets") or []) or None, None, relayed
 
 
 def configure_tool(

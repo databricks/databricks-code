@@ -50,7 +50,6 @@ MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
 # tool (codex, claude), so a workspace turns it on once.
 SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
 
-
 SPEC: ToolSpec = {
     "binary": "codex",
     "package": "@openai/codex",
@@ -483,6 +482,18 @@ _PROFILE_REJECTED_MAX_SECONDS = 3.0
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
+    if os.environ.get("ENABLE_SMART_ROUTING_V2") == "1":
+        # V2 imports the WebSocket interposer; keep it out of the legacy import
+        # path so flag-off launches retain their existing dependencies and behavior.
+        from ucode.smart_routing import v2 as smart_routing_v2
+
+        smart_routing_v2.launch_codex(
+            state,
+            tool_args,
+            binary=binary,
+            start_model=default_model(state),
+            render_overlay=render_overlay,
+        )
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     # Run codex with --profile first — the TUI and runtime subcommands

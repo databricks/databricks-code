@@ -1,7 +1,7 @@
 """Interactive `ucode setup`: author the workspace's managed coding-agent config.
 
 Workspace admins run this to build the ``CodingAgentConfig`` their developers will pull, then publish
-it with ``ucode apply`` (a separate command, so the manifest can be reviewed first). The config lives
+it with ``ucode publish`` (a separate command, so the manifest can be reviewed first). The config lives
 at ``~/.ucode/managed-state.json`` (the one local managed-config file, owned by
 :mod:`ucode.managed_config`).
 
@@ -48,7 +48,6 @@ from ucode.managed_config import (
     get_managed_config,
     load_managed_state,
     managed_state_workspace,
-    normalize_managed_config,
     save_managed_state,
 )
 from ucode.managed_setup import (
@@ -89,6 +88,12 @@ GLOBAL_SETTINGS_FILES = {
     "claude": "managed-settings.json",
     "codex": "managed_config.toml",
 }
+
+# Shown whenever the workspace's coding-agent-config APIs return FEATURE_DISABLED.
+CODING_AGENT_CONFIGS_DISABLED_MESSAGE = (
+    "Workspace-managed coding agent configuration is not available on this workspace. Use "
+    "`ucode configure` to set up agents for individual users instead."
+)
 
 BUDGET_POLICY_BLURB = (
     "As the workspace spends more of a budget, a tiered spend policy automatically switches "
@@ -257,6 +262,9 @@ def _select_provider_service(tool: str, workspace: str, token: str) -> dict | No
         return None
 
     usable = [service for service in services if service_usable_for_tool(tool, service)]
+    if tool == "claude":
+        # Claude subscription relays are not reliable enough for managed configurations yet.
+        usable = [service for service in usable if not service.get("relayed")]
     if not usable:
         if services:
             # Services exist but none match this agent's dialect — say so, since "no picker appeared"
@@ -1138,6 +1146,10 @@ def _config_facts(manifest: dict) -> list[tuple[str, str, str]]:
     """
     facts: list[tuple[str, str, str]] = []
 
+    display_name = manifest.get("display_name")
+    if isinstance(display_name, str) and display_name:
+        facts.append(("display_name", "Display name", display_name))
+
     default_agent = manifest.get("default_agent")
     if isinstance(default_agent, str):
         display = TOOL_SPECS.get(default_agent, {}).get("display", default_agent)
@@ -1255,7 +1267,7 @@ def _require_admin(workspace: str, token: str) -> None:
         )
     if admin is None:
         print_warning(
-            "Could not verify workspace admin permissions. Continuing — `ucode apply` will fail "
+            "Could not verify workspace admin permissions. Continuing — `ucode publish` will fail "
             "if you lack them."
         )
     else:
@@ -1277,6 +1289,10 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
     with spinner("Checking for an existing managed config..."):
         existing, reason = get_managed_config(workspace, token)
     if reason is not None:
+        if "feature_disabled" in reason.lower():
+            # Authoring a draft that the workspace cannot publish only leads the admin through a
+            # dead-end wizard. Stop before model discovery and point them to per-user setup instead.
+            raise RuntimeError(CODING_AGENT_CONFIGS_DISABLED_MESSAGE)
         print_note(f"Could not check for an existing config: {reason}")
         return True, None
     if existing is None:
@@ -1443,7 +1459,7 @@ def _print_next_steps(manifest: dict) -> None:
     print_heading("Next steps")
     if config_io.is_dry_run():
         # Under --dry-run nothing was written, so the section commands (which read the saved draft)
-        # and `apply` have nothing to act on. Say so rather than send the admin to commands that
+        # and `publish` have nothing to act on. Say so rather than send the admin to commands that
         # would report "run `ucode setup` first".
         print_note("Dry run — nothing was saved. Re-run without --dry-run to author the config.")
         return
@@ -1454,28 +1470,28 @@ def _print_next_steps(manifest: dict) -> None:
         console.print(line)
     print_panel(
         "All done?",
-        ["Publish with [bold]ucode apply[/bold] so all developers use this configuration."],
+        ["Publish with [bold]ucode publish[/bold] so all developers use this configuration."],
     )
 
 
-def _offer_apply() -> None:
+def _offer_publish() -> None:
     """Offer to publish the saved draft right away, so an admin can apply changes incrementally.
 
     Each `ucode setup` command only writes a local draft. Without this an admin has to remember to run
-    `ucode apply` separately, and a `ucode setup` re-run in the meantime is easy to mistake for having
-    lost the change. Answering yes runs `apply_command`, which shows the diff against the published
-    config as it publishes; declining leaves the draft for a later `ucode apply`. Skipped under
+    `ucode publish` separately, and a `ucode setup` re-run in the meantime is easy to mistake for having
+    lost the change. Answering yes runs `publish_command`, which shows the diff against the published
+    config as it publishes; declining leaves the draft for a later `ucode publish`. Skipped under
     --dry-run, where nothing was saved to publish.
     """
     if config_io.is_dry_run():
         return
     console.print()
     if not prompt_yes_no_default(
-        "Publish these changes to the workspace now? (runs `ucode apply`)", default=False
+        "Publish these changes to the workspace now? (runs `ucode publish`)", default=False
     ):
-        print_note("Draft saved. Run `ucode apply` when you're ready to publish.")
+        print_note("Draft saved. Run `ucode publish` when you're ready to publish.")
         return
-    apply_command(yes=True)
+    publish_command(yes=True)
 
 
 # The sections `ucode setup` carries forward instead of prompting for, and how to rebuild each one.
@@ -1650,7 +1666,7 @@ def setup_command(
     errors = validate_manifest(manifest, state)
     if errors:
         # A validation failure here is a wizard bug, not admin error — the pickers only offer valid
-        # choices. Surface it plainly rather than writing a manifest that `apply` would reject.
+        # choices. Surface it plainly rather than writing a manifest that `publish` would reject.
         print_err("The generated config is not valid:")
         for error in errors:
             print_note(error)
@@ -1661,7 +1677,7 @@ def setup_command(
     console.print()
     print_success("Saved to ~/.ucode/managed-state.json")
     _print_next_steps(manifest)
-    _offer_apply()
+    _offer_publish()
     return 0
 
 
@@ -1714,7 +1730,7 @@ def _save_section_update(workspace: str, manifest: dict) -> int:
     availability. That's deliberate: a section command doesn't touch agents or models, so re-checking
     them would only reject a legitimately pinned older Claude model (`load_state` keeps just the newest
     per family) or, worse, wrongly flag a codex/gemini model whenever the re-fetched inventory happens
-    to be Claude-only. `ucode apply` runs the full model check against the live catalog before
+    to be Claude-only. `ucode publish` runs the full model check against the live catalog before
     publishing, which is where it belongs.
     """
     errors = validate_manifest(manifest, None)
@@ -1729,7 +1745,7 @@ def _save_section_update(workspace: str, manifest: dict) -> int:
     console.print()
     print_success("Saved to ~/.ucode/managed-state.json")
     _print_next_steps(manifest)
-    _offer_apply()
+    _offer_publish()
     return 0
 
 
@@ -1845,7 +1861,7 @@ def setup_help_command() -> int:
     """Walk through the whole managed-config setup, marking what this machine has authored.
 
     Hand-written rather than left to `--help`: the point is the *order* of the commands and the fact
-    that nothing reaches developers until `ucode apply`, neither of which a flag listing conveys. Reads
+    that nothing reaches developers until `ucode publish`, neither of which a flag listing conveys. Reads
     the manifest but never authenticates, so it works before `ucode configure`.
     """
     print_section("ucode setup")
@@ -1855,7 +1871,7 @@ def setup_help_command() -> int:
     )
     print_note(
         "Each command below edits your local draft; nothing reaches the workspace until "
-        "`ucode apply`."
+        "`ucode publish`."
     )
 
     workspace = load_state().get("workspace") or managed_state_workspace()
@@ -1884,9 +1900,9 @@ def setup_help_command() -> int:
 
     print_heading("3. Review and publish")
     console.print(
-        _command_line("ucode setup show", "The draft, and the payload `apply` sends", width=width)
+        _command_line("ucode setup show", "The draft, and the payload `publish` sends", width=width)
     )
-    console.print(_command_line("ucode apply", "Publish it to the workspace", width=width))
+    console.print(_command_line("ucode publish", "Publish it to the workspace", width=width))
 
     print_heading("Also")
     console.print(
@@ -1907,7 +1923,7 @@ def setup_help_command() -> int:
 
 
 def show_command() -> int:
-    """Print the authored manifest and the proto-JSON `ucode apply` would publish."""
+    """Print the authored manifest and the proto-JSON `ucode publish` would publish."""
     # Fall back to the workspace the on-disk file was authored for, so `ucode setup --show` still
     # works before `ucode configure` has put a workspace in local state.
     workspace = load_state().get("workspace") or managed_state_workspace()
@@ -1917,7 +1933,7 @@ def show_command() -> int:
         return 0
     _render_summary(workspace or "unknown", manifest)
     console.print()
-    print_heading("Payload for `ucode apply`")
+    print_heading("Payload for `ucode publish`")
     console.print(json.dumps(serialize_managed_config(manifest), indent=2))
     return 0
 
@@ -1928,11 +1944,7 @@ def show_command() -> int:
 def _explain_publish_failure(reason: str) -> str:
     lowered = reason.lower()
     if "feature_disabled" in lowered:
-        return (
-            "Managed coding-agent configs aren't enabled on this workspace yet. Ask your Databricks "
-            "contact to enable the `codingAgentConfigCrudEnabled` flag for it, then re-run "
-            "`ucode apply`."
-        )
+        return CODING_AGENT_CONFIGS_DISABLED_MESSAGE
     if "permission_denied" in lowered or "http 403" in lowered:
         return (
             "Publishing a managed config requires workspace admin. Your account can read the "
@@ -1941,7 +1953,7 @@ def _explain_publish_failure(reason: str) -> str:
     if "already_exists" in lowered:
         return (
             "This workspace already has a managed config, but ucode couldn't read it to update in "
-            "place. Run `ucode apply` again — if it keeps failing, the existing config may need to "
+            "place. Run `ucode publish` again — if it keeps failing, the existing config may need to "
             "be deleted by hand."
         )
     if "invalid_parameter_value" in lowered:
@@ -1962,7 +1974,7 @@ def _with_claude_inventory(state: dict, workspace: str, profile: str | None) -> 
         claude: model 'system.ai.claude-opus-4-8' is not available on this workspace.
 
     The wizard stashes the full listing on ``state["all_claude_models"]`` mid-run, but that is never
-    persisted — `setup` saves the manifest, not the state — so a separate `ucode apply` process
+    persisted — `setup` saves the manifest, not the state — so a separate `ucode publish` process
     starts from a fresh ``load_state()`` without it. Re-fetching here makes the check independent of
     what the wizard happened to leave behind, which also covers a hand-edited or ``--from-file``
     manifest authored on another machine.
@@ -1984,16 +1996,24 @@ def _with_claude_inventory(state: dict, workspace: str, profile: str | None) -> 
     return {**state, "all_claude_models": all_claude}
 
 
-def apply_command(*, yes: bool = False) -> int:
-    """Publish the authored manifest to the workspace.
+def publish_command(*, file_path: str | None = None, yes: bool = False) -> int:
+    """Publish a managed config to the workspace.
 
-    Updates the existing config in place when there is one, rather than deleting and recreating it:
-    a failed recreate would leave the workspace with no managed config at all, and every developer
-    would silently fall back to their own settings. Returns a process exit code.
+    With no ``file_path`` the locally authored manifest is published; with one, the config file
+    (produced by ``ucode export``) is published instead. Both routes are validated against the
+    configured workspace and canonicalized before anything is sent. Updates the existing config in
+    place when there is one, rather than deleting and recreating it: a failed recreate would leave
+    the workspace with no managed config at all, and every developer would silently fall back to
+    their own settings. Returns a process exit code.
+
+    Model-availability validation runs against the authored manifest for the no-file case, since the
+    export round-trip that builds its payload drops the internal ``model_config.custom_models``
+    exemption for hand-entered ids that discovery won't surface.
     """
     from ucode.cli import _prompt_for_configuration
+    from ucode.managed_publish import load_publish_payload, parse_publish_payload
 
-    print_section("ucode apply")
+    print_section("ucode publish")
 
     state = load_state()
     workspace = state.get("workspace")
@@ -2001,29 +2021,29 @@ def apply_command(*, yes: bool = False) -> int:
     if not workspace:
         workspace, profile = _prompt_for_configuration()
 
-    manifest = load_managed_state(workspace)
-    if manifest is None:
-        raise RuntimeError(
-            "No managed config has been authored for this workspace. Run `ucode setup` first "
-            "(or `ucode setup --from-file <json>`)."
-        )
+    manifest, api_payload = parse_publish_payload(load_publish_payload(file_path), workspace)
 
     # Auth first: validating a Claude manifest needs the workspace's full model listing, and that
     # listing needs a token. Nothing is written until well below this point.
     ensure_databricks_auth(workspace, profile)
 
-    errors = validate_manifest(manifest, _with_claude_inventory(state, workspace, profile))
+    validation_manifest = load_managed_state(workspace) if file_path is None else manifest
+    errors = validate_manifest(
+        validation_manifest or manifest, _with_claude_inventory(state, workspace, profile)
+    )
     if errors:
-        print_err("The authored config is not valid, so it was not published:")
+        print_err("The config is not valid, so it was not published:")
         for error in errors:
             print_note(error)
-        print_note("Re-run `ucode setup` to fix it, or edit ~/.ucode/managed-state.json.")
+        if file_path is None:
+            print_note("Re-run `ucode setup` to fix it, or edit ~/.ucode/managed-state.json.")
+        else:
+            print_note("Fix the config file and re-run `ucode publish -f`.")
         return 1
 
     token = get_databricks_token(workspace, profile)
     _require_admin(workspace, token)
 
-    payload = serialize_managed_config(manifest)
     _render_summary(workspace, manifest)
 
     # Read before writing: the resource name tells us whether to create or update, and shows the
@@ -2031,6 +2051,8 @@ def apply_command(*, yes: bool = False) -> int:
     with spinner("Checking for an existing managed config..."):
         existing, reason = get_managed_config(workspace, token)
     if reason is not None:
+        if "feature_disabled" in reason.lower():
+            raise RuntimeError(CODING_AGENT_CONFIGS_DISABLED_MESSAGE)
         raise RuntimeError(
             f"Could not check whether {workspace} already has a managed config: {reason}. "
             "Refusing to publish without knowing, since that could overwrite a config silently."
@@ -2040,7 +2062,7 @@ def apply_command(*, yes: bool = False) -> int:
     if existing is not None and not isinstance(existing_name, str):
         raise RuntimeError(
             "This workspace has a managed config but the API didn't return its resource name, so "
-            "ucode can't update it in place. Delete it in the workspace and re-run `ucode apply`."
+            "ucode can't update it in place. Delete it in the workspace and re-run `ucode publish`."
         )
 
     console.print()
@@ -2051,7 +2073,7 @@ def apply_command(*, yes: bool = False) -> int:
         # rather than a bare "this replaces the current config". Comparing the round-tripped payload
         # (not the raw manifest) shows the real post-publish state — any field serialization drops
         # won't appear as a phantom change.
-        changed = _render_config_diff(existing, normalize_managed_config(payload), workspace)
+        changed = _render_config_diff(existing, manifest, workspace)
         if not changed:
             print_success(f"{workspace}'s published config already matches this one.")
             print_note("Nothing to publish.")
@@ -2064,11 +2086,11 @@ def apply_command(*, yes: bool = False) -> int:
 
     if existing is None:
         with spinner("Publishing the managed config..."):
-            published, publish_reason = create_coding_agent_config(workspace, token, payload)
+            published, publish_reason = create_coding_agent_config(workspace, token, api_payload)
     else:
         with spinner("Updating the managed config..."):
             published, publish_reason = update_coding_agent_config(
-                workspace, token, cast("str", existing_name), payload
+                workspace, token, cast("str", existing_name), api_payload
             )
     if publish_reason is not None:
         raise RuntimeError(_explain_publish_failure(publish_reason))
@@ -2080,7 +2102,7 @@ def apply_command(*, yes: bool = False) -> int:
 
 
 __all__ = [
-    "apply_command",
+    "publish_command",
     "setup_budget_policy_command",
     "setup_command",
     "setup_from_file",

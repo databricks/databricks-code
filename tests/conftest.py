@@ -21,19 +21,30 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     """Redirect ucode's state file and APP_DIR to a per-test tmp dir.
 
     Defense in depth: even if an individual test forgets to patch save_state,
-    it can never touch the developer's real ~/.ucode/state.json.
+    it can never touch the developer's real ~/.ucode/state.json or invoke the
+    privileged writer for an OS-managed agent config.
     """
     import ucode.config_io as config_io_mod
     import ucode.databricks as databricks_mod
+    import ucode.managed_files as managed_files_mod
     import ucode.state as state_mod
 
     state_dir = tmp_path / ".ucode"
     state_dir.mkdir()
     monkeypatch.setattr(state_mod, "STATE_PATH", state_dir / "state.json")
     monkeypatch.setattr(config_io_mod, "APP_DIR", state_dir)
+
+    def reject_privileged_write(path, _desired_text):
+        pytest.fail(
+            f"test attempted a privileged managed-config write to {path}; "
+            "mock the agent's managed path and writer"
+        )
+
+    monkeypatch.setattr(managed_files_mod, "_sudo_replace", reject_privileged_write)
     # Isolate the managed-config opt-in from the developer's own shell: leaving it set changes what
     # `ucode`/`ucode configure` do mid-test. Tests that exercise the managed path set it explicitly.
     monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
+    monkeypatch.delenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", raising=False)
     # The model-services listing is memoized for the life of the process, so without this a cached
     # result would leak into the next test and make a stubbed listing look like it was never called.
     databricks_mod.clear_model_services_cache()
