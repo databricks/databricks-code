@@ -1613,7 +1613,7 @@ def _fetch_budget_recommendation(state: dict, managed: dict | None) -> dict | No
 
 
 def _launch_title(tool: str) -> str:
-    return f"Launching {TOOL_SPECS[tool]['display'].title()} with Unity Gateway"
+    return f"Launching {TOOL_SPECS[tool]['display']} with Unity Gateway"
 
 
 def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = None) -> None:
