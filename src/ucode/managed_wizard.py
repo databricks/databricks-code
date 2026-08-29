@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import cast
 
 from ucode import config_io
-from ucode.agents import GLOBAL_SETTINGS_AGENTS, TOOL_SPECS, check_gateway_endpoint
+from ucode.agents import TOOL_SPECS, check_gateway_endpoint
 from ucode.databricks import (
     ANTHROPIC_FAMILIES,
     all_users_can_use_schema,
@@ -80,14 +80,6 @@ from ucode.ui import (
     prompt_yes_no_default,
     spinner,
 )
-
-# The OS-level managed settings file `use_as_global_settings` writes for each agent — named in the
-# prompt so an admin sees exactly what answering "yes" touches. Yes writes this file (needs sudo
-# once) so a bare `claude`/`codex` reaches the gateway on its own; no keeps it ucode-only.
-GLOBAL_SETTINGS_FILES = {
-    "claude": "managed-settings.json",
-    "codex": "managed_config.toml",
-}
 
 # Shown whenever the workspace's coding-agent-config APIs return FEATURE_DISABLED.
 CODING_AGENT_CONFIGS_DISABLED_MESSAGE = (
@@ -429,9 +421,6 @@ def _confirm_agent(tool: str, agent_config: dict) -> None:
     provider = model_config.get("model_provider_service")
     if provider:
         detail = f"{detail} via {provider}"
-    if tool in GLOBAL_SETTINGS_AGENTS:
-        scope = "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
-        detail = f"{detail} · {scope}"
     print_success(f"{display} configured — {detail}")
 
 
@@ -1085,14 +1074,7 @@ def _render_summary(workspace: str, manifest: dict) -> None:
         provider = model_config.get("model_provider_service")
         if provider:
             detail = f"{detail} via {provider}"
-        # Only agents that can use global settings carry the scope label; for the rest it's not a choice.
-        if tool in GLOBAL_SETTINGS_AGENTS:
-            scope = (
-                "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
-            )
-            lines.append(kv_line(display, f"{detail} ({scope})"))
-        else:
-            lines.append(kv_line(display, detail))
+        lines.append(kv_line(display, detail))
         # Spell out the per-family slots and model lists: the one-line default alone doesn't show
         # which families an admin configured, which is most of what they chose for claude.
         models = model_config.get("models")
@@ -1170,12 +1152,6 @@ def _config_facts(manifest: dict) -> list[tuple[str, str, str]]:
                 facts.append((f"agent:{tool}:model:{family}", f"{display} ({family})", str(model)))
         elif isinstance(models, list) and len(models) > 1:
             facts.append((f"agent:{tool}:models", f"{display} models", ", ".join(map(str, models))))
-        if tool in GLOBAL_SETTINGS_AGENTS:
-            scope = (
-                "global settings" if agent_config.get("use_as_global_settings") else "ucode-only"
-            )
-            facts.append((f"agent:{tool}:scope", f"{display} settings", scope))
-
     for server in manifest.get("mcp_servers") or []:
         name = str(server.get("name"))
         facts.append((f"mcp:{name}", f"MCP server {name}", str(server.get("type") or "")))
@@ -1650,16 +1626,6 @@ def setup_command(
         agent_config: dict = {
             "model_config": _prompt_models_for_agent(tool, state, provider_service)
         }
-        # Only claude and codex have an OS-level managed settings file that a bare `claude`/`codex`
-        # reads (`/etc/claude-code/managed-settings.json`, `/etc/codex/managed_config.toml`); the
-        # other agents don't, so we don't offer them the choice.
-        if tool in GLOBAL_SETTINGS_AGENTS:
-            binary = TOOL_SPECS[tool]["binary"]
-            agent_config["use_as_global_settings"] = prompt_yes_no_default(
-                f"Route `{binary}` through the gateway too, not just `ucode {binary}`? "
-                f"(writes {GLOBAL_SETTINGS_FILES[tool]}, needs sudo once)",
-                default=False,
-            )
         enabled_agents[tool] = agent_config
         _confirm_agent(tool, agent_config)
 

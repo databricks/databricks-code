@@ -1047,6 +1047,11 @@ def status() -> int:
             print_kv("OS-managed settings", managed_status)
             print_kv("Managed settings file", str(managed_path) if managed_path else "unsupported")
             print_kv("Managed settings backup", backup_status)
+        elif tool == "codex":
+            managed_path, managed_status, backup_status = codex_agent.managed_config_status(state)
+            print_kv("OS-managed settings", managed_status)
+            print_kv("Managed settings file", str(managed_path) if managed_path else "unsupported")
+            print_kv("Managed settings backup", backup_status)
         console.print()
 
     print_heading("Skills")
@@ -1103,6 +1108,7 @@ def revert() -> int:
     managed_configs = state.get("managed_configs") or {}
     mcp_results = revert_mcp_configs(state)
     claude_managed_result = claude_agent.revert_managed_settings()
+    codex_managed_result = codex_agent.revert_managed_config()
 
     results: dict[str, bool] = {
         tool: restore_file(
@@ -1125,6 +1131,7 @@ def revert() -> int:
     if legacy_codex_stripped:
         print_kv("Codex shared config", "ucode entries removed")
     print_kv("Claude Code OS-managed settings", claude_managed_result)
+    print_kv("Codex OS-managed settings", codex_managed_result)
     print_kv("Pi settings", "restored" if pi_settings_restored else "unchanged")
     for client, spec in MCP_CLIENTS.items():
         print_kv(
@@ -1862,7 +1869,7 @@ def _can_launch_from_cached_config(
             claude_agent.CLAUDE_SETTINGS_PATH.exists()
             and claude_agent.managed_settings_are_current(state)
         )
-    return codex_agent.has_ucode_config()
+    return codex_agent.has_ucode_config() and codex_agent.managed_config_is_current(state)
 
 
 def _launch_tool(

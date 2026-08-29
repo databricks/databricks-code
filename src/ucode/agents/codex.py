@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import tomlkit
+from tomlkit.exceptions import ParseError
 
 from ucode.config_io import (
     APP_DIR,
@@ -25,7 +28,18 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
-from ucode.managed_files import OS, current_os, write_managed_file
+from ucode.managed_files import (
+    OS,
+    current_os,
+    managed_file_conflicts,
+    managed_file_is_verified,
+    managed_file_status,
+    managed_writes_allowed,
+    mark_managed_file_verified,
+    read_managed_file,
+    reconcile_managed_file,
+    revert_managed_file,
+)
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
     routing_models,
@@ -355,27 +369,24 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         use_pat=bool(state.get("use_pat")),
         provider=provider,
     )
+
+    def compose(base: dict) -> dict:
+        deep_merge_dict(base, copy.deepcopy(overlay))
+        if provider:
+            # deep_merge can't drop keys, so clear a `model` pinned by an earlier
+            # non-provider run that the provider overlay omits.
+            base.pop("model", None)
+        return base
+
     doc = read_toml_safe(CODEX_CONFIG_PATH)
-    deep_merge_dict(doc, overlay)
-    if provider:
-        # deep_merge can't drop keys, so clear a `model` pinned by an earlier
-        # non-provider run that the provider overlay omits.
-        doc.pop("model", None)
+    compose(doc)
     sync_smart_routing_hooks(
         doc,
         state,
         enabled=smart_routing_enabled(state) and provider is None,
     )
     write_toml_file(CODEX_CONFIG_PATH, doc)
-    # use_as_global_settings: also write the modern overlay to Codex's OS managed config
-    # (/etc/codex/managed_config.toml), the highest-precedence scope a bare `codex` reads — so it
-    # defaults to the gateway without `--profile ucode`. codex auth self-refreshes via
-    # `ucode auth-token`, so the file keeps working. The write goes through the sudo path in
-    # `managed_files`.
-    if state.get("write_managed_config"):
-        _write_managed_config(
-            workspace, chosen_model, databricks_profile, bool(state.get("use_pat")), provider
-        )
+    _reconcile_managed_config(state, compose)
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
     return state
@@ -390,45 +401,85 @@ def _is_gpt_family(model: str) -> bool:
 
 
 def _managed_config_path() -> Path | None:
-    """OS-level Codex managed config file, or None on unsupported platforms.
-
-    Linux and macOS use ``/etc/codex/managed_config.toml`` (root-owned, highest precedence). See
-    https://learn.chatgpt.com/docs/enterprise/managed-configuration. Codex also supports a
-    ``~/.codex/managed_config.toml`` on Windows, but ucode's write path is sudo/Unix-only
-    (see :func:`managed_files.managed_files_supported`), so Windows returns None here too.
-    """
+    """Return Codex's managed config path on platforms supported by ucode's sudo writer."""
     if current_os() in (OS.LINUX, OS.MACOS):
         return Path("/etc/codex/managed_config.toml")
     return None
 
 
-def _write_managed_config(
-    workspace: str,
-    model: str | None,
-    databricks_profile: str | None,
-    use_pat: bool,
-    provider: str | None,
-) -> None:
-    """Merge the modern overlay into Codex's OS managed_config.toml, preserving any other keys there.
+def _parse_managed_config(text: str) -> dict:
+    try:
+        return tomlkit.parse(text)
+    except ParseError as exc:
+        raise RuntimeError(f"invalid TOML: {exc}") from exc
 
-    Written via the sudo path in `managed_files` (drift-suppressed).
-    """
+
+def managed_config_is_current(state: dict) -> bool:
+    path = _managed_config_path()
+    if path is None:
+        return True
+    required_scope = "managed" if managed_writes_allowed() else None
+    return managed_file_is_verified(state, "codex", path, required_scope=required_scope)
+
+
+def managed_config_status(state: dict) -> tuple[Path | None, str, str]:
+    path = _managed_config_path()
+    status, backup = managed_file_status(state, "codex", path, parser=_parse_managed_config)
+    return path, status, backup
+
+
+def revert_managed_config() -> str:
+    return revert_managed_file(
+        "codex",
+        display="Codex",
+        parser=_parse_managed_config,
+        dumper=tomlkit.dumps,
+    )
+
+
+def _reconcile_managed_config(state: dict, compose: Callable[[dict], dict]) -> None:
+    """Reconcile Codex's highest-precedence config while preserving unrelated policy."""
     path = _managed_config_path()
     if path is None:
         print_warning_err(
             "Machine-wide Codex settings aren't supported on this platform; skipped the managed "
-            "config write."
+            "config."
         )
         return
-    overlay = render_overlay(
-        workspace, model, databricks_profile, use_pat=use_pat, provider=provider
+    if path.is_symlink():
+        raise RuntimeError(
+            f"Refusing to use Codex managed settings through symlink {path}. Replace it with a "
+            "regular file or contact your administrator."
+        )
+    current_text = read_managed_file(path)
+    try:
+        existing = _parse_managed_config(current_text) if current_text is not None else {}
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Cannot safely update Codex managed settings at {path}: {exc}. ucode did not modify "
+            "the file. Repair it or contact your administrator."
+        ) from exc
+    managed_before = copy.deepcopy(existing)
+    desired_doc = compose(existing)
+    if not managed_writes_allowed():
+        conflicts = managed_file_conflicts(managed_before, desired_doc, MANAGED_KEYS)
+        if conflicts:
+            raise RuntimeError(
+                "Codex configuration cannot be applied non-interactively because OS-managed "
+                f"settings at {path} override ucode values: {', '.join(conflicts)}. Run `ucode "
+                "configure --agent codex` from an interactive terminal or contact your "
+                "administrator."
+            )
+        mark_managed_file_verified(state, "codex", path, scope="local-compatible")
+        return
+    reconcile_managed_file(
+        path,
+        tomlkit.dumps(desired_doc),
+        tool="codex",
+        display="Codex",
+        owned_paths=MANAGED_KEYS,
     )
-    doc = read_toml_safe(path)
-    deep_merge_dict(doc, overlay)
-    if provider:
-        # deep_merge can't drop keys; clear a `model` a prior non-provider run pinned.
-        doc.pop("model", None)
-    write_managed_file(path, tomlkit.dumps(doc), display="Codex")
+    mark_managed_file_verified(state, "codex", path)
 
 
 def default_model(state: dict) -> str | None:
@@ -521,8 +572,8 @@ def launch(state: dict, tool_args: list[str]) -> None:
         # since execvp replaces this process.
         print_warning_err(
             "ucode's `--profile` isn't accepted here (error above). Retrying "
-            f"without it: this run uses {LEGACY_CODEX_CONFIG_PATH}, NOT the "
-            "Databricks gateway."
+            f"without it: Codex will resolve {LEGACY_CODEX_CONFIG_PATH} and any OS-managed "
+            "settings instead of the ucode profile."
         )
         exec_or_spawn([binary, *tool_args])
         return  # unreachable in production (exec replaces the process)

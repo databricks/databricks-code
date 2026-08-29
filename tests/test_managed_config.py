@@ -30,7 +30,6 @@ RAW_MANIFEST = {
         {
             "agent": "CODING_AGENT_CLAUDE_CODE",
             "config": {
-                "use_as_global_settings": True,
                 "custom_headers": {"x-databricks-workspace": "eng-ml-inference"},
                 "tracing_config": {"table": "main.default.ucode_traces"},
                 "model_config": {
@@ -91,7 +90,6 @@ class TestNormalize:
 
     def test_claude_agent_config_fields(self):
         claude = normalize_managed_config(RAW_MANIFEST)["enabled_agents"]["claude"]
-        assert claude["use_as_global_settings"] is True
         assert claude["custom_headers"] == {"x-databricks-workspace": "eng-ml-inference"}
         assert claude["tracing_table"] == "main.default.ucode_traces"
         assert claude["model_config"]["default_model"] == "system.ai.claude-opus-4-8"

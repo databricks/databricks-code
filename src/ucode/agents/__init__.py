@@ -71,10 +71,6 @@ DEFAULT_TOOL = "codex"
 BUNDLE_VERSION = 1
 _MANAGED_SETTINGS_TOOLS = {"claude"}
 
-# Codex still honors the legacy managed-config opt-in until its follow-up migration. Claude always
-# reconciles its OS-managed settings and therefore no longer appears in the setup prompt.
-GLOBAL_SETTINGS_AGENTS = frozenset({"codex"})
-
 # ucode tool -> `databricks aitools` agent id. gemini/pi aren't supported.
 AITOOLS_AGENT_TOKENS = {
     "claude": "claude-code",

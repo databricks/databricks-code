@@ -1229,10 +1229,21 @@ class TestCachedConfigPredicate:
         with (
             patch("ucode.cli.managed_agent_config_enabled", return_value=False),
             patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=True),
         ):
             assert (
                 cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
                 is True
+            )
+
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=False),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
+                is False
             )
 
     def test_accepts_claude_only_when_managed_settings_are_verified(self, tmp_path):
