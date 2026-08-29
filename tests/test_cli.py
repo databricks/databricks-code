@@ -1336,14 +1336,10 @@ class TestConfigureAgentFlag:
             patch("ucode.cli.install_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
-            patch("ucode.cli._configure_optional_setup") as mock_optional_setup,
         ):
             result = runner.invoke(app, ["configure"])
         assert result.exit_code == 0, result.output
-        mock_cfg.assert_called_once_with(
-            prompt_optional_updates=True, databricks_ai_tools_enabled=False
-        )
-        mock_optional_setup.assert_called_once_with()
+        mock_cfg.assert_called_once_with(prompt_optional_updates=True, offer_optional_setup=True)
 
     def test_optional_setup_installs_ai_tools_and_configures_mcp(self):
         import ucode.cli as cli_mod
@@ -1351,12 +1347,11 @@ class TestConfigureAgentFlag:
         state = {"available_tools": ["claude", "codex"]}
         with (
             patch("ucode.cli.prompt_yes_no", return_value=True) as mock_prompt,
-            patch("ucode.cli.load_state", return_value=state),
             patch("ucode.cli.save_state") as mock_save,
             patch("ucode.cli.install_databricks_ai_tools_for_agents") as mock_install,
             patch("ucode.cli.configure_mcp_command") as mock_mcp,
         ):
-            cli_mod._configure_optional_setup()
+            cli_mod._configure_optional_setup(state, ["claude", "codex"])
 
         mock_prompt.assert_called_once_with("Configure MCP servers, skills, and plugins?")
         assert state["databricks_ai_tools_enabled"] is True
@@ -1369,12 +1364,16 @@ class TestConfigureAgentFlag:
 
         with (
             patch("ucode.cli.prompt_yes_no", return_value=False),
-            patch("ucode.cli.load_state") as mock_load,
+            patch("ucode.cli.save_state") as mock_save,
+            patch("ucode.cli.install_databricks_ai_tools_for_agents") as mock_install,
             patch("ucode.cli.configure_mcp_command") as mock_mcp,
         ):
-            cli_mod._configure_optional_setup()
+            state = {}
+            cli_mod._configure_optional_setup(state, ["claude"])
 
-        mock_load.assert_not_called()
+        assert state["databricks_ai_tools_enabled"] is False
+        mock_save.assert_called_once_with(state)
+        mock_install.assert_not_called()
         mock_mcp.assert_not_called()
 
     def test_agents_flag_skips_mcp_prompt(self):
@@ -1383,11 +1382,9 @@ class TestConfigureAgentFlag:
             patch("ucode.cli.install_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command"),
-            patch("ucode.cli._configure_optional_setup") as mock_optional_setup,
         ):
             result = runner.invoke(app, ["configure", "--agents", "claude,codex"])
         assert result.exit_code == 0, result.output
-        mock_optional_setup.assert_not_called()
 
     def test_agents_flag_calls_configure_with_tools(self):
         with (
@@ -1540,9 +1537,7 @@ class TestConfigureAgentFlag:
         ):
             result = runner.invoke(app, ["configure", "--skip-upgrade"])
         assert result.exit_code == 0, result.output
-        mock_cfg.assert_called_once_with(
-            prompt_optional_updates=False, databricks_ai_tools_enabled=False
-        )
+        mock_cfg.assert_called_once_with(prompt_optional_updates=False, offer_optional_setup=True)
 
     def test_disable_databricks_ai_tools_forwards_false_and_skips_prompt(self):
         # An explicit flag suppresses the interactive prompt and forwards the choice.

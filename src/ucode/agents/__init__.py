@@ -437,7 +437,9 @@ def _configure_one(tool: str, state: dict, provider: str | None) -> dict:
     return configure_tool(tool, state, model)
 
 
-def configure_selected_tools(state: dict, tools: list[str]) -> dict:
+def configure_selected_tools(
+    state: dict, tools: list[str], *, install_ai_tools: bool = True
+) -> dict:
     """Configure the given tools. Caller is responsible for ensuring each tool
     is available on the workspace.
 
@@ -452,7 +454,8 @@ def configure_selected_tools(state: dict, tools: list[str]) -> dict:
     existing = state.get("available_tools") or []
     state["available_tools"] = sorted(set(existing) | set(tools))
     save_state(state)
-    install_databricks_ai_tools_for_agents(tools, state)
+    if install_ai_tools:
+        install_databricks_ai_tools_for_agents(tools, state)
     return state
 
 

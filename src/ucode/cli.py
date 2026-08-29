@@ -838,6 +838,7 @@ def configure_workspace_command(
     skip_unavailable: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    offer_optional_setup: bool = False,
 ) -> int:
     if tool is not None and selected_tools is not None:
         raise RuntimeError("Use either --agent or --agents, not both.")
@@ -949,7 +950,10 @@ def configure_workspace_command(
         for tool_name in picked:
             state = _maybe_select_provider_service(tool_name, state)
 
-    state = configure_selected_tools(state, picked)
+    if offer_optional_setup:
+        state = configure_selected_tools(state, picked, install_ai_tools=False)
+    else:
+        state = configure_selected_tools(state, picked)
 
     summary_lines = [f"[bold]Workspace:[/bold] [cyan]{state['workspace']}[/cyan]"]
     for tool_name in picked:
@@ -969,11 +973,13 @@ def configure_workspace_command(
 
     if skip_validate:
         print_note("Skipping agent validation (--skip-validate).")
-        return 0
-    # Limit validation to just-configured tools so we don't re-validate
-    # previously-configured tools the user didn't touch this run.
-    validate_state = {**state, "available_tools": picked}
-    validate_all_tools(validate_state)
+    else:
+        # Limit validation to just-configured tools so we don't re-validate
+        # previously-configured tools the user didn't touch this run.
+        validate_state = {**state, "available_tools": picked}
+        validate_all_tools(validate_state)
+    if offer_optional_setup and not is_dry_run():
+        _configure_optional_setup(state, picked)
     return 0
 
 
@@ -1189,14 +1195,14 @@ def _configure_agents_for_mcp(
     return configured
 
 
-def _configure_optional_setup() -> None:
-    if not prompt_yes_no("Configure MCP servers, skills, and plugins?"):
+def _configure_optional_setup(state: dict, tools: list[str]) -> None:
+    enabled = prompt_yes_no("Configure MCP servers, skills, and plugins?")
+    state["databricks_ai_tools_enabled"] = enabled
+    save_state(state)
+    if not enabled:
         return
 
-    state = load_state()
-    state["databricks_ai_tools_enabled"] = True
-    save_state(state)
-    install_databricks_ai_tools_for_agents(state.get("available_tools") or [], state)
+    install_databricks_ai_tools_for_agents(tools, state)
     configure_mcp_command()
 
 
@@ -2778,8 +2784,7 @@ def configure(
                 not flag_driven_workspace and enable_databricks_ai_tools is None
             )
             if combined_optional_setup:
-                # Defer AI Tools until the combined optional setup prompt below.
-                skip_kwargs["databricks_ai_tools_enabled"] = False
+                skip_kwargs["offer_optional_setup"] = True
             if workspace_entries is None:
                 configure_workspace_command(
                     prompt_optional_updates=prompt_optional_updates,
@@ -2827,9 +2832,12 @@ def configure(
                     "interactive picker."
                 )
             configure_mcp_command(services=services)
-        if combined_optional_setup and not dry_run:
-            _configure_optional_setup()
-        elif fully_interactive and not dry_run and prompt_yes_no("Configure MCP servers now?"):
+        if (
+            fully_interactive
+            and not combined_optional_setup
+            and not dry_run
+            and prompt_yes_no("Configure MCP servers now?")
+        ):
             configure_mcp_command()
     except typer.Exit:
         # `typer.Exit` subclasses RuntimeError, so it has to be re-raised ahead of the handler

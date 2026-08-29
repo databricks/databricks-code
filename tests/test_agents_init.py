@@ -123,6 +123,13 @@ class TestConfigureWiresAiToolsInstall:
         agents_mod.configure_selected_tools({"profile": "myprof"}, ["codex"])
         assert captured == {"agents": ["codex"], "profile": "myprof"}
 
+    def test_configure_selected_tools_can_defer_install(self, monkeypatch):
+        captured = self._stub_configure(monkeypatch)
+        agents_mod.configure_selected_tools(
+            {"profile": "myprof"}, ["codex"], install_ai_tools=False
+        )
+        assert captured == {}
+
 
 class TestNormalizeTool:
     @pytest.mark.parametrize(
