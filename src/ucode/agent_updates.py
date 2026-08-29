@@ -68,4 +68,3 @@ def latest_version_below(package: str, ceiling: tuple[int, int, int]) -> str | N
     pool = stable or at_max
     # npm returns versions in ascending order, so the last entry is newest.
     return pool[-1]
-

@@ -57,6 +57,7 @@ class TestToolSpecs:
     def test_default_tool_is_codex(self):
         assert DEFAULT_TOOL == "codex"
 
+
 class TestInstallAiToolsForAgents:
     def _capture(self, monkeypatch):
         captured = {}

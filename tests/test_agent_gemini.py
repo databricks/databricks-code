@@ -156,6 +156,7 @@ class TestGeminiVersionGating:
         monkeypatch.setattr(gemini, "latest_version_below", lambda pkg, ceiling: None)
         assert gemini.too_new_downgrade() is None
 
+
 class TestGeminiValidateCmd:
     def test_starts_with_binary(self):
         cmd = gemini.validate_cmd("gemini")
