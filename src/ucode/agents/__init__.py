@@ -69,7 +69,7 @@ TOOL_ALIASES = {
 
 DEFAULT_TOOL = "codex"
 BUNDLE_VERSION = 1
-_MANAGED_SETTINGS_TOOLS = {"claude"}
+_MANAGED_SETTINGS_TOOLS = {"claude", "codex"}
 
 # ucode tool -> `databricks aitools` agent id. gemini/pi aren't supported.
 AITOOLS_AGENT_TOKENS = {
