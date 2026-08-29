@@ -205,6 +205,34 @@ class TestLaunchCodex:
         assert configured[1]["matcher"] == "Agent|.*spawn_agent$"
         assert "--model system.ai.gpt-5-6-sol" in configured[1]["hooks"][0]["command"]
 
+    def test_v2_pre_tool_hook_replaces_existing_ucode_hook(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            "[[hooks.PreToolUse]]\n"
+            'matcher = "Agent|.*spawn_agent$"\n'
+            "[[hooks.PreToolUse.hooks]]\n"
+            'type = "command"\n'
+            'command = "ucode codex-router-hook route-subagent --model old"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        configured = v2._v2_pre_tool_use_hooks(
+            {"workspace": WS, "profile": "myprof"},
+            ["system.ai.gpt-5-6-sol"],
+        )
+
+        routing_commands = [
+            hook["command"]
+            for group in configured
+            for hook in group["hooks"]
+            if "codex-router-hook" in hook["command"]
+        ]
+        assert len(routing_commands) == 1
+        assert "--model system.ai.gpt-5-6-sol" in routing_commands[0]
+        assert "--model old" not in routing_commands[0]
+
     def test_missing_cached_models_blocks_launch(self, monkeypatch):
         monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
 

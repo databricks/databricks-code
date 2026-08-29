@@ -343,6 +343,42 @@ class TestSubcommandRouting:
         assert result.output == ""
         mock_request.assert_not_called()
 
+    def test_codex_subagent_hook_refreshes_expired_launch_token(self):
+        routed = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": {"message": "fix it", "model": "gpt-5.6-sol"},
+            }
+        }
+        with (
+            patch("ucode.cli.get_databricks_token", return_value="fresh-token") as mock_token,
+            patch(
+                "ucode.smart_routing.codex_routing.route_pre_tool_use",
+                return_value=routed,
+            ) as mock_route,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "codex-router-hook",
+                    "route-subagent",
+                    "--host",
+                    "https://example.com",
+                    "--profile",
+                    "my-profile",
+                    "--model",
+                    "system.ai.gpt-5-6-sol",
+                ],
+                input='{"tool_name":"collaboration.spawn_agent","tool_input":{"message":"fix it"}}',
+                env={"OAUTH_TOKEN": "expired-launch-token"},
+            )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == routed
+        mock_token.assert_called_once_with("https://example.com", "my-profile")
+        assert mock_route.call_args.kwargs["token"] == "fresh-token"
+
     def test_claude_v2_subagent_hook_uses_v2_router(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
         routed = {

@@ -1435,14 +1435,12 @@ def codex_router_hook_cmd(
         return
     if event != "route-subagent" or not host:
         return
-    token = os.environ.get("OAUTH_TOKEN") or os.environ.get("DATABRICKS_BEARER")
-    if not token:
-        if use_pat and not ensure_pat_bearer(profile):
-            return
-        try:
-            token = get_databricks_token(host, profile)
-        except RuntimeError:
-            return
+    if use_pat and not ensure_pat_bearer(profile):
+        return
+    try:
+        token = get_databricks_token(host, profile)
+    except RuntimeError:
+        return
     output = route_pre_tool_use(
         payload,
         workspace=host,
