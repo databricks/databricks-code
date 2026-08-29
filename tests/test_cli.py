@@ -52,15 +52,6 @@ def no_state_writes():
         yield
 
 
-@pytest.fixture(autouse=True)
-def no_blocking_ai_tools_prompt():
-    """The interactive configure flow prompts for AI Tools; default it to yes so
-    tests that drive that path don't block reading stdin. Tests that assert on the
-    prompt override this with their own patch."""
-    with patch("ucode.cli.prompt_yes_no_default", lambda msg, *, default: default):
-        yield
-
-
 MINIMAL_STATE = {
     "workspace": "https://example.databricks.com",
     "base_urls": {
@@ -1559,14 +1550,12 @@ class TestConfigureAgentFlag:
             patch("ucode.cli.install_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
-            patch("ucode.cli.prompt_yes_no_default") as mock_prompt,
             # Fully-interactive configure ends by offering the MCP step; decline it.
             patch("ucode.cli.prompt_yes_no", return_value=False),
             patch("ucode.cli.configure_mcp_command"),
         ):
             result = runner.invoke(app, ["configure", "--disable-databricks-ai-tools"])
         assert result.exit_code == 0, result.output
-        mock_prompt.assert_not_called()
         mock_cfg.assert_called_once_with(
             prompt_optional_updates=True, databricks_ai_tools_enabled=False
         )
