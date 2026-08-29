@@ -15,7 +15,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
-from ucode.agent_updates import available_npm_package_update
 from ucode.anthropic_model_discovery_proxy import (
     start_proxy as start_anthropic_model_discovery_proxy,
 )
@@ -103,10 +102,6 @@ CLAUDE_OPTIONAL_VALUE_OPTIONS = frozenset(
         "--worktree",
     }
 )
-
-
-def is_update_available() -> tuple[str, str] | None:
-    return available_npm_package_update(SPEC["package"])
 
 
 def _resolve_web_search_model(state: dict) -> str | None:

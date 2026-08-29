@@ -57,11 +57,6 @@ class TestToolSpecs:
     def test_default_tool_is_codex(self):
         assert DEFAULT_TOOL == "codex"
 
-    def test_each_agent_exposes_update_check(self):
-        for tool, module in agents_mod._MODULES.items():
-            assert callable(module.is_update_available), f"{tool} missing is_update_available"
-
-
 class TestInstallAiToolsForAgents:
     def _capture(self, monkeypatch):
         captured = {}
@@ -380,10 +375,6 @@ class TestInstallToolBinary:
 
         monkeypatch.setattr("ucode.agents.shutil.which", fake_which)
         monkeypatch.setattr("ucode.agents.subprocess.run", fake_run)
-        monkeypatch.setattr(
-            "ucode.agents.opencode.is_update_available",
-            lambda: (_ for _ in ()).throw(AssertionError("should not check for optional updates")),
-        )
         monkeypatch.setattr(
             "ucode.agents.prompt_yes_no",
             lambda prompt: (_ for _ in ()).throw(AssertionError("should not prompt")),

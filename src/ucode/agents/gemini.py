@@ -75,26 +75,6 @@ def latest_working_version() -> str | None:
     return latest_version_below(SPEC["package"], MAX_GEMINI_VERSION)
 
 
-def is_update_available() -> tuple[str, str] | None:
-    """Offer an update only toward a known-working version.
-
-    The npm `latest` tag points at the broken >= 0.45 line, so the generic
-    "outdated" check would steer clients onto the regression. Instead we
-    compare the installed build against the latest working release and only
-    surface an upgrade when it is genuinely newer (and still safe).
-    """
-    installed = _parse_version(agent_version(SPEC["binary"]))
-    if installed is None:
-        return None
-    target = latest_working_version()
-    if target is None:
-        return None
-    target_base = _parse_version(target)
-    if target_base is None or target_base <= installed:
-        return None
-    return f"{installed[0]}.{installed[1]}.{installed[2]}", target
-
-
 def too_new_version() -> str | None:
     """Return the installed version string when it exceeds the safe ceiling.
 

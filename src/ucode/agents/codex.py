@@ -11,7 +11,6 @@ from pathlib import Path
 
 import tomlkit
 
-from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -74,10 +73,6 @@ LEGACY_MANAGED_KEYS: list[list[str]] = [
 ]
 
 _GPT_RE = re.compile(r"(?:databricks-)?gpt-(\d+)(?:[.-](\d+))?(?:[.-](\d+))?(-.+|[a-z].*)?")
-
-
-def is_update_available() -> tuple[str, str] | None:
-    return available_npm_package_update(SPEC["package"])
 
 
 def _parse_version(value: str) -> tuple[int, int, int] | None:
