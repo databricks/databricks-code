@@ -1842,12 +1842,12 @@ class TestSummary:
         assert "models:" not in out
 
     def test_scope_label_only_for_global_capable_agents(self, capsys):
-        # claude/codex can use global settings, so they carry the scope; gemini can't, so it doesn't.
+        # Codex retains the legacy scope choice; Claude now always installs managed settings.
         manifest = {
-            "default_agent": "claude",
+            "default_agent": "codex",
             "enabled_agents": {
-                "claude": {
-                    "model_config": {"default_model": "system.ai.claude-opus-4-8"},
+                "codex": {
+                    "model_config": {"default_model": "system.ai.gpt-5"},
                     "use_as_global_settings": True,
                 },
                 "gemini": {"model_config": {"default_model": "system.ai.gemini-3-flash"}},

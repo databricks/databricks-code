@@ -45,6 +45,7 @@ def no_state_writes():
         patch("ucode.agents.__init__.save_state"),
         patch("ucode.agents.codex.save_state"),
         patch("ucode.agents.claude.save_state"),
+        patch("ucode.agents.claude._managed_settings_path", return_value=None),
         patch("ucode.agents.gemini.save_state"),
         patch("ucode.agents.opencode.save_state"),
     ):
@@ -534,46 +535,6 @@ class TestClaudeModelFlag:
 
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.args[1]["_claude_launch_provider"] == "main.default.anthropic"
-
-    def test_warns_when_enterprise_settings_pin_the_model(self):
-        # Claude Code's enterprise managed-settings scope outranks the --settings file ucode writes,
-        # so --model is silently ignored; warn instead of launching on the "wrong" model unexplained.
-        from pathlib import Path
-
-        with (
-            patch("ucode.cli.ensure_bootstrap_dependencies"),
-            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.resolve_launch_model", return_value=(MINIMAL_STATE, "system.ai.opus")),
-            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
-            patch(
-                "ucode.cli.claude_agent.managed_settings_model_overrides",
-                return_value=Path("/etc/claude-code/managed-settings.json"),
-            ),
-            patch("ucode.cli.launch_agent"),
-        ):
-            result = runner.invoke(app, ["claude", "--model", "main.aarushi.claude-opus-5"])
-        assert result.exit_code == 0, result.output
-        assert "enterprise managed settings" in _strip_ansi(result.output)
-        assert "overrides `--model main.aarushi.claude-opus-5`" in _strip_ansi(result.output)
-
-    def test_no_enterprise_warning_when_no_managed_settings(self):
-        with (
-            patch("ucode.cli.ensure_bootstrap_dependencies"),
-            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.resolve_launch_model", return_value=(MINIMAL_STATE, "system.ai.opus")),
-            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
-            patch("ucode.cli.claude_agent.managed_settings_model_overrides", return_value=None),
-            patch("ucode.cli.launch_agent"),
-        ):
-            result = runner.invoke(app, ["claude", "--model", "main.aarushi.claude-opus-5"])
-        assert result.exit_code == 0, result.output
-        assert "enterprise managed settings" not in _strip_ansi(result.output)
 
 
 class TestMcpSubcommands:
@@ -1281,6 +1242,31 @@ class TestCachedConfigPredicate:
             assert (
                 cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
                 is True
+            )
+
+    def test_accepts_claude_only_when_managed_settings_are_verified(self, tmp_path):
+        import ucode.cli as cli_mod
+
+        settings_path = tmp_path / "ucode-settings.json"
+        settings_path.write_text("{}", encoding="utf-8")
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.claude_agent.CLAUDE_SETTINGS_PATH", settings_path),
+            patch("ucode.cli.claude_agent.managed_settings_are_current", return_value=True),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config("claude", MINIMAL_STATE, **self._kwargs())
+                is True
+            )
+
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.claude_agent.CLAUDE_SETTINGS_PATH", settings_path),
+            patch("ucode.cli.claude_agent.managed_settings_are_current", return_value=False),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config("claude", MINIMAL_STATE, **self._kwargs())
+                is False
             )
 
     @pytest.mark.parametrize(
