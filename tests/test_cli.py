@@ -402,21 +402,15 @@ class TestSubcommandRouting:
             {"OAUTH_TOKEN": _jwt(time.time() + 90)}
         )
 
-        mock_token.assert_called_once_with(
-            "https://example.com", "my-profile", force_refresh=True
-        )
+        mock_token.assert_called_once_with("https://example.com", "my-profile", force_refresh=True)
         assert mock_route.call_args.kwargs["token"] == "fresh-token"
 
     def test_codex_subagent_hook_refreshes_opaque_oauth_token(self, monkeypatch):
         monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
 
-        mock_token, mock_route = self._invoke_codex_subagent_hook(
-            {"OAUTH_TOKEN": "opaque-token"}
-        )
+        mock_token, mock_route = self._invoke_codex_subagent_hook({"OAUTH_TOKEN": "opaque-token"})
 
-        mock_token.assert_called_once_with(
-            "https://example.com", "my-profile", force_refresh=True
-        )
+        mock_token.assert_called_once_with("https://example.com", "my-profile", force_refresh=True)
         assert mock_route.call_args.kwargs["token"] == "fresh-token"
 
     def test_codex_subagent_hook_reuses_bearer(self):
