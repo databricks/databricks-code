@@ -33,12 +33,14 @@ class _FakeResponse:
 
 class _FakeClient:
     def __init__(self, response):
-        self.response = response
+        self.responses = list(response) if isinstance(response, list) else [response]
         self.request = None
+        self.requests = []
 
     def stream(self, method, url, headers, content):
         self.request = (method, url, headers, content)
-        return self.response
+        self.requests.append(self.request)
+        return self.responses.pop(0)
 
 
 class _FakeCache:
@@ -167,6 +169,42 @@ class TestAnthropicModelDiscoveryHandler:
         assert headers["Authorization"] == "Bearer subscription-token"
         assert headers["X-Databricks-AI-Gateway-Token"] == "Bearer databricks-token"
         assert b"anthropic-aigw-custom-model" in bytes(out.data)
+
+    def test_retries_rate_limited_model_discovery(self, monkeypatch):
+        out = _Collect()
+        handler = _handler(out)
+        handler.headers = {"Authorization": "Bearer subscription-token"}
+        handler.rfile = io.BytesIO()
+        handler.cache = _FakeCache()
+        rate_limited = _FakeResponse(429, {"Retry-After": "0"}, b"rate limited")
+        success = _FakeResponse(200, {}, b'{"data":[{"id":"custom-model"}]}')
+        handler.client = _FakeClient([rate_limited, success])
+        monkeypatch.setattr(anthropic_model_discovery_proxy.time, "sleep", lambda _delay: None)
+
+        handler._handle()
+
+        assert len(handler.client.requests) == 2
+        assert rate_limited.read_calls == 1
+        assert b"429 Too Many Requests" not in bytes(out.data)
+        assert b"anthropic-aigw-custom-model" in bytes(out.data)
+
+    def test_relays_rate_limit_after_model_discovery_retries_are_exhausted(self, monkeypatch):
+        out = _Collect()
+        handler = _handler(out)
+        handler.headers = {"Authorization": "Bearer subscription-token"}
+        handler.rfile = io.BytesIO()
+        handler.cache = _FakeCache()
+        responses = [_FakeResponse(429, {"Retry-After": "0"}, b"rate limited") for _ in range(2)]
+        handler.client = _FakeClient(responses)
+        monkeypatch.setattr(anthropic_model_discovery_proxy.time, "sleep", lambda _delay: None)
+
+        handler._handle()
+
+        assert len(handler.client.requests) == 2
+        assert responses[0].read_calls == 1
+        assert responses[1].read_calls == 0
+        assert b"429 Too Many Requests" in bytes(out.data)
+        assert b"rate limited" in bytes(out.data)
 
     def test_prefixes_successful_model_response_and_drops_content_encoding(self):
         out = _Collect()
