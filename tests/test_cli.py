@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import os
 import re
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,6 +29,11 @@ def _strip_ansi(text: str) -> str:
 runner = CliRunner()
 
 TOOLS = ["codex", "claude", "gemini", "opencode"]
+
+
+def _jwt(expires_at: float) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": expires_at}).encode()).decode()
+    return f"header.{payload.rstrip('=')}.signature"
 
 
 @pytest.fixture(autouse=True)
@@ -343,7 +350,8 @@ class TestSubcommandRouting:
         assert result.output == ""
         mock_request.assert_not_called()
 
-    def test_codex_subagent_hook_refreshes_expired_launch_token(self):
+    @staticmethod
+    def _invoke_codex_subagent_hook(token_env):
         routed = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -371,13 +379,53 @@ class TestSubcommandRouting:
                     "system.ai.gpt-5-6-sol",
                 ],
                 input='{"tool_name":"collaboration.spawn_agent","tool_input":{"message":"fix it"}}',
-                env={"OAUTH_TOKEN": "expired-launch-token"},
+                env=token_env,
             )
 
         assert result.exit_code == 0, result.output
         assert json.loads(result.output) == routed
-        mock_token.assert_called_once_with("https://example.com", "my-profile")
+        return mock_token, mock_route
+
+    def test_codex_subagent_hook_reuses_fresh_oauth_token(self, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
+        token = _jwt(time.time() + 300)
+
+        mock_token, mock_route = self._invoke_codex_subagent_hook({"OAUTH_TOKEN": token})
+
+        mock_token.assert_not_called()
+        assert mock_route.call_args.kwargs["token"] == token
+
+    def test_codex_subagent_hook_refreshes_near_expiry_oauth_token(self, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
+
+        mock_token, mock_route = self._invoke_codex_subagent_hook(
+            {"OAUTH_TOKEN": _jwt(time.time() + 30)}
+        )
+
+        mock_token.assert_called_once_with(
+            "https://example.com", "my-profile", force_refresh=True
+        )
         assert mock_route.call_args.kwargs["token"] == "fresh-token"
+
+    def test_codex_subagent_hook_refreshes_opaque_oauth_token(self, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
+
+        mock_token, mock_route = self._invoke_codex_subagent_hook(
+            {"OAUTH_TOKEN": "opaque-token"}
+        )
+
+        mock_token.assert_called_once_with(
+            "https://example.com", "my-profile", force_refresh=True
+        )
+        assert mock_route.call_args.kwargs["token"] == "fresh-token"
+
+    def test_codex_subagent_hook_reuses_bearer(self):
+        mock_token, mock_route = self._invoke_codex_subagent_hook(
+            {"DATABRICKS_BEARER": "pat-token", "OAUTH_TOKEN": "opaque-token"}
+        )
+
+        mock_token.assert_not_called()
+        assert mock_route.call_args.kwargs["token"] == "pat-token"
 
     def test_claude_v2_subagent_hook_uses_v2_router(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
