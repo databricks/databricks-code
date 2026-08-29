@@ -14,7 +14,8 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
 from pathlib import Path
@@ -29,6 +30,8 @@ MANAGED_BACKUP_DIR = APP_DIR / "managed-backups"
 MANAGED_BACKUP_MANIFEST_PATH = MANAGED_BACKUP_DIR / "manifest.json"
 MANAGED_FINGERPRINT_VERSION = 1
 _MISSING = object()
+_managed_write_batch: tuple[str, ...] = ()
+_managed_write_notice_shown = False
 
 ManagedParser = Callable[[str], dict]
 ManagedDumper = Callable[[dict], str]
@@ -138,6 +141,38 @@ def managed_writes_allowed() -> bool:
     return sys.stdin.isatty()
 
 
+@contextmanager
+def managed_write_batch(displays: list[str]) -> Iterator[None]:
+    """Group setup messaging for agents configured in one command."""
+    global _managed_write_batch, _managed_write_notice_shown
+
+    previous_batch = _managed_write_batch
+    previous_notice = _managed_write_notice_shown
+    _managed_write_batch = tuple(dict.fromkeys(displays))
+    _managed_write_notice_shown = False
+    try:
+        yield
+        if _managed_write_notice_shown:
+            print_success(f"Settings configured for {' and '.join(_managed_write_batch)}")
+    finally:
+        _managed_write_batch = previous_batch
+        _managed_write_notice_shown = previous_notice
+
+
+def _print_managed_write_permission(display: str) -> None:
+    global _managed_write_notice_shown
+
+    if not _managed_write_batch:
+        print_note(f"Enter password to configure settings for {display}.")
+        return
+    if _managed_write_notice_shown:
+        return
+
+    displays = " and ".join(_managed_write_batch)
+    print_note(f"Enter password to configure settings for {displays}.")
+    _managed_write_notice_shown = True
+
+
 def managed_file_conflicts(
     existing: dict, desired: dict, owned_paths: list[list[str]]
 ) -> list[str]:
@@ -232,10 +267,8 @@ def reconcile_managed_file(
         return "written"
 
     created = current_text is None
-    backup_created = _ensure_backup(tool, path, current_text)
-    if backup_created:
-        print_note(f"{display}: original managed settings backed up under {MANAGED_BACKUP_DIR}.")
-    print_note(f"{display}: administrator permission is required to update {path}.")
+    _ensure_backup(tool, path, current_text)
+    _print_managed_write_permission(display)
     if read_managed_file(path) != current_text:
         raise RuntimeError(
             f"{display} managed settings changed while ucode was preparing the update. "
@@ -271,7 +304,8 @@ def reconcile_managed_file(
             "the newer policy; run the command again or contact your administrator."
         )
     _record_last_applied(tool, path, desired_text, owned_paths)
-    print_success(f"{display} managed settings {'created' if created else 'updated'} and verified")
+    if not _managed_write_batch:
+        print_success(f"Settings configured for {display}")
     return "created" if created else "written"
 
 

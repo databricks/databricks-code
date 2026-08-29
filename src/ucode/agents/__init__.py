@@ -24,6 +24,7 @@ from ucode.databricks import (
     map_claude_family_models,
     resolve_provider_service,
 )
+from ucode.managed_files import managed_write_batch
 from ucode.state import get_provider_service, load_state, save_state
 from ucode.telemetry import agent_version
 from ucode.ui import (
@@ -68,6 +69,7 @@ TOOL_ALIASES = {
 
 DEFAULT_TOOL = "codex"
 BUNDLE_VERSION = 1
+_MANAGED_SETTINGS_TOOLS = {"claude"}
 
 # Codex still honors the legacy managed-config opt-in until its follow-up migration. Claude always
 # reconciles its OS-managed settings and therefore no longer appears in the setup prompt.
@@ -140,16 +142,6 @@ def _required_update_message(tool: str) -> str | None:
     return checker()
 
 
-def _confirm_update_installed_tool_binary(tool: str) -> bool:
-    spec = TOOL_SPECS[tool]
-    update = _MODULES[tool].is_update_available()
-
-    if not update:
-        return False
-    current, latest = update
-    return prompt_yes_no(f"(Optional) Update {spec['display']} from {current} to {latest}?")
-
-
 def _too_new_downgrade(tool: str) -> tuple[str, str] | None:
     """Return (installed_version, downgrade_target) when the installed tool is
     too new to work, or None. Agents opt in by defining `too_new_downgrade`."""
@@ -207,9 +199,6 @@ def install_tool_binary(
                 print_warning(required_update)
                 if not _update_installed_tool_binary(tool):
                     raise RuntimeError(_minimum_version_error(tool) or required_update)
-            elif prompt_optional_updates and _confirm_update_installed_tool_binary(tool):
-                _update_installed_tool_binary(tool)
-
         version_error = _minimum_version_error(tool)
         if version_error:
             raise RuntimeError(version_error)
@@ -425,7 +414,8 @@ def configure_single_tool(tool: str, state: dict) -> dict:
             raise RuntimeError(
                 f"{TOOL_SPECS[tool]['display']} is not available on this workspace.{detail}"
             )
-    state = _configure_one(tool, state, provider)
+    with managed_write_batch(_managed_settings_displays([tool])):
+        state = _configure_one(tool, state, provider)
     available_tools = list(set((state.get("available_tools") or []) + [tool]))
     state["available_tools"] = available_tools
     save_state(state)
@@ -455,14 +445,19 @@ def configure_selected_tools(state: dict, tools: list[str]) -> dict:
     replacing it, so a previously-configured tool the user didn't pick this
     run is preserved.
     """
-    for tool in tools:
-        state = _configure_one(tool, state, get_provider_service(state, tool))
+    with managed_write_batch(_managed_settings_displays(tools)):
+        for tool in tools:
+            state = _configure_one(tool, state, get_provider_service(state, tool))
 
     existing = state.get("available_tools") or []
     state["available_tools"] = sorted(set(existing) | set(tools))
     save_state(state)
     install_databricks_ai_tools_for_agents(tools, state)
     return state
+
+
+def _managed_settings_displays(tools: list[str]) -> list[str]:
+    return [TOOL_SPECS[tool]["display"] for tool in tools if tool in _MANAGED_SETTINGS_TOOLS]
 
 
 def configure_all_tools(state: dict) -> dict:

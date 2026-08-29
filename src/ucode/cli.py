@@ -133,7 +133,6 @@ from ucode.ui import (
     prompt_for_tools,
     prompt_for_workspace,
     prompt_yes_no,
-    prompt_yes_no_default,
     set_verbosity,
     spinner,
     status_badge,
@@ -950,16 +949,6 @@ def configure_workspace_command(
         for tool_name in picked:
             state = _maybe_select_provider_service(tool_name, state)
 
-    # Last question in the interactive flow: opt out of AI Tools. When a flag
-    # already decided it, configure_shared_state persisted that; skip the prompt.
-    # The default is the resolved prior choice, so Enter won't undo a past opt-out.
-    if databricks_ai_tools_enabled is None and offer_provider:
-        state["databricks_ai_tools_enabled"] = prompt_yes_no_default(
-            "Install Databricks AI Tools for your coding agents? "
-            "This adds Databricks skills and plugins.",
-            default=state.get("databricks_ai_tools_enabled", True),
-        )
-
     state = configure_selected_tools(state, picked)
 
     summary_lines = [f"[bold]Workspace:[/bold] [cyan]{state['workspace']}[/cyan]"]
@@ -1198,6 +1187,17 @@ def _configure_agents_for_mcp(
             )
         configured.add("cursor")
     return configured
+
+
+def _configure_optional_setup() -> None:
+    if not prompt_yes_no("Configure MCP servers, skills, and plugins?"):
+        return
+
+    state = load_state()
+    state["databricks_ai_tools_enabled"] = True
+    save_state(state)
+    install_databricks_ai_tools_for_agents(state.get("available_tools") or [], state)
+    configure_mcp_command()
 
 
 @mcp_app.command("add")
@@ -2701,6 +2701,7 @@ def configure(
         # Set True only in the fully-interactive branch below; gates the optional
         # MCP setup prompt so flag-driven / scripted runs are never interrupted.
         fully_interactive = False
+        combined_optional_setup = False
         if agent is not None:
             tool = normalize_tool(agent)
             install_tool_binary(
@@ -2773,6 +2774,12 @@ def configure(
         else:
             # Tool binaries are installed after the user picks which agents
             # they want, in configure_workspace_command.
+            combined_optional_setup = (
+                not flag_driven_workspace and enable_databricks_ai_tools is None
+            )
+            if combined_optional_setup:
+                # Defer AI Tools until the combined optional setup prompt below.
+                skip_kwargs["databricks_ai_tools_enabled"] = False
             if workspace_entries is None:
                 configure_workspace_command(
                     prompt_optional_updates=prompt_optional_updates,
@@ -2820,11 +2827,9 @@ def configure(
                     "interactive picker."
                 )
             configure_mcp_command(services=services)
-        # Offer MCP setup as the natural next step of interactive configuration,
-        # so users discover it without needing to know `configure mcp` exists.
-        # Skipped in dry-run and non-interactive/flag-driven runs (which stay
-        # scriptable), and when --dry-run is set.
-        if fully_interactive and not dry_run and prompt_yes_no("Configure MCP servers now?"):
+        if combined_optional_setup and not dry_run:
+            _configure_optional_setup()
+        elif fully_interactive and not dry_run and prompt_yes_no("Configure MCP servers now?"):
             configure_mcp_command()
     except typer.Exit:
         # `typer.Exit` subclasses RuntimeError, so it has to be re-raised ahead of the handler

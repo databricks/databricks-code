@@ -197,6 +197,31 @@ class TestManagedFileLifecycle:
         manifest = json.loads((backup_dir / "manifest.json").read_text())
         assert manifest["files"]["claude"]["original_existed"] is True
 
+    def test_batch_messages_name_all_agents_once(self, tmp_path, backup_dir, monkeypatch):
+        notes: list[str] = []
+        successes: list[str] = []
+
+        monkeypatch.setattr(managed_files, "print_note", notes.append)
+        monkeypatch.setattr(managed_files, "print_success", successes.append)
+        monkeypatch.setattr(
+            managed_files,
+            "_sudo_replace",
+            lambda target, text: target.write_text(text, encoding="utf-8"),
+        )
+
+        with managed_files.managed_write_batch(["Codex", "Claude Code"]):
+            for tool in ("codex", "claude"):
+                managed_files.reconcile_managed_file(
+                    tmp_path / f"{tool}.json",
+                    '{"ucode": true}\n',
+                    tool=tool,
+                    display=tool.title(),
+                    owned_paths=[["ucode"]],
+                )
+
+        assert notes == ["Enter password to configure settings for Codex and Claude Code."]
+        assert successes == ["Settings configured for Codex and Claude Code"]
+
     def test_unchanged_file_never_creates_backup(self, tmp_path, backup_dir, monkeypatch):
         path = tmp_path / "managed.json"
         path.write_text("same", encoding="utf-8")
