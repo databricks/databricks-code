@@ -63,6 +63,11 @@ TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 # raced — so we retry rather than treat them as an expired session.
 _TOKEN_CACHE_LOCK_MARKERS = ("cache update", "exit status 45")
 _TOKEN_FETCH_MAX_ATTEMPTS = 4
+_HTTP_GET_RETRYABLE_STATUS_CODES = frozenset({429})
+_HTTP_GET_RETRY_BASE_SECONDS = 1.0
+_HTTP_GET_RETRY_MAX_SECONDS = 5.0
+_HTTP_GET_RETRY_AFTER_JITTER_SECONDS = 0.25
+_ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES = 2
 
 
 def _debug_enabled() -> bool:
@@ -214,52 +219,100 @@ def _log_auth_diagnostics() -> None:
         _debug(f"databrickscfg ({cfg_path})", f"read error: {exc}")
 
 
+def _http_get_retry_delay(retry_after: str | None, retry_index: int) -> float:
+    if retry_after is not None:
+        try:
+            retry_after_seconds = float(retry_after)
+        except ValueError:
+            pass
+        else:
+            if retry_after_seconds >= 0:
+                return min(retry_after_seconds, _HTTP_GET_RETRY_MAX_SECONDS) + random.uniform(
+                    0, _HTTP_GET_RETRY_AFTER_JITTER_SECONDS
+                )
+
+    backoff = min(
+        _HTTP_GET_RETRY_BASE_SECONDS * (2 ** min(retry_index, 10)),
+        _HTTP_GET_RETRY_MAX_SECONDS,
+    )
+    return backoff + random.uniform(0, min(backoff * 0.25, 0.5))
+
+
 def _http_get_json(
-    url: str, token: str, *, timeout: int = 10
+    url: str,
+    token: str,
+    *,
+    timeout: int = 10,
+    max_retries: int = 0,
 ) -> tuple[dict | list | None, str | None]:
     """GET a JSON endpoint. Returns (payload, None) on success, (None, reason) on failure.
 
+    ``max_retries`` opts individual callers into bounded retries for rate limits
+    and network failures. Other callers retain the original single-attempt
+    behavior.
+
     Honors UCODE_DEBUG=1 to append status + truncated body to ~/.ucode/debug.log.
     """
+    if max_retries < 0:
+        raise ValueError("max_retries must be non-negative")
+
     request = urllib_request.Request(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
-    try:
-        with urllib_request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-        _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
-        if _debug_enabled():
-            _debug("body", body[:4000])
+    for attempt in range(max_retries + 1):
         try:
-            return json.loads(body), None
-        except json.JSONDecodeError as exc:
-            return None, f"response was not valid JSON ({exc.msg})"
-    except urllib_error.HTTPError as exc:
-        body = ""
-        try:
-            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        except Exception:
+            with urllib_request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+            _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
+            if _debug_enabled():
+                _debug("body", body[:4000])
+            try:
+                return json.loads(body), None
+            except json.JSONDecodeError as exc:
+                return None, f"response was not valid JSON ({exc.msg})"
+        except urllib_error.HTTPError as exc:
             body = ""
-        _debug(f"GET {url}", f"HTTP {exc.code} {exc.reason}")
-        if _debug_enabled() and body:
-            _debug("body", body[:4000])
-        reason = f"HTTP {exc.code} {exc.reason}"
-        # Surface the response body too — gateway auth failures return 400
-        # with body `Invalid Token`, which is invisible without this.
-        body_excerpt = body.strip()[:200]
-        if body_excerpt:
-            reason = f"{reason}: {body_excerpt}"
-        return None, reason
-    except urllib_error.URLError as exc:
-        _debug(f"GET {url}", f"URLError: {exc.reason}")
-        return None, f"network error: {exc.reason}"
-    except OSError as exc:
-        # A socket read timeout raises a bare TimeoutError (an OSError), not a
-        # URLError, so it must be caught explicitly or it escapes the whole
-        # discovery flow. Surface it as a reason like every other failure.
-        _debug(f"GET {url}", f"OSError: {exc}")
-        return None, f"network error: {exc}"
+            try:
+                body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+            except Exception:
+                body = ""
+            _debug(f"GET {url}", f"HTTP {exc.code} {exc.reason}")
+            if _debug_enabled() and body:
+                _debug("body", body[:4000])
+            reason = f"HTTP {exc.code} {exc.reason}"
+            # Surface the response body too — gateway auth failures return 400
+            # with body `Invalid Token`, which is invisible without this.
+            body_excerpt = body.strip()[:200]
+            if body_excerpt:
+                reason = f"{reason}: {body_excerpt}"
+            if exc.code not in _HTTP_GET_RETRYABLE_STATUS_CODES or attempt == max_retries:
+                return None, reason
+            retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+        except urllib_error.URLError as exc:
+            _debug(f"GET {url}", f"URLError: {exc.reason}")
+            reason = f"network error: {exc.reason}"
+            if attempt == max_retries:
+                return None, reason
+            retry_after = None
+        except OSError as exc:
+            # A socket read timeout raises a bare TimeoutError (an OSError), not a
+            # URLError, so it must be caught explicitly or it escapes the whole
+            # discovery flow. Surface it as a reason like every other failure.
+            _debug(f"GET {url}", f"OSError: {exc}")
+            reason = f"network error: {exc}"
+            if attempt == max_retries:
+                return None, reason
+            retry_after = None
+
+        delay = _http_get_retry_delay(retry_after, attempt)
+        _debug(
+            f"GET {url}",
+            f"attempt {attempt + 1} failed: {reason}; retrying in {delay:.2f}s",
+        )
+        time.sleep(delay)
+
+    raise AssertionError("unreachable")
 
 
 def _http_send_json(
@@ -2731,6 +2784,15 @@ def list_all_mcp_services(
     return sorted(names), None
 
 
+def _get_anthropic_models_json(workspace: str, token: str) -> tuple[dict | list | None, str | None]:
+    hostname = workspace_hostname(workspace)
+    return _http_get_json(
+        f"https://{hostname}{ANTHROPIC_MODELS_PATH}",
+        token,
+        max_retries=_ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES,
+    )
+
+
 def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | None]:
     """List every model id advertised by AI Gateway's Anthropic endpoint.
 
@@ -2738,8 +2800,7 @@ def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | 
     using that mode must not apply ucode's legacy ``databricks-claude-*`` family
     validation.
     """
-    hostname = workspace_hostname(workspace)
-    payload, reason = _http_get_json(f"https://{hostname}{ANTHROPIC_MODELS_PATH}", token)
+    payload, reason = _get_anthropic_models_json(workspace, token)
     if payload is None:
         return [], reason
 
@@ -2765,8 +2826,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     describes why the dict is empty (HTTP error, network error, or no models
     matching the expected naming convention).
     """
-    hostname = workspace_hostname(workspace)
-    payload, reason = _http_get_json(f"https://{hostname}{ANTHROPIC_MODELS_PATH}", token)
+    payload, reason = _get_anthropic_models_json(workspace, token)
     if payload is None:
         return {}, reason
 
