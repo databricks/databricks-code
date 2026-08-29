@@ -1381,7 +1381,7 @@ def auth_token_cmd(
     sys.stdout.write(token + "\n")
 
 
-def _oauth_token_is_fresh(token: str, buffer_seconds: float = 60) -> bool:
+def _oauth_token_is_fresh(token: str, buffer_seconds: float = 120) -> bool:
     import base64
     import binascii
     import json

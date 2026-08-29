@@ -399,7 +399,7 @@ class TestSubcommandRouting:
         monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
 
         mock_token, mock_route = self._invoke_codex_subagent_hook(
-            {"OAUTH_TOKEN": _jwt(time.time() + 30)}
+            {"OAUTH_TOKEN": _jwt(time.time() + 90)}
         )
 
         mock_token.assert_called_once_with(
