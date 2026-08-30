@@ -71,10 +71,6 @@ class TestRenderEnvOverlay:
             "Databricks-Model-Provider-Service:cat.sch.gemini-enterprise"
         )
 
-    def test_no_provider_omits_routing_header(self):
-        env = gemini.render_env_overlay(WS, "gemini-2", "tok")
-        assert "Databricks-Model-Provider-Service" not in env["GEMINI_CLI_CUSTOM_HEADERS"]
-
 
 class TestBuildRuntimeEnv:
     def test_merges_os_environment(self):

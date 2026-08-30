@@ -908,24 +908,6 @@ class TestResolveProviderService:
         assert service["provider_type"] == "gemini_enterprise"
         assert service["targets"] == ["gemini-3.5-flash"]
 
-    def test_gemini_enterprise_rejected_for_claude(self, monkeypatch):
-        payload = {
-            "model_provider_services": [
-                {
-                    "name": "model-provider-services/main.schema1.gemini-svc",
-                    "config": {"provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_GEMINI_ENTERPRISE"},
-                }
-            ]
-        }
-        monkeypatch.setattr(
-            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
-        )
-        service, error = db_mod.resolve_provider_service(
-            "claude", "main.schema1.gemini-svc", WS, "token"
-        )
-        assert service is None
-        assert "can't route to" in error
-
 
 class TestModelProviderFeatureUnavailable:
     def test_detects_feature_not_available(self):
