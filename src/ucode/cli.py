@@ -36,6 +36,7 @@ from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
 from ucode.config_io import is_dry_run, restore_file, set_dry_run
 from ucode.databricks import (
+    SKILLS_MCP_MIN_DATABRICKS_CLI_VERSION,
     apply_pat_environment,
     build_shared_base_urls,
     discover_claude_models,
@@ -2936,6 +2937,8 @@ def configure_skills(
     ``--location``).
     """
     try:
+        # Gate on a CLI new enough for skills uploads before registering the connection.
+        install_databricks_cli(minimum=SKILLS_MCP_MIN_DATABRICKS_CLI_VERSION)
         locations = _parse_skill_locations(location)
         # `--skill` absent -> None (whole schema); present (even empty) -> the
         # explicit subset, so `--skill ""` downloads nothing.

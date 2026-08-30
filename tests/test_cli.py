@@ -818,6 +818,20 @@ class TestStatus:
 
 
 class TestConfigureSkillsCommand:
+    @pytest.fixture(autouse=True)
+    def _stub_install_cli(self):
+        # These tests cover dispatch only; stub the CLI installer configure_skills runs.
+        with patch("ucode.cli.install_databricks_cli") as mock_install:
+            yield mock_install
+
+    def test_requires_skills_mcp_cli_floor(self, _stub_install_cli):
+        from ucode.databricks import SKILLS_MCP_MIN_DATABRICKS_CLI_VERSION
+
+        with patch("ucode.cli.configure_skills_mcp_command"):
+            result = runner.invoke(app, ["configure", "skills", "--location", "a.b", "--mcp"])
+        assert result.exit_code == 0, result.output
+        _stub_install_cli.assert_called_once_with(minimum=SKILLS_MCP_MIN_DATABRICKS_CLI_VERSION)
+
     def test_mcp_flag_dispatches_location_set(self):
         with patch("ucode.cli.configure_skills_mcp_command") as mock_mcp:
             result = runner.invoke(app, ["configure", "skills", "--location", "a.b", "--mcp"])
