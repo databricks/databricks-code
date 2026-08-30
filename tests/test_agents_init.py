@@ -382,6 +382,49 @@ class TestResolveProviderModels:
         assert relayed is False
 
 
+class TestResolveGeminiProviderModel:
+    _STATE = {"workspace": "https://ws.databricks.com", "profile": None}
+
+    def _patch(self, monkeypatch, service, error=None):
+        monkeypatch.setattr(agents_mod, "get_databricks_token", lambda w, p: "token")
+        monkeypatch.setattr(
+            agents_mod, "resolve_provider_service", lambda t, n, w, tok: (service, error)
+        )
+
+    def test_sole_target_used_by_default(self, monkeypatch):
+        self._patch(monkeypatch, {"name": "c.s.g", "targets": ["gemini-3.5-flash"]})
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert (model, error) == ("gemini-3.5-flash", None)
+
+    def test_explicit_model_selects_matching_target(self, monkeypatch):
+        self._patch(
+            monkeypatch, {"name": "c.s.g", "targets": ["gemini-3.5-flash", "gemini-2.5-pro"]}
+        )
+        model, error = agents_mod.resolve_gemini_provider_model(
+            self._STATE, "c.s.g", "gemini-2.5-pro"
+        )
+        assert (model, error) == ("gemini-2.5-pro", None)
+
+    def test_explicit_model_not_a_target_errors(self, monkeypatch):
+        self._patch(monkeypatch, {"name": "c.s.g", "targets": ["gemini-3.5-flash"]})
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", "gpt-5")
+        assert model is None
+        assert "is not a target" in error
+
+    def test_multiple_targets_without_model_asks_to_choose(self, monkeypatch):
+        self._patch(
+            monkeypatch, {"name": "c.s.g", "targets": ["gemini-3.5-flash", "gemini-2.5-pro"]}
+        )
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert model is None
+        assert "pass --model" in error
+
+    def test_unresolvable_service_surfaces_error(self, monkeypatch):
+        self._patch(monkeypatch, None, "boom")
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert (model, error) == (None, "boom")
+
+
 class TestInstallToolBinary:
     def test_non_strict_returns_false_when_npm_missing(self, monkeypatch):
         monkeypatch.setattr("ucode.agents.shutil.which", lambda _: None)

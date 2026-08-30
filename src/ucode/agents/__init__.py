@@ -344,6 +344,40 @@ def resolve_provider_models(
     return map_claude_family_models(service.get("targets") or []) or None, None, relayed
 
 
+def resolve_gemini_provider_model(
+    state: dict, provider: str, explicit_model: str | None
+) -> tuple[str | None, str | None]:
+    """Pick the Gemini model to pin for a provider-service launch.
+
+    A Gemini Enterprise service routes by header but the request still names a
+    concrete model in the URL, so one of the service's declared targets must be
+    pinned. Uses ``explicit_model`` (from ``--model``) when it names a target;
+    the sole target when the service declares exactly one; otherwise asks the
+    user to choose. Returns ``(model, error)``.
+    """
+    token = get_databricks_token(state["workspace"], state.get("profile"))
+    service, error = resolve_provider_service("gemini", provider, state["workspace"], token)
+    if error or service is None:
+        return None, error or f"Model provider service '{provider}' was not found."
+    targets = [t for t in (service.get("targets") or []) if isinstance(t, str) and t]
+    if explicit_model:
+        if explicit_model in targets:
+            return explicit_model, None
+        available = ", ".join(targets) or "none"
+        return None, (
+            f"Model '{explicit_model}' is not a target of provider service '{provider}'. "
+            f"Available: {available}."
+        )
+    if len(targets) == 1:
+        return targets[0], None
+    if not targets:
+        return None, f"Provider service '{provider}' exposes no models to launch."
+    return None, (
+        f"Provider service '{provider}' exposes several models "
+        f"({', '.join(targets)}); pass --model to choose one."
+    )
+
+
 def configure_tool(
     tool: str,
     state: dict,
@@ -379,7 +413,9 @@ def configure_tool(
         if not model:
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         if tool == "gemini":
-            result = gemini.write_tool_config(state, model)
+            # Gemini routes through a provider by header (like codex), but must also
+            # pin the service's target model in the URL — `model` already holds it.
+            result = gemini.write_tool_config(state, model, provider=provider)
         elif tool == "copilot":
             result = copilot.write_tool_config(state, model)
         elif tool == "pi":

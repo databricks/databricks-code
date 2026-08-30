@@ -59,6 +59,22 @@ class TestRenderEnvOverlay:
         env = gemini.render_env_overlay(WS, "gemini-2", "tok")
         assert env["GEMINI_CLI_CUSTOM_HEADERS"] == "User-Agent:ucode/0.1.0 gemini/0.40.0"
 
+    def test_provider_adds_routing_header_and_pins_target(self, monkeypatch):
+        monkeypatch.setattr(gemini, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.40.0")
+        env = gemini.render_env_overlay(
+            WS, "gemini-3.5-flash", "tok", provider="cat.sch.gemini-enterprise"
+        )
+        assert env["GEMINI_MODEL"] == "gemini-3.5-flash"
+        assert env["GEMINI_CLI_CUSTOM_HEADERS"] == (
+            "User-Agent:ucode/0.1.0 gemini/0.40.0,"
+            "Databricks-Model-Provider-Service:cat.sch.gemini-enterprise"
+        )
+
+    def test_no_provider_omits_routing_header(self):
+        env = gemini.render_env_overlay(WS, "gemini-2", "tok")
+        assert "Databricks-Model-Provider-Service" not in env["GEMINI_CLI_CUSTOM_HEADERS"]
+
 
 class TestBuildRuntimeEnv:
     def test_merges_os_environment(self):
