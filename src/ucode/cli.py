@@ -1573,8 +1573,14 @@ def claude_router_hook_cmd(
         sys.stdout.write(json.dumps(output))
 
 
-def _auto_configure_tool(tool: str) -> None:
-    """First-time setup for a single tool — mirrors configure_workspace_command."""
+def _auto_configure_tool(tool: str, model: str | None = None) -> None:
+    """First-time setup for a single tool — mirrors configure_workspace_command.
+
+    ``model`` is an explicit --model request (currently only threaded for copilot): without it,
+    a first-time `ucode copilot --model X` would auto-configure and validate against the
+    automatic sonnet/opus/haiku/codex default instead of X, so a bad automatic pick could fail
+    validation and abort the launch before X is ever tried.
+    """
     existing = load_state()
     workspace = existing.get("workspace")
     profile = existing.get("profile")
@@ -1582,7 +1588,7 @@ def _auto_configure_tool(tool: str) -> None:
         workspace, profile = _prompt_for_configuration(tool)
     state = configure_shared_state(workspace, profile=profile, tools=[tool])
 
-    state = configure_single_tool(tool, state)
+    state = configure_single_tool(tool, state, explicit_model=model)
 
     spec = TOOL_SPECS[tool]
     console.print(
@@ -1597,7 +1603,7 @@ def _auto_configure_tool(tool: str) -> None:
     )
 
     with spinner(f"Validating {spec['display']}..."):
-        ok, err = validate_tool(tool)
+        ok, err = validate_tool(tool, model=model)
     if ok:
         print_success(f"{spec['display']} is working")
     else:
@@ -1881,7 +1887,7 @@ def _launch_tool(
         )
         ensure_bootstrap_dependencies(tool, update_existing=needs_auto_configure)
         if needs_auto_configure:
-            _auto_configure_tool(tool)
+            _auto_configure_tool(tool, model=model if tool == "copilot" else None)
         state = ensure_provider_state(tool)
         # Remembered before the fallback below collapses the two cases: a managed config may not
         # silently override a provider the user typed on the command line (it errors instead).
@@ -2135,7 +2141,11 @@ def _launch_tool(
             if provider:
                 state["_claude_launch_provider"] = provider
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
-        launch_agent(tool, state, ctx.args)
+        # Pass the already-settled resolved_model (which absorbs --model, a managed config's
+        # default, and any budget recommendation), not the raw --model flag — otherwise a launch
+        # without an explicit --model would have copilot.launch() call default_model(state) fresh
+        # and silently rewrite whatever configure_tool just wrote, and every refresh after it.
+        launch_agent(tool, state, ctx.args, model=resolved_model if tool == "copilot" else None)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
@@ -2479,12 +2489,21 @@ def opencode_cmd(
 @app.command("copilot", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def copilot_cmd(
     ctx: typer.Context,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Launch on a specific Databricks model id (e.g. a UC "
+            "`<catalog>.<schema>.<name>`). Outranks the automatic sonnet/opus/haiku/codex "
+            "pick and stays pinned across ucode's automatic token refreshes.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
 ) -> None:
     """Launch GitHub Copilot CLI via Databricks."""
     _disable_managed_config_if_requested(skip_managed_config)
-    _launch_tool("copilot", ctx, skip_preflight=skip_preflight)
+    _launch_tool("copilot", ctx, model=model, skip_preflight=skip_preflight)
 
 
 @app.command("pi", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})

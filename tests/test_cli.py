@@ -576,6 +576,63 @@ class TestClaudeModelFlag:
         assert "enterprise managed settings" not in _strip_ansi(result.output)
 
 
+class TestCopilotModelFlag:
+    """`ucode copilot --model <id>` outranks the automatic sonnet/opus/haiku/codex pick and
+    stays pinned across ucode's automatic token refreshes (unlike claude, copilot takes the
+    id as its resolved model directly rather than as a custom_model override)."""
+
+    def test_model_threads_through_to_launch_tool(self):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, ["copilot", "--model", "cat.schema.claude-opus-5"])
+        assert result.exit_code == 0, result.output
+        assert mock_launch.call_args.kwargs["model"] == "cat.schema.claude-opus-5"
+
+    def test_model_becomes_resolved_model_for_configure_tool(self):
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli._auto_configure_tool"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE) as mock_configure,
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch_agent,
+        ):
+            result = runner.invoke(app, ["copilot", "--model", "cat.schema.claude-opus-5"])
+        assert result.exit_code == 0, result.output
+        # Unlike claude, copilot has no family-alias pinning — the explicit id rides as the
+        # ordinary resolved model, both into configure_tool and into the launch call.
+        assert mock_configure.call_args.args[2] == "cat.schema.claude-opus-5"
+        assert mock_launch_agent.call_args.kwargs["model"] == "cat.schema.claude-opus-5"
+
+    def test_no_model_flag_still_pins_the_resolved_model_to_launch_agent(self):
+        # Without an explicit --model, resolved_model (whatever resolve_launch_model/managed
+        # config/budget recommendation settled on) must still ride to launch_agent — passing None
+        # here would make copilot.launch() recompute default_model(state) fresh and can silently
+        # diverge from what configure_tool actually wrote to the config file.
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli._auto_configure_tool"),
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(MINIMAL_STATE, "databricks-claude-sonnet-4"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch_agent,
+        ):
+            result = runner.invoke(app, ["copilot"])
+        assert result.exit_code == 0, result.output
+        assert mock_launch_agent.call_args.kwargs["model"] == "databricks-claude-sonnet-4"
+
+
 class TestMcpSubcommands:
     def test_web_search_subcommand_help(self):
         result = runner.invoke(app, ["mcp", "web-search", "--help"])
@@ -1189,7 +1246,7 @@ class TestAutoConfigureOnFirstRun:
             result = runner.invoke(app, ["claude"])
         assert result.exit_code == 0, result.output
         mock_bootstrap.assert_called_once_with("claude", update_existing=True)
-        mock_auto.assert_called_once_with("claude")
+        mock_auto.assert_called_once_with("claude", model=None)
 
     def test_triggers_when_tool_not_in_available_tools(self):
         """Auto-configure runs when workspace exists but the tool wasn't configured."""
@@ -1214,7 +1271,7 @@ class TestAutoConfigureOnFirstRun:
             result = runner.invoke(app, ["claude"])
         assert result.exit_code == 0, result.output
         mock_bootstrap.assert_called_once_with("claude", update_existing=True)
-        mock_auto.assert_called_once_with("claude")
+        mock_auto.assert_called_once_with("claude", model=None)
 
     def test_skipped_when_already_configured(self):
         """Auto-configure is skipped when workspace and tool are already set up."""

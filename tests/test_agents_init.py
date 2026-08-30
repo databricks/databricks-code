@@ -191,6 +191,34 @@ class TestCheckGatewayEndpoint:
         assert check_gateway_endpoint({}, "pi") is False
 
 
+class TestLaunch:
+    def test_copilot_forwards_model_as_override(self, monkeypatch):
+        calls: list[tuple] = []
+        monkeypatch.setattr(
+            agents_mod.copilot,
+            "launch",
+            lambda state, tool_args, model_override=None: calls.append(
+                (state, tool_args, model_override)
+            ),
+        )
+
+        agents_mod.launch("copilot", {"workspace": "ws"}, ["--foo"], model="explicit-model")
+
+        assert calls == [({"workspace": "ws"}, ["--foo"], "explicit-model")]
+
+    def test_non_copilot_tools_ignore_model_argument(self, monkeypatch):
+        calls: list[tuple] = []
+        monkeypatch.setitem(
+            agents_mod._MODULES,
+            "gemini",
+            type("_Stub", (), {"launch": staticmethod(lambda s, a: calls.append((s, a)))}),
+        )
+
+        agents_mod.launch("gemini", {"workspace": "ws"}, ["--foo"], model="ignored-for-gemini")
+
+        assert calls == [({"workspace": "ws"}, ["--foo"])]
+
+
 class TestDefaultModelForTool:
     def test_codex_returns_highest_gpt_model(self):
         models = ["databricks-gpt-5", "databricks-gpt-5-5"]
@@ -601,6 +629,46 @@ class TestInstallToolBinary:
             ensure_tool_binary_available("opencode")
 
 
+class TestConfigureSingleToolExplicitModel:
+    """A first-time `ucode copilot --model X` must configure and validate against X, not the
+    automatic sonnet/opus/haiku/codex default — otherwise a bad automatic pick can fail
+    availability/validation before X is ever tried."""
+
+    def test_explicit_model_wins_over_the_automatic_default(self, monkeypatch):
+        monkeypatch.setattr(agents_mod, "check_gateway_endpoint", lambda state, tool: True)
+        monkeypatch.setattr(agents_mod, "get_provider_service", lambda state, tool: None)
+        monkeypatch.setattr(agents_mod, "save_state", lambda state: None)
+        seen: dict = {}
+
+        def fake_configure_tool(tool, state, model, **kwargs):
+            seen["model"] = model
+            return state
+
+        monkeypatch.setattr(agents_mod, "configure_tool", fake_configure_tool)
+        state = {"claude_models": {"sonnet": "should-not-win"}}
+
+        agents_mod.configure_single_tool("copilot", state, explicit_model="explicit-model")
+
+        assert seen["model"] == "explicit-model"
+
+    def test_falls_back_to_default_without_an_explicit_model(self, monkeypatch):
+        monkeypatch.setattr(agents_mod, "check_gateway_endpoint", lambda state, tool: True)
+        monkeypatch.setattr(agents_mod, "get_provider_service", lambda state, tool: None)
+        monkeypatch.setattr(agents_mod, "save_state", lambda state: None)
+        seen: dict = {}
+
+        def fake_configure_tool(tool, state, model, **kwargs):
+            seen["model"] = model
+            return state
+
+        monkeypatch.setattr(agents_mod, "configure_tool", fake_configure_tool)
+        state = {"claude_models": {"sonnet": "the-default"}}
+
+        agents_mod.configure_single_tool("copilot", state)
+
+        assert seen["model"] == "the-default"
+
+
 class TestConfigureSelectedTools:
     def test_merges_with_existing_available_tools(self, monkeypatch):
         """Configuring a new tool should not drop previously-configured tools
@@ -714,3 +782,41 @@ class TestValidateTool:
 
         assert ok is True
         assert err == ""
+
+    def test_copilot_model_override_reaches_validate_env(self, monkeypatch):
+        # An explicit --model must be what gets smoke-tested, not the automatic
+        # sonnet/opus/haiku/codex default — otherwise a bad automatic pick can fail
+        # validation before the requested model is ever tried.
+        seen: dict = {}
+
+        def fake_validate_env(state, model_override=None):
+            seen["model_override"] = model_override
+            return {"COPILOT_MODEL": model_override}
+
+        monkeypatch.setattr(agents_mod.copilot, "validate_env", fake_validate_env)
+        monkeypatch.setattr(
+            "ucode.agents.subprocess.run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        )
+        monkeypatch.setattr(agents_mod, "load_state", lambda: {})
+
+        ok, _ = agents_mod.validate_tool("copilot", model="explicit-model")
+
+        assert ok is True
+        assert seen["model_override"] == "explicit-model"
+
+    def test_non_copilot_tools_ignore_the_model_argument(self, monkeypatch):
+        # Only copilot's validate_env accepts a model override today.
+        def fake_validate_env(state):
+            return {}
+
+        monkeypatch.setattr(agents_mod.gemini, "validate_env", fake_validate_env)
+        monkeypatch.setattr(
+            "ucode.agents.subprocess.run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+        )
+        monkeypatch.setattr(agents_mod, "load_state", lambda: {})
+
+        ok, _ = agents_mod.validate_tool("gemini", model="ignored-for-gemini")
+
+        assert ok is True
