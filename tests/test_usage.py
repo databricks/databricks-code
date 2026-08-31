@@ -517,7 +517,7 @@ class TestRenderUsageSummary:
         assert "┃ Today" in result
         assert "Last 7 days" in result
         assert "Last 30 days" in result
-        assert "│ 5.0K tokens" in result
+        assert "│ [cyan]5.0K tokens[/cyan]" in result
 
     def test_weekly_total_includes_past_week(self):
         records = [
@@ -548,6 +548,27 @@ class TestRenderUsageSummary:
         ]
         result = render_usage_summary(records, "user", {"claude": "Claude Code"})
         assert "claude-sonnet-4" in result
+
+    def test_estimated_cost_label(self):
+        records = [
+            {
+                "tool": "claude",
+                "usage_day": date.today(),
+                "total_tokens_used": 1_000_000,
+                "model_tokens": (
+                    '[{"model":"databricks-claude-sonnet-4","tokens":1000000,'
+                    '"input":1000000,"output":0}]'
+                ),
+            }
+        ]
+        result = render_usage_summary(
+            records,
+            "user",
+            {"claude": "Claude Code"},
+            price_lookup={"claudesonnet4": ModelPrice(Decimal("4.12"), None, None)},
+        )
+        assert "Estimated Cost for Last 7 Days:" in result
+        assert "$4.12" in result
 
     def test_includes_budget_spend_when_available(self):
         records = [self._make_record(0, "claude", 1000)]

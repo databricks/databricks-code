@@ -643,6 +643,9 @@ def render_usage_summary(
         ["Today", "Last 7 days", "Last 30 days"],
         [[f"{today_text} tokens", f"{weekly_text} tokens", f"{monthly_text} tokens"]],
     )
+    for token_text in {today_text, weekly_text, monthly_text}:
+        plain_value = f"{token_text} tokens"
+        token_table = token_table.replace(plain_value, value(plain_value))
     lines = [
         heading(f"Usage Summary for {requester_name}"),
         "",
@@ -667,8 +670,10 @@ def render_usage_summary(
             Decimal(0),
         )
         if weekly_cost > 0:
-            cost_text = f"{format_cost_usd(weekly_cost)} estimated cost · last 7 days"
-            lines.append(f"   💰  {value(cost_text)}")
+            lines.append(
+                f"   💰  {label('Estimated Cost for Last 7 Days:')} "
+                f"{value(format_cost_usd(weekly_cost))}"
+            )
     lines.extend(render_budget_lines(budget_spend))
     return "\n".join(lines)
 
