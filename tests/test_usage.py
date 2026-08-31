@@ -34,6 +34,7 @@ from ucode.usage import (
     render_budget_lines,
     render_usage_summary,
     run_query_on_first_working_warehouse,
+    select_and_run_usage_query,
     select_sql_warehouse,
     simplify_model_name,
     summarize_models,
@@ -857,6 +858,54 @@ class TestRunQueryOnFirstWorkingWarehouse:
         monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
         with pytest.raises(RuntimeError, match="No SQL warehouse could run"):
             run_query_on_first_working_warehouse("https://ws", "token", [], "SELECT 1")
+
+
+class TestSelectAndRunUsageQuery:
+    _COLUMNS = ["requester_name"]
+    _ROWS = [("user@example.com",)]
+
+    def _warehouses(self) -> list[SqlWarehouse]:
+        return [
+            SqlWarehouse("/sql/1.0/warehouses/dead", "Dead", "RUNNING"),
+            SqlWarehouse("/sql/1.0/warehouses/alive", "Alive", "RUNNING"),
+        ]
+
+    def test_prompts_again_without_failed_warehouse(self, monkeypatch):
+        candidates = self._warehouses()
+        picker_options: list[list[str]] = []
+
+        def choose(remaining):
+            picker_options.append([warehouse.label for warehouse in remaining])
+            return remaining[0]
+
+        def query(workspace, http_path, token, query, on_connected=None):
+            if http_path.endswith("dead"):
+                raise RuntimeError("warehouse unavailable")
+            return self._COLUMNS, self._ROWS
+
+        monkeypatch.setattr(usage_mod, "select_sql_warehouse", choose)
+        monkeypatch.setattr(usage_mod, "run_usage_query", query)
+        monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
+        monkeypatch.setattr(usage_mod, "print_warning", lambda *a: None)
+
+        result = select_and_run_usage_query("https://ws", "token", candidates, "SELECT 1")
+
+        assert result == (candidates[1].http_path, self._COLUMNS, self._ROWS)
+        assert picker_options == [["Dead", "Alive"], ["Alive"]]
+
+    def test_can_cancel_after_a_warehouse_fails(self, monkeypatch):
+        candidates = self._warehouses()
+        choices = iter([candidates[0], None])
+        monkeypatch.setattr(usage_mod, "select_sql_warehouse", lambda remaining: next(choices))
+        monkeypatch.setattr(
+            usage_mod,
+            "run_usage_query",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("warehouse unavailable")),
+        )
+        monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
+        monkeypatch.setattr(usage_mod, "print_warning", lambda *a: None)
+
+        assert select_and_run_usage_query("https://ws", "token", candidates, "SELECT 1") is None
 
 
 class TestUsageWarehouseIdPassthrough:

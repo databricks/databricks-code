@@ -714,6 +714,34 @@ def select_sql_warehouse(candidates: list[SqlWarehouse]) -> SqlWarehouse | None:
     )
 
 
+def select_and_run_usage_query(
+    workspace: str,
+    token: str,
+    candidates: list[SqlWarehouse],
+    query: str,
+) -> tuple[str, list[str], list[tuple]] | None:
+    """Let the user choose warehouses until one runs the query or they cancel.
+
+    A failed warehouse is removed before the picker is shown again so the user cannot
+    accidentally retry the same unusable option forever. Returns ``None`` when the picker
+    is cancelled and raises the final warehouse error when no candidates remain.
+    """
+    remaining = list(candidates)
+    last_error: RuntimeError | None = None
+    while remaining:
+        selected = select_sql_warehouse(remaining)
+        if selected is None:
+            return None
+        try:
+            return run_query_on_first_working_warehouse(workspace, token, [selected], query)
+        except RuntimeError as exc:
+            last_error = exc
+            remaining = [
+                warehouse for warehouse in remaining if warehouse.http_path != selected.http_path
+            ]
+    raise last_error or RuntimeError("No SQL warehouse could run the usage query.")
+
+
 def _query_with_progress(
     workspace: str,
     token: str,
@@ -769,15 +797,17 @@ def usage(warehouse_id: str | None = None) -> int:
     with spinner("Discovering SQL warehouse..."):
         candidates = discover_sql_warehouses(workspace, token, warehouse_id=warehouse_id)
     if warehouse_id is None:
-        selected = select_sql_warehouse(candidates)
-        if selected is None:
+        query_result = select_and_run_usage_query(
+            workspace, token, candidates, build_usage_report_query()
+        )
+        if query_result is None:
             print_note("Usage details cancelled.")
             return 0
-        candidates = [selected]
-
-    resolved_http_path, columns, rows = run_query_on_first_working_warehouse(
-        workspace, token, candidates, build_usage_report_query()
-    )
+        resolved_http_path, columns, rows = query_result
+    else:
+        resolved_http_path, columns, rows = run_query_on_first_working_warehouse(
+            workspace, token, candidates, build_usage_report_query()
+        )
     records = parse_usage_rows(columns, rows)
     requester_name = find_requester_name(workspace, resolved_http_path, token, records)
 
