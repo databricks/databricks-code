@@ -504,7 +504,13 @@ class ToolUsageTotals(NamedTuple):
     cost: Decimal | None
 
 
-TOOL_MODEL_TABLE_HEADERS = ["Model", "Requests", "Input (incl. cache)", "Output", "Cost (USD)"]
+TOOL_MODEL_TABLE_HEADERS = [
+    "Model",
+    "Requests",
+    "Input (incl. cache)",
+    "Output",
+    "Est. Cost (USD)",
+]
 
 
 def aggregate_tool_model_usage(records: list[dict[str, object]], tool: str) -> list[ModelUsage]:
@@ -815,6 +821,6 @@ def usage(warehouse_id: str | None = None) -> int:
         console.print(f"{label('Requests:')} {value(f'{totals.requests:,}')}")
         console.print(f"{label('Total tokens:')} {value(f'{totals.tokens:,}')}")
         if totals.cost is not None:
-            console.print(f"{label('Cost (USD):')} {value(format_cost_usd(totals.cost))}")
+            console.print(f"{label('Est. Cost (USD):')} {value(format_cost_usd(totals.cost))}")
         console.print(render_box_table(TOOL_MODEL_TABLE_HEADERS, rows, max_widths=table_widths))
     return 0
