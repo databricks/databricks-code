@@ -256,6 +256,7 @@ class TestLaunchCodex:
 
     def test_missing_cached_models_starts_with_bootstrap_model(self, monkeypatch):
         monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "unknown")
         monkeypatch.setattr(v2, "_free_port", lambda: 41001)
         monkeypatch.setattr(v2, "_wait_for_app_server", lambda port, timeout: True)
         monkeypatch.setattr(
