@@ -598,7 +598,7 @@ class TestCodexDefaultModel:
             "oss_models": ["system.ai.glm-5-2"],
         }
 
-        assert codex.starting_model(state) == "system.ai.gpt-5-6-luna"
+        assert codex.starting_model(state) == "gpt-5.6-luna"
 
     def test_starting_model_prefers_managed_default(self):
         state = {

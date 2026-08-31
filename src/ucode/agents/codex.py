@@ -31,6 +31,7 @@ from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
 )
+from ucode.smart_routing.codex_routing import codex_model_id
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.ui import print_warning_err
@@ -431,7 +432,7 @@ def starting_model(state: dict) -> str | None:
         if isinstance(models, list):
             for model in models:
                 if isinstance(model, str) and model:
-                    return model
+                    return codex_model_id(model)
     return V2_BOOTSTRAP_MODEL
 
 
