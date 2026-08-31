@@ -12,27 +12,58 @@ from pathlib import Path
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
+from ucode.smart_routing import codex_routing, routing
+
 SETTINGS_UPDATED = "thread/settings/updated"
 ITEM_STARTED = "item/started"
 ITEM_COMPLETED = "item/completed"
 TURN_START = "turn/start"
 TURN_STARTED = "turn/started"
 
+RouteDecisionFn = Callable[[str], tuple[routing.RoutingDecision | None, str | None]]
+SwitchMessageFn = Callable[[str, str], str]
+TokenProvider = Callable[[], str]
+
+
+def _prompt_from_turn(params: dict) -> str | None:
+    """Extract the plaintext portions of a Codex ``turn/start`` input."""
+    raw_input = params.get("input")
+    if isinstance(raw_input, str):
+        return raw_input if raw_input.strip() else None
+    if not isinstance(raw_input, list):
+        return None
+
+    parts: list[str] = []
+    for item in raw_input:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    prompt = "\n".join(part for part in parts if part.strip())
+    return prompt or None
+
 
 class _Session:
     def __init__(
         self,
-        target_model: str,
+        target_model: str | None,
         log: Callable[[str], None],
         switch_message: str | None = None,
+        available_models: list[str] | None = None,
+        route_decision: RouteDecisionFn | None = None,
+        switch_message_fn: SwitchMessageFn | None = None,
     ) -> None:
         self.target = target_model
+        self.available_models = list(available_models or [])
         self.log = log
         self.switch_message = switch_message
+        self.route_decision = route_decision
+        self.switch_message_fn = switch_message_fn
         self.thread_id: str | None = None
         self.settings: dict | None = None
         self.first_turn_seen = False
         self.switch_pending = False
+        self.notice_pending = False
         self.injected = False
 
     def on_tui_frame(self, raw: str) -> str:
@@ -50,8 +81,22 @@ class _Session:
             if self.first_turn_seen:
                 return raw
             self.first_turn_seen = True
+            if self.route_decision is not None:
+                prompt = _prompt_from_turn(params)
+                if prompt is None:
+                    self.log("[ROUTE] first turn had no plaintext prompt; keeping current model")
+                    return raw
+                decision, reason = self.route_decision(prompt)
+                if decision is None:
+                    self.log(f"[ROUTE] selection failed; keeping current model: {reason}")
+                    return raw
+                self.target = decision.model
+                if self.switch_message_fn is not None:
+                    self.switch_message = self.switch_message_fn(decision.model, decision.rationale)
+                self.notice_pending = self.switch_message is not None
+                self.log(f"[ROUTE] selected {decision.model!r}; rationale={decision.rationale!r}")
             old = params.get("model")
-            if old != self.target:
+            if self.target is not None and old != self.target:
                 params["model"] = self.target
                 self.switch_pending = True
                 self.log(f"[REWRITE] model {old!r} -> {self.target!r}")
@@ -78,20 +123,24 @@ class _Session:
         if (
             msg.get("method") == TURN_STARTED
             and not self.injected
-            and self.switch_pending
+            and (self.switch_pending or self.notice_pending)
             and self.thread_id
         ):
             self.injected = True
+            switch_pending = self.switch_pending
             self.switch_pending = False
-            settings = dict(self.settings) if isinstance(self.settings, dict) else {}
-            settings["model"] = self.target
-            self.log(f"[INJECT] {SETTINGS_UPDATED}: model -> {self.target!r} (flip TUI chip)")
-            injected: list[dict] = [
-                {
-                    "method": SETTINGS_UPDATED,
-                    "params": {"threadId": self.thread_id, "threadSettings": settings},
-                }
-            ]
+            self.notice_pending = False
+            injected: list[dict] = []
+            if switch_pending:
+                settings = dict(self.settings) if isinstance(self.settings, dict) else {}
+                settings["model"] = self.target
+                self.log(f"[INJECT] {SETTINGS_UPDATED}: model -> {self.target!r} (flip TUI chip)")
+                injected.append(
+                    {
+                        "method": SETTINGS_UPDATED,
+                        "params": {"threadId": self.thread_id, "threadSettings": settings},
+                    }
+                )
             if self.switch_message:
                 turn = params.get("turn")
                 turn_id = turn.get("id") if isinstance(turn, dict) else None
@@ -132,18 +181,52 @@ class _Session:
 
 
 async def _handle_tui(
-    tui, upstream_uri: str, target_model: str, log, switch_message: str | None = None
+    tui,
+    upstream_uri: str,
+    target_model: str | None,
+    log,
+    switch_message: str | None = None,
+    available_models: list[str] | None = None,
+    workspace: str | None = None,
+    token_provider: TokenProvider | None = None,
+    switch_message_fn: SwitchMessageFn | None = None,
 ) -> None:
     path = getattr(getattr(tui, "request", None), "path", "/") or "/"
     uri = upstream_uri.rstrip("/") + path
     log(f"[CONN] TUI connected (path={path}); dialing app-server {uri}")
-    sess = _Session(target_model, log, switch_message)
+    route_decision: RouteDecisionFn | None = None
+    if workspace is not None and token_provider is not None:
+
+        def route_decision(prompt: str):
+            try:
+                token = token_provider()
+            except RuntimeError as exc:
+                return None, f"could not refresh workspace auth: {exc}"
+            return codex_routing.request_routing_decision(
+                workspace,
+                token,
+                prompt,
+                list(available_models or []),
+                log=log,
+            )
+
+    sess = _Session(
+        target_model,
+        log,
+        switch_message,
+        available_models,
+        route_decision,
+        switch_message_fn,
+    )
     async with connect(uri, max_size=None) as upstream:
 
         async def tui_to_app():
             async for frame in tui:
                 if isinstance(frame, str):
-                    frame = sess.on_tui_frame(frame)
+                    # Route selection is a blocking HTTP call. Keep it off the
+                    # WebSocket event loop while holding this first frame until
+                    # its selected model has been written into ``turn/start``.
+                    frame = await asyncio.to_thread(sess.on_tui_frame, frame)
                 await upstream.send(frame)
 
         async def app_to_tui():
@@ -168,13 +251,27 @@ async def _serve(
     host: str,
     port: int,
     upstream_uri: str,
-    model: str,
+    model: str | None,
     log,
     switch_message: str | None = None,
+    available_models: list[str] | None = None,
+    workspace: str | None = None,
+    token_provider: TokenProvider | None = None,
+    switch_message_fn: SwitchMessageFn | None = None,
 ):
     async def handler(tui):
         try:
-            await _handle_tui(tui, upstream_uri, model, log, switch_message)
+            await _handle_tui(
+                tui,
+                upstream_uri,
+                model,
+                log,
+                switch_message,
+                available_models,
+                workspace,
+                token_provider,
+                switch_message_fn,
+            )
         except Exception as exc:  # noqa: BLE001
             log(f"[ERR] session: {exc!r}")
 
@@ -187,8 +284,12 @@ async def _serve(
 def start_interposer_thread(
     host: str,
     upstream_uri: str,
-    model: str,
+    model: str | None = None,
     *,
+    available_models: list[str] | None = None,
+    workspace: str | None = None,
+    token_provider: TokenProvider | None = None,
+    switch_message_fn: SwitchMessageFn | None = None,
     switch_message: str | None = None,
     log_path: Path | None = None,
     ready_timeout: float = 10.0,
@@ -211,7 +312,18 @@ def start_interposer_thread(
         asyncio.set_event_loop(loop)
         try:
             holder["server"] = loop.run_until_complete(
-                _serve(host, 0, upstream_uri, model, log, switch_message)
+                _serve(
+                    host,
+                    0,
+                    upstream_uri,
+                    model,
+                    log,
+                    switch_message,
+                    available_models,
+                    workspace,
+                    token_provider,
+                    switch_message_fn,
+                )
             )
             holder["port"] = holder["server"].sockets[0].getsockname()[1]
         except Exception as exc:  # noqa: BLE001

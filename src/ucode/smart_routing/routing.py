@@ -23,6 +23,36 @@ from typing import Any
 ROUTER_NAME = "task_v1"
 ROUTING_PATH = "/ai-gateway/routing/v1/routes:select"
 REQUEST_TIMEOUT_S = 30.0
+SUBAGENT_ROUTING_DISCLAIMER = (
+    "Spawned subagents are routed independently based on their own complexity."
+)
+
+
+def format_switch_message(model: str, reason: str | None) -> str:
+    """Format the first-prompt routed-model notice."""
+    lines = [
+        "Using Unity Gateway Smart Router.",
+        f"Selected Model : {model}",
+        *([f"Reason : {reason}"] if reason else []),
+        SUBAGENT_ROUTING_DISCLAIMER,
+    ]
+    return _format_box(lines)
+
+
+def format_subagent_message(model: str, reason: str | None) -> str:
+    """Format a routed-subagent notice without the first-prompt disclaimer."""
+    lines = [
+        "Using Unity Gateway Smart Router - Subagent",
+        f"Selected Model : {model}",
+        *([f"Reason : {reason}"] if reason else []),
+    ]
+    return _format_box(lines)
+
+
+def _format_box(lines: list[str]) -> str:
+    width = max(len(line) for line in lines)
+    border = "─" * (width + 2)
+    return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
 
 
 @dataclass(frozen=True)
@@ -33,18 +63,24 @@ class RoutingDecision:
     raw_model: str
     rationale: str = ""
 
-    def display_message(self, model_label: str | None = None) -> str:
-        """User-facing "Using Smart Routing" line, with the router's rationale.
+    def display_message(self, model_label: str | None = None, *, subagent: bool = False) -> str:
+        """Return the boxed smart-routing notice with the router's rationale.
 
         Used by both the launch-time notice and the subagent-routing hook so the
         "what" (model) and the "why" (rationale) are surfaced consistently.
         ``model_label`` overrides the shown model id (e.g. a harness-translated
-        id); defaults to ``model``. The rationale is appended when present.
+        id); defaults to ``model``.
         """
-        message = f"Using Smart Routing. Routing to {model_label or self.model}."
-        if self.rationale:
-            message += f" {self.rationale}"
-        return message
+        formatter = format_subagent_message if subagent else format_switch_message
+        return formatter(model_label or self.model, self.rationale)
+
+
+@dataclass(frozen=True)
+class SpawnRoute:
+    tool_input: dict[str, Any]
+    task: str
+    decision: RoutingDecision
+    routed_model: str
 
 
 def normalize_model(model: str) -> str:
@@ -119,7 +155,7 @@ def select_route(
     workspace: str,
     token: str,
     task: str,
-    route_options: Iterable[tuple[str, str]],
+    route_options: Iterable[tuple[str, str | None]],
     resolve: Callable[[str], str | None],
     *,
     router_name: str = ROUTER_NAME,
@@ -135,7 +171,7 @@ def select_route(
     """
     body = {
         "route_options": [{"model": model, "harness": harness} for model, harness in route_options],
-        "task": {"prompt": task[:4000]},
+        "task": {"prompt": task},
         "route_selector": {"router_name": router_name},
     }
     request = urllib.request.Request(
@@ -180,23 +216,15 @@ def select_route(
     )
 
 
-def route_spawn_tool(
+def resolve_spawn_route(
     payload: dict[str, Any],
     *,
     is_spawn_agent: Callable[[Any], bool],
     decision_fn: Callable[[str], tuple[RoutingDecision | None, str | None]],
     default_task_label: str,
     model_id_mapper: Callable[[str], str],
-    skip_arms: dict[str, str] | None = None,
-    record_decision: Callable[[dict[str, Any], str, RoutingDecision, str], None] | None = None,
-) -> dict[str, Any] | None:
-    """Route one subagent-spawn tool call, rewriting its ``model`` input.
-
-    Returns a PreToolUse hook output that allows the call with the routed model
-    injected; a bare ``systemMessage`` when the pick is an arm the harness can't
-    use for subagents (``skip_arms``); or None when the tool is not a spawn or
-    routing was unavailable — fail open, leaving the original model in place.
-    """
+) -> SpawnRoute | None:
+    """Resolve one subagent-spawn payload to a routed model."""
     if not is_spawn_agent(payload.get("tool_name")):
         return None
     tool_input = payload.get("tool_input")
@@ -219,19 +247,45 @@ def route_spawn_tool(
     decision, _ = decision_fn(task)
     if decision is None:
         return None
-    if skip_arms and decision.raw_model in skip_arms:
-        return {"systemMessage": skip_arms[decision.raw_model]}
     routed_model = model_id_mapper(decision.model)
+    return SpawnRoute(tool_input, task, decision, routed_model)
+
+
+def route_spawn_tool(
+    payload: dict[str, Any],
+    *,
+    is_spawn_agent: Callable[[Any], bool],
+    decision_fn: Callable[[str], tuple[RoutingDecision | None, str | None]],
+    default_task_label: str,
+    model_id_mapper: Callable[[str], str],
+    skip_arms: dict[str, str] | None = None,
+    record_decision: Callable[[dict[str, Any], str, RoutingDecision, str], None] | None = None,
+) -> dict[str, Any] | None:
+    """Route one subagent-spawn tool call, rewriting its ``model`` input."""
+    route = resolve_spawn_route(
+        payload,
+        is_spawn_agent=is_spawn_agent,
+        decision_fn=decision_fn,
+        default_task_label=default_task_label,
+        model_id_mapper=model_id_mapper,
+    )
+    if route is None:
+        return None
+    if skip_arms and route.decision.raw_model in skip_arms:
+        return {"systemMessage": skip_arms[route.decision.raw_model]}
     if record_decision is not None:
-        record_decision(payload, task, decision, routed_model)
+        record_decision(payload, route.task, route.decision, route.routed_model)
     # Surface the router's rationale in BOTH the systemMessage (the line the
     # harness shows the user) and permissionDecisionReason — the "why", not just
     # the "what". The shown model is the harness-translated id (routed_model).
-    routing_message = decision.display_message(model_label=routed_model)
+    routing_message = route.decision.display_message(
+        model_label=route.routed_model,
+        subagent=True,
+    )
     output: dict[str, Any] = {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
-        "updatedInput": {**tool_input, "model": routed_model},
+        "updatedInput": {**route.tool_input, "model": route.routed_model},
         "permissionDecisionReason": routing_message,
     }
     return {"systemMessage": routing_message, "hookSpecificOutput": output}

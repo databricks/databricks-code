@@ -73,7 +73,7 @@ class TestInstallAiToolsForAgents:
 
     def test_maps_supported_tools_and_drops_others(self, monkeypatch):
         captured = self._capture(monkeypatch)
-        # gemini and pi aren't supported by `databricks aitools`, so they drop.
+        # Gemini and Pi aren't supported by `databricks aitools`, so they drop.
         install_databricks_ai_tools_for_agents(
             ["claude", "codex", "gemini", "pi"], {"profile": "prof"}
         )
@@ -278,10 +278,10 @@ class TestResolveProviderModels:
         models, error, relayed = agents_mod.resolve_provider_models("claude", self._STATE, None)
         assert (models, error, relayed) == (None, None, False)
 
-    def test_anthropic_returns_no_models(self, monkeypatch):
-        # The developer-configured path is deliberately unchanged: an Anthropic service pins nothing
-        # even with explicit targets — Claude Code's canonical names route fine. (The managed path
-        # pins from authored manifest slots instead; see managed_resolve.)
+    def test_anthropic_pins_family_targets(self, monkeypatch):
+        # An API-key Anthropic service pins its declared targets by family, so the client sends
+        # exactly the ids the MPS allows rather than Claude Code's canonical names (which may not
+        # match the declared targets → gateway 403 "not in the allowed models list").
         self._patch(
             monkeypatch,
             {"provider_type": "anthropic", "targets": ["claude-sonnet-5", "claude-haiku-4-5"]},
@@ -291,8 +291,17 @@ class TestResolveProviderModels:
             "claude", self._STATE, "main.a.svc"
         )
         assert error is None
-        assert models is None
+        assert models == {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
         assert relayed is False
+
+    def test_anthropic_with_no_claude_targets_pins_nothing(self, monkeypatch):
+        # No Claude-family targets → no pins (the `or None` fallback), leaving Claude Code's
+        # defaults in place rather than an empty dict.
+        self._patch(monkeypatch, {"provider_type": "anthropic", "targets": []}, None)
+        models, error, relayed = agents_mod.resolve_provider_models(
+            "claude", self._STATE, "main.a.empty"
+        )
+        assert (models, error, relayed) == (None, None, False)
 
     def test_relayed_anthropic_flagged(self, monkeypatch):
         self._patch(

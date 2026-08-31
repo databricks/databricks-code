@@ -161,6 +161,38 @@ class TestBuildSkillsMcpUrl:
 
 
 class TestDiscoverClaudeModels:
+    def test_lists_all_anthropic_model_ids_without_legacy_validation(self, monkeypatch):
+        captured = {}
+        payload = {
+            "data": [
+                {"id": "system.ai.claude-opus-5"},
+                {"id": "databricks-claude-sonnet-5"},
+                {"id": "opaque-model-id"},
+                {"id": "opaque-model-id"},
+                {"id": ""},
+            ]
+        }
+
+        def fake_get(url, token, **kwargs):
+            captured["request"] = (url, token, kwargs)
+            return payload, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        models, reason = db_mod.list_anthropic_models(WS, "token")
+
+        assert reason is None
+        assert models == [
+            "system.ai.claude-opus-5",
+            "databricks-claude-sonnet-5",
+            "opaque-model-id",
+        ]
+        assert captured["request"] == (
+            f"{WS}/ai-gateway/anthropic/v1/models",
+            "token",
+            {"max_retries": 2},
+        )
+
     def test_selects_opus_4_8_when_advertised(self, monkeypatch):
         payload = {
             "data": [
@@ -169,7 +201,7 @@ class TestDiscoverClaudeModels:
                 {"id": "databricks-claude-sonnet-4-6"},
             ]
         }
-        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token, **kwargs: (payload, None))
 
         models, reason = db_mod.discover_claude_models(WS, "token")
 
@@ -183,7 +215,7 @@ class TestDiscoverClaudeModels:
                 {"id": "databricks-claude-opus-4-8"},
             ]
         }
-        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token, **kwargs: (payload, None))
 
         models, reason = db_mod.discover_claude_models(WS, "token")
 
@@ -625,6 +657,47 @@ class TestMapClaudeFamilyModels:
 
     def test_empty_when_no_claude(self):
         assert db_mod.map_claude_family_models(["amazon.titan-text-express-v1"]) == {}
+
+
+class TestResolveProviderLaunchModel:
+    def test_none_when_service_offers_opus(self):
+        # Claude Code's own opus default already works, so we pin nothing (and avoid the duplicate
+        # /model picker row that setting ANTHROPIC_MODEL causes).
+        models = {
+            "opus": "claude-opus-4-8",
+            "sonnet": "claude-sonnet-5",
+            "haiku": "claude-haiku-4-5",
+        }
+        assert db_mod.resolve_provider_launch_model(None, models) is None
+
+    def test_falls_back_to_best_tier_when_no_opus(self):
+        # No opus target: launch on the most capable tier the service does offer (sonnet > haiku).
+        models = {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+        assert db_mod.resolve_provider_launch_model(None, models) == "claude-sonnet-5"
+
+    def test_falls_back_to_haiku_when_only_haiku(self):
+        assert db_mod.resolve_provider_launch_model(None, {"haiku": "claude-haiku-4-5"}) == (
+            "claude-haiku-4-5"
+        )
+
+    def test_family_alias_resolves_to_declared_target(self):
+        models = {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+        assert db_mod.resolve_provider_launch_model("haiku", models) == "claude-haiku-4-5"
+
+    def test_family_alias_not_offered_raises_with_available_list(self):
+        models = {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+        with pytest.raises(RuntimeError, match="does not offer a 'opus' model.*haiku, sonnet"):
+            db_mod.resolve_provider_launch_model("opus", models)
+
+    def test_raw_target_id_is_trusted(self):
+        # A non-family value is a raw target the user knows the service allows; pass it through.
+        models = {"sonnet": "claude-sonnet-5"}
+        assert db_mod.resolve_provider_launch_model("claude-3-7-sonnet", models) == (
+            "claude-3-7-sonnet"
+        )
+
+    def test_no_models_and_no_override_is_none(self):
+        assert db_mod.resolve_provider_launch_model(None, {}) is None
 
 
 class TestProviderServicePagination:
@@ -1989,6 +2062,103 @@ class TestHttpGetJsonReason:
         assert reason == "HTTP 404 Not Found"
 
 
+class TestHttpGetJsonRetries:
+    @staticmethod
+    def _http_error(code: int, message: str, headers: dict[str, str] | None = None):
+        from urllib.error import HTTPError
+
+        return HTTPError(url="", code=code, msg=message, hdrs=headers or {}, fp=None)
+
+    def test_retries_429_after_retry_after_delay(self, monkeypatch):
+        outcomes = iter(
+            [
+                self._http_error(429, "Too Many Requests", {"Retry-After": "1"}),
+                _FakeResponse({"data": []}),
+            ]
+        )
+        calls = []
+        sleeps = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(db_mod.random, "uniform", lambda low, high: high)
+        monkeypatch.setattr(db_mod.time, "sleep", sleeps.append)
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload == {"data": []}
+        assert reason is None
+        assert len(calls) == 2
+        assert sleeps == [1.25]
+
+    def test_retries_network_error_with_exponential_backoff(self, monkeypatch):
+        from urllib.error import URLError
+
+        outcomes = iter([URLError("connection reset"), _FakeResponse({"ok": True})])
+        sleeps = []
+
+        def fake_urlopen(request, timeout=None):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(db_mod.random, "uniform", lambda low, high: high)
+        monkeypatch.setattr(db_mod.time, "sleep", sleeps.append)
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload == {"ok": True}
+        assert reason is None
+        assert sleeps == [1.25]
+
+    def test_stops_after_configured_retries(self, monkeypatch):
+        calls = []
+        sleeps = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            raise self._http_error(429, "Too Many Requests")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(db_mod.random, "uniform", lambda low, high: high)
+        monkeypatch.setattr(db_mod.time, "sleep", sleeps.append)
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload is None
+        assert reason == "HTTP 429 Too Many Requests"
+        assert len(calls) == 3
+        assert sleeps == [1.25, 2.5]
+
+    def test_does_not_retry_other_http_error(self, monkeypatch):
+        calls = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request)
+            raise self._http_error(503, "Service Unavailable")
+
+        monkeypatch.setattr(db_mod.urllib_request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(
+            db_mod.time,
+            "sleep",
+            lambda delay: pytest.fail(f"unexpected retry delay: {delay}"),
+        )
+
+        payload, reason = db_mod._http_get_json("https://x/y", "tok", max_retries=2)
+
+        assert payload is None
+        assert reason == "HTTP 503 Service Unavailable"
+        assert len(calls) == 1
+
+
 class TestParseDatabricksCliVersion:
     def test_parses_standard_format(self):
         assert _parse_databricks_cli_version("Databricks CLI v0.299.2") == (0, 299, 2)
@@ -2678,7 +2848,7 @@ class TestCodingAgentConfigCrudClients:
                 }
             )
         )
-        assert emitted == set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS)
+        assert set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS) == emitted | {"spec_version"}
 
     def test_delete_returns_only_a_reason(self, monkeypatch):
         seen = {}

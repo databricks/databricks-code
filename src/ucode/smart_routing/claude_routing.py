@@ -63,7 +63,7 @@ def route_launch_model(state: dict, tool_args: list[str]):
 # their values must not be mistaken for the seed prompt. Options whose value is
 # optional (`-c`/`-d`/`-r`/`-w`) are intentionally omitted — treating them as
 # booleans is safe here (we only skip the flag, never a following positional).
-_CLAUDE_VALUE_OPTIONS = frozenset(
+CLAUDE_VALUE_OPTIONS = frozenset(
     {
         "-n",
         "--name",
@@ -103,7 +103,7 @@ def _launch_routing_task(tool_args: list[str]) -> str | None:
     # line (`claude "<prompt>"` or `claude -p "<prompt>"`, or after `--`). A bare
     # interactive launch has no prompt yet → None, and the caller skips routing
     # (the root model can't be re-routed once the session is running).
-    return routing.extract_seed_prompt(tool_args, _CLAUDE_VALUE_OPTIONS)
+    return routing.extract_seed_prompt(tool_args, CLAUDE_VALUE_OPTIONS)
 
 
 def request_routing_decision(

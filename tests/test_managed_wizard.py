@@ -314,6 +314,20 @@ class TestExistingConfigHandling:
             assert keep_going is False
         delete.assert_called_once_with(WORKSPACE, "token", "cfg/1")
 
+    def test_choosing_adopt_confirms_and_stops(self):
+        existing = {"name": "cfg/1", "enabled_agents": {"claude": {}}}
+        with (
+            patch.object(wizard, "get_managed_config", return_value=(existing, None)),
+            patch.object(wizard, "prompt_for_selection", return_value="adopt"),
+            patch("ucode.cli._confirm_managed_config_applied") as confirm,
+        ):
+            # Adopting just confirms the config is in force (the launch path applies it) and stops
+            # the wizard — no re-authoring, no local writes.
+            keep_going, published = wizard._handle_existing_config(WORKSPACE, "token")
+            assert keep_going is False
+            assert published == existing
+        confirm.assert_called_once_with(existing, WORKSPACE)
+
     def test_delete_declined_leaves_config_intact(self):
         with (
             patch.object(
@@ -355,6 +369,63 @@ class TestExistingConfigHandling:
             pytest.raises(KeyboardInterrupt),
         ):
             wizard._handle_existing_config(WORKSPACE, "token")
+
+
+class TestStepBanner:
+    """The step headers brand themselves to the invoking command, so a `ucode configure` run
+    doesn't show `ucode setup` headers."""
+
+    def test_defaults_to_ucode_setup(self):
+        with patch.object(wizard, "print_section") as section:
+            wizard._step_banner(1, "Agents")
+        assert section.call_args.args[0].startswith("ucode setup · step 1 of ")
+
+    def test_uses_the_command_label_when_given(self):
+        with patch.object(wizard, "print_section") as section:
+            wizard._step_banner(2, "Models", "ucode configure")
+        assert section.call_args.args[0].startswith("ucode configure · step 2 of ")
+
+
+class TestSetupCommandToken:
+    """A caller (e.g. `ucode configure`) can hand setup a token so its admin gate uses the same
+    identity as the routing decision, instead of fetching a second time."""
+
+    def test_reuses_a_passed_token_and_skips_a_second_fetch(self):
+        seen: list[tuple[str, str]] = []
+        with (
+            patch.object(
+                wizard,
+                "get_databricks_token",
+                side_effect=AssertionError("must not fetch a token when one was passed"),
+            ),
+            patch.object(
+                wizard,
+                "ensure_databricks_auth",
+                side_effect=AssertionError("must not re-authenticate when a token was passed"),
+            ),
+            patch.object(
+                wizard, "_require_admin", side_effect=lambda ws, tok: seen.append((ws, tok))
+            ),
+            # Stop right after the admin gate so the heavy discovery/picker path doesn't run.
+            patch.object(wizard, "_handle_existing_config", return_value=(False, None)),
+        ):
+            code = wizard.setup_command(workspace="https://w", profile=None, token="tok")
+        assert code == 0
+        assert seen == [("https://w", "tok")]
+
+    def test_fetches_its_own_token_when_none_passed(self):
+        seen: list[tuple[str, str]] = []
+        with (
+            patch.object(wizard, "ensure_databricks_auth", return_value=None),
+            patch.object(wizard, "get_databricks_token", return_value="fetched"),
+            patch.object(
+                wizard, "_require_admin", side_effect=lambda ws, tok: seen.append((ws, tok))
+            ),
+            patch.object(wizard, "_handle_existing_config", return_value=(False, None)),
+        ):
+            code = wizard.setup_command(workspace="https://w", profile=None)
+        assert code == 0
+        assert seen == [("https://w", "fetched")]
 
 
 class TestModelPrompting:
@@ -1846,7 +1917,7 @@ class TestShowCommand:
         with patch.object(wizard, "load_state", return_value={"workspace": WORKSPACE}):
             assert wizard.show_command() == 0
 
-    def test_prints_the_apply_payload(self, capsys):
+    def test_prints_the_publish_payload(self, capsys):
         manifest = {
             "default_agent": "claude",
             "enabled_agents": {
@@ -1857,7 +1928,7 @@ class TestShowCommand:
         with patch.object(wizard, "load_state", return_value={"workspace": WORKSPACE}):
             assert wizard.show_command() == 0
         out = capsys.readouterr().out
-        # The proto enum spelling is what `apply` sends, so it must appear verbatim.
+        # The proto enum spelling is what `publish` sends, so it must appear verbatim.
         assert "CODING_AGENT_CLAUDE_CODE" in out
 
 
@@ -2137,14 +2208,14 @@ class TestNextSteps:
         assert "ucode setup mcps" in out
         assert "ucode setup skills" in out
         assert "ucode setup spend-tiers" in out
-        assert "ucode apply" in out
+        assert "ucode publish" in out
 
     def test_dry_run_says_nothing_was_saved(self, capsys, monkeypatch):
         monkeypatch.setattr(config_io_mod, "_dry_run", True)
         wizard._print_next_steps(AGENTS_ONLY)
         out = capsys.readouterr().out
         assert "Dry run" in out
-        assert "ucode apply" not in out
+        assert "ucode publish" not in out
 
 
 class TestSectionCommands:
@@ -2159,7 +2230,7 @@ class TestSectionCommands:
             "get_databricks_token": lambda *a, **k: "tok",
             "is_workspace_admin": lambda *a, **k: True,
             # Decline the end-of-section "publish now?" offer so a section run saves the draft without
-            # trying to apply; the apply path is exercised in TestApplyCommand.
+            # trying to publish; the publish path is exercised in TestPublishCommand.
             "prompt_yes_no_default": lambda *a, **k: False,
         }
         defaults.update(overrides)
@@ -2313,12 +2384,12 @@ class TestSetupHelp:
             "ucode setup skills",
             "ucode setup spend-tiers",
             "ucode setup show",
-            "ucode apply",
+            "ucode publish",
         ):
             assert command in out
 
 
-class TestApplyDiff:
+class TestPublishDiff:
     def test_lists_added_removed_and_changed(self, capsys):
         existing = {
             "name": "cfg/1",
@@ -2342,8 +2413,16 @@ class TestApplyDiff:
     def test_identical_configs_report_no_change(self, capsys):
         assert wizard._render_config_diff(AGENTS_ONLY, AGENTS_ONLY, WORKSPACE) is False
 
+    def test_display_name_change_is_detected(self, capsys):
+        existing = {"display_name": "old-name", **AGENTS_ONLY}
+        incoming = {"display_name": "new-name", **AGENTS_ONLY}
+        changed = wizard._render_config_diff(existing, incoming, WORKSPACE)
+        out = capsys.readouterr().out
+        assert changed is True
+        assert "old-name" in out and "new-name" in out
 
-class TestApplyCommand:
+
+class TestPublishCommand:
     MANIFEST = {
         "default_agent": "claude",
         "enabled_agents": {
@@ -2353,7 +2432,7 @@ class TestApplyCommand:
 
     @staticmethod
     def _patches(**overrides):
-        """The network/auth boundary `apply_command` sits behind, with per-test overrides."""
+        """The network/auth boundary `publish_command` sits behind, with per-test overrides."""
         defaults = {
             "load_state": lambda: {"workspace": WORKSPACE, "profile": "p", **STATE},
             "ensure_databricks_auth": lambda *a, **k: None,
@@ -2373,18 +2452,27 @@ class TestApplyCommand:
         defaults.update(overrides)
         return [patch.object(wizard, name, value) for name, value in defaults.items()]
 
-    def _run(self, *, yes=False, **overrides):
+    def _run(self, *, yes=False, file_path=None, **overrides):
         import contextlib
 
         with contextlib.ExitStack() as stack:
             for p in self._patches(**overrides):
                 stack.enter_context(p)
-            return wizard.apply_command(yes=yes)
+            return wizard.publish_command(file_path=file_path, yes=yes)
+
+    @staticmethod
+    def _config_file(tmp_path, manifest, *, workspace=WORKSPACE, spec_version=1, **extra):
+        config = serialize_managed_config(manifest)
+        config.pop("name", None)
+        payload = {"workspace": workspace, "spec_version": spec_version, **config, **extra}
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
 
     def test_unauthored_config_is_an_actionable_error(self):
         with patch.object(wizard, "load_state", return_value={"workspace": WORKSPACE}):
             with pytest.raises(RuntimeError, match="ucode setup"):
-                wizard.apply_command()
+                wizard.publish_command()
 
     def test_creates_when_no_config_exists(self):
         managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
@@ -2430,7 +2518,7 @@ class TestApplyCommand:
         # Publishing a config identical to what's live is a no-op; say so and skip the write rather
         # than PATCH the same bytes back.
         managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
-        # What's live is the manifest normalized the same way `apply` will send it.
+        # What's live is the manifest normalized the same way `publish` will send it.
         existing = {
             "name": "coding-agent-configs/abc",
             **managed_config_mod.normalize_managed_config(serialize_managed_config(self.MANIFEST)),
@@ -2451,7 +2539,6 @@ class TestApplyCommand:
         assert updated["called"] is False
 
     def test_invalid_manifest_is_not_published(self):
-        # `default_agent` names an agent that isn't enabled.
         managed_config_mod.save_managed_state(
             WORKSPACE, {"default_agent": "codex", "enabled_agents": {"claude": {}}}
         )
@@ -2461,15 +2548,16 @@ class TestApplyCommand:
             created["called"] = True
             return {}, None
 
-        assert self._run(create_coding_agent_config=fake_create) == 1
+        with pytest.raises(RuntimeError, match="not valid"):
+            self._run(create_coding_agent_config=fake_create)
         assert created["called"] is False
 
     def test_an_older_family_version_the_wizard_offered_still_publishes(self):
         # `setup` offers every version of a Claude family, but `claude_models` keeps only the newest
         # per family and the wizard's `all_claude_models` stash is never persisted — so a separate
-        # `apply` process used to reject a model it had just offered:
+        # `publish` process used to reject a model it had just offered:
         #   claude: model 'system.ai.claude-opus-4-1' is not available on this workspace.
-        # `apply` re-fetches the full listing rather than trusting what `setup` left in state.
+        # `publish` re-fetches the full listing rather than trusting what `setup` left in state.
         managed_config_mod.save_managed_state(
             WORKSPACE,
             {
@@ -2599,6 +2687,100 @@ class TestApplyCommand:
         with pytest.raises(RuntimeError, match="resource name"):
             self._run(get_managed_config=lambda *a, **k: ({"enabled_agents": {}}, None))
 
+    def test_file_input_creates_and_sends_spec_version_without_workspace(self, tmp_path):
+        path = self._config_file(tmp_path, self.MANIFEST)
+        created = {}
+
+        def fake_create(workspace, token, payload):
+            created.update(workspace=workspace, payload=payload)
+            return {"name": "coding-agent-configs/new"}, None
+
+        assert self._run(file_path=path, create_coding_agent_config=fake_create) == 0
+        assert created["workspace"] == WORKSPACE
+        assert created["payload"]["spec_version"] == 1
+        assert "workspace" not in created["payload"]
+        assert "name" not in created["payload"]
+        assert created["payload"]["default_agent"] == "CODING_AGENT_CLAUDE_CODE"
+
+    def test_file_input_updates_in_place_and_sends_spec_version(self, tmp_path):
+        path = self._config_file(tmp_path, self.MANIFEST)
+        existing = {"name": "coding-agent-configs/abc", "enabled_agents": {"codex": {}}}
+        updated = {}
+
+        def fake_update(workspace, token, name, payload):
+            updated.update(name=name, payload=payload)
+            return {"name": name}, None
+
+        assert (
+            self._run(
+                file_path=path,
+                get_managed_config=lambda *a, **k: (existing, None),
+                update_coding_agent_config=fake_update,
+            )
+            == 0
+        )
+        assert updated["name"] == "coding-agent-configs/abc"
+        assert updated["payload"]["spec_version"] == 1
+        assert "workspace" not in updated["payload"]
+
+    def test_file_workspace_mismatch_aborts_before_auth_or_mutation(self, tmp_path):
+        path = self._config_file(tmp_path, self.MANIFEST, workspace="https://other.example.com")
+        called = {"auth": False, "create": False}
+
+        def fake_auth(*a, **k):
+            called["auth"] = True
+
+        def fake_create(*a, **k):
+            called["create"] = True
+            return {}, None
+
+        with pytest.raises(RuntimeError, match="configured workspace"):
+            self._run(
+                file_path=path,
+                ensure_databricks_auth=fake_auth,
+                create_coding_agent_config=fake_create,
+            )
+        assert called == {"auth": False, "create": False}
+
+    def test_file_bad_spec_version_aborts_before_auth(self, tmp_path):
+        path = self._config_file(tmp_path, self.MANIFEST, spec_version=2)
+        called = {"auth": False}
+
+        def fake_auth(*a, **k):
+            called["auth"] = True
+
+        with pytest.raises(RuntimeError, match="spec_version"):
+            self._run(file_path=path, ensure_databricks_auth=fake_auth)
+        assert called["auth"] is False
+
+    def test_missing_file_is_actionable(self, tmp_path):
+        with pytest.raises(RuntimeError, match="No config file"):
+            self._run(file_path=str(tmp_path / "absent.json"))
+
+    def test_no_file_publishes_a_hand_entered_custom_model(self):
+        managed_config_mod.save_managed_state(
+            WORKSPACE,
+            {
+                "default_agent": "codex",
+                "enabled_agents": {
+                    "codex": {
+                        "model_config": {
+                            "default_model": "main.custom.model",
+                            "custom_models": ["main.custom.model"],
+                        }
+                    }
+                },
+            },
+        )
+        created = {"called": False}
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {"name": "coding-agent-configs/new"}, None
+
+        assert self._run(create_coding_agent_config=fake_create) == 0
+        assert created["called"] is True
+
 
 class TestPublishFailureMessages:
     """The server's error codes, turned into something an admin can act on."""
@@ -2651,30 +2833,47 @@ class TestCliWiring:
         assert result.exit_code == 0
         assert "show" in result.output
 
-    def test_apply_is_registered(self):
+    def test_publish_is_registered(self):
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        assert "apply" in result.output
+        assert "publish" in result.output
 
-    def test_apply_declares_yes_and_no_dry_run(self):
-        # `--dry-run` was removed: apply always validates before publishing, so a separate
+    def test_publish_declares_yes_and_no_dry_run(self):
+        # `--dry-run` was removed: publish always validates before publishing, so a separate
         # validate-only mode is redundant. Asserted on declared options rather than rendered help,
         # which Rich ellipsizes at narrow widths (see test_setup_help_lists_from_file).
-        command = typer.main.get_command(app).commands["apply"]  # type: ignore[attr-defined]
+        command = typer.main.get_command(app).commands["publish"]  # type: ignore[attr-defined]
         declared = {opt for param in command.params for opt in param.opts}
         assert "--yes" in declared
         assert "--dry-run" not in declared
 
-    def test_apply_error_exits_nonzero_with_a_message(self):
-        with patch.object(cli_mod, "apply_command", side_effect=RuntimeError("no config authored")):
-            result = runner.invoke(app, ["apply"])
+    def test_publish_declares_file_option(self):
+        command = typer.main.get_command(app).commands["publish"]  # type: ignore[attr-defined]
+        declared = {opt for param in command.params for opt in param.opts}
+        assert "--file" in declared
+        assert "-f" in declared
+
+    def test_publish_file_flag_is_forwarded(self):
+        for flag in ("-f", "--file"):
+            with (
+                patch("ucode.cli.install_databricks_cli"),
+                patch.object(cli_mod, "publish_command", return_value=0) as publish,
+            ):
+                runner.invoke(app, ["publish", flag, "/tmp/cfg.json"])
+            assert publish.call_args.kwargs["file_path"] == "/tmp/cfg.json"
+
+    def test_publish_error_exits_nonzero_with_a_message(self):
+        with patch.object(
+            cli_mod, "publish_command", side_effect=RuntimeError("no config authored")
+        ):
+            result = runner.invoke(app, ["publish"])
         assert result.exit_code == 1
 
-    def test_successful_apply_exits_zero(self):
+    def test_successful_publish_exits_zero(self):
         # Same trap as `setup`: `typer.Exit` subclasses RuntimeError, so raising it inside the
         # command's try block would report success as "ERROR 0".
-        with patch.object(cli_mod, "apply_command", return_value=0):
-            result = runner.invoke(app, ["apply"])
+        with patch.object(cli_mod, "publish_command", return_value=0):
+            result = runner.invoke(app, ["publish"])
         assert result.exit_code == 0
         assert "ERROR" not in result.output
 

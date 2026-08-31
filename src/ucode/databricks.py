@@ -52,6 +52,7 @@ WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
 AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
+ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
@@ -62,6 +63,11 @@ TOKEN_REFRESH_INTERVAL_SECONDS = 1800
 # raced — so we retry rather than treat them as an expired session.
 _TOKEN_CACHE_LOCK_MARKERS = ("cache update", "exit status 45")
 _TOKEN_FETCH_MAX_ATTEMPTS = 4
+_HTTP_GET_RETRYABLE_STATUS_CODES = frozenset({429})
+_HTTP_GET_RETRY_BASE_SECONDS = 1.0
+_HTTP_GET_RETRY_MAX_SECONDS = 5.0
+_HTTP_GET_RETRY_AFTER_JITTER_SECONDS = 0.25
+_ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES = 2
 
 
 def _debug_enabled() -> bool:
@@ -213,52 +219,100 @@ def _log_auth_diagnostics() -> None:
         _debug(f"databrickscfg ({cfg_path})", f"read error: {exc}")
 
 
+def _http_get_retry_delay(retry_after: str | None, retry_index: int) -> float:
+    if retry_after is not None:
+        try:
+            retry_after_seconds = float(retry_after)
+        except ValueError:
+            pass
+        else:
+            if retry_after_seconds >= 0:
+                return min(retry_after_seconds, _HTTP_GET_RETRY_MAX_SECONDS) + random.uniform(
+                    0, _HTTP_GET_RETRY_AFTER_JITTER_SECONDS
+                )
+
+    backoff = min(
+        _HTTP_GET_RETRY_BASE_SECONDS * (2 ** min(retry_index, 10)),
+        _HTTP_GET_RETRY_MAX_SECONDS,
+    )
+    return backoff + random.uniform(0, min(backoff * 0.25, 0.5))
+
+
 def _http_get_json(
-    url: str, token: str, *, timeout: int = 10
+    url: str,
+    token: str,
+    *,
+    timeout: int = 10,
+    max_retries: int = 0,
 ) -> tuple[dict | list | None, str | None]:
     """GET a JSON endpoint. Returns (payload, None) on success, (None, reason) on failure.
 
+    ``max_retries`` opts individual callers into bounded retries for rate limits
+    and network failures. Other callers retain the original single-attempt
+    behavior.
+
     Honors UCODE_DEBUG=1 to append status + truncated body to ~/.ucode/debug.log.
     """
+    if max_retries < 0:
+        raise ValueError("max_retries must be non-negative")
+
     request = urllib_request.Request(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
-    try:
-        with urllib_request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-        _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
-        if _debug_enabled():
-            _debug("body", body[:4000])
+    for attempt in range(max_retries + 1):
         try:
-            return json.loads(body), None
-        except json.JSONDecodeError as exc:
-            return None, f"response was not valid JSON ({exc.msg})"
-    except urllib_error.HTTPError as exc:
-        body = ""
-        try:
-            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        except Exception:
+            with urllib_request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+            _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
+            if _debug_enabled():
+                _debug("body", body[:4000])
+            try:
+                return json.loads(body), None
+            except json.JSONDecodeError as exc:
+                return None, f"response was not valid JSON ({exc.msg})"
+        except urllib_error.HTTPError as exc:
             body = ""
-        _debug(f"GET {url}", f"HTTP {exc.code} {exc.reason}")
-        if _debug_enabled() and body:
-            _debug("body", body[:4000])
-        reason = f"HTTP {exc.code} {exc.reason}"
-        # Surface the response body too — gateway auth failures return 400
-        # with body `Invalid Token`, which is invisible without this.
-        body_excerpt = body.strip()[:200]
-        if body_excerpt:
-            reason = f"{reason}: {body_excerpt}"
-        return None, reason
-    except urllib_error.URLError as exc:
-        _debug(f"GET {url}", f"URLError: {exc.reason}")
-        return None, f"network error: {exc.reason}"
-    except OSError as exc:
-        # A socket read timeout raises a bare TimeoutError (an OSError), not a
-        # URLError, so it must be caught explicitly or it escapes the whole
-        # discovery flow. Surface it as a reason like every other failure.
-        _debug(f"GET {url}", f"OSError: {exc}")
-        return None, f"network error: {exc}"
+            try:
+                body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+            except Exception:
+                body = ""
+            _debug(f"GET {url}", f"HTTP {exc.code} {exc.reason}")
+            if _debug_enabled() and body:
+                _debug("body", body[:4000])
+            reason = f"HTTP {exc.code} {exc.reason}"
+            # Surface the response body too — gateway auth failures return 400
+            # with body `Invalid Token`, which is invisible without this.
+            body_excerpt = body.strip()[:200]
+            if body_excerpt:
+                reason = f"{reason}: {body_excerpt}"
+            if exc.code not in _HTTP_GET_RETRYABLE_STATUS_CODES or attempt == max_retries:
+                return None, reason
+            retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+        except urllib_error.URLError as exc:
+            _debug(f"GET {url}", f"URLError: {exc.reason}")
+            reason = f"network error: {exc.reason}"
+            if attempt == max_retries:
+                return None, reason
+            retry_after = None
+        except OSError as exc:
+            # A socket read timeout raises a bare TimeoutError (an OSError), not a
+            # URLError, so it must be caught explicitly or it escapes the whole
+            # discovery flow. Surface it as a reason like every other failure.
+            _debug(f"GET {url}", f"OSError: {exc}")
+            reason = f"network error: {exc}"
+            if attempt == max_retries:
+                return None, reason
+            retry_after = None
+
+        delay = _http_get_retry_delay(retry_after, attempt)
+        _debug(
+            f"GET {url}",
+            f"attempt {attempt + 1} failed: {reason}; retrying in {delay:.2f}s",
+        )
+        time.sleep(delay)
+
+    raise AssertionError("unreachable")
 
 
 def _http_send_json(
@@ -377,7 +431,7 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
         return None, f"network error: {exc.reason}"
 
 
-# Workspace group whose members are workspace admins. `ucode setup` / `ucode apply` are restricted
+# Workspace group whose members are workspace admins. `ucode setup` / `ucode publish` are restricted
 # to this group because the coding-agent-config CRUD API enforces the same check server-side.
 WORKSPACE_ADMIN_GROUP = "admins"
 
@@ -1847,6 +1901,7 @@ def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict],
 # currently populated, is what lets a re-run *clear* a field the admin removed: the server merges
 # per path, so an omitted path leaves the old value in place.
 MANAGED_CONFIG_UPDATE_MASK_PATHS: tuple[str, ...] = (
+    "spec_version",
     "display_name",
     "default_agent",
     "enabled_agents",
@@ -2345,6 +2400,46 @@ def map_claude_family_models(targets: list[str]) -> dict[str, str]:
     return result
 
 
+# Claude Code starts every session on its opus tier, which the gateway 403s when a Model Provider
+# Service declares no opus target. When opus is missing, fall back to the most capable tier the
+# service does offer. opus > sonnet > haiku.
+_CLAUDE_LAUNCH_TIER_PREFERENCE = ("opus", "sonnet", "haiku")
+
+
+def resolve_provider_launch_model(model: str | None, provider_models: dict[str, str]) -> str | None:
+    """Pick the model a provider-routed Claude session starts on, or None to keep Claude Code's default.
+
+    ``provider_models`` maps the Claude families a service declares to their target ids (see
+    ``map_claude_family_models``). With an explicit ``model`` (``ucode claude --model``) the user's
+    choice wins: a family alias resolves to that tier's declared target (erroring when the service
+    doesn't offer it), any other value is trusted as a raw target id the service allows. Without one,
+    return None when the service offers opus — Claude Code's own default already works, so we avoid
+    setting ANTHROPIC_MODEL and the duplicate ``/model`` picker row it produces — else the most
+    capable tier the service does offer, so the launch doesn't dead-end on an unservable opus.
+    """
+    if model:
+        if model in ANTHROPIC_FAMILIES:
+            target = provider_models.get(model)
+            if not target:
+                available = ", ".join(sorted(provider_models)) or "none"
+                raise RuntimeError(
+                    f"This Model Provider Service does not offer a '{model}' model "
+                    f"(available families: {available})."
+                )
+            return target
+        return model
+    if provider_models.get("opus"):
+        return None
+    return next(
+        (
+            provider_models[fam]
+            for fam in _CLAUDE_LAUNCH_TIER_PREFERENCE
+            if provider_models.get(fam)
+        ),
+        None,
+    )
+
+
 # `list_vector_search_catalog_schemas` walks Vector Search endpoints+indexes.
 # `list_uc_functions_catalog_schemas` walks UC catalogs+schemas in parallel and
 # keeps only schemas with at least one user function.
@@ -2729,6 +2824,41 @@ def list_all_mcp_services(
     return sorted(names), None
 
 
+def _get_anthropic_models_json(workspace: str, token: str) -> tuple[dict | list | None, str | None]:
+    hostname = workspace_hostname(workspace)
+    return _http_get_json(
+        f"https://{hostname}{ANTHROPIC_MODELS_PATH}",
+        token,
+        max_retries=_ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES,
+    )
+
+
+def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """List every model id advertised by AI Gateway's Anthropic endpoint.
+
+    Claude Code's native gateway discovery consumes this same catalog, so callers
+    using that mode must not apply ucode's legacy ``databricks-claude-*`` family
+    validation.
+    """
+    payload, reason = _get_anthropic_models_json(workspace, token)
+    if payload is None:
+        return [], reason
+
+    data = cast(dict, payload) if isinstance(payload, dict) else {}
+    model_ids: list[str] = []
+    seen: set[str] = set()
+    for model in data.get("data", []):
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if isinstance(model_id, str) and model_id and model_id not in seen:
+            seen.add(model_id)
+            model_ids.append(model_id)
+    if model_ids:
+        return model_ids, None
+    return [], "AI Gateway returned no Anthropic model ids"
+
+
 def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], str | None]:
     """Discover Claude families on this workspace's AI Gateway.
 
@@ -2736,8 +2866,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     describes why the dict is empty (HTTP error, network error, or no models
     matching the expected naming convention).
     """
-    hostname = workspace_hostname(workspace)
-    payload, reason = _http_get_json(f"https://{hostname}/ai-gateway/anthropic/v1/models", token)
+    payload, reason = _get_anthropic_models_json(workspace, token)
     if payload is None:
         return {}, reason
 

@@ -2,12 +2,12 @@
 
 Reads the local managed config (the one file :mod:`ucode.managed_config` owns, authored by
 ``ucode setup`` and refreshed by a launch), validates and serializes it through the same path
-``ucode apply`` uses, and writes the external proto-JSON ``CodingAgentConfig`` — prefixed with the
-source ``workspace`` and a ``spec_version`` envelope, the format a future ``ucode publish -f <path>``
-will consume — to stdout or a file.
+``ucode publish`` uses, and writes the external proto-JSON ``CodingAgentConfig`` — prefixed with the
+source ``workspace`` and a ``spec_version`` envelope, the format ``ucode publish -f <path>`` consumes
+— to stdout or a file.
 
 Deliberately read-only and offline: no auth, no admin check, no discovery, no publish, and no write
-except the explicitly requested ``--output`` file. That makes it role-agnostic (any developer can
+except the explicitly requested ``--file`` output. That makes it role-agnostic (any developer can
 run it) and keeps the machine-readable stream on stdout uncontaminated by Rich output.
 """
 
@@ -53,20 +53,20 @@ def build_export_payload() -> dict:
     return {"workspace": workspace, "spec_version": EXPORT_SPEC_VERSION, **config}
 
 
-def export_command(output: str | None = None) -> None:
-    """Serialize the managed config once and write it to ``output`` or stdout.
+def export_command(file_path: str | None = None) -> None:
+    """Serialize the managed config once and write it to ``file_path`` or stdout.
 
     The complete payload is built and serialized before the destination is touched, so a validation
-    or serialization failure never creates or truncates it. With no ``output`` the JSON goes to
-    stdout with exactly one trailing newline and nothing else; with ``output`` the identical bytes
+    or serialization failure never creates or truncates it. With no ``file_path`` the JSON goes to
+    stdout with exactly one trailing newline and nothing else; with ``file_path`` the identical bytes
     are written atomically and stdout stays empty. Raises RuntimeError on failure.
     """
     payload = build_export_payload()
     json_text = json.dumps(payload, indent=2) + "\n"
-    if output is None:
+    if file_path is None:
         sys.stdout.write(json_text)
         return
-    _write_atomic(Path(output).expanduser(), json_text)
+    _write_atomic(Path(file_path).expanduser(), json_text)
 
 
 def _write_atomic(destination: Path, json_text: str) -> None:
