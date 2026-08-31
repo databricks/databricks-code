@@ -572,14 +572,9 @@ class TestCodexDefaultModel:
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", tmp_path / "ucode.config.toml")
 
     def test_prefers_profile_config_model(self, tmp_path):
-        codex.CODEX_CONFIG_PATH.write_text(
-            'model = "gpt-5.6-sol"\n', encoding="utf-8"
-        )
+        codex.CODEX_CONFIG_PATH.write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
 
-        assert (
-            codex.default_model({"codex_models": ["system.ai.gpt-5-6-luna"]})
-            == "gpt-5.6-sol"
-        )
+        assert codex.default_model({"codex_models": ["system.ai.gpt-5-6-luna"]}) == "gpt-5.6-sol"
 
     def test_none_when_no_configured_model(self):
         assert codex.default_model({}) is None
@@ -590,6 +585,7 @@ class TestCodexDefaultModel:
             "codex_models": ["databricks-gpt-5-5"],
         }
         assert codex.default_model(state) == "admin-chosen-default"
+
 
 class TestCodexValidateCmd:
     def test_starts_with_binary(self):

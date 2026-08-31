@@ -72,6 +72,7 @@ LEGACY_MANAGED_KEYS: list[list[str]] = [
     ["model_providers", CODEX_MODEL_PROVIDER_NAME, "http_headers"],
 ]
 
+
 def is_update_available() -> tuple[str, str] | None:
     return available_npm_package_update(SPEC["package"])
 
@@ -354,7 +355,9 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     # `ucode auth-token`, so the file keeps working. The write goes through the sudo path in
     # `managed_files`.
     if state.get("write_managed_config"):
-        _write_managed_config(workspace, None, databricks_profile, bool(state.get("use_pat")), provider)
+        _write_managed_config(
+            workspace, None, databricks_profile, bool(state.get("use_pat")), provider
+        )
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
     return state
