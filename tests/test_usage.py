@@ -533,9 +533,7 @@ class TestRenderUsageSummary:
             self._make_record(0, "claude", 1000),
             self._make_record(0, "codex", 1000),
         ]
-        result = render_usage_summary(
-            records, "user", {"claude": "Claude Code", "codex": "Codex"}
-        )
+        result = render_usage_summary(records, "user", {"claude": "Claude Code", "codex": "Codex"})
         assert "🤖  [bold]Top Harnesses:[/bold] [cyan]Claude Code · Codex[/cyan]" in result
 
     def test_top_models_listed(self):
