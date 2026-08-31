@@ -2050,6 +2050,7 @@ def _launch_tool(
                 routing_agent is not None
                 and routing_agent.smart_routing_enabled(state)
                 and not first_prompt_routes_claude
+                and not forwarded_model
             ):
                 display = TOOL_SPECS[tool]["display"]
                 with spinner(f"Selecting a {display} model with smart routing..."):

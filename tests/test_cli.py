@@ -340,6 +340,37 @@ class TestSubcommandRouting:
         assert "Selected Model : databricks-gpt-5-5" in output
         assert "Reason : Cross-cutting refactor." in output
 
+    @pytest.mark.parametrize("tool", ["claude", "codex"])
+    def test_forwarded_model_skips_legacy_smart_routing(self, tool):
+        model = f"system.ai.{tool}-override"
+        state = {
+            **MINIMAL_STATE,
+            "smart_routing_enabled": True,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+            "codex_models": ["system.ai.gpt-5-6-luna"],
+        }
+        routing_module = "claude_routing" if tool == "claude" else "codex_routing"
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.resolve_launch_model", return_value=(state, "configured-model")),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch(f"ucode.cli.{routing_module}.route_launch_model") as mock_route,
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(
+                app,
+                [tool, "--workspace", "https://example.databricks.com", "--", "--model", model],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert f"Model: {model}" in _strip_ansi(result.output)
+        mock_route.assert_not_called()
+
     def test_claude_v2_skips_legacy_prelaunch_routing(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
         state = {
