@@ -660,7 +660,7 @@ def render_usage_summary(
             key=lambda u: (-u.total, u.name.lower()),
         )[:3]
         models_text = ", ".join(usage.name for usage in top_models)
-        lines.append(f"{label('Top models this week:')} {value(models_text)}")
+        lines.append(f"{label('Top models last 7 days:')} {value(models_text)}")
         weekly_cost = sum(
             (
                 model_usage_cost(usage, price_lookup) or Decimal(0)

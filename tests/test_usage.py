@@ -589,7 +589,7 @@ class TestRenderUsageSummary:
         )
         # Top-models line is full names only, ranked by per-model token totals
         # (claude-opus-4 236.1K > gpt-5 13.3K > claude-haiku-4.5 920).
-        assert "Top models this week:" in result
+        assert "Top models last 7 days:" in result
         assert "claude-opus-4, gpt-5, claude-haiku-4.5" in result
         # No token counts in this line — those live in the per-model table.
         assert "236.1K" not in result
