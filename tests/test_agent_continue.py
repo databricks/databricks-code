@@ -48,44 +48,47 @@ class TestDefaultModel:
         assert continue_dev.default_model(state) == "pinned"
 
 
-class TestRenderConfig:
-    def test_top_level_schema_fields(self):
-        doc = continue_dev.render_config("claude-sonnet-4-6", "tok", WS)
-        assert doc["name"] == "ucode"
-        assert doc["version"] == "0.0.1"
-        assert doc["schema"] == "v1"
-
-    def test_single_model_entry(self):
-        doc = continue_dev.render_config("claude-sonnet-4-6", "tok", WS)
-        assert len(doc["models"]) == 1
-
+class TestUcodeModelEntry:
+    # `_ucode_model_entry` is the primitive the production write path uses, so
+    # asserting on it directly (rather than a test-only builder) can't drift.
     def test_provider_is_openai(self):
-        entry = continue_dev.render_config("m", "tok", WS)["models"][0]
-        assert entry["provider"] == "openai"
+        assert continue_dev._ucode_model_entry("m", "tok", WS)["provider"] == "openai"
 
     def test_api_base_is_mlflow_gateway(self):
-        entry = continue_dev.render_config("m", "tok", WS)["models"][0]
+        entry = continue_dev._ucode_model_entry("m", "tok", WS)
         assert entry["apiBase"] == f"{WS}/ai-gateway/mlflow/v1"
 
     def test_model_id_verbatim(self):
-        entry = continue_dev.render_config("databricks-gpt-5", "tok", WS)["models"][0]
-        assert entry["model"] == "databricks-gpt-5"
+        assert continue_dev._ucode_model_entry("databricks-gpt-5", "tok", WS)["model"] == (
+            "databricks-gpt-5"
+        )
 
     def test_api_key_is_token(self):
-        entry = continue_dev.render_config("m", "tok123", WS)["models"][0]
-        assert entry["apiKey"] == "tok123"
+        assert continue_dev._ucode_model_entry("m", "tok123", WS)["apiKey"] == "tok123"
 
     def test_roles_are_chat_edit_apply(self):
-        entry = continue_dev.render_config("m", "tok", WS)["models"][0]
-        assert entry["roles"] == ["chat", "edit", "apply"]
+        assert continue_dev._ucode_model_entry("m", "tok", WS)["roles"] == ["chat", "edit", "apply"]
 
     def test_name_carries_ucode_prefix(self):
-        entry = continue_dev.render_config("m", "tok", WS)["models"][0]
+        entry = continue_dev._ucode_model_entry("m", "tok", WS)
         assert entry["name"].startswith(continue_dev.UCODE_MODEL_NAME_PREFIX)
 
     def test_user_agent_header_present(self):
-        entry = continue_dev.render_config("m", "tok", WS)["models"][0]
+        entry = continue_dev._ucode_model_entry("m", "tok", WS)
         assert "User-Agent" in entry["requestOptions"]["headers"]
+
+
+class TestSchemaHeader:
+    def test_sets_required_keys_on_empty(self):
+        doc: dict = {}
+        continue_dev._ensure_schema_header(doc)
+        assert doc == {"name": "ucode", "version": "0.0.1", "schema": "v1"}
+
+    def test_keeps_user_values(self):
+        doc = {"name": "mine", "version": "9.9", "schema": "v1"}
+        continue_dev._ensure_schema_header(doc)
+        assert doc["name"] == "mine"
+        assert doc["version"] == "9.9"
 
 
 class TestWriteToolConfig:
@@ -233,6 +236,60 @@ class TestMcpServerConfig:
     def test_remove_absent_returns_false(self, tmp_path, monkeypatch):
         self._patch_paths(tmp_path, monkeypatch)
         assert continue_dev.remove_mcp_server_config("nope") is False
+
+
+class TestRevertConfig:
+    def _patch_paths(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.yaml"
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(continue_dev, "CONTINUE_CONFIG_PATH", config_file)
+        monkeypatch.setattr(continue_dev, "CONTINUE_BACKUP_PATH", tmp_path / "continue-backup.yaml")
+        return config_file
+
+    def test_strips_only_ucode_models_keeping_user_content(self, tmp_path, monkeypatch):
+        config_file = self._patch_paths(tmp_path, monkeypatch)
+        config_file.write_text(
+            yaml.safe_dump(
+                {
+                    "name": "mine",
+                    "schema": "v1",
+                    "models": [
+                        {"name": "My Local Model", "provider": "ollama", "model": "llama"},
+                        {"name": f"{continue_dev.UCODE_MODEL_NAME_PREFIX} m", "model": "m"},
+                    ],
+                    "mcpServers": [{"name": "mine-mcp", "command": "x"}],
+                }
+            )
+        )
+        assert continue_dev.revert_config() is True
+        doc = yaml.safe_load(config_file.read_text())
+        # ucode's model is gone; the user's model, servers, and name survive.
+        assert [m["name"] for m in doc["models"]] == ["My Local Model"]
+        assert [s["name"] for s in doc["mcpServers"]] == ["mine-mcp"]
+        assert doc["name"] == "mine"
+
+    def test_drops_models_key_when_only_ucode(self, tmp_path, monkeypatch):
+        config_file = self._patch_paths(tmp_path, monkeypatch)
+        config_file.write_text(
+            yaml.safe_dump(
+                {
+                    "name": "ucode",
+                    "schema": "v1",
+                    "models": [{"name": f"{continue_dev.UCODE_MODEL_NAME_PREFIX} m", "model": "m"}],
+                }
+            )
+        )
+        assert continue_dev.revert_config() is True
+        assert "models" not in yaml.safe_load(config_file.read_text())
+
+    def test_returns_false_when_no_ucode_models(self, tmp_path, monkeypatch):
+        config_file = self._patch_paths(tmp_path, monkeypatch)
+        config_file.write_text(yaml.safe_dump({"schema": "v1", "models": [{"name": "Mine"}]}))
+        assert continue_dev.revert_config() is False
+
+    def test_returns_false_when_no_config(self, tmp_path, monkeypatch):
+        self._patch_paths(tmp_path, monkeypatch)
+        assert continue_dev.revert_config() is False
 
 
 class TestValidateCmd:

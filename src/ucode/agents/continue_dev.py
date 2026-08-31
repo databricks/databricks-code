@@ -22,6 +22,7 @@ import signal
 import subprocess
 import threading
 from pathlib import Path
+from typing import cast
 
 from ucode.config_io import (
     APP_DIR,
@@ -103,14 +104,12 @@ def _ensure_schema_header(doc: dict) -> None:
     doc.setdefault("schema", "v1")
 
 
-def render_config(model: str, token: str, workspace: str) -> dict:
-    """Return a complete Continue config document pinning the ucode model."""
-    return {
-        "name": "ucode",
-        "version": "0.0.1",
-        "schema": "v1",
-        "models": [_ucode_model_entry(model, token, workspace)],
-    }
+def _is_ucode_model(entry: object) -> bool:
+    """True for a ucode-managed `models:` entry (identified by its name prefix)."""
+    if not isinstance(entry, dict):
+        return False
+    name = cast("dict[str, object]", entry).get("name", "")
+    return isinstance(name, str) and name.startswith(UCODE_MODEL_NAME_PREFIX)
 
 
 def write_tool_config(
@@ -132,11 +131,7 @@ def write_tool_config(
         models = []
     # Drop any prior ucode entry so a rewrite replaces (not duplicates) it, while
     # leaving the user's own models untouched.
-    models = [
-        m
-        for m in models
-        if not (isinstance(m, dict) and str(m.get("name", "")).startswith(UCODE_MODEL_NAME_PREFIX))
-    ]
+    models = [m for m in models if not _is_ucode_model(m)]
     models.append(_ucode_model_entry(model, token, state["workspace"]))
     existing["models"] = models
     write_yaml_file(CONTINUE_CONFIG_PATH, existing)
@@ -184,6 +179,33 @@ def remove_mcp_server_config(name: str) -> bool:
     if len(filtered) == len(servers):
         return False
     existing["mcpServers"] = filtered
+    write_yaml_file(CONTINUE_CONFIG_PATH, existing)
+    return True
+
+
+def revert_config() -> bool:
+    """Surgically remove ucode's model entries from the shared ``config.yaml``.
+
+    Continue's config is the user's real IDE config — unlike the other agents'
+    ucode-owned/isolated files — so a whole-file restore would clobber models the
+    user added since ucode first ran. Strip only ucode's own entries instead
+    (mirroring Codex's ``revert_legacy_shared_config``); the MCP servers ucode
+    registered are removed separately by ``mcp.revert_mcp_configs``. Returns True
+    if anything was removed.
+    """
+    if not CONTINUE_CONFIG_PATH.exists():
+        return False
+    existing = read_yaml_safe(CONTINUE_CONFIG_PATH)
+    models = existing.get("models")
+    if not isinstance(models, list):
+        return False
+    kept = [m for m in models if not _is_ucode_model(m)]
+    if len(kept) == len(models):
+        return False
+    if kept:
+        existing["models"] = kept
+    else:
+        existing.pop("models", None)
     write_yaml_file(CONTINUE_CONFIG_PATH, existing)
     return True
 

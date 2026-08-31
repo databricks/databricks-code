@@ -16,6 +16,7 @@ from ucode.agents import (
     configure_selected_tools,
     configure_single_tool,
     configure_tool,
+    continue_dev,
     ensure_bootstrap_dependencies,
     ensure_provider_state,
     explicit_model_arg_value,
@@ -1118,7 +1119,13 @@ def revert() -> int:
             spec["config_path"], spec["backup_path"], bool(managed_configs.get(tool))
         )
         for tool, spec in TOOL_SPECS.items()
+        if tool != "continue"
     }
+    # Continue writes the user's shared ~/.continue/config.yaml (read by the IDE
+    # extensions), so a whole-file restore would clobber models the user added
+    # since ucode first ran — strip only ucode's own entries instead. Its MCP
+    # servers are removed above by revert_mcp_configs.
+    results["continue"] = continue_dev.revert_config()
     pi_settings_restored = restore_file(
         PI_SETTINGS_PATH, PI_SETTINGS_BACKUP_PATH, bool(managed_configs.get("pi"))
     )
@@ -2527,6 +2534,19 @@ def pi_cmd(
     """Launch Pi coding agent via Databricks."""
     _disable_managed_config_if_requested(skip_managed_config)
     _launch_tool("pi", ctx, skip_preflight=skip_preflight)
+
+
+@app.command(
+    "continue", context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
+)
+def continue_cmd(
+    ctx: typer.Context,
+    skip_preflight: SkipPreflightOption = False,
+    skip_managed_config: SkipManagedConfigOption = False,
+) -> None:
+    """Launch Continue via Databricks."""
+    _disable_managed_config_if_requested(skip_managed_config)
+    _launch_tool("continue", ctx, skip_preflight=skip_preflight)
 
 
 @app.command("cursor", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})

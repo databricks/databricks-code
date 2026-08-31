@@ -3335,19 +3335,22 @@ def build_pi_base_urls(workspace: str) -> dict[str, str]:
     }
 
 
-def build_copilot_base_url(workspace: str) -> str:
-    # Copilot CLI's `openai` provider appends `/chat/completions` to the
-    # configured base URL. The Databricks MLflow chat-completions gateway is
-    # OpenAI-compatible and serves Claude, codex (gpt-5), and gemini models
-    # behind one URL.
+def _mlflow_chat_completions_base_url(workspace: str) -> str:
+    # The Databricks MLflow chat-completions gateway: OpenAI-compatible, serving
+    # Claude, codex (gpt-5), and gemini models behind one URL. Shared by the tools
+    # whose `openai` provider appends `/chat/completions` to `apiBase` (Copilot,
+    # Continue), so the endpoint has a single definition.
     return f"{workspace}/ai-gateway/mlflow/v1"
+
+
+def build_copilot_base_url(workspace: str) -> str:
+    return _mlflow_chat_completions_base_url(workspace)
 
 
 def build_continue_base_url(workspace: str) -> str:
-    # Continue's `openai` provider appends `/chat/completions` to `apiBase`. The Databricks
-    # MLflow chat-completions gateway is OpenAI-compatible and serves Claude and codex (gpt-5)
-    # models behind one URL — the same endpoint Copilot uses.
-    return f"{workspace}/ai-gateway/mlflow/v1"
+    # Continue's `openai` provider appends `/chat/completions` to `apiBase`; it
+    # shares Copilot's MLflow chat-completions endpoint.
+    return _mlflow_chat_completions_base_url(workspace)
 
 
 def build_shared_base_urls(workspace: str) -> dict[str, str | dict[str, str]]:
