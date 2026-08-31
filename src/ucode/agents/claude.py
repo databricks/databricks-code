@@ -50,6 +50,8 @@ from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_err, print_note, print_success, print_warning
 
+from .args import has_explicit_model_arg
+
 GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
 CLAUDE_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "ucode-settings.json"
@@ -989,12 +991,8 @@ def _uses_interactive_tui(tool_args: list[str]) -> bool:
     return True
 
 
-def _has_explicit_model_arg(tool_args: list[str]) -> bool:
-    return any(arg in {"--model", "-m"} or arg.startswith("--model=") for arg in tool_args)
-
-
 def _launch_model_args(tool_args: list[str], launch_model: str | None) -> list[str]:
-    if not launch_model or _has_explicit_model_arg(tool_args):
+    if not launch_model or has_explicit_model_arg(tool_args):
         return []
     return ["--model", launch_model]
 
@@ -1217,7 +1215,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
         smart_routing_v2.enabled()
         and bool(workspace)
         and not _has_launch_model_override(state)
-        and not _has_explicit_model_arg(tool_args)
+        and not has_explicit_model_arg(tool_args)
         and not _has_provider_launch(state)
         and _uses_interactive_tui(tool_args)
     )
