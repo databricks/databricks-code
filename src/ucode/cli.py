@@ -2015,18 +2015,6 @@ def _launch_tool(
             # provider). Skip model resolution, which would otherwise fail when
             # the workspace has no matching Databricks models.
             resolved_model = None
-            # Claude Code starts on its built-in "family default" (opus), which the gateway 403s when
-            # the service declares no opus target. Pick the launch model explicitly and pin it via
-            # ANTHROPIC_MODEL (route_root_model): the user's --model when given, else the most capable
-            # tier the service actually offers. A relayed service selects the model server-side, so
-            # there's nothing to pin — and --model can't be honored, so say so rather than ignore it.
-            #
-            # KNOWN GAP (deferred): ANTHROPIC_MODEL is checked client-side, so this covers services
-            # whose targets are canonical Anthropic names (an API-key Anthropic service); a Bedrock
-            # service's region-prefixed slug can be rejected there. Only an opus-less Bedrock service
-            # hits this — an opus-having one returns None above and is unaffected — and that case was
-            # already broken (bare launch 403s on opus). The follow-up fix is to pin the servable
-            # target into the opus family slot instead (that channel is passed through unchecked).
             if tool == "claude" and relayed:
                 if model:
                     print_warning(
