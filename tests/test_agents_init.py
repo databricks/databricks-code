@@ -192,13 +192,6 @@ class TestCheckGatewayEndpoint:
 
 
 class TestDefaultModelForTool:
-    def test_codex_managed_default_model_takes_priority(self):
-        state = {
-            "codex_default_model": "admin-chosen-default",
-            "codex_models": ["databricks-gpt-5-5"],
-        }
-        assert default_model_for_tool("codex", state) == "admin-chosen-default"
-
     def test_codex_returns_none_without_a_configured_model(self):
         models = ["databricks-gpt-5", "databricks-gpt-5-5"]
         assert default_model_for_tool("codex", {"codex_models": models}) is None

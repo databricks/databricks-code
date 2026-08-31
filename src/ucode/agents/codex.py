@@ -403,6 +403,8 @@ def _write_managed_config(
 
 def default_model(state: dict) -> str | None:
     """Return a configured Codex model, or leave selection to Codex."""
+    if isinstance(state.get("codex_default_model"), str):
+        return state["codex_default_model"]
     configured_model = read_toml_safe(CODEX_CONFIG_PATH).get("model")
     if isinstance(configured_model, str) and configured_model:
         return configured_model

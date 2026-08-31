@@ -584,12 +584,12 @@ class TestCodexDefaultModel:
     def test_none_when_no_configured_model(self):
         assert codex.default_model({}) is None
 
-    def test_ignores_managed_default_model(self):
+    def test_managed_default_model_takes_priority(self):
         state = {
             "codex_default_model": "admin-chosen-default",
             "codex_models": ["databricks-gpt-5-5"],
         }
-        assert codex.default_model(state) is None
+        assert codex.default_model(state) == "admin-chosen-default"
 
 class TestCodexValidateCmd:
     def test_starts_with_binary(self):

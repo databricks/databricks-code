@@ -277,8 +277,6 @@ def ensure_bootstrap_dependencies(
 
 
 def default_model_for_tool(tool: str, state: dict) -> str | None:
-    if tool == "codex" and isinstance(state.get("codex_default_model"), str):
-        return state["codex_default_model"]
     return _MODULES[tool].default_model(state)
 
 
