@@ -534,6 +534,20 @@ class TestCodexRevertLegacySharedConfig:
 
 
 class TestCodexDefaultModel:
+    @pytest.fixture(autouse=True)
+    def _isolate_profile_config(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", tmp_path / "ucode.config.toml")
+
+    def test_prefers_profile_config_model(self, tmp_path):
+        codex.CODEX_CONFIG_PATH.write_text(
+            'model = "gpt-5.6-sol"\n', encoding="utf-8"
+        )
+
+        assert (
+            codex.default_model({"codex_models": ["system.ai.gpt-5-6-luna"]})
+            == "gpt-5.6-sol"
+        )
+
     def test_picks_highest_semver_over_alpha(self):
         state = {"codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"]}
 

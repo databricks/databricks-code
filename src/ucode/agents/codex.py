@@ -439,15 +439,19 @@ def _write_managed_config(
 def default_model(state: dict) -> str | None:
     """Pick the best available codex model.
 
-    A managed config's ``codex_default_model`` takes priority. Among versioned
-    GPT ids (e.g. ``system.ai.gpt-5``, ``system.ai.gpt-5-6-luna``) the highest
-    semantic version wins. When no versioned GPT is present but other codex-family
-    ids are available (e.g. ``system.ai.gpt-oss-120b``), the first of those is
-    used — UC model-services only places ids in the codex bucket when they expose
-    the responses API, so any id there is routable.
+    A managed config's ``codex_default_model`` takes priority, followed by the
+    user's ucode Codex profile. Among versioned GPT ids (e.g.
+    ``system.ai.gpt-5``, ``system.ai.gpt-5-6-luna``) the highest semantic version
+    wins. When no versioned GPT is present but other codex-family ids are available
+    (e.g. ``system.ai.gpt-oss-120b``), the first of those is used — UC
+    model-services only places ids in the codex bucket when they expose the
+    responses API, so any id there is routable.
     """
     if isinstance(state.get("codex_default_model"), str):
         return state.get("codex_default_model")
+    configured_model = read_toml_safe(CODEX_CONFIG_PATH).get("model")
+    if isinstance(configured_model, str) and configured_model:
+        return configured_model
     models = routing_models(state)
     parsed: list[tuple[str, tuple[int, int | None, int | None, str]]] = [
         (mid, gpt) for mid in models if (gpt := _parse_gpt(mid)) is not None
