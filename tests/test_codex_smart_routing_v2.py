@@ -78,6 +78,26 @@ class TestLaunchCodex:
             )
         ]
 
+    def test_codex_launch_normalizes_cached_bootstrap_model(self, monkeypatch):
+        calls = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        monkeypatch.setattr(codex, "default_model", lambda state: None)
+
+        def launch_v2(state, tool_args, **kwargs):
+            calls.append(kwargs)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(v2, "launch_codex", launch_v2)
+
+        with pytest.raises(SystemExit):
+            codex.launch(
+                {"workspace": WS, "codex_models": ["system.ai.gpt-5-6-luna"]},
+                [],
+            )
+
+        assert calls[0]["start_model"] == "gpt-5.6-luna"
+
     def test_owns_app_server_interposer_and_tui_lifecycle(self, monkeypatch):
         processes = []
         interposer_args = {}

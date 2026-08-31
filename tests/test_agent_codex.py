@@ -592,26 +592,6 @@ class TestCodexDefaultModel:
         }
         assert codex.default_model(state) == "admin-chosen-default"
 
-    def test_starting_model_uses_cached_codex_model(self):
-        state = {
-            "codex_models": ["system.ai.gpt-5-6-luna"],
-            "oss_models": ["system.ai.glm-5-2"],
-        }
-
-        assert codex.starting_model(state) == "gpt-5.6-luna"
-
-    def test_starting_model_prefers_managed_default(self):
-        state = {
-            "codex_default_model": "admin-chosen-default",
-            "codex_models": ["system.ai.gpt-5-6-luna"],
-        }
-
-        assert codex.starting_model(state) == "admin-chosen-default"
-
-    def test_starting_model_falls_back_to_codex_catalog_default(self):
-        assert codex.starting_model({}) == "gpt-5.6-luna"
-
-
 class TestCodexValidateCmd:
     def test_starts_with_binary(self):
         cmd = codex.validate_cmd("codex")
