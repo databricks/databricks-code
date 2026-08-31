@@ -39,6 +39,7 @@ from ucode.ui import (
 )
 
 from . import claude, codex, copilot, gemini, opencode, pi
+from .args import explicit_model_arg_value as explicit_model_arg_value
 
 _MODULES = {
     "codex": codex,
@@ -50,6 +51,7 @@ _MODULES = {
 }
 
 TOOL_SPECS: dict[str, ToolSpec] = {name: module.SPEC for name, module in _MODULES.items()}
+
 
 # Model-routing agents ucode configures end to end. Cursor is deliberately NOT
 # here: it runs models on the user's own Cursor account, so `normalize_tool`

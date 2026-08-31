@@ -14,12 +14,36 @@ from ucode.agents import (
     configure_selected_tools,
     default_model_for_tool,
     ensure_tool_binary_available,
+    explicit_model_arg_value,
     install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
     provider_permission_error,
     resolve_launch_model,
 )
+from ucode.agents.args import has_explicit_model_arg
+
+
+class TestModelArgumentParsing:
+    @pytest.mark.parametrize(
+        ("tool_args", "expected"),
+        [
+            ([], None),
+            (["--model", "model-a"], "model-a"),
+            (["-m", "model-a"], "model-a"),
+            (["--model=model-a"], "model-a"),
+            (["--model", "model-a", "--model=model-b"], "model-b"),
+            (["--model", "model-a", "--", "--model", "model-b"], "model-a"),
+            (["--", "--model", "model-a"], None),
+            (["--model", "--other"], None),
+        ],
+    )
+    def test_explicit_model_arg_value(self, tool_args, expected):
+        assert explicit_model_arg_value(tool_args) == expected
+
+    def test_has_explicit_model_arg_stops_at_harness_separator(self):
+        assert has_explicit_model_arg(["--", "--model", "model-a"]) is False
+        assert has_explicit_model_arg(["--model", "model-a", "--", "--model", "model-b"])
 
 
 class TestProviderPermissionError:

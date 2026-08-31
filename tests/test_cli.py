@@ -235,6 +235,37 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.kwargs["refresh"] is True
 
+    def test_codex_forwarded_model_is_reported_in_launch_summary(self):
+        state = {
+            **MINIMAL_STATE,
+            "codex_models": ["system.ai.gpt-5-6-luna"],
+        }
+        forwarded_args = ["--model", "system.ai.gpt-5-6-sol"]
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(state, "system.ai.gpt-5-6-luna"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(
+                app,
+                ["codex", "--workspace", "https://example.databricks.com", "--", *forwarded_args],
+            )
+
+        output = _strip_ansi(result.output)
+        assert result.exit_code == 0, result.output
+        assert "Model: system.ai.gpt-5-6-sol" in output
+        assert "Model: system.ai.gpt-5-6-luna" not in output
+        assert mock_launch.call_args.args[2] == forwarded_args
+
     def test_claude_enable_model_discovery_sets_ucode_env(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
             result = runner.invoke(app, ["claude", "--enable-model-discovery"])
@@ -308,6 +339,37 @@ class TestSubcommandRouting:
         assert "Using Unity Gateway Smart Router." in output
         assert "Selected Model : databricks-gpt-5-5" in output
         assert "Reason : Cross-cutting refactor." in output
+
+    @pytest.mark.parametrize("tool", ["claude", "codex"])
+    def test_forwarded_model_skips_legacy_smart_routing(self, tool):
+        model = f"system.ai.{tool}-override"
+        state = {
+            **MINIMAL_STATE,
+            "smart_routing_enabled": True,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+            "codex_models": ["system.ai.gpt-5-6-luna"],
+        }
+        routing_module = "claude_routing" if tool == "claude" else "codex_routing"
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.resolve_launch_model", return_value=(state, "configured-model")),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch(f"ucode.cli.{routing_module}.route_launch_model") as mock_route,
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(
+                app,
+                [tool, "--workspace", "https://example.databricks.com", "--", "--model", model],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert f"Model: {model}" in _strip_ansi(result.output)
+        mock_route.assert_not_called()
 
     def test_claude_v2_skips_legacy_prelaunch_routing(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
@@ -472,6 +534,44 @@ class TestClaudeModelFlag:
             result = runner.invoke(app, ["claude", "--refresh"])
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.kwargs["refresh"] is True
+
+    @pytest.mark.parametrize(
+        "forwarded_args",
+        [
+            ["--model", "system.ai.claude-sonnet-5"],
+            ["--model=system.ai.claude-sonnet-5"],
+            ["-m", "system.ai.claude-sonnet-5"],
+        ],
+    )
+    def test_forwarded_model_is_reported_in_launch_summary(self, forwarded_args):
+        state = {
+            **MINIMAL_STATE,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+        }
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(state, "system.ai.claude-opus-4-8"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(
+                app,
+                ["claude", "--workspace", "https://example.databricks.com", "--", *forwarded_args],
+            )
+
+        output = _strip_ansi(result.output)
+        assert result.exit_code == 0, result.output
+        assert "Model: system.ai.claude-sonnet-5" in output
+        assert "Model: system.ai.claude-opus-4-8" not in output
+        assert mock_launch.call_args.args[2] == forwarded_args
 
     def test_model_threads_to_claude_as_custom_model(self, monkeypatch):
         monkeypatch.delenv("ENABLE_SMART_ROUTING_V2", raising=False)
