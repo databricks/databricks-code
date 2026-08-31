@@ -49,6 +49,7 @@ MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
 # Shared across agents: one opt-in enables smart routing for every routing-capable
 # tool (codex, claude), so a workspace turns it on once.
 SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
+V2_BOOTSTRAP_MODEL = "gpt-5.6-luna"
 
 SPEC: ToolSpec = {
     "binary": "codex",
@@ -420,6 +421,20 @@ def default_model(state: dict) -> str | None:
     return None
 
 
+def starting_model(state: dict) -> str | None:
+    """Return the model V2 uses to bootstrap the Codex app-server."""
+    managed_model = default_model(state)
+    if managed_model:
+        return managed_model
+    for key in ("codex_models", "oss_models"):
+        models = state.get(key)
+        if isinstance(models, list):
+            for model in models:
+                if isinstance(model, str) and model:
+                    return model
+    return V2_BOOTSTRAP_MODEL
+
+
 def clear_model_preferences(state: dict) -> bool:
     """Remove ucode profile model preferences so Codex selects its default."""
     if isinstance(state.get("codex_default_model"), str):
@@ -460,7 +475,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
             state,
             tool_args,
             binary=binary,
-            start_model=default_model(state),
+            start_model=starting_model(state),
             render_overlay=render_overlay,
         )
     if workspace:

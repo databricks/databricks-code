@@ -53,6 +53,7 @@ class TestLaunchCodex:
         calls = []
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(codex, "default_model", lambda state: "gpt-start")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
 
         def launch_v2(state, tool_args, **kwargs):
             calls.append((state, tool_args, kwargs))
@@ -233,17 +234,39 @@ class TestLaunchCodex:
         assert "--model system.ai.gpt-5-6-sol" in routing_commands[0]
         assert "--model old" not in routing_commands[0]
 
-    def test_missing_cached_models_blocks_launch(self, monkeypatch):
+    def test_missing_cached_models_starts_with_bootstrap_model(self, monkeypatch):
         monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
+        monkeypatch.setattr(v2, "_free_port", lambda: 41001)
+        monkeypatch.setattr(v2, "_wait_for_app_server", lambda port, timeout: True)
+        monkeypatch.setattr(
+            v2.subprocess,
+            "Popen",
+            lambda *args, **kwargs: type(
+                "Process",
+                (),
+                {
+                    "wait": lambda self, timeout=None: 0,
+                    "terminate": lambda self: None,
+                    "kill": lambda self: None,
+                },
+            )(),
+        )
+        monkeypatch.setattr(
+            codex_interposer,
+            "start_interposer_thread",
+            lambda *args, **kwargs: (41002, lambda: None),
+        )
 
-        with pytest.raises(RuntimeError, match="ucode configure codex"):
+        with pytest.raises(SystemExit) as exc:
             v2.launch_codex(
                 {"workspace": WS},
                 [],
                 binary="codex",
-                start_model="gpt-start",
+                start_model="gpt-5.6-luna",
                 render_overlay=codex.render_overlay,
             )
+
+        assert exc.value.code == 0
 
 
 def test_interposer_startup_failure_is_propagated(monkeypatch):
