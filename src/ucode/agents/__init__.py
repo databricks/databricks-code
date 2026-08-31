@@ -39,6 +39,7 @@ from ucode.ui import (
 )
 
 from . import claude, codex, copilot, gemini, opencode, pi
+from .args import explicit_model_arg_value as explicit_model_arg_value
 
 _MODULES = {
     "codex": codex,
@@ -50,6 +51,7 @@ _MODULES = {
 }
 
 TOOL_SPECS: dict[str, ToolSpec] = {name: module.SPEC for name, module in _MODULES.items()}
+
 
 # Model-routing agents ucode configures end to end. Cursor is deliberately NOT
 # here: it runs models on the user's own Cursor account, so `normalize_tool`
@@ -286,7 +288,8 @@ def resolve_launch_model(
     explicit_model: str | None,
 ) -> tuple[dict, str | None]:
     model = explicit_model or default_model_for_tool(tool, state)
-    if not model:
+    # if model is not specified for codex, then launch with harness's default model.
+    if not model and tool != "codex":
         raise RuntimeError(
             f"No models available for {tool}. Run `ucode configure` to set up your workspace."
         )
