@@ -50,7 +50,7 @@ MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
 # Shared across agents: one opt-in enables smart routing for every routing-capable
 # tool (codex, claude), so a workspace turns it on once.
 SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
-V2_BOOTSTRAP_MODEL = "gpt-5.6-luna"
+APP_SERVER_SMART_ROUTING_STARTING_MODEL = "gpt-5.6-luna"
 
 SPEC: ToolSpec = {
     "binary": "codex",
@@ -468,7 +468,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
                     for model in models:
                         if isinstance(model, str) and model:
                             return codex_model_id(model)
-            return V2_BOOTSTRAP_MODEL
+            return APP_SERVER_SMART_ROUTING_STARTING_MODEL
 
         smart_routing_v2.launch_codex(
             state,
