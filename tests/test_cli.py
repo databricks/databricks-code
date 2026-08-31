@@ -503,12 +503,81 @@ class TestClaudeModelFlag:
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.args[1]["_claude_launch_model"] == "system.ai.glm-5-2"
 
-    def test_model_and_provider_are_mutually_exclusive(self):
-        result = runner.invoke(
-            app, ["claude", "--model", "cat.schema.m", "--provider", "cat.schema.svc"]
+    @staticmethod
+    def _provider_launch(monkeypatch, argv, provider_models, relayed=False):
+        """Invoke a provider launch with model discovery/config stubbed, returning the
+        configure_tool mock so tests can assert what was threaded to it."""
+        import ucode.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "ensure_bootstrap_dependencies", lambda *a, **k: None)
+        monkeypatch.setattr(cli_mod, "load_state", lambda: MINIMAL_STATE)
+        monkeypatch.setattr(cli_mod, "ensure_provider_state", lambda t: MINIMAL_STATE)
+        monkeypatch.setattr(cli_mod, "configure_shared_state", lambda *a, **k: MINIMAL_STATE)
+        monkeypatch.setattr(cli_mod, "_fetch_managed_config", lambda s: (None, False))
+        monkeypatch.setattr(cli_mod, "_fetch_budget_recommendation", lambda s, m: None)
+        monkeypatch.setattr(cli_mod, "launch_agent", lambda *a, **k: None)
+        monkeypatch.setattr(
+            cli_mod, "resolve_provider_models", lambda t, s, p: (provider_models, None, relayed)
+        )
+        mock_configure = MagicMock(return_value=MINIMAL_STATE)
+        monkeypatch.setattr(cli_mod, "configure_tool", mock_configure)
+        result = runner.invoke(app, argv)
+        return result, mock_configure
+
+    def test_model_and_provider_now_pin_the_launch_tier(self, monkeypatch):
+        # --model under a provider is no longer rejected: a family alias resolves to that tier's
+        # declared target and is threaded as route_root_model (ANTHROPIC_MODEL), not custom_model.
+        result, mock_configure = self._provider_launch(
+            monkeypatch,
+            ["claude", "--model", "haiku", "--provider", "cat.schema.svc"],
+            {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"},
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.kwargs["route_root_model"] == "claude-haiku-4-5"
+        assert mock_configure.call_args.kwargs["custom_model"] is None
+
+    def test_provider_without_opus_auto_picks_best_servable_tier(self, monkeypatch):
+        # No --model, and the service declares no opus target: launch on the most capable tier it
+        # does offer (sonnet) instead of dead-ending on Claude Code's opus default.
+        result, mock_configure = self._provider_launch(
+            monkeypatch,
+            ["claude", "--provider", "cat.schema.svc"],
+            {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"},
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.kwargs["route_root_model"] == "claude-sonnet-5"
+
+    def test_provider_with_opus_keeps_claude_default(self, monkeypatch):
+        # Opus is offered, so Claude Code's own default already works — pin nothing (no ANTHROPIC_MODEL
+        # and no duplicate /model picker row).
+        result, mock_configure = self._provider_launch(
+            monkeypatch,
+            ["claude", "--provider", "cat.schema.svc"],
+            {"opus": "claude-opus-4-8", "sonnet": "claude-sonnet-5"},
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.kwargs["route_root_model"] is None
+
+    def test_model_family_not_offered_by_provider_errors(self, monkeypatch):
+        result, _ = self._provider_launch(
+            monkeypatch,
+            ["claude", "--model", "opus", "--provider", "cat.schema.svc"],
+            {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"},
         )
         assert result.exit_code == 1
-        assert "Use either --model or --provider" in result.output
+        assert "does not offer a 'opus' model" in result.output
+
+    def test_model_ignored_for_relayed_provider(self, monkeypatch):
+        # A relayed (subscription) service selects the model server-side; --model can't be honored.
+        result, mock_configure = self._provider_launch(
+            monkeypatch,
+            ["claude", "--model", "haiku", "--provider", "cat.schema.svc"],
+            None,
+            relayed=True,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.kwargs["route_root_model"] is None
+        assert "--model is ignored" in _strip_ansi(result.output)
 
     def test_provider_sets_transient_claude_launch_marker(self):
         state = dict(MINIMAL_STATE)
