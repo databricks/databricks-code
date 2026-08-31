@@ -289,7 +289,9 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     workspace = state["workspace"]
     # Leave model selection to Codex. The gateway still receives the configured
     # provider and authentication settings, while Codex uses its own default.
-    chosen_model = None
+    # A managed default is the sole exception.
+    managed_model = state.get("codex_default_model")
+    chosen_model = managed_model if isinstance(managed_model, str) else None
     databricks_profile = state.get("profile")
 
     if _use_legacy_layout():
@@ -313,7 +315,11 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         deep_merge_dict(doc, overlay)
         # deep_merge can't drop keys, so clear model preferences from an earlier run.
         profiles = doc.get("profiles")
-        if isinstance(profiles, dict) and isinstance(profiles.get(CODEX_PROFILE_NAME), dict):
+        if (
+            chosen_model is None
+            and isinstance(profiles, dict)
+            and isinstance(profiles.get(CODEX_PROFILE_NAME), dict)
+        ):
             for key in ("model", "model_reasoning_effort"):
                 profiles[CODEX_PROFILE_NAME].pop(key, None)
         write_toml_file(LEGACY_CODEX_CONFIG_PATH, doc)
@@ -333,8 +339,9 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     doc = read_toml_safe(CODEX_CONFIG_PATH)
     deep_merge_dict(doc, overlay)
     # deep_merge can't drop keys, so clear model preferences from an earlier run.
-    for key in ("model", "model_reasoning_effort"):
-        doc.pop(key, None)
+    if chosen_model is None:
+        for key in ("model", "model_reasoning_effort"):
+            doc.pop(key, None)
     sync_smart_routing_hooks(
         doc,
         state,
@@ -396,16 +403,16 @@ def _write_managed_config(
 
 def default_model(state: dict) -> str | None:
     """Return a configured Codex model, or leave selection to Codex."""
-    if isinstance(state.get("codex_default_model"), str):
-        return state.get("codex_default_model")
     configured_model = read_toml_safe(CODEX_CONFIG_PATH).get("model")
     if isinstance(configured_model, str) and configured_model:
         return configured_model
     return None
 
 
-def clear_model_preferences() -> bool:
+def clear_model_preferences(state: dict) -> bool:
     """Remove ucode profile model preferences so Codex selects its default."""
+    if isinstance(state.get("codex_default_model"), str):
+        return False
     doc = read_toml_safe(CODEX_CONFIG_PATH)
     changed = False
     for key in ("model", "model_reasoning_effort"):
@@ -430,7 +437,7 @@ _PROFILE_REJECTED_MAX_SECONDS = 3.0
 
 
 def launch(state: dict, tool_args: list[str]) -> None:
-    clear_model_preferences()
+    clear_model_preferences(state)
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if os.environ.get("ENABLE_SMART_ROUTING_V2") == "1":

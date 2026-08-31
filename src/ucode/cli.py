@@ -1846,9 +1846,6 @@ def _can_launch_from_cached_config(
 
     if tool == "claude":
         return claude_agent.CLAUDE_SETTINGS_PATH.exists()
-    configured_model = state.get("agents", {}).get("codex", {}).get("model")
-    if isinstance(configured_model, str) and configured_model != codex_agent.default_model(state):
-        return False
     return codex_agent.has_ucode_config()
 
 

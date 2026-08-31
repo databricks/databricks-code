@@ -199,7 +199,7 @@ class TestCodexWriteConfig:
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
         monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
 
-        assert codex.clear_model_preferences() is True
+        assert codex.clear_model_preferences({}) is True
 
         doc = read_toml_safe(config_path)
         assert "model" not in doc
@@ -212,8 +212,17 @@ class TestCodexWriteConfig:
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
         monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
 
-        assert codex.clear_model_preferences() is False
+        assert codex.clear_model_preferences({}) is False
         assert not (tmp_path / "backup.toml").exists()
+
+    def test_preserves_profile_model_for_managed_default(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text('model = "managed-default"\n', encoding="utf-8")
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+
+        assert codex.clear_model_preferences({"codex_default_model": "managed-default"}) is False
+        assert read_toml_safe(config_path)["model"] == "managed-default"
 
     def test_removes_legacy_ucode_profile_from_shared_config(self, tmp_path, monkeypatch):
         config_dir = tmp_path / ".codex"
@@ -575,12 +584,12 @@ class TestCodexDefaultModel:
     def test_none_when_no_configured_model(self):
         assert codex.default_model({}) is None
 
-    def test_codex_default_model_wins_over_allowlist(self):
+    def test_ignores_managed_default_model(self):
         state = {
             "codex_default_model": "admin-chosen-default",
             "codex_models": ["databricks-gpt-5-5"],
         }
-        assert codex.default_model(state) == "admin-chosen-default"
+        assert codex.default_model(state) is None
 
 class TestCodexValidateCmd:
     def test_starts_with_binary(self):
@@ -629,7 +638,7 @@ class TestCodexLaunch:
         monkeypatch.setattr(codex.time, "monotonic", lambda: next(clock))
         monkeypatch.setattr(codex, "exec_or_spawn", lambda argv: fallbacks.append(argv))
         monkeypatch.setattr(codex, "get_databricks_token", lambda workspace, profile=None: "tok")
-        monkeypatch.setattr(codex, "clear_model_preferences", lambda: False)
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
         return runs, fallbacks
 
     def test_sets_oauth_token_and_runs_with_profile(self, monkeypatch):
