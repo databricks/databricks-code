@@ -1352,6 +1352,23 @@ class TestCachedConfigPredicate:
                 is True
             )
 
+    def test_rejects_codex_launch_when_default_model_changed(self):
+        import ucode.cli as cli_mod
+
+        state = {
+            **MINIMAL_STATE,
+            "agents": {"codex": {"model": "system.ai.gpt-5-6-luna"}},
+        }
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.codex_agent.default_model", return_value="gpt-5.6-sol"),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config("codex", state, **self._kwargs())
+                is False
+            )
+
     @pytest.mark.parametrize(
         "override",
         [

@@ -286,6 +286,8 @@ def resolve_launch_model(
     explicit_model: str | None,
 ) -> tuple[dict, str | None]:
     model = explicit_model or default_model_for_tool(tool, state)
+    if tool == "codex" and not model:
+        return state, None
     if not model:
         raise RuntimeError(
             f"No models available for {tool}. Run `ucode configure` to set up your workspace."
