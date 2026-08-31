@@ -29,9 +29,11 @@ class TestOpencodeSpec:
     def test_display(self):
         assert opencode.SPEC["display"] == "OpenCode"
 
-    def test_config_path_is_outside_the_user_config_dir(self):
-        assert opencode.SPEC["config_path"] == opencode.OPENCODE_CONFIG_DIR / "opencode.json"
-        assert Path.home() / ".config" not in opencode.OPENCODE_CONFIG_PATH.parents
+    def test_config_path_stays_at_the_registered_location(self):
+        # A change here orphans the MCP servers that `ucode mcp add` already wrote.
+        assert opencode.SPEC["config_path"] == (
+            Path.home() / ".ucode" / "opencode-xdg" / "opencode" / "opencode.json"
+        )
 
 
 class TestRenderOverlay:
