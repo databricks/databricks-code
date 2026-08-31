@@ -368,7 +368,7 @@ class TestInterposerSession:
         assert json.loads(output)["params"]["model"] == "claude-opus-4-8"
         assert "Task classified as bugfix." in sess.switch_message
 
-    def test_shows_routing_notice_when_selected_model_is_already_active(self):
+    def test_maps_selected_uc_gpt_model_and_shows_routing_notice(self):
         def select(_prompt):
             return (
                 codex_interposer.routing.RoutingDecision(
@@ -387,14 +387,16 @@ class TestInterposerSession:
         )
         frame = self._turn_start("system.ai.gpt-5-6-luna")
 
-        assert sess.on_tui_frame(frame) == frame
+        output = sess.on_tui_frame(frame)
+        assert json.loads(output)["params"]["model"] == "gpt-5.6-luna"
         injected = sess.on_engine_frame(self._turn_started("turn-1"))
 
         assert [message["method"] for message in injected] == [
+            codex_interposer.SETTINGS_UPDATED,
             codex_interposer.ITEM_STARTED,
             codex_interposer.ITEM_COMPLETED,
         ]
-        assert "Selected Model : system.ai.gpt-5-6-luna" in (injected[0]["params"]["item"]["text"])
+        assert "Selected Model : gpt-5.6-luna" in (injected[1]["params"]["item"]["text"])
 
     def test_routes_first_prompt_to_oss_model(self):
         def select(_prompt):
