@@ -235,6 +235,37 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.kwargs["refresh"] is True
 
+    def test_codex_forwarded_model_is_reported_in_launch_summary(self):
+        state = {
+            **MINIMAL_STATE,
+            "codex_models": ["system.ai.gpt-5-6-luna"],
+        }
+        forwarded_args = ["--model", "system.ai.gpt-5-6-sol"]
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(state, "system.ai.gpt-5-6-luna"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(
+                app,
+                ["codex", "--workspace", "https://example.databricks.com", "--", *forwarded_args],
+            )
+
+        output = _strip_ansi(result.output)
+        assert result.exit_code == 0, result.output
+        assert "Model: system.ai.gpt-5-6-sol" in output
+        assert "Model: system.ai.gpt-5-6-luna" not in output
+        assert mock_launch.call_args.args[2] == forwarded_args
+
     def test_claude_enable_model_discovery_sets_ucode_env(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
             result = runner.invoke(app, ["claude", "--enable-model-discovery"])

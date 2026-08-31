@@ -1867,11 +1867,13 @@ def _launch_tool(
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
-        # Launchers such as isaac put their harness arguments after `--`, so Claude Code's own
-        # `--model` lands in ctx.args instead of this command's `model` option. It still determines
-        # the effective launch model and should therefore win in the launch summary.
-        forwarded_claude_model = (
-            claude_agent.explicit_model_arg_value(ctx.args) if tool == "claude" else None
+        # Launchers such as isaac put their harness arguments after `--`, so the harness's own
+        # `--model` lands in ctx.args instead of a ucode option. It still determines the effective
+        # launch model and should therefore win in the launch summary.
+        forwarded_model = (
+            claude_agent.explicit_model_arg_value(ctx.args)
+            if tool in {"claude", "codex"}
+            else None
         )
         # `--model` is claude-only (no other launch command exposes it). Under a provider it selects
         # which tier the service offers to launch on, rather than being rejected — see the provider
@@ -1911,8 +1913,8 @@ def _launch_tool(
             needs_auto_configure=needs_auto_configure,
         ):
             print_section(_launch_title(tool))
-            if forwarded_claude_model:
-                print_kv("Model", forwarded_claude_model)
+            if forwarded_model:
+                print_kv("Model", forwarded_model)
             print_success(f"Starting {TOOL_SPECS[tool]['display']}")
             launch_agent(tool, state, ctx.args)
             return
@@ -2116,12 +2118,12 @@ def _launch_tool(
         if provider:
             print_kv("Provider", provider)
             # The tier the session will start on when it isn't Claude Code's own opus default.
-            if forwarded_claude_model:
-                print_kv("Model", forwarded_claude_model)
+            if forwarded_model:
+                print_kv("Model", forwarded_model)
             elif route_root_model:
                 print_kv("Model", route_root_model)
-        elif forwarded_claude_model:
-            print_kv("Model", forwarded_claude_model)
+        elif forwarded_model:
+            print_kv("Model", forwarded_model)
         elif model and tool == "claude":
             # Claude's --model is pinned via the family aliases, not resolved_model/route_root_model.
             print_kv("Model", model)
