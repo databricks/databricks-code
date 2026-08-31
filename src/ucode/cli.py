@@ -1829,6 +1829,10 @@ def _can_launch_from_cached_config(
     if refresh or model or explicit_provider is not None:
         return False
 
+    if tool == "codex" and smart_routing_v2.enabled():
+        if not state.get("codex_models") or not state.get("oss_models"):
+            return False
+
     smart_routing_enabled = _ROUTING_AGENTS[tool].smart_routing_enabled(state)
     legacy_smart_routing_enabled = enable_smart_routing_flag or smart_routing_enabled
 

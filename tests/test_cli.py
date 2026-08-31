@@ -1352,6 +1352,48 @@ class TestCachedConfigPredicate:
                 is True
             )
 
+    def test_accepts_codex_v2_launch_with_complete_model_cache(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
+        state = {
+            **MINIMAL_STATE,
+            "codex_models": ["system.ai.gpt-5-6-sol"],
+            "oss_models": ["system.ai.glm-5-2"],
+        }
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+        ):
+            assert cli_mod._can_launch_from_cached_config("codex", state, **self._kwargs()) is True
+
+    @pytest.mark.parametrize(
+        ("incomplete_key", "value"),
+        [
+            ("codex_models", None),
+            ("codex_models", []),
+            ("oss_models", None),
+            ("oss_models", []),
+        ],
+    )
+    def test_rejects_codex_v2_launch_with_incomplete_model_cache(
+        self, monkeypatch, incomplete_key, value
+    ):
+        import ucode.cli as cli_mod
+
+        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
+        state = {
+            **MINIMAL_STATE,
+            "codex_models": ["system.ai.gpt-5-6-sol"],
+            "oss_models": ["system.ai.glm-5-2"],
+        }
+        if value is None:
+            state.pop(incomplete_key)
+        else:
+            state[incomplete_key] = value
+        with patch("ucode.cli.managed_agent_config_enabled", return_value=False):
+            assert cli_mod._can_launch_from_cached_config("codex", state, **self._kwargs()) is False
+
     @pytest.mark.parametrize(
         "override",
         [
