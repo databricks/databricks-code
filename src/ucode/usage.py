@@ -639,18 +639,15 @@ def render_usage_summary(
     today_text = format_token_count(daily_total)
     weekly_text = format_token_count(weekly_total)
     monthly_text = format_token_count(monthly_total)
-    metric_width = 13
+    token_table = render_box_table(
+        ["Today", "Last 7 days", "Last 30 days"],
+        [[f"{today_text} tokens", f"{weekly_text} tokens", f"{monthly_text} tokens"]],
+    )
     lines = [
         heading(f"Usage Summary for {requester_name}"),
         "",
         "[bold green]✓[/bold green]  [bold]Databricks AI Gateway Token Usage[/bold]",
-        muted("   ─────────────────────────────────────"),
-        f"   {value(f'{today_text:<{metric_width}}')}"
-        f"{value(f'{weekly_text:<{metric_width}}')}"
-        f"{value(monthly_text)}",
-        f"   {muted('today'.ljust(metric_width))}"
-        f"{muted('7 days'.ljust(metric_width))}"
-        f"{muted('30 days')}",
+        token_table,
     ]
     if active_tools_last_week:
         tool_text = " · ".join(tool_displays[tool] for tool in active_tools_last_week)

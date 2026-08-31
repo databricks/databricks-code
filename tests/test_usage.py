@@ -514,9 +514,10 @@ class TestRenderUsageSummary:
         result = render_usage_summary(records, "user", {"claude": "Claude Code"})
         assert "5.0K" in result
         assert "Databricks AI Gateway Token Usage" in result
-        assert "today" in result
-        assert "7 days" in result
-        assert "30 days" in result
+        assert "┃ Today" in result
+        assert "Last 7 days" in result
+        assert "Last 30 days" in result
+        assert "│ 5.0K tokens" in result
 
     def test_weekly_total_includes_past_week(self):
         records = [
@@ -687,11 +688,12 @@ class TestUsageCommand:
             "Using SQL warehouse `wh` (RUNNING).",
             f"No usage for Claude Code in the last {USAGE_BREAKDOWN_DAYS} days.",
         ]
-        assert len(rendered_tables) == 1
+        assert len(rendered_tables) == 2
+        assert rendered_tables[0] == [["100 tokens", "100 tokens", "300 tokens"]]
         # One per-model row for codex: full model name "gpt-5", 1 request, 80 input / 20 output.
-        assert rendered_tables[0][0][0] == "gpt-5"
-        assert rendered_tables[0][0][1] == "1"
-        assert rendered_tables[0][0][2] == "80"
+        assert rendered_tables[1][0][0] == "gpt-5"
+        assert rendered_tables[1][0][1] == "1"
+        assert rendered_tables[1][0][2] == "80"
         assert "gemini" not in "\n".join(printed).lower()
         assert "900" not in "\n".join(printed)
 
