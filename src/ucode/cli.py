@@ -1872,9 +1872,7 @@ def _launch_tool(
         # `--model` lands in ctx.args instead of a ucode option. It still determines the effective
         # launch model and should therefore win in the launch summary.
         forwarded_model = (
-            explicit_model_arg_value(ctx.args)
-            if tool in {"claude", "codex"}
-            else None
+            explicit_model_arg_value(ctx.args) if tool in {"claude", "codex"} else None
         )
         # `--model` is claude-only (no other launch command exposes it). Under a provider it selects
         # which tier the service offers to launch on, rather than being rejected — see the provider
