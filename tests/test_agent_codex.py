@@ -592,6 +592,7 @@ class TestCodexDefaultModel:
         }
         assert codex.default_model(state) == "admin-chosen-default"
 
+
 class TestCodexValidateCmd:
     def test_starts_with_binary(self):
         cmd = codex.validate_cmd("codex")
