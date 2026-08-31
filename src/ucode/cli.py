@@ -18,6 +18,7 @@ from ucode.agents import (
     configure_tool,
     ensure_bootstrap_dependencies,
     ensure_provider_state,
+    explicit_model_arg_value,
     install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
@@ -1829,6 +1830,10 @@ def _can_launch_from_cached_config(
     if refresh or model or explicit_provider is not None:
         return False
 
+    if tool == "codex" and smart_routing_v2.enabled():
+        if not state.get("codex_models") or not state.get("oss_models"):
+            return False
+
     smart_routing_enabled = _ROUTING_AGENTS[tool].smart_routing_enabled(state)
     legacy_smart_routing_enabled = enable_smart_routing_flag or smart_routing_enabled
 
@@ -1863,6 +1868,12 @@ def _launch_tool(
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        # Launchers such as isaac put their harness arguments after `--`, so the harness's own
+        # `--model` lands in ctx.args instead of a ucode option. It still determines the effective
+        # launch model and should therefore win in the launch summary.
+        forwarded_model = (
+            explicit_model_arg_value(ctx.args) if tool in {"claude", "codex"} else None
+        )
         # `--model` is claude-only (no other launch command exposes it). Under a provider it selects
         # which tier the service offers to launch on, rather than being rejected — see the provider
         # branch below.
@@ -1901,6 +1912,8 @@ def _launch_tool(
             needs_auto_configure=needs_auto_configure,
         ):
             print_section(_launch_title(tool))
+            if forwarded_model:
+                print_kv("Model", forwarded_model)
             print_success(f"Starting {TOOL_SPECS[tool]['display']}")
             launch_agent(tool, state, ctx.args)
             return
@@ -2037,6 +2050,7 @@ def _launch_tool(
                 routing_agent is not None
                 and routing_agent.smart_routing_enabled(state)
                 and not first_prompt_routes_claude
+                and not forwarded_model
             ):
                 display = TOOL_SPECS[tool]["display"]
                 with spinner(f"Selecting a {display} model with smart routing..."):
@@ -2104,8 +2118,12 @@ def _launch_tool(
         if provider:
             print_kv("Provider", provider)
             # The tier the session will start on when it isn't Claude Code's own opus default.
-            if route_root_model:
+            if forwarded_model:
+                print_kv("Model", forwarded_model)
+            elif route_root_model:
                 print_kv("Model", route_root_model)
+        elif forwarded_model:
+            print_kv("Model", forwarded_model)
         elif model and tool == "claude":
             # Claude's --model is pinned via the family aliases, not resolved_model/route_root_model.
             print_kv("Model", model)

@@ -14,12 +14,36 @@ from ucode.agents import (
     configure_selected_tools,
     default_model_for_tool,
     ensure_tool_binary_available,
+    explicit_model_arg_value,
     install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
     provider_permission_error,
     resolve_launch_model,
 )
+from ucode.agents.args import has_explicit_model_arg
+
+
+class TestModelArgumentParsing:
+    @pytest.mark.parametrize(
+        ("tool_args", "expected"),
+        [
+            ([], None),
+            (["--model", "model-a"], "model-a"),
+            (["-m", "model-a"], "model-a"),
+            (["--model=model-a"], "model-a"),
+            (["--model", "model-a", "--model=model-b"], "model-b"),
+            (["--model", "model-a", "--", "--model", "model-b"], "model-a"),
+            (["--", "--model", "model-a"], None),
+            (["--model", "--other"], None),
+        ],
+    )
+    def test_explicit_model_arg_value(self, tool_args, expected):
+        assert explicit_model_arg_value(tool_args) == expected
+
+    def test_has_explicit_model_arg_stops_at_harness_separator(self):
+        assert has_explicit_model_arg(["--", "--model", "model-a"]) is False
+        assert has_explicit_model_arg(["--model", "model-a", "--", "--model", "model-b"])
 
 
 class TestProviderPermissionError:
@@ -192,9 +216,9 @@ class TestCheckGatewayEndpoint:
 
 
 class TestDefaultModelForTool:
-    def test_codex_returns_highest_gpt_model(self):
+    def test_codex_returns_none_without_a_configured_model(self):
         models = ["databricks-gpt-5", "databricks-gpt-5-5"]
-        assert default_model_for_tool("codex", {"codex_models": models}) == "databricks-gpt-5-5"
+        assert default_model_for_tool("codex", {"codex_models": models}) is None
 
     def test_codex_returns_none_when_no_models(self):
         assert default_model_for_tool("codex", {}) is None
@@ -249,7 +273,7 @@ class TestResolveLaunchModel:
     def test_codex_default_model_used_when_no_explicit(self):
         state = {"codex_models": ["databricks-gpt-5"]}
         _, model = resolve_launch_model("codex", state, None)
-        assert model == "databricks-gpt-5"
+        assert model is None
 
     def test_explicit_model_used_when_provided(self):
         _, model = resolve_launch_model("claude", {}, "my-model")
