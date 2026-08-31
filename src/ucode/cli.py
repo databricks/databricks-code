@@ -142,8 +142,8 @@ from ucode.ui import (
 from ucode.usage import usage as usage_report
 
 _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
-    "claude": ("claude", "opencode", "copilot", "pi"),
-    "codex": ("codex", "copilot", "pi"),
+    "claude": ("claude", "opencode", "copilot", "pi", "continue"),
+    "codex": ("codex", "copilot", "pi", "continue"),
     "gemini": ("gemini", "opencode", "pi"),
     "oss": ("opencode",),
 }
@@ -638,10 +638,17 @@ def configure_shared_state(
     print_success("Unity AI Gateway detected")
 
     want_claude = (
-        fetch_all or "claude" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools
+        fetch_all
+        or "claude" in tools
+        or "opencode" in tools
+        or "copilot" in tools
+        or "pi" in tools
+        or "continue" in tools
     )
     want_gemini = fetch_all or "gemini" in tools or "opencode" in tools or "pi" in tools
-    want_codex = fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools
+    want_codex = (
+        fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools or "continue" in tools
+    )
     # Codex smart routing can select OSS models such as GLM, so a Codex-only
     # configure must persist that discovered family too.
     want_oss = fetch_all or "opencode" in tools or "codex" in tools
@@ -2565,7 +2572,8 @@ def configure(
         str | None,
         typer.Option(
             "--agent",
-            help="Configure only the named agent (e.g. claude, codex, gemini, opencode, copilot, pi).",
+            help="Configure only the named agent (e.g. claude, codex, gemini, opencode, copilot, "
+            "pi, continue).",
         ),
     ] = None,
     agents: Annotated[

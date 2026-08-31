@@ -26,7 +26,7 @@ from questionary.prompts.common import InquirerControl
 from questionary.question import Question
 from questionary.styles import merge_styles_default
 
-from ucode.agents import copilot, cursor, gemini, opencode
+from ucode.agents import continue_dev, copilot, cursor, gemini, opencode
 from ucode.config_io import restore_file
 from ucode.databricks import (
     apply_pat_environment,
@@ -97,6 +97,11 @@ MCP_CLIENTS = {
         "binary": "cursor-agent",
         "display": "Cursor",
         "list_command": "cursor-agent mcp list",
+    },
+    "continue": {
+        "binary": "cn",
+        "display": "Continue",
+        "list_command": "cn mcp list",
     },
 }
 SKILLS_MCP_KIND = "skills"
@@ -330,6 +335,9 @@ def configure_client_mcp_server(
     if client == "cursor":
         removed = cursor.write_mcp_server_config(name, argv)
         return [MCP_USER_SCOPE] if removed else []
+    if client == "continue":
+        removed = continue_dev.write_mcp_server_config(name, argv)
+        return [MCP_USER_SCOPE] if removed else []
     raise RuntimeError(f"Unsupported MCP client '{client}'.")
 
 
@@ -346,6 +354,8 @@ def remove_client_mcp_server(client: str, name: str) -> list[str]:
         return [MCP_USER_SCOPE] if copilot.remove_mcp_server_config(name) else []
     if client == "cursor":
         return [MCP_USER_SCOPE] if cursor.remove_mcp_server_config(name) else []
+    if client == "continue":
+        return [MCP_USER_SCOPE] if continue_dev.remove_mcp_server_config(name) else []
     raise RuntimeError(f"Unsupported MCP client '{client}'.")
 
 
