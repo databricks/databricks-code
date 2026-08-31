@@ -1346,9 +1346,7 @@ class TestAutoConfigureOnFirstRun:
             patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
             patch("ucode.cli.launch_agent") as mock_launch,
         ):
-            result = runner.invoke(
-                app, ["codex", "--workspace", "https://example.databricks.com/"]
-            )
+            result = runner.invoke(app, ["codex", "--workspace", "https://example.databricks.com/"])
 
         assert result.exit_code == 0, result.output
         mock_set_workspace.assert_called_once_with("https://example.databricks.com")
