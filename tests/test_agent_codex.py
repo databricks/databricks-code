@@ -25,6 +25,29 @@ class TestCodexSpec:
         assert codex.SPEC["display"] == "Codex"
 
 
+class TestHasUcodeConfig:
+    def test_detects_profile_config(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "ucode.config.toml"
+        legacy_path = tmp_path / "config.toml"
+        legacy_path.write_text(
+            'profile = "ucode"\n\n[profiles.ucode]\nmodel_provider = "ucode-databricks"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
+
+        assert codex.has_ucode_config() is True
+
+    def test_ignores_unrelated_legacy_config(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "ucode.config.toml"
+        legacy_path = tmp_path / "config.toml"
+        legacy_path.write_text('profile = "default"\n', encoding="utf-8")
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
+
+        assert codex.has_ucode_config() is False
+
+
 class TestRenderOverlay:
     def test_uses_profile_file_shape_without_legacy_profiles(self):
         overlay = codex.render_overlay(WS)
@@ -242,6 +265,7 @@ class TestCodexWriteConfig:
                 "workspace": WS,
                 "profile": "prod",
                 "codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"],
+                "oss_models": ["system.ai.glm-5-2"],
                 codex.SMART_ROUTING_STATE_KEY: True,
             }
         )
@@ -259,6 +283,7 @@ class TestCodexWriteConfig:
         assert "--host https://example.databricks.com" in route_command
         assert "--profile prod" in route_command
         assert "--model databricks-gpt-5-5" in route_command
+        assert "--model system.ai.glm-5-2" in route_command
 
     def test_provider_launch_removes_routing_hooks(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
@@ -409,6 +434,27 @@ class TestCodexSmartRouting:
         assert decision is None
         assert error is None
 
+    def test_route_launch_model_includes_codex_and_oss_models(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(codex_routing, "get_databricks_token", lambda *args: "token")
+
+        def request(workspace, token, task, models):
+            captured["models"] = models
+            return None, "expected test stop"
+
+        monkeypatch.setattr(codex_routing, "request_routing_decision", request)
+
+        codex_routing.route_launch_model(
+            {
+                "workspace": WS,
+                "codex_models": ["system.ai.gpt-5-6-sol"],
+                "oss_models": ["system.ai.glm-5-2"],
+            },
+            ["Fix the parser"],
+        )
+
+        assert captured["models"] == ["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"]
+
 
 class TestCodexRemoveLegacyProfile:
     def test_drops_provider_block_on_modern_path(self, tmp_path, monkeypatch):
@@ -536,6 +582,14 @@ class TestCodexDefaultModel:
         # returns None for them (no semantic version to rank).
         models = ["system.ai.gpt-oss-120b", "system.ai.gpt-oss-20b"]
         assert codex.default_model({"codex_models": models}) == "system.ai.gpt-oss-120b"
+
+    def test_default_model_includes_oss_models(self):
+        state = {
+            "codex_models": [],
+            "oss_models": ["system.ai.kimi-k3", "system.ai.gpt-oss-120b"],
+        }
+
+        assert codex.default_model(state) == "system.ai.gpt-oss-120b"
 
     def test_default_model_prefers_versioned_gpt_over_oss(self):
         # When both versioned and OSS models are present, the versioned one wins.

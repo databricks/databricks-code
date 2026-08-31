@@ -142,7 +142,7 @@ class TestExportCommandFile:
 
         dest = tmp_path / "config.json"
         with _with_manifest(FULL_MANIFEST):
-            export_mod.export_command(output=str(dest))
+            export_mod.export_command(file_path=str(dest))
         captured = capsys.readouterr()
         assert captured.out == ""
         assert dest.read_text(encoding="utf-8") == stdout_bytes
@@ -150,7 +150,7 @@ class TestExportCommandFile:
     def test_expands_user_home_in_output_path(self, capsys, tmp_path, monkeypatch):
         monkeypatch.setenv("HOME", str(tmp_path))
         with _with_manifest(FULL_MANIFEST):
-            export_mod.export_command(output="~/config.json")
+            export_mod.export_command(file_path="~/config.json")
         capsys.readouterr()
         assert (tmp_path / "config.json").exists()
 
@@ -158,7 +158,7 @@ class TestExportCommandFile:
         dest = tmp_path / "config.json"
         dest.write_text("stale contents", encoding="utf-8")
         with _with_manifest(FULL_MANIFEST):
-            export_mod.export_command(output=str(dest))
+            export_mod.export_command(file_path=str(dest))
         assert json.loads(dest.read_text(encoding="utf-8"))["default_agent"] == (
             "CODING_AGENT_CLAUDE_CODE"
         )
@@ -169,7 +169,7 @@ class TestExportCommandFile:
         invalid = {"enabled_agents": {"claude": {}}}
         with _with_manifest(invalid):
             with pytest.raises(RuntimeError):
-                export_mod.export_command(output=str(dest))
+                export_mod.export_command(file_path=str(dest))
         assert dest.read_text(encoding="utf-8") == "original"
 
     def test_invalid_config_does_not_create_destination(self, tmp_path):
@@ -177,7 +177,7 @@ class TestExportCommandFile:
         invalid = {"enabled_agents": {"claude": {}}}
         with _with_manifest(invalid):
             with pytest.raises(RuntimeError):
-                export_mod.export_command(output=str(dest))
+                export_mod.export_command(file_path=str(dest))
         assert not dest.exists()
 
     def test_missing_parent_directory_fails_without_creating_it(self, tmp_path):
@@ -185,7 +185,7 @@ class TestExportCommandFile:
         dest = missing_parent / "config.json"
         with _with_manifest(FULL_MANIFEST):
             with pytest.raises(RuntimeError, match="parent directory does not exist"):
-                export_mod.export_command(output=str(dest))
+                export_mod.export_command(file_path=str(dest))
         assert not missing_parent.exists()
 
     def test_write_failure_is_actionable_and_leaves_no_temp_file(self, tmp_path):
@@ -193,7 +193,7 @@ class TestExportCommandFile:
         dest.mkdir()
         with _with_manifest(FULL_MANIFEST):
             with pytest.raises(RuntimeError, match="Failed to write"):
-                export_mod.export_command(output=str(dest))
+                export_mod.export_command(file_path=str(dest))
         leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".ucode-export-")]
         assert leftovers == []
 
@@ -231,11 +231,11 @@ class TestExportCLI:
         result = runner.invoke(app, ["export", "--help"])
         assert result.exit_code == 0
         cleaned = _ANSI_RE.sub("", result.output)
-        assert "--output" in cleaned
-        assert "-o" in cleaned
+        assert "--file" in cleaned
+        assert "-f" in cleaned
 
-    def test_long_and_short_output_flags_both_write_the_file(self, tmp_path):
-        for flag in ("--output", "-o"):
+    def test_long_and_short_file_flags_both_write_the_file(self, tmp_path):
+        for flag in ("--file", "-f"):
             dest = tmp_path / f"cfg{flag.strip('-')}.json"
             with _with_manifest(FULL_MANIFEST):
                 result = runner.invoke(app, ["export", flag, str(dest)])

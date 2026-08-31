@@ -157,9 +157,10 @@ def test_spawn_rewrite_injects_routed_model(monkeypatch):
     # The rationale is surfaced in the systemMessage (shown to the user), not
     # only in permissionDecisionReason. The model field is the short family
     # name ("opus") that Claude Code's Agent tool schema accepts.
-    assert output["systemMessage"] == (
-        "Using Smart Routing. Routing to opus. Deep exploration needs the strongest model."
+    expected_message = claude_routing.routing.format_subagent_message(
+        "opus", "Deep exploration needs the strongest model."
     )
+    assert output["systemMessage"] == expected_message
     assert hook["permissionDecision"] == "allow"
     assert hook["updatedInput"] == {
         "subagent_type": "Explore",
@@ -167,9 +168,7 @@ def test_spawn_rewrite_injects_routed_model(monkeypatch):
         "description": "explore",
         "model": "opus",
     }
-    assert hook["permissionDecisionReason"] == (
-        "Using Smart Routing. Routing to opus. Deep exploration needs the strongest model."
-    )
+    assert hook["permissionDecisionReason"] == expected_message
 
 
 def test_task_tool_alias_is_routed(monkeypatch):
