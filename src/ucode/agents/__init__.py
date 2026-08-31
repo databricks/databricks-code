@@ -51,6 +51,21 @@ _MODULES = {
 
 TOOL_SPECS: dict[str, ToolSpec] = {name: module.SPEC for name, module in _MODULES.items()}
 
+
+def explicit_model_arg_value(tool_args: list[str]) -> str | None:
+    """Return the last model selected in forwarded Claude Code or Codex arguments."""
+    model: str | None = None
+    for index, arg in enumerate(tool_args):
+        if arg in {"--model", "-m"}:
+            if index + 1 < len(tool_args) and not tool_args[index + 1].startswith("-"):
+                model = tool_args[index + 1]
+        elif arg.startswith("--model="):
+            value = arg.partition("=")[2]
+            if value:
+                model = value
+    return model
+
+
 # Model-routing agents ucode configures end to end. Cursor is deliberately NOT
 # here: it runs models on the user's own Cursor account, so `normalize_tool`
 # rejects it and the model-config paths never see it. The `configure`/MCP flows
