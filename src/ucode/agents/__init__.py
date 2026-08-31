@@ -286,6 +286,7 @@ def resolve_launch_model(
     explicit_model: str | None,
 ) -> tuple[dict, str | None]:
     model = explicit_model or default_model_for_tool(tool, state)
+    # if model is not specified for codex, then launch with harness's default model.
     if not model and tool != "codex":
         raise RuntimeError(
             f"No models available for {tool}. Run `ucode configure` to set up your workspace."
