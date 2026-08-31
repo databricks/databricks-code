@@ -363,6 +363,14 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     return state
 
 
+def _is_gpt_family(model: str) -> bool:
+    """Return True if this id is in the GPT family (versioned or OSS variants)."""
+    tail = model.split("/")[-1]
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    return tail.startswith("gpt-")
+
+
 def _managed_config_path() -> Path | None:
     """OS-level Codex managed config file, or None on unsupported platforms.
 
@@ -402,14 +410,6 @@ def _write_managed_config(
     # deep_merge can't drop keys, so clear a model pinned by an earlier run.
     doc.pop("model", None)
     write_managed_file(path, tomlkit.dumps(doc), display="Codex")
-
-
-def _is_gpt_family(model: str) -> bool:
-    """Return True if this id is in the GPT family (versioned or OSS variants)."""
-    tail = model.split("/")[-1]
-    if tail.startswith("system.ai."):
-        tail = tail[len("system.ai.") :]
-    return tail.startswith("gpt-")
 
 
 def default_model(state: dict) -> str | None:
