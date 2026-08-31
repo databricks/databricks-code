@@ -993,6 +993,20 @@ def _has_explicit_model_arg(tool_args: list[str]) -> bool:
     return any(arg in {"--model", "-m"} or arg.startswith("--model=") for arg in tool_args)
 
 
+def explicit_model_arg_value(tool_args: list[str]) -> str | None:
+    """Return the last model selected in Claude Code's forwarded arguments."""
+    model: str | None = None
+    for index, arg in enumerate(tool_args):
+        if arg in {"--model", "-m"}:
+            if index + 1 < len(tool_args) and not tool_args[index + 1].startswith("-"):
+                model = tool_args[index + 1]
+        elif arg.startswith("--model="):
+            value = arg.partition("=")[2]
+            if value:
+                model = value
+    return model
+
+
 def _launch_model_args(tool_args: list[str], launch_model: str | None) -> list[str]:
     if not launch_model or _has_explicit_model_arg(tool_args):
         return []
