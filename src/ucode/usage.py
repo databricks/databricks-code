@@ -636,24 +636,32 @@ def render_usage_summary(
         if usage_day == today:
             daily_total += token_total
 
+    today_text = format_token_count(daily_total)
+    weekly_text = format_token_count(weekly_total)
+    monthly_text = format_token_count(monthly_total)
+    metric_width = 13
     lines = [
         heading(f"Usage Summary for {requester_name}"),
         "",
-        "[bold green]✓[/bold green] Databricks AI Gateway usage",
-        f"{label('Today:')} {value(format_token_count(daily_total) + ' tokens')}",
-        f"{label('Last 7 days:')} {value(format_token_count(weekly_total) + ' tokens')}",
-        f"{label('Last 30 days:')} {value(format_token_count(monthly_total) + ' tokens')}",
+        "[bold green]✓[/bold green]  [bold]Databricks AI Gateway Token Usage[/bold]",
+        muted("   ─────────────────────────────────────"),
+        f"   {value(f'{today_text:<{metric_width}}')}"
+        f"{value(f'{weekly_text:<{metric_width}}')}"
+        f"{value(monthly_text)}",
+        f"   {muted('today'.ljust(metric_width))}"
+        f"{muted('7 days'.ljust(metric_width))}"
+        f"{muted('30 days')}",
     ]
     if active_tools_last_week:
-        tool_text = ", ".join(tool_displays[tool] for tool in active_tools_last_week)
-        lines.append(f"{label('Active tools:')} {value(tool_text)}")
+        tool_text = " · ".join(tool_displays[tool] for tool in active_tools_last_week)
+        lines.extend(["", f"   🤖  {label('Top Harnesses:')} {value(tool_text)}"])
     if weekly_model_usage:
         top_models = sorted(
             weekly_model_usage.values(),
             key=lambda u: (-u.total, u.name.lower()),
         )[:3]
-        models_text = ", ".join(usage.name for usage in top_models)
-        lines.append(f"{label('Top models this week:')} {value(models_text)}")
+        models_text = " · ".join(usage.name for usage in top_models)
+        lines.append(f"   ⭐  {label('Top Models:')} {value(models_text)}")
         weekly_cost = sum(
             (
                 model_usage_cost(usage, price_lookup) or Decimal(0)
@@ -662,7 +670,8 @@ def render_usage_summary(
             Decimal(0),
         )
         if weekly_cost > 0:
-            lines.append(f"{label('Est. cost (7 days):')} {value(format_cost_usd(weekly_cost))}")
+            cost_text = f"{format_cost_usd(weekly_cost)} estimated cost · last 7 days"
+            lines.append(f"   💰  {value(cost_text)}")
     lines.extend(render_budget_lines(budget_spend))
     return "\n".join(lines)
 

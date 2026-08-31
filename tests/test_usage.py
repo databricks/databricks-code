@@ -513,6 +513,10 @@ class TestRenderUsageSummary:
         records = [self._make_record(0, "claude", 5000)]
         result = render_usage_summary(records, "user", {"claude": "Claude Code"})
         assert "5.0K" in result
+        assert "Databricks AI Gateway Token Usage" in result
+        assert "today" in result
+        assert "7 days" in result
+        assert "30 days" in result
 
     def test_weekly_total_includes_past_week(self):
         records = [
@@ -525,9 +529,14 @@ class TestRenderUsageSummary:
         assert "3.0K" in result or "3" in result
 
     def test_active_tools_listed(self):
-        records = [self._make_record(0, "claude", 1000)]
-        result = render_usage_summary(records, "user", {"claude": "Claude Code"})
-        assert "Claude Code" in result
+        records = [
+            self._make_record(0, "claude", 1000),
+            self._make_record(0, "codex", 1000),
+        ]
+        result = render_usage_summary(
+            records, "user", {"claude": "Claude Code", "codex": "Codex"}
+        )
+        assert "🤖  [bold]Top Harnesses:[/bold] [cyan]Claude Code · Codex[/cyan]" in result
 
     def test_top_models_listed(self):
         records = [
@@ -583,8 +592,8 @@ class TestRenderUsageSummary:
         )
         # Top-models line is full names only, ranked by per-model token totals
         # (claude-opus-4 236.1K > gpt-5 13.3K > claude-haiku-4.5 920).
-        assert "Top models this week:" in result
-        assert "claude-opus-4, gpt-5, claude-haiku-4.5" in result
+        assert "⭐  [bold]Top Models:[/bold]" in result
+        assert "claude-opus-4 · gpt-5 · claude-haiku-4.5" in result
         # No token counts in this line — those live in the per-model table.
         assert "236.1K" not in result
 
