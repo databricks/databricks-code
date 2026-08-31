@@ -673,6 +673,47 @@ class TestMapClaudeFamilyModels:
         assert db_mod.map_claude_family_models(["amazon.titan-text-express-v1"]) == {}
 
 
+class TestResolveProviderLaunchModel:
+    def test_none_when_service_offers_opus(self):
+        # Claude Code's own opus default already works, so we pin nothing (and avoid the duplicate
+        # /model picker row that setting ANTHROPIC_MODEL causes).
+        models = {
+            "opus": "claude-opus-4-8",
+            "sonnet": "claude-sonnet-5",
+            "haiku": "claude-haiku-4-5",
+        }
+        assert db_mod.resolve_provider_launch_model(None, models) is None
+
+    def test_falls_back_to_best_tier_when_no_opus(self):
+        # No opus target: launch on the most capable tier the service does offer (sonnet > haiku).
+        models = {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+        assert db_mod.resolve_provider_launch_model(None, models) == "claude-sonnet-5"
+
+    def test_falls_back_to_haiku_when_only_haiku(self):
+        assert db_mod.resolve_provider_launch_model(None, {"haiku": "claude-haiku-4-5"}) == (
+            "claude-haiku-4-5"
+        )
+
+    def test_family_alias_resolves_to_declared_target(self):
+        models = {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+        assert db_mod.resolve_provider_launch_model("haiku", models) == "claude-haiku-4-5"
+
+    def test_family_alias_not_offered_raises_with_available_list(self):
+        models = {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"}
+        with pytest.raises(RuntimeError, match="does not offer a 'opus' model.*haiku, sonnet"):
+            db_mod.resolve_provider_launch_model("opus", models)
+
+    def test_raw_target_id_is_trusted(self):
+        # A non-family value is a raw target the user knows the service allows; pass it through.
+        models = {"sonnet": "claude-sonnet-5"}
+        assert db_mod.resolve_provider_launch_model("claude-3-7-sonnet", models) == (
+            "claude-3-7-sonnet"
+        )
+
+    def test_no_models_and_no_override_is_none(self):
+        assert db_mod.resolve_provider_launch_model(None, {}) is None
+
+
 class TestProviderServicePagination:
     """The listing is paginated; ignoring next_page_token hid services on later pages entirely."""
 
