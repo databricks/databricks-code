@@ -29,6 +29,7 @@ from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
+    routing_models,
     sync_smart_routing_hooks,
 )
 from ucode.smart_routing.codex_routing import codex_model_id
@@ -458,23 +459,20 @@ def launch(state: dict, tool_args: list[str]) -> None:
         # path so flag-off launches retain their existing dependencies and behavior.
         from ucode.smart_routing import v2 as smart_routing_v2
 
-        def starting_model() -> str:
+        def _app_server_start_model() -> str:
             managed_model = default_model(state)
             if managed_model:
                 return managed_model
-            for key in ("codex_models", "oss_models"):
-                models = state.get(key)
-                if isinstance(models, list):
-                    for model in models:
-                        if isinstance(model, str) and model:
-                            return codex_model_id(model)
+            models = routing_models(state)
+            if models:
+                return codex_model_id(models[0])
             return APP_SERVER_SMART_ROUTING_STARTING_MODEL
 
         smart_routing_v2.launch_codex(
             state,
             tool_args,
             binary=binary,
-            start_model=starting_model(),
+            start_model=_app_server_start_model(),
             render_overlay=render_overlay,
         )
     if workspace:
