@@ -216,9 +216,9 @@ class TestCheckGatewayEndpoint:
 
 
 class TestDefaultModelForTool:
-    def test_codex_returns_highest_gpt_model(self):
+    def test_codex_returns_none_without_a_configured_model(self):
         models = ["databricks-gpt-5", "databricks-gpt-5-5"]
-        assert default_model_for_tool("codex", {"codex_models": models}) == "databricks-gpt-5-5"
+        assert default_model_for_tool("codex", {"codex_models": models}) is None
 
     def test_codex_returns_none_when_no_models(self):
         assert default_model_for_tool("codex", {}) is None
@@ -273,7 +273,7 @@ class TestResolveLaunchModel:
     def test_codex_default_model_used_when_no_explicit(self):
         state = {"codex_models": ["databricks-gpt-5"]}
         _, model = resolve_launch_model("codex", state, None)
-        assert model == "databricks-gpt-5"
+        assert model is None
 
     def test_explicit_model_used_when_provided(self):
         _, model = resolve_launch_model("claude", {}, "my-model")
