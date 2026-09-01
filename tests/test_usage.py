@@ -12,6 +12,7 @@ import ucode.usage as usage_mod
 from ucode.databricks import SqlWarehouse
 from ucode.ui import label, value
 from ucode.usage import (
+    TOOL_MODEL_TABLE_HEADERS,
     USAGE_BREAKDOWN_DAYS,
     USAGE_SUMMARY_DAYS,
     ModelPrice,
@@ -33,6 +34,8 @@ from ucode.usage import (
     render_budget_lines,
     render_usage_summary,
     run_query_on_first_working_warehouse,
+    select_and_run_usage_query,
+    select_sql_warehouse,
     simplify_model_name,
     summarize_models,
     usage,
@@ -464,6 +467,9 @@ class TestBuildToolModelRows:
         _, totals = build_tool_model_rows(records, "claude", self._lookup())
         assert totals.cost is None
 
+    def test_cost_header_is_explicitly_estimated(self):
+        assert TOOL_MODEL_TABLE_HEADERS[-1] == "Est. Cost (USD)"
+
 
 class TestRenderBudgetLines:
     def test_no_lines_when_unavailable(self):
@@ -692,6 +698,9 @@ class TestUsageCommand:
         )
         monkeypatch.setattr(usage_mod, "prompt_yes_no_default", lambda *args, **kwargs: True)
         monkeypatch.setattr(
+            usage_mod, "prompt_for_selection", lambda prompt, options: options[0][0]
+        )
+        monkeypatch.setattr(
             usage_mod, "fetch_external_model_prices", lambda *args, **kwargs: ([], "disabled")
         )
         monkeypatch.setattr(usage_mod, "console", DummyConsole())
@@ -717,6 +726,53 @@ class TestUsageCommand:
         assert rendered_tables[1][0][2] == "80"
         assert "gemini" not in "\n".join(printed).lower()
         assert "900" not in "\n".join(printed)
+
+    def test_queries_only_the_selected_warehouse(self, monkeypatch):
+        queried_paths: list[str] = []
+        candidates = [
+            SqlWarehouse("/sql/1.0/warehouses/first", "First", "RUNNING"),
+            SqlWarehouse("/sql/1.0/warehouses/second", "Second", "STOPPED"),
+        ]
+
+        monkeypatch.setattr(
+            usage_mod,
+            "load_state",
+            lambda: {"workspace": "https://workspace", "available_tools": []},
+        )
+        monkeypatch.setattr(usage_mod, "ensure_databricks_auth", lambda *args, **kwargs: None)
+        monkeypatch.setattr(usage_mod, "get_databricks_token", lambda *args, **kwargs: "token")
+        monkeypatch.setattr(
+            usage_mod,
+            "resolve_current_budget_spend",
+            lambda *args, **kwargs: ((Decimal("1"), Decimal("10")), None),
+        )
+        monkeypatch.setattr(usage_mod, "prompt_yes_no_default", lambda *args, **kwargs: True)
+        monkeypatch.setattr(
+            usage_mod, "discover_sql_warehouses", lambda *args, **kwargs: candidates
+        )
+
+        def choose_second(prompt, options):
+            assert options == [
+                (candidates[0].http_path, "First (RUNNING)"),
+                (candidates[1].http_path, "Second (STOPPED)"),
+            ]
+            return candidates[1].http_path
+
+        monkeypatch.setattr(usage_mod, "prompt_for_selection", choose_second)
+
+        def fake_query(workspace, http_path, token, query, on_connected=None):
+            queried_paths.append(http_path)
+            return ["requester_name"], [("user@example.com",)]
+
+        monkeypatch.setattr(usage_mod, "run_usage_query", fake_query)
+        monkeypatch.setattr(
+            usage_mod, "fetch_external_model_prices", lambda *args, **kwargs: ([], None)
+        )
+        monkeypatch.setattr(usage_mod, "print_note", lambda *args: None)
+        monkeypatch.setattr(usage_mod, "console", type("C", (), {"print": lambda *args: None})())
+
+        assert usage() == 0
+        assert queried_paths == [candidates[1].http_path]
 
     def test_shows_budget_before_prompt_and_skips_sql_when_declined(self, monkeypatch):
         events: list[str] = []
@@ -758,6 +814,22 @@ class TestUsageCommand:
         )
 
         assert usage() == 0
+
+
+class TestSelectSqlWarehouse:
+    def test_returns_selected_candidate(self, monkeypatch):
+        candidates = [
+            SqlWarehouse("/sql/1.0/warehouses/a", "Alpha", "RUNNING"),
+            SqlWarehouse("/sql/1.0/warehouses/b", "Beta", "STOPPED"),
+        ]
+        monkeypatch.setattr(
+            usage_mod, "prompt_for_selection", lambda prompt, options: candidates[1].http_path
+        )
+        assert select_sql_warehouse(candidates) == candidates[1]
+
+    def test_returns_none_when_cancelled(self, monkeypatch):
+        monkeypatch.setattr(usage_mod, "prompt_for_selection", lambda prompt, options: None)
+        assert select_sql_warehouse([SqlWarehouse("/path", "Warehouse", "RUNNING")]) is None
 
 
 class TestRunQueryOnFirstWorkingWarehouse:
@@ -816,6 +888,54 @@ class TestRunQueryOnFirstWorkingWarehouse:
         monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
         with pytest.raises(RuntimeError, match="No SQL warehouse could run"):
             run_query_on_first_working_warehouse("https://ws", "token", [], "SELECT 1")
+
+
+class TestSelectAndRunUsageQuery:
+    _COLUMNS = ["requester_name"]
+    _ROWS = [("user@example.com",)]
+
+    def _warehouses(self) -> list[SqlWarehouse]:
+        return [
+            SqlWarehouse("/sql/1.0/warehouses/dead", "Dead", "RUNNING"),
+            SqlWarehouse("/sql/1.0/warehouses/alive", "Alive", "RUNNING"),
+        ]
+
+    def test_prompts_again_without_failed_warehouse(self, monkeypatch):
+        candidates = self._warehouses()
+        picker_options: list[list[str]] = []
+
+        def choose(remaining):
+            picker_options.append([warehouse.label for warehouse in remaining])
+            return remaining[0]
+
+        def query(workspace, http_path, token, query, on_connected=None):
+            if http_path.endswith("dead"):
+                raise RuntimeError("warehouse unavailable")
+            return self._COLUMNS, self._ROWS
+
+        monkeypatch.setattr(usage_mod, "select_sql_warehouse", choose)
+        monkeypatch.setattr(usage_mod, "run_usage_query", query)
+        monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
+        monkeypatch.setattr(usage_mod, "print_warning", lambda *a: None)
+
+        result = select_and_run_usage_query("https://ws", "token", candidates, "SELECT 1")
+
+        assert result == (candidates[1].http_path, self._COLUMNS, self._ROWS)
+        assert picker_options == [["Dead", "Alive"], ["Alive"]]
+
+    def test_can_cancel_after_a_warehouse_fails(self, monkeypatch):
+        candidates = self._warehouses()
+        choices = iter([candidates[0], None])
+        monkeypatch.setattr(usage_mod, "select_sql_warehouse", lambda remaining: next(choices))
+        monkeypatch.setattr(
+            usage_mod,
+            "run_usage_query",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("warehouse unavailable")),
+        )
+        monkeypatch.setattr(usage_mod, "print_note", lambda *a: None)
+        monkeypatch.setattr(usage_mod, "print_warning", lambda *a: None)
+
+        assert select_and_run_usage_query("https://ws", "token", candidates, "SELECT 1") is None
 
 
 class TestUsageWarehouseIdPassthrough:

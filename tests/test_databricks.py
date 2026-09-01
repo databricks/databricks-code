@@ -27,6 +27,7 @@ from ucode.databricks import (
     build_skills_mcp_url,
     build_tool_base_url,
     classify_model_family,
+    databricks_cli_version,
     discover_sql_warehouses,
     ensure_databricks_cli_version,
     ensure_pat_bearer,
@@ -38,6 +39,7 @@ from ucode.databricks import (
     list_genie_spaces,
     list_workspace_budgets,
     resolve_current_budget_spend,
+    upgrade_databricks_cli,
     workspace_hostname,
 )
 
@@ -2216,6 +2218,50 @@ class TestEnsureDatabricksCliVersion:
         monkeypatch.setattr("os.environ", env)
         with pytest.raises(RuntimeError, match="Could not parse"):
             ensure_databricks_cli_version()
+
+
+class TestDatabricksCliVersion:
+    def test_none_when_absent(self, monkeypatch):
+        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: None)
+        assert databricks_cli_version() is None
+
+    def test_parses_installed_version(self, monkeypatch):
+        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: "/usr/bin/databricks")
+        monkeypatch.setattr(
+            db_mod,
+            "run",
+            lambda *a, **kw: subprocess.CompletedProcess(a, 0, "Databricks CLI v0.299.2", ""),
+        )
+        assert databricks_cli_version() == (0, 299, 2)
+
+    def test_none_on_unparseable_output(self, monkeypatch):
+        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: "/usr/bin/databricks")
+        monkeypatch.setattr(
+            db_mod, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, "garbage", "")
+        )
+        assert databricks_cli_version() is None
+
+    def test_never_raises_on_subprocess_error(self, monkeypatch):
+        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: "/usr/bin/databricks")
+
+        def boom(*a, **kw):
+            raise OSError("nope")
+
+        monkeypatch.setattr(db_mod, "run", boom)
+        assert databricks_cli_version() is None
+
+
+class TestUpgradeDatabricksCli:
+    def test_true_on_success(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "_run_databricks_cli_installer", lambda **kw: None)
+        assert upgrade_databricks_cli() is True
+
+    def test_false_when_installer_fails(self, monkeypatch):
+        def boom(**kw):
+            raise RuntimeError("install failed")
+
+        monkeypatch.setattr(db_mod, "_run_databricks_cli_installer", boom)
+        assert upgrade_databricks_cli() is False
 
 
 class TestRunDatabricksCliInstaller:

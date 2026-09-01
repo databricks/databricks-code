@@ -204,6 +204,21 @@ def test_spawn_rewrite_uses_codex_model_id_for_uc_endpoint(monkeypatch):
     assert output["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-5.6-luna"
 
 
+def test_codex_model_id_maps_uc_gpt_models_to_codex_slugs():
+    expected = {
+        "system.ai.gpt-5-2": "gpt-5.2",
+        "system.ai.gpt-5-4": "gpt-5.4",
+        "system.ai.gpt-5-4-mini": "gpt-5.4-mini",
+        "system.ai.gpt-5-5": "gpt-5.5",
+        "system.ai.gpt-5-6-luna": "gpt-5.6-luna",
+        "system.ai.gpt-5-6-sol": "gpt-5.6-sol",
+        "system.ai.gpt-5-6-terra": "gpt-5.6-terra",
+    }
+    assert {model: codex_routing.codex_model_id(model) for model in expected} == expected
+    assert codex_routing.codex_model_id("system.ai.gpt-5-6-experimental") == "gpt-5.6-experimental"
+    assert codex_routing.codex_model_id("system.ai.glm-5-2") == "system.ai.glm-5-2"
+
+
 def test_spawn_glm_decision_applies_glm_model(monkeypatch):
     # GLM is no longer skipped for Codex subagents: a GLM routing decision is
     # applied like any other arm.
