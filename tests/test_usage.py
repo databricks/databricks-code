@@ -519,6 +519,11 @@ class TestRenderUsageSummary:
         records = [self._make_record(0, "claude", 5000)]
         result = render_usage_summary(records, "user", {"claude": "Claude Code"})
         assert "5.0K" in result
+        assert "Databricks AI Gateway Token Usage" in result
+        assert "┃ Today" in result
+        assert "Last 7 days" in result
+        assert "Last 30 days" in result
+        assert "│ [cyan]5.0K tokens[/cyan]" in result
 
     def test_weekly_total_includes_past_week(self):
         records = [
@@ -531,9 +536,12 @@ class TestRenderUsageSummary:
         assert "3.0K" in result or "3" in result
 
     def test_active_tools_listed(self):
-        records = [self._make_record(0, "claude", 1000)]
-        result = render_usage_summary(records, "user", {"claude": "Claude Code"})
-        assert "Claude Code" in result
+        records = [
+            self._make_record(0, "claude", 1000),
+            self._make_record(0, "codex", 1000),
+        ]
+        result = render_usage_summary(records, "user", {"claude": "Claude Code", "codex": "Codex"})
+        assert "🤖  [bold]Top Harnesses:[/bold] [cyan]Claude Code · Codex[/cyan]" in result
 
     def test_top_models_listed(self):
         records = [
@@ -546,6 +554,27 @@ class TestRenderUsageSummary:
         ]
         result = render_usage_summary(records, "user", {"claude": "Claude Code"})
         assert "claude-sonnet-4" in result
+
+    def test_estimated_cost_label(self):
+        records = [
+            {
+                "tool": "claude",
+                "usage_day": date.today(),
+                "total_tokens_used": 1_000_000,
+                "model_tokens": (
+                    '[{"model":"databricks-claude-sonnet-4","tokens":1000000,'
+                    '"input":1000000,"output":0}]'
+                ),
+            }
+        ]
+        result = render_usage_summary(
+            records,
+            "user",
+            {"claude": "Claude Code"},
+            price_lookup={"claudesonnet4": ModelPrice(Decimal("4.12"), None, None)},
+        )
+        assert "Estimated Cost for Last 7 Days:" in result
+        assert "$4.12" in result
 
     def test_includes_budget_spend_when_available(self):
         records = [self._make_record(0, "claude", 1000)]
@@ -589,8 +618,8 @@ class TestRenderUsageSummary:
         )
         # Top-models line is full names only, ranked by per-model token totals
         # (claude-opus-4 236.1K > gpt-5 13.3K > claude-haiku-4.5 920).
-        assert "Top models last 7 days:" in result
-        assert "claude-opus-4, gpt-5, claude-haiku-4.5" in result
+        assert "⭐  [bold]Top Models:[/bold]" in result
+        assert "claude-opus-4 · gpt-5 · claude-haiku-4.5" in result
         # No token counts in this line — those live in the per-model table.
         assert "236.1K" not in result
 
@@ -689,11 +718,12 @@ class TestUsageCommand:
             "Using SQL warehouse `wh` (RUNNING).",
             f"No usage for Claude Code in the last {USAGE_BREAKDOWN_DAYS} days.",
         ]
-        assert len(rendered_tables) == 1
+        assert len(rendered_tables) == 2
+        assert rendered_tables[0] == [["100 tokens", "100 tokens", "300 tokens"]]
         # One per-model row for codex: full model name "gpt-5", 1 request, 80 input / 20 output.
-        assert rendered_tables[0][0][0] == "gpt-5"
-        assert rendered_tables[0][0][1] == "1"
-        assert rendered_tables[0][0][2] == "80"
+        assert rendered_tables[1][0][0] == "gpt-5"
+        assert rendered_tables[1][0][1] == "1"
+        assert rendered_tables[1][0][2] == "80"
         assert "gemini" not in "\n".join(printed).lower()
         assert "900" not in "\n".join(printed)
 
