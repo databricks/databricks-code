@@ -54,6 +54,13 @@ class TestMinimumVersion:
             "updating Claude Code is required for gateway model discovery."
         )
 
+    def test_older_version_requires_update_for_model_discovery(self, monkeypatch):
+        monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
+
+        assert claude.minimum_version_error() is not None
+        assert claude.required_update_message() is not None
+
     def test_unknown_version_does_not_block(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "unknown")
@@ -61,8 +68,9 @@ class TestMinimumVersion:
         assert claude.minimum_version_error() is None
         assert claude.required_update_message() is None
 
-    def test_older_version_is_not_validated_without_smart_routing_v2(self, monkeypatch):
+    def test_older_version_is_not_validated_without_discovery_features(self, monkeypatch):
         monkeypatch.delenv(v2.ENV_VAR, raising=False)
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() is None
