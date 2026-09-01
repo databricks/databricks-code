@@ -36,9 +36,11 @@ from ucode.databricks import (
     fetch_model_recommendation,
     get_databricks_token,
 )
-from ucode.ui import console, print_warning
+from ucode.ui import print_warning
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
+
+MANAGED_STATE_VERSION = 2
 
 # Opt-in switch while the feature is in bug bash: unset means launches ignore managed configs
 # entirely and behave exactly as they did before.
@@ -342,29 +344,96 @@ def _is_permission_denied(reason: str) -> bool:
     return "http 403" in lowered or "permission_denied" in lowered
 
 
-def save_managed_state(workspace: str, config: dict) -> None:
-    """Persist the normalized managed config to ``~/.ucode/managed-state.json`` at mode 0600.
+def _migrated_workspaces(data: dict) -> dict[str, dict]:
+    """Return the ``workspaces`` map from a raw ``managed-state.json`` dict, migrating v1 in-memory.
 
-    The file is org-authored, not developer-editable — 0600 keeps it readable/writable only by the
-    user (a light guard; hard enforcement / sudo ownership is a separate concern). No-op in dry-run.
-
-    An empty ``config`` records "this workspace has no managed config", which matters because the
-    file doubles as the fallback when a later read fails: without it, removing a config server-side
-    would leave the old one on disk to be reapplied after a transient outage.
+    v1 stored a single ``{workspace, config}`` slot shared by both the admin's authored draft and the
+    launch-fetched published copy, so a legacy value's provenance can't be recovered. It is migrated
+    into the ``published`` slot — the common case is a developer's fetched snapshot, and treating it
+    as published keeps ``ucode export`` / ``ucode publish`` (now strictly draft-only) from mistaking a
+    cached fetch for authored work. A one-time backup (see :func:`_backup_legacy_file_once`) makes a
+    rare unpublished admin draft recoverable. Read-only: never writes.
     """
-    payload = {"workspace": workspace, "config": config}
-    if config_io.is_dry_run():
-        # Print rather than write, matching how the agent config writers behave under --dry-run.
-        console.print(
-            f"\n[bold]\\[dry run] {MANAGED_STATE_PATH}[/bold]\n{json.dumps(payload, indent=2)}\n"
-        )
+    if data.get("version") == MANAGED_STATE_VERSION and isinstance(data.get("workspaces"), dict):
+        return {k: v for k, v in cast("dict", data["workspaces"]).items() if isinstance(v, dict)}
+    workspaces: dict[str, dict] = {}
+    legacy_ws = data.get("workspace")
+    if isinstance(legacy_ws, str) and legacy_ws:
+        legacy_cfg = data.get("config")
+        workspaces[legacy_ws] = {"published": legacy_cfg if isinstance(legacy_cfg, dict) else {}}
+    return workspaces
+
+
+def _is_legacy_file(data: dict) -> bool:
+    """True when ``data`` is a pre-v2 ``{workspace, config}`` file (not the versioned map)."""
+    return data.get("version") != MANAGED_STATE_VERSION and "workspace" in data
+
+
+def _backup_legacy_file_once() -> None:
+    """Copy a pre-v2 ``managed-state.json`` to ``<path>.pre-v2.bak`` before it is overwritten.
+
+    Best-effort and idempotent: migration maps the single legacy slot into ``published``, which can't
+    preserve a rare unpublished admin draft, so the original bytes are kept once for recovery. Written
+    through a temp file so an interrupted copy cannot leave a truncated backup that the ``exists()``
+    guard would then treat as the original."""
+    backup = MANAGED_STATE_PATH.with_suffix(MANAGED_STATE_PATH.suffix + ".pre-v2.bak")
+    if backup.exists() or not MANAGED_STATE_PATH.exists():
         return
-    config_io.ensure_parent_dir(MANAGED_STATE_PATH)
+    if not _is_legacy_file(config_io.read_json_safe(MANAGED_STATE_PATH)):
+        return
+    tmp = backup.with_name(backup.name + ".tmp")
     try:
-        MANAGED_STATE_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        tmp.write_bytes(MANAGED_STATE_PATH.read_bytes())
+        _restrict_permissions(tmp)
+        os.replace(tmp, backup)
+    except OSError:
+        pass
+
+
+def _save_slot(workspace: str, slot: str, config: dict) -> None:
+    """Write ``config`` to ``workspace``'s ``published`` or ``draft`` slot, preserving everything else.
+
+    Reads the current file, migrates it to the v2 map, sets one slot for one workspace, and writes it
+    back — so a refresh of the published slot never disturbs an admin's draft (or other workspaces).
+    0600 keeps the org-authored file readable/writable only by the user. No-op write in dry-run.
+
+    An empty ``config`` in the ``published`` slot records "this workspace has no managed config",
+    which matters because that slot doubles as the fallback when a later read fails: without it,
+    removing a config server-side would leave the old one on disk to be reapplied after an outage.
+    """
+    workspaces = _migrated_workspaces(config_io.read_json_safe(MANAGED_STATE_PATH))
+    workspaces[workspace] = {**workspaces.get(workspace, {}), slot: config}
+    payload = {"version": MANAGED_STATE_VERSION, "workspaces": workspaces}
+    if config_io.is_dry_run():
+        config_io.write_json_file(MANAGED_STATE_PATH, payload)
+        return
+    _backup_legacy_file_once()
+    _write_state_atomically(payload)
+
+
+def _write_state_atomically(payload: dict) -> None:
+    """Write the state map through a sibling temp file and rename it into place.
+
+    The map holds the admin's draft, which nothing can rebuild: a torn write would take the draft
+    with it, where before v2 an interrupted write only cost a snapshot the next launch refetches.
+    """
+    tmp = MANAGED_STATE_PATH.with_name(MANAGED_STATE_PATH.name + ".tmp")
+    config_io.write_json_file(tmp, payload)
+    _restrict_permissions(tmp)
+    try:
+        os.replace(tmp, MANAGED_STATE_PATH)
     except OSError as exc:
         raise RuntimeError(f"Failed to write managed state file: {MANAGED_STATE_PATH}") from exc
-    _restrict_permissions(MANAGED_STATE_PATH)
+
+
+def save_published_config(workspace: str, config: dict) -> None:
+    """Persist the workspace's launch-fetched ``published`` snapshot, leaving any ``draft`` intact."""
+    _save_slot(workspace, "published", config)
+
+
+def save_draft_config(workspace: str, config: dict) -> None:
+    """Persist the admin's locally authored ``draft``, leaving the ``published`` snapshot intact."""
+    _save_slot(workspace, "draft", config)
 
 
 def _restrict_permissions(path: Path) -> None:
@@ -376,34 +445,55 @@ def _restrict_permissions(path: Path) -> None:
         pass
 
 
-def load_managed_state(workspace: str | None) -> dict | None:
-    """Load the persisted managed config for ``workspace``, or None if absent/mismatched.
-
-    Returns the normalized config dict (the ``config`` field), only when the stored file is for the
-    same workspace — so a stale file from another workspace is ignored rather than misapplied.
-
-    This is the single local managed config: ``ucode setup`` authors it here, ``ucode publish``
-    publishes it, and a launch refreshes it from the workspace. The admin-authored draft and the
-    pulled copy share one file because the workspace is the source of truth — to keep a draft,
-    publish it with ``ucode publish``.
-    """
+def _load_slot(workspace: str | None, slot: str) -> dict | None:
+    """Return ``workspace``'s ``published`` or ``draft`` config, or None if absent."""
     if not workspace:
         return None
-    data = config_io.read_json_safe(MANAGED_STATE_PATH)
-    if data.get("workspace") != workspace:
-        return None
-    config = data.get("config")
+    entry = _migrated_workspaces(config_io.read_json_safe(MANAGED_STATE_PATH)).get(workspace) or {}
+    config = entry.get(slot)
     return config if isinstance(config, dict) else None
 
 
-def managed_state_workspace() -> str | None:
-    """The workspace the on-disk managed config was authored/pulled for, or None when there is none.
+def load_published_config(workspace: str | None) -> dict | None:
+    """Load the launch-fetched ``published`` snapshot for ``workspace``, or None if absent.
 
-    Lets a caller that has no workspace in local ucode state (e.g. ``ucode setup --show`` before
-    ``ucode configure``) still find the manifest on disk and report which workspace it belongs to.
+    This is what the launch path overlays (:func:`ucode.managed_resolve.resolve_state`) and what
+    ``ucode status`` reports — the admin-defined config a developer actually runs under. A stale
+    snapshot from a different workspace is ignored rather than misapplied.
     """
-    workspace = config_io.read_json_safe(MANAGED_STATE_PATH).get("workspace")
-    return workspace if isinstance(workspace, str) and workspace else None
+    return _load_slot(workspace, "published")
+
+
+def load_draft_config(workspace: str | None) -> dict | None:
+    """Load the admin's locally authored, unpublished ``draft`` for ``workspace``, or None.
+
+    Only ``ucode configure`` (admin authoring) writes this, and only ``ucode export`` / ``ucode
+    publish`` read it — never the launch path. A developer who has only ever fetched a published
+    snapshot has no draft, which is why export/publish are draft-only rather than falling back to the
+    fetched copy: a cached publication is not authored work.
+    """
+    return _load_slot(workspace, "draft")
+
+
+def managed_state_workspace() -> str | None:
+    """The sole workspace recorded in ``managed-state.json``, or None when absent/ambiguous.
+
+    Lets a caller with no workspace in local ucode state still find the config on disk. With several
+    workspaces recorded the answer is ambiguous, so it returns None and the caller reports that a
+    workspace must be selected first.
+    """
+    workspaces = _migrated_workspaces(config_io.read_json_safe(MANAGED_STATE_PATH))
+    return next(iter(workspaces)) if len(workspaces) == 1 else None
+
+
+def save_managed_state(workspace: str, config: dict) -> None:
+    """Deprecated alias for :func:`save_published_config`, kept while callers migrate to the slots."""
+    save_published_config(workspace, config)
+
+
+def load_managed_state(workspace: str | None) -> dict | None:
+    """Deprecated alias for :func:`load_published_config`, kept while callers migrate to the slots."""
+    return load_published_config(workspace)
 
 
 def refresh_managed_config(state: dict) -> tuple[dict | None, bool]:

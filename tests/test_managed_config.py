@@ -13,11 +13,15 @@ import ucode.databricks as db_mod
 import ucode.managed_config as mc_mod
 from ucode.managed_config import (
     get_managed_config,
+    load_draft_config,
     load_managed_state,
+    load_published_config,
     managed_state_workspace,
     normalize_managed_config,
     refresh_managed_config,
+    save_draft_config,
     save_managed_state,
+    save_published_config,
 )
 from ucode.managed_setup import serialize_managed_config
 
@@ -246,7 +250,9 @@ class TestPersistence:
     def test_dry_run_writes_nothing(self, _managed_path, monkeypatch):
         # Under --dry-run the config writers print instead of touching disk, so a launch that
         # dry-runs an admin's authored draft never overwrites it.
-        monkeypatch.setattr(config_io_mod, "is_dry_run", lambda: True)
+        # Patch the flag itself rather than `is_dry_run`: the shared JSON writer reads the module
+        # global directly.
+        monkeypatch.setattr(config_io_mod, "_dry_run", True)
         save_managed_state("https://ws.example.com", {"default_agent": "claude"})
         assert not _managed_path.exists()
 
@@ -266,6 +272,83 @@ class TestPersistence:
         loaded = load_managed_state("https://ws.example.com")
         assert loaded is not None
         assert json.loads(json.dumps(serialize_managed_config(loaded)))
+
+
+class TestDraftPublishedSeparation:
+    """The draft (admin-authored, unpublished) and published (fetched) slots are kept apart."""
+
+    @pytest.fixture(autouse=True)
+    def _managed_path(self, tmp_path, monkeypatch):
+        path = tmp_path / ".ucode" / "managed-state.json"
+        monkeypatch.setattr(mc_mod, "MANAGED_STATE_PATH", path)
+        return path
+
+    def test_slots_are_independent(self, _managed_path):
+        ws = "https://ws.example.com"
+        save_draft_config(ws, {"default_agent": "claude"})
+        save_published_config(ws, {"default_agent": "codex"})
+        assert load_draft_config(ws) == {"default_agent": "claude"}
+        assert load_published_config(ws) == {"default_agent": "codex"}
+
+    def test_saving_published_preserves_the_draft(self, _managed_path):
+        ws = "https://ws.example.com"
+        save_draft_config(ws, {"default_agent": "claude"})
+        save_published_config(ws, {"default_agent": "codex"})
+        save_published_config(ws, {"default_agent": "gemini"})
+        assert load_draft_config(ws) == {"default_agent": "claude"}
+
+    def test_refresh_never_clobbers_a_draft(self, _managed_path, monkeypatch):
+        ws = "https://ws.example.com"
+        save_draft_config(ws, {"default_agent": "claude", "enabled_agents": {"claude": {}}})
+        monkeypatch.setattr(mc_mod, "get_databricks_token", lambda w, p: "tok")
+        monkeypatch.setattr(
+            mc_mod, "get_managed_config", lambda w, tok: ({"default_agent": "codex"}, None)
+        )
+        result, _ = refresh_managed_config({"workspace": ws})
+        assert result == {"default_agent": "codex"}
+        assert load_published_config(ws) == {"default_agent": "codex"}
+        assert load_draft_config(ws) == {
+            "default_agent": "claude",
+            "enabled_agents": {"claude": {}},
+        }
+
+    def test_refresh_of_one_workspace_keeps_another_workspaces_draft(
+        self, _managed_path, monkeypatch
+    ):
+        ws_a, ws_b = "https://a.example.com", "https://b.example.com"
+        save_draft_config(ws_a, {"default_agent": "claude"})
+        monkeypatch.setattr(mc_mod, "get_databricks_token", lambda w, p: "tok")
+        monkeypatch.setattr(
+            mc_mod, "get_managed_config", lambda w, tok: ({"default_agent": "codex"}, None)
+        )
+        refresh_managed_config({"workspace": ws_b})
+        assert load_draft_config(ws_a) == {"default_agent": "claude"}
+
+    def test_a_failed_write_leaves_the_previous_state_intact(self, _managed_path, monkeypatch):
+        ws = "https://ws.example.com"
+        save_draft_config(ws, {"default_agent": "claude"})
+
+        def partial_write(path, payload):
+            path.write_text('{"version": 2, "workspa', encoding="utf-8")
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(mc_mod.config_io, "write_json_file", partial_write)
+        with pytest.raises(RuntimeError):
+            save_published_config(ws, {"default_agent": "codex"})
+        assert load_draft_config(ws) == {"default_agent": "claude"}
+
+    def test_legacy_file_migrates_into_the_published_slot_with_a_backup(self, _managed_path):
+        ws = "https://ws.example.com"
+        _managed_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy = {"workspace": ws, "config": {"default_agent": "claude"}}
+        _managed_path.write_text(json.dumps(legacy), encoding="utf-8")
+        assert load_published_config(ws) == {"default_agent": "claude"}
+        assert load_draft_config(ws) is None
+        backup = _managed_path.with_suffix(_managed_path.suffix + ".pre-v2.bak")
+        assert not backup.exists()
+        save_published_config(ws, {"default_agent": "codex"})
+        assert backup.exists()
+        assert json.loads(backup.read_text()) == legacy
 
 
 class TestFetchClient:

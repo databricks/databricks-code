@@ -387,6 +387,7 @@ control the installation.
 | `~/.pi/agent/models.json` | Pi |
 | `~/.cursor/mcp.json` | Cursor Agent (MCP servers only) |
 | `~/.ucode/managed-state.json` | The managed config — authored by `ucode setup` (admins) and refreshed from the workspace on launch |
+| `~/.ucode/managed-state.json.pre-v2.bak` | One-time copy of a pre-slots `managed-state.json`, kept when it is first migrated |
 | `~/.ucode/managed-backups/` | Baseline backups for OS-managed files changed by ucode |
 
 Existing files are backed up before being overwritten. `ucode revert` restores backups.
