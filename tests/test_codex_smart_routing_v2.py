@@ -5,7 +5,7 @@ import json
 import pytest
 
 from ucode.agents import codex
-from ucode.smart_routing import codex_interposer, v2
+from ucode.smart_routing import codex_interposer, codex_routing, v2
 
 WS = "https://example.databricks.com"
 
@@ -39,11 +39,12 @@ def test_smart_routing_switch_message_is_boxed():
     message = v2.format_routing_notice("model-x", "Because X.")
 
     assert message == (
-        "┌───────────────────────────────────┐\n"
-        "│ Using Unity Gateway Smart Router. │\n"
-        "│ Selected Model : model-x          │\n"
-        "│ Reason : Because X.               │\n"
-        "└───────────────────────────────────┘"
+        "┌───────────────────────────────────────────────────────────────────────────┐\n"
+        "│ Using Unity Gateway Smart Router.                                         │\n"
+        "│ Selected Model : model-x                                                  │\n"
+        "│ Reason : Because X.                                                       │\n"
+        "│ Spawned subagents are routed independently based on their own complexity. │\n"
+        "└───────────────────────────────────────────────────────────────────────────┘"
     )
 
 
@@ -52,6 +53,7 @@ class TestLaunchCodex:
         calls = []
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(codex, "default_model", lambda state: "gpt-start")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
 
         def launch_v2(state, tool_args, **kwargs):
             calls.append((state, tool_args, kwargs))
@@ -75,6 +77,26 @@ class TestLaunchCodex:
                 },
             )
         ]
+
+    def test_codex_launch_normalizes_cached_bootstrap_model(self, monkeypatch):
+        calls = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        monkeypatch.setattr(codex, "default_model", lambda state: None)
+
+        def launch_v2(state, tool_args, **kwargs):
+            calls.append(kwargs)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(v2, "launch_codex", launch_v2)
+
+        with pytest.raises(SystemExit):
+            codex.launch(
+                {"workspace": WS, "codex_models": ["system.ai.gpt-5-6-luna"]},
+                [],
+            )
+
+        assert calls[0]["start_model"] == "gpt-5.6-luna"
 
     def test_owns_app_server_interposer_and_tui_lifecycle(self, monkeypatch):
         processes = []
@@ -145,11 +167,20 @@ class TestLaunchCodex:
             'model="gpt-start"',
             "--config",
         ]
-        assert processes[0].argv[8:] == [
+        assert processes[0].argv[7].startswith("model_providers.ucode-databricks={")
+        assert processes[0].argv[8] == "--config"
+        hook_override = processes[0].argv[9]
+        assert hook_override.startswith("hooks.PreToolUse=[{")
+        assert 'matcher = "Agent|.*spawn_agent$"' in hook_override
+        assert "codex-router-hook route-subagent" in hook_override
+        assert f"--host {WS}" in hook_override
+        assert "--profile myprof" in hook_override
+        assert "--model system.ai.gpt-5-6-sol" in hook_override
+        assert "--model system.ai.glm-5-2" in hook_override
+        assert processes[0].argv[10:] == [
             "--listen",
             "ws://127.0.0.1:41001",
         ]
-        assert processes[0].argv[7].startswith("model_providers.ucode-databricks={")
         assert processes[0].kwargs["env"][v2.OAUTH_TOKEN_ENV_VAR] == "token-1"
         assert processes[0].kwargs["env"]["CODEX_HOME"] == "/user/codex-home"
         assert processes[1].argv == [
@@ -173,17 +204,90 @@ class TestLaunchCodex:
         assert stopped == [True]
         assert processes[0].terminated is True
 
-    def test_missing_cached_models_blocks_launch(self, monkeypatch):
-        monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
+    def test_v2_pre_tool_hook_preserves_user_hooks(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            "[[hooks.PreToolUse]]\n"
+            'matcher = "Bash"\n'
+            "[[hooks.PreToolUse.hooks]]\n"
+            'type = "command"\n'
+            'command = "user-policy"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
-        with pytest.raises(RuntimeError, match="ucode configure codex"):
+        configured = v2._v2_pre_tool_use_hooks(
+            {"workspace": WS, "profile": "myprof"},
+            ["system.ai.gpt-5-6-sol"],
+        )
+
+        assert configured[0]["hooks"][0]["command"] == "user-policy"
+        assert configured[1]["matcher"] == "Agent|.*spawn_agent$"
+        assert "--model system.ai.gpt-5-6-sol" in configured[1]["hooks"][0]["command"]
+
+    def test_v2_pre_tool_hook_replaces_existing_ucode_hook(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            "[[hooks.PreToolUse]]\n"
+            'matcher = "Agent|.*spawn_agent$"\n'
+            "[[hooks.PreToolUse.hooks]]\n"
+            'type = "command"\n'
+            'command = "ucode codex-router-hook route-subagent --model old"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        configured = v2._v2_pre_tool_use_hooks(
+            {"workspace": WS, "profile": "myprof"},
+            ["system.ai.gpt-5-6-sol"],
+        )
+
+        routing_commands = [
+            hook["command"]
+            for group in configured
+            for hook in group["hooks"]
+            if "codex-router-hook" in hook["command"]
+        ]
+        assert len(routing_commands) == 1
+        assert "--model system.ai.gpt-5-6-sol" in routing_commands[0]
+        assert "--model old" not in routing_commands[0]
+
+    def test_missing_cached_models_starts_with_bootstrap_model(self, monkeypatch):
+        monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "unknown")
+        monkeypatch.setattr(v2, "_free_port", lambda: 41001)
+        monkeypatch.setattr(v2, "_wait_for_app_server", lambda port, timeout: True)
+        monkeypatch.setattr(
+            v2.subprocess,
+            "Popen",
+            lambda *args, **kwargs: type(
+                "Process",
+                (),
+                {
+                    "wait": lambda self, timeout=None: 0,
+                    "terminate": lambda self: None,
+                    "kill": lambda self: None,
+                },
+            )(),
+        )
+        monkeypatch.setattr(
+            codex_interposer,
+            "start_interposer_thread",
+            lambda *args, **kwargs: (41002, lambda: None),
+        )
+
+        with pytest.raises(SystemExit) as exc:
             v2.launch_codex(
                 {"workspace": WS},
                 [],
                 binary="codex",
-                start_model="gpt-start",
+                start_model="gpt-5.6-luna",
                 render_overlay=codex.render_overlay,
             )
+
+        assert exc.value.code == 0
 
 
 def test_interposer_startup_failure_is_propagated(monkeypatch):
@@ -308,6 +412,60 @@ class TestInterposerSession:
         assert json.loads(output)["params"]["model"] == "claude-opus-4-8"
         assert "Task classified as bugfix." in sess.switch_message
 
+    def test_maps_selected_uc_gpt_model_and_shows_routing_notice(self):
+        def select(_prompt):
+            return (
+                codex_interposer.routing.RoutingDecision(
+                    model="system.ai.gpt-5-6-luna",
+                    raw_model="gpt-5-6-luna",
+                    rationale="Trivial task.",
+                ),
+                None,
+            )
+
+        sess = codex_interposer._Session(
+            None,
+            log=lambda _m: None,
+            route_decision=select,
+            switch_message_fn=v2._switch_message,
+        )
+        frame = self._turn_start("system.ai.gpt-5-6-luna")
+
+        output = sess.on_tui_frame(frame)
+        assert json.loads(output)["params"]["model"] == "gpt-5.6-luna"
+        injected = sess.on_engine_frame(self._turn_started("turn-1"))
+
+        assert [message["method"] for message in injected] == [
+            codex_interposer.SETTINGS_UPDATED,
+            codex_interposer.ITEM_STARTED,
+            codex_interposer.ITEM_COMPLETED,
+        ]
+        assert "Selected Model : gpt-5.6-luna" in (injected[1]["params"]["item"]["text"])
+
+    def test_routes_first_prompt_to_oss_model(self):
+        def select(_prompt):
+            return (
+                codex_interposer.routing.RoutingDecision(
+                    model="system.ai.glm-5-2",
+                    raw_model="glm-5-2",
+                    rationale="Short isolated task.",
+                ),
+                None,
+            )
+
+        sess = codex_interposer._Session(
+            None,
+            log=lambda _m: None,
+            available_models=["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"],
+            route_decision=select,
+            switch_message_fn=v2._switch_message,
+        )
+
+        output = sess.on_tui_frame(self._turn_start("system.ai.gpt-5-6-sol"))
+
+        assert json.loads(output)["params"]["model"] == "system.ai.glm-5-2"
+        assert "Selected Model : system.ai.glm-5-2" in sess.switch_message
+
     def test_router_failure_keeps_original_model(self):
         sess = codex_interposer._Session(
             None,
@@ -323,12 +481,13 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
     captured = {}
     logged = []
 
-    def select_route(workspace, token, task, route_options, resolve):
+    def select_route(workspace, token, task, route_options, resolve, *, timeout):
         captured.update(
             workspace=workspace,
             token=token,
             task=task,
             route_options=list(route_options),
+            timeout=timeout,
         )
         return (
             codex_interposer.routing.RoutingDecision(
@@ -339,9 +498,9 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
             None,
         )
 
-    monkeypatch.setattr(codex_interposer.routing, "select_route", select_route)
+    monkeypatch.setattr(codex_routing.routing, "select_route", select_route)
 
-    decision, reason = codex_interposer._request_routing_decision(
+    decision, reason = codex_routing.request_routing_decision(
         WS,
         "same-oauth-token",
         "Fix the parser",
@@ -351,7 +510,7 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
             "system.ai.gpt-5-6-luna",
             "system.ai.glm-5-2",
         ],
-        logged.append,
+        log=logged.append,
     )
 
     assert reason is None
@@ -360,6 +519,7 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
         "workspace": WS,
         "token": "same-oauth-token",
         "task": "Fix the parser",
+        "timeout": codex_routing.REQUEST_TIMEOUT_S,
         "route_options": [
             ("kimi-k3-neo", "codex"),
             ("gpt-5-6-sol", "codex"),

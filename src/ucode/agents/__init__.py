@@ -24,6 +24,7 @@ from ucode.databricks import (
     map_claude_family_models,
     resolve_provider_service,
 )
+from ucode.managed_files import managed_write_batch
 from ucode.state import get_provider_service, load_state, save_state
 from ucode.telemetry import agent_version
 from ucode.ui import (
@@ -39,6 +40,7 @@ from ucode.ui import (
 )
 
 from . import claude, codex, copilot, gemini, opencode, pi
+from .args import explicit_model_arg_value as explicit_model_arg_value
 
 _MODULES = {
     "codex": codex,
@@ -50,6 +52,7 @@ _MODULES = {
 }
 
 TOOL_SPECS: dict[str, ToolSpec] = {name: module.SPEC for name, module in _MODULES.items()}
+
 
 # Model-routing agents ucode configures end to end. Cursor is deliberately NOT
 # here: it runs models on the user's own Cursor account, so `normalize_tool`
@@ -68,16 +71,11 @@ TOOL_ALIASES = {
 
 DEFAULT_TOOL = "codex"
 BUNDLE_VERSION = 1
+_MANAGED_SETTINGS_TOOLS = {"claude"}
 
-# Agents that can mirror ucode's managed config into the tool's NATIVE default config file, so a
-# bare `claude` / `codex` (not just `ucode <agent>`) picks up the gateway settings. This is gated by
-# the admin's `use_as_global_settings` choice in `ucode setup`. Only agents whose gateway auth
-# self-refreshes qualify: claude's `apiKeyHelper` and codex's `ucode auth-token` command both re-mint
-# tokens on their own, so the native file keeps working indefinitely. The other agents bake a
-# short-lived bearer token with no bare-launch refresher (opencode/pi/gemini) or expose no native
-# config file at all (copilot is env-var only), so they're excluded — and `ucode setup` doesn't even
-# ask them the machine-wide question.
-GLOBAL_SETTINGS_AGENTS = frozenset({"claude", "codex"})
+# Codex still honors the legacy managed-config opt-in until its follow-up migration. Claude always
+# reconciles its OS-managed settings and therefore no longer appears in the setup prompt.
+GLOBAL_SETTINGS_AGENTS = frozenset({"codex"})
 
 # ucode tool -> `databricks aitools` agent id. gemini/pi aren't supported.
 AITOOLS_AGENT_TOKENS = {
@@ -146,16 +144,6 @@ def _required_update_message(tool: str) -> str | None:
     return checker()
 
 
-def _confirm_update_installed_tool_binary(tool: str) -> bool:
-    spec = TOOL_SPECS[tool]
-    update = _MODULES[tool].is_update_available()
-
-    if not update:
-        return False
-    current, latest = update
-    return prompt_yes_no(f"(Optional) Update {spec['display']} from {current} to {latest}?")
-
-
 def _too_new_downgrade(tool: str) -> tuple[str, str] | None:
     """Return (installed_version, downgrade_target) when the installed tool is
     too new to work, or None. Agents opt in by defining `too_new_downgrade`."""
@@ -213,9 +201,6 @@ def install_tool_binary(
                 print_warning(required_update)
                 if not _update_installed_tool_binary(tool):
                     raise RuntimeError(_minimum_version_error(tool) or required_update)
-            elif prompt_optional_updates and _confirm_update_installed_tool_binary(tool):
-                _update_installed_tool_binary(tool)
-
         version_error = _minimum_version_error(tool)
         if version_error:
             raise RuntimeError(version_error)
@@ -286,7 +271,8 @@ def resolve_launch_model(
     explicit_model: str | None,
 ) -> tuple[dict, str | None]:
     model = explicit_model or default_model_for_tool(tool, state)
-    if not model:
+    # if model is not specified for codex, then launch with harness's default model.
+    if not model and tool != "codex":
         raise RuntimeError(
             f"No models available for {tool}. Run `ucode configure` to set up your workspace."
         )
@@ -431,7 +417,8 @@ def configure_single_tool(tool: str, state: dict) -> dict:
             raise RuntimeError(
                 f"{TOOL_SPECS[tool]['display']} is not available on this workspace.{detail}"
             )
-    state = _configure_one(tool, state, provider)
+    with managed_write_batch(_managed_settings_displays([tool])):
+        state = _configure_one(tool, state, provider)
     available_tools = list(set((state.get("available_tools") or []) + [tool]))
     state["available_tools"] = available_tools
     save_state(state)
@@ -453,7 +440,9 @@ def _configure_one(tool: str, state: dict, provider: str | None) -> dict:
     return configure_tool(tool, state, model)
 
 
-def configure_selected_tools(state: dict, tools: list[str]) -> dict:
+def configure_selected_tools(
+    state: dict, tools: list[str], *, install_ai_tools: bool = True
+) -> dict:
     """Configure the given tools. Caller is responsible for ensuring each tool
     is available on the workspace.
 
@@ -461,14 +450,20 @@ def configure_selected_tools(state: dict, tools: list[str]) -> dict:
     replacing it, so a previously-configured tool the user didn't pick this
     run is preserved.
     """
-    for tool in tools:
-        state = _configure_one(tool, state, get_provider_service(state, tool))
+    with managed_write_batch(_managed_settings_displays(tools)):
+        for tool in tools:
+            state = _configure_one(tool, state, get_provider_service(state, tool))
 
     existing = state.get("available_tools") or []
     state["available_tools"] = sorted(set(existing) | set(tools))
     save_state(state)
-    install_databricks_ai_tools_for_agents(tools, state)
+    if install_ai_tools:
+        install_databricks_ai_tools_for_agents(tools, state)
     return state
+
+
+def _managed_settings_displays(tools: list[str]) -> list[str]:
+    return [TOOL_SPECS[tool]["display"] for tool in tools if tool in _MANAGED_SETTINGS_TOOLS]
 
 
 def configure_all_tools(state: dict) -> dict:

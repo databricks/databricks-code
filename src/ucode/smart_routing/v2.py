@@ -16,7 +16,7 @@ from typing import NoReturn, TextIO
 
 import tomlkit
 
-from ucode.config_io import APP_DIR, read_json_safe, write_json_file
+from ucode.config_io import APP_DIR, read_json_safe, read_toml_safe, write_json_file
 from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import (
     build_auth_token_argv,
@@ -29,6 +29,7 @@ from ucode.smart_routing.claude_hooks import (
     sync_first_prompt_hook,
     sync_smart_routing_hooks,
 )
+from ucode.smart_routing.codex_hooks import merge_pre_tool_use_hooks, routing_models
 from ucode.ui import print_note
 
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
@@ -80,17 +81,12 @@ def _wait_for_app_server(port: int, timeout: float) -> bool:
     return False
 
 
-def format_routing_notice(model: str, reason: str | None, *, title: str | None = None) -> str:
-    lines = [
-        *([title] if title else []),
-        "Using Unity Gateway Smart Router.",
-        f"Selected Model : {model}",
-    ]
-    if reason:
-        lines.append(f"Reason : {reason}")
-    width = max(map(len, lines))
-    border = "─" * (width + 2)
-    return "\n".join([f"┌{border}┐", *(f"│ {line:<{width}} │" for line in lines), f"└{border}┘"])
+def _switch_message(model: str, reason: str) -> str:
+    return routing.format_switch_message(model, reason)
+
+
+def format_routing_notice(model: str, reason: str | None) -> str:
+    return routing.format_switch_message(model, reason or "")
 
 
 def _canonical_claude_model_id(model: str) -> str:
@@ -249,10 +245,9 @@ def route_claude_pre_tool_use(
             route.decision,
             route.routed_model,
         )
-    routing_message = format_routing_notice(
+    routing_message = routing.format_subagent_message(
         route.routed_model,
         route.decision.rationale,
-        title="Subagent Smart Routing",
     )
     updated_input = {
         **{key: value for key, value in route.tool_input.items() if key != "model"},
@@ -401,6 +396,11 @@ def _toml_value(value: str | int | float | bool | list[object] | dict[str, objec
         item = tomlkit.inline_table()
         item.update(value)
         return item.as_string()
+    if isinstance(value, list) and any(isinstance(entry, dict) for entry in value):
+        wrapper = tomlkit.inline_table()
+        wrapper["value"] = value
+        rendered = wrapper.as_string()
+        return rendered.removeprefix("{value = ").removesuffix("}")
     return tomlkit.item(value).as_string()
 
 
@@ -409,12 +409,12 @@ def _codex_config_args(overlay: dict) -> list[str]:
     for key, value in overlay.items():
         # This is Codex's AI Gateway transport definition, not Unity Catalog
         # Model Provider Service support; smart routing still cannot use --provider.
-        if key == "model_providers" and isinstance(value, dict):
+        if key in {"hooks", "model_providers"} and isinstance(value, dict):
             for provider_name, provider_config in value.items():
                 args.extend(
                     [
                         "--config",
-                        f"model_providers.{provider_name}={_toml_value(provider_config)}",
+                        f"{key}.{provider_name}={_toml_value(provider_config)}",
                     ]
                 )
         else:
@@ -425,12 +425,25 @@ def _codex_config_args(overlay: dict) -> list[str]:
 # TODO: Replace with /codex/v1/models once /codex/v1/models can send GPT models as well.
 def _cached_routing_models(state: dict) -> list[str]:
     """Return the persisted UC model-service ids usable by Codex routing."""
-    models: list[str] = []
-    for key in ("codex_models", "oss_models"):
-        values = state.get(key)
-        if isinstance(values, list):
-            models.extend(value for value in values if isinstance(value, str) and value)
-    return list(dict.fromkeys(models))
+    return routing_models(state)
+
+
+def _codex_home_config_path() -> Path:
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).expanduser() / "config.toml"
+    return Path.home() / ".codex" / "config.toml"
+
+
+def _v2_pre_tool_use_hooks(state: dict, available_models: list[str]) -> list[dict]:
+    doc = read_toml_safe(_codex_home_config_path())
+    configured_hooks = doc.get("hooks")
+    existing = configured_hooks.get("PreToolUse") if isinstance(configured_hooks, dict) else None
+    return merge_pre_tool_use_hooks(
+        existing if isinstance(existing, list) else [],
+        state,
+        available_models=available_models,
+    )
 
 
 def launch_codex(
@@ -455,9 +468,9 @@ def launch_codex(
     os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, profile)
     available_models = _cached_routing_models(state)
     if not available_models:
-        raise RuntimeError(
-            "Smart routing v2 has no cached Unity Catalog model services; "
-            "run `ucode configure codex` to refresh them."
+        print_note(
+            "Smart routing model metadata is unavailable; starting Codex on gpt-5.6-luna "
+            "without automatic model switching. Run `ucode configure codex` to enable routing."
         )
     overlay = render_overlay(
         workspace,
@@ -465,6 +478,9 @@ def launch_codex(
         state.get("profile"),
         use_pat=bool(state.get("use_pat")),
     )
+    overlay["hooks"] = {
+        "PreToolUse": _v2_pre_tool_use_hooks(state, available_models),
+    }
     config_args = _codex_config_args(overlay)
     app_port = _free_port()
     app_server_url = _loopback_websocket_url(app_port)

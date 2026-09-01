@@ -15,6 +15,11 @@ from ucode.smart_routing import claude_routing, v2
 WS = "https://example.databricks.com"
 
 
+@pytest.fixture(autouse=True)
+def _avoid_real_managed_settings(monkeypatch):
+    monkeypatch.setattr(claude, "_managed_settings_path", lambda: None)
+
+
 class TestClaudeSpec:
     def test_binary(self):
         assert claude.SPEC["binary"] == "claude"
@@ -516,6 +521,7 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
         )
         monkeypatch.setattr(claude, "save_state", lambda state: None)
         monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
+        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: True)
 
     def test_strips_stale_disable_experimental_betas(self, monkeypatch):
         existing = {"env": {"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"}}
@@ -533,7 +539,7 @@ FAKE_MANAGED_PATH = Path("/tmp/ucode-test/managed-settings.json")
 
 
 class TestWriteToolConfigManagedSettings:
-    """use_as_global_settings: also write Claude Code's OS managed-settings.json (via sudo, mocked)."""
+    """Every normal configuration also writes Claude Code's OS-managed settings."""
 
     def _patch(self, monkeypatch, private_writes, managed_writes, existing_by_path=None):
         existing_by_path = existing_by_path or {}
@@ -551,20 +557,29 @@ class TestWriteToolConfigManagedSettings:
         )
         monkeypatch.setattr(claude, "save_state", lambda state: None)
         monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
+        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: True)
         # Deterministic managed path, and a mocked sudo writer so NO real sudo/`/etc` write happens.
         monkeypatch.setattr(claude, "_managed_settings_path", lambda: FAKE_MANAGED_PATH)
+        monkeypatch.setattr(
+            claude,
+            "read_managed_file",
+            lambda path: (
+                json.dumps(existing_by_path[str(path)]) if str(path) in existing_by_path else None
+            ),
+        )
+        monkeypatch.setattr(claude, "mark_managed_file_verified", lambda *a, **kw: None)
 
-        def fake_write_managed(path, text, *, display):
+        def fake_write_managed(path, text, **kwargs):
             managed_writes.append((str(path), text))
             return "written"
 
-        monkeypatch.setattr(claude, "write_managed_file", fake_write_managed)
+        monkeypatch.setattr(claude, "reconcile_managed_file", fake_write_managed)
 
-    def test_writes_managed_file_when_flagged(self, monkeypatch):
+    def test_writes_managed_file_by_default(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
         self._patch(monkeypatch, private_writes, managed_writes)
-        state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
+        state = {"workspace": WS, "codex_models": []}
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
         # Private file still written; managed file written too.
         assert str(claude.CLAUDE_SETTINGS_PATH) in [p for p, _ in private_writes]
@@ -576,7 +591,7 @@ class TestWriteToolConfigManagedSettings:
         # An IT-authored key already in the managed file must survive the merge.
         existing = {str(FAKE_MANAGED_PATH): {"env": {"MY_OWN": "keep"}}}
         self._patch(monkeypatch, private_writes, managed_writes, existing)
-        state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
+        state = {"workspace": WS, "codex_models": []}
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
         _, text = managed_writes[0]
         written = json.loads(text)
@@ -584,13 +599,15 @@ class TestWriteToolConfigManagedSettings:
         assert written["env"]["ANTHROPIC_BASE_URL"]
         assert written["apiKeyHelper"]
 
-    def test_no_managed_write_by_default(self, monkeypatch):
+    def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
-        self._patch(monkeypatch, private_writes, managed_writes)
-        state = {"workspace": WS, "codex_models": []}
+        existing = {str(FAKE_MANAGED_PATH): {"permissions": {"deny": ["Bash(rm:*)"]}}}
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": ["databricks-gpt-5"]}
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
-        assert managed_writes == []
+        _, text = managed_writes[0]
+        assert json.loads(text)["permissions"]["deny"] == ["Bash(rm:*)", "WebSearch"]
 
     def test_relayed_skips_managed_write(self, monkeypatch):
         private_writes: list = []
@@ -599,10 +616,63 @@ class TestWriteToolConfigManagedSettings:
         self._patch(monkeypatch, private_writes, managed_writes)
         monkeypatch.setattr(claude, "print_warning", lambda msg: warns.append(msg))
         monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
-        state = {"workspace": WS, "codex_models": [], "write_managed_config": True}
+        monkeypatch.setattr(claude, "_managed_relayed_conflicts", lambda path: [])
+        state = {"workspace": WS, "codex_models": []}
         claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
         assert managed_writes == []
-        assert any("bare `claude`" in w for w in warns)
+        assert warns == []
+
+    def test_relayed_fails_on_conflicting_managed_auth(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {str(FAKE_MANAGED_PATH): {"apiKeyHelper": "enterprise-helper"}}
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
+        state = {"workspace": WS, "codex_models": []}
+
+        with pytest.raises(RuntimeError, match="run `ucode revert`"):
+            claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
+
+        assert managed_writes == []
+
+    def test_relayed_rejects_invalid_managed_json(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        monkeypatch.setattr(claude, "read_managed_file", lambda path: "{")
+        monkeypatch.setattr(claude, "relayed_proxy_base_url", lambda state: "http://127.0.0.1:9999")
+        state = {"workspace": WS, "codex_models": []}
+
+        with pytest.raises(RuntimeError, match="Cannot safely inspect"):
+            claude.write_tool_config(state, "databricks-claude-sonnet-4", relayed=True)
+
+        assert managed_writes == []
+
+    def test_noninteractive_uses_local_settings_when_managed_file_is_compatible(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: False)
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        assert managed_writes == []
+
+    def test_noninteractive_fails_when_managed_file_conflicts(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {
+            str(FAKE_MANAGED_PATH): {"env": {"ANTHROPIC_BASE_URL": "https://other.example.com"}}
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: False)
+        state = {"workspace": WS, "codex_models": []}
+
+        with pytest.raises(RuntimeError, match="cannot be applied non-interactively"):
+            claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        assert managed_writes == []
 
 
 class TestRegisterWebSearchMcp:
@@ -751,7 +821,6 @@ class TestClaudeLaunch:
             return Server(), Cache(), Client()
 
         monkeypatch.setattr(claude, "_managed_relayed_conflicts", lambda: None)
-        monkeypatch.setattr(claude, "_managed_pinned_model", lambda: None)
         monkeypatch.setattr(claude, "_ensure_subscription_login", lambda: None)
         monkeypatch.setattr(claude.gateway_proxy, "start_proxy", start_proxy)
         monkeypatch.setattr(
@@ -1310,44 +1379,3 @@ class TestClaudeSmartRouting:
         assert state.get(claude.SMART_ROUTING_STATE_KEY) is None
         assert list(doc["hooks"]) == ["PreToolUse"]
         assert doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "user-policy"
-
-
-class TestManagedSettingsModelOverrides:
-    """Enterprise managed settings outrank ucode's --settings, so a model pinned there beats the
-    one an admin published — worth pointing a developer at the file."""
-
-    @staticmethod
-    def _write(monkeypatch, tmp_path, payload):
-        path = tmp_path / "managed-settings.json"
-        path.write_text(json.dumps(payload), encoding="utf-8")
-        monkeypatch.setattr(claude, "_managed_settings_path", lambda: path)
-        return path
-
-    @pytest.mark.parametrize(
-        "key",
-        ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"],
-    )
-    def test_reports_the_path_when_a_model_is_pinned(self, monkeypatch, tmp_path, key):
-        path = self._write(monkeypatch, tmp_path, {"env": {key: "system.ai.claude-opus-5"}})
-        assert claude.managed_settings_model_overrides() == path
-
-    def test_none_for_name_companions_that_select_nothing(self, monkeypatch, tmp_path):
-        # The `_NAME` keys are picker labels, so an enterprise value there overrides no model.
-        self._write(monkeypatch, tmp_path, {"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "Opus 5"}})
-        assert claude.managed_settings_model_overrides() is None
-
-    def test_none_when_no_model_keys_are_set(self, monkeypatch, tmp_path):
-        self._write(monkeypatch, tmp_path, {"env": {"SOMETHING_ELSE": "1"}})
-        assert claude.managed_settings_model_overrides() is None
-
-    def test_none_when_env_block_is_absent(self, monkeypatch, tmp_path):
-        self._write(monkeypatch, tmp_path, {"permissions": {}})
-        assert claude.managed_settings_model_overrides() is None
-
-    def test_none_on_platforms_without_managed_settings(self, monkeypatch):
-        monkeypatch.setattr(claude, "_managed_settings_path", lambda: None)
-        assert claude.managed_settings_model_overrides() is None
-
-    def test_none_when_the_file_does_not_exist(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(claude, "_managed_settings_path", lambda: tmp_path / "missing.json")
-        assert claude.managed_settings_model_overrides() is None

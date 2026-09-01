@@ -310,10 +310,9 @@ class TestSubagentRouting:
         assert updated_input["subagent_type"] == v2._routed_claude_agent_name(
             "system.ai.claude-opus-4-8"
         )
-        expected_message = v2.format_routing_notice(
+        expected_message = routing.format_subagent_message(
             "system.ai.claude-opus-4-8",
             "",
-            title="Subagent Smart Routing",
         )
         assert output["systemMessage"] == expected_message
         assert output["hookSpecificOutput"]["permissionDecisionReason"] == expected_message

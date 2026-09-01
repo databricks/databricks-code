@@ -18,6 +18,7 @@ from ucode.agents import (
     configure_tool,
     ensure_bootstrap_dependencies,
     ensure_provider_state,
+    explicit_model_arg_value,
     install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
@@ -55,6 +56,7 @@ from ucode.databricks import (
     list_tool_provider_services,
     normalize_workspace_url,
     resolve_pat_token,
+    resolve_provider_launch_model,
     run_databricks_login,
 )
 from ucode.managed_budget import (
@@ -77,7 +79,6 @@ from ucode.managed_resolve import (
     managed_provider_service,
     managed_supplies_models,
     managed_unservable_models,
-    managed_use_as_global_settings,
     recommended_agent,
     resolve_state,
 )
@@ -134,7 +135,6 @@ from ucode.ui import (
     prompt_for_tools,
     prompt_for_workspace,
     prompt_yes_no,
-    prompt_yes_no_default,
     set_verbosity,
     spinner,
     status_badge,
@@ -642,7 +642,9 @@ def configure_shared_state(
     )
     want_gemini = fetch_all or "gemini" in tools or "opencode" in tools or "pi" in tools
     want_codex = fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools
-    want_oss = fetch_all or "opencode" in tools
+    # Codex smart routing can select OSS models such as GLM, so a Codex-only
+    # configure must persist that discovered family too.
+    want_oss = fetch_all or "opencode" in tools or "codex" in tools
 
     claude_reason: str | None = None
     gemini_reason: str | None = None
@@ -838,6 +840,7 @@ def configure_workspace_command(
     skip_unavailable: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    offer_optional_setup: bool = False,
 ) -> int:
     if tool is not None and selected_tools is not None:
         raise RuntimeError("Use either --agent or --agents, not both.")
@@ -949,17 +952,10 @@ def configure_workspace_command(
         for tool_name in picked:
             state = _maybe_select_provider_service(tool_name, state)
 
-    # Last question in the interactive flow: opt out of AI Tools. When a flag
-    # already decided it, configure_shared_state persisted that; skip the prompt.
-    # The default is the resolved prior choice, so Enter won't undo a past opt-out.
-    if databricks_ai_tools_enabled is None and offer_provider:
-        state["databricks_ai_tools_enabled"] = prompt_yes_no_default(
-            "Install Databricks AI Tools for your coding agents? "
-            "This adds Databricks skills and plugins.",
-            default=state.get("databricks_ai_tools_enabled", True),
-        )
-
-    state = configure_selected_tools(state, picked)
+    if offer_optional_setup:
+        state = configure_selected_tools(state, picked, install_ai_tools=False)
+    else:
+        state = configure_selected_tools(state, picked)
 
     summary_lines = [f"[bold]Workspace:[/bold] [cyan]{state['workspace']}[/cyan]"]
     for tool_name in picked:
@@ -979,11 +975,13 @@ def configure_workspace_command(
 
     if skip_validate:
         print_note("Skipping agent validation (--skip-validate).")
-        return 0
-    # Limit validation to just-configured tools so we don't re-validate
-    # previously-configured tools the user didn't touch this run.
-    validate_state = {**state, "available_tools": picked}
-    validate_all_tools(validate_state)
+    else:
+        # Limit validation to just-configured tools so we don't re-validate
+        # previously-configured tools the user didn't touch this run.
+        validate_state = {**state, "available_tools": picked}
+        validate_all_tools(validate_state)
+    if offer_optional_setup and not is_dry_run():
+        _configure_optional_setup(state, picked)
     return 0
 
 
@@ -1044,6 +1042,13 @@ def status() -> int:
                 ", ".join(tool_mcp_servers) if tool_mcp_servers else "none saved by ucode",
             )
         print_kv("Config file", str(config_path) if config_path.exists() else "missing")
+        if tool == "claude":
+            managed_path, managed_status, backup_status = claude_agent.managed_settings_status(
+                state
+            )
+            print_kv("OS-managed settings", managed_status)
+            print_kv("Managed settings file", str(managed_path) if managed_path else "unsupported")
+            print_kv("Managed settings backup", backup_status)
         console.print()
 
     print_heading("Skills")
@@ -1099,6 +1104,7 @@ def revert() -> int:
     state = load_state()
     managed_configs = state.get("managed_configs") or {}
     mcp_results = revert_mcp_configs(state)
+    claude_managed_result = claude_agent.revert_managed_settings()
 
     results: dict[str, bool] = {
         tool: restore_file(
@@ -1120,6 +1126,7 @@ def revert() -> int:
         print_kv(f"{spec['display']} config", "restored" if results[tool] else "unchanged")
     if legacy_codex_stripped:
         print_kv("Codex shared config", "ucode entries removed")
+    print_kv("Claude Code OS-managed settings", claude_managed_result)
     print_kv("Pi settings", "restored" if pi_settings_restored else "unchanged")
     for client, spec in MCP_CLIENTS.items():
         print_kv(
@@ -1188,6 +1195,17 @@ def _configure_agents_for_mcp(
             )
         configured.add("cursor")
     return configured
+
+
+def _configure_optional_setup(state: dict, tools: list[str]) -> None:
+    enabled = prompt_yes_no("Configure MCP servers, skills, and plugins?")
+    state["databricks_ai_tools_enabled"] = enabled
+    save_state(state)
+    if not enabled:
+        return
+
+    install_databricks_ai_tools_for_agents(tools, state)
+    configure_mcp_command()
 
 
 @mcp_app.command("add")
@@ -1379,6 +1397,21 @@ def auth_token_cmd(
     sys.stdout.write(token + "\n")
 
 
+def _oauth_token_is_fresh(token: str, buffer_seconds: float = 120) -> bool:
+    import base64
+    import binascii
+    import json
+    import time
+
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        expires_at = float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+    except (IndexError, KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError):
+        return False
+    return time.time() < expires_at - buffer_seconds
+
+
 @app.command("codex-router-hook", hidden=True)
 def codex_router_hook_cmd(
     event: str,
@@ -1433,14 +1466,16 @@ def codex_router_hook_cmd(
         return
     if event != "route-subagent" or not host:
         return
-    token = os.environ.get("OAUTH_TOKEN") or os.environ.get("DATABRICKS_BEARER")
+    if use_pat and not ensure_pat_bearer(profile):
+        return
+    token = os.environ.get("DATABRICKS_BEARER", "").strip()
     if not token:
-        if use_pat and not ensure_pat_bearer(profile):
-            return
-        try:
-            token = get_databricks_token(host, profile)
-        except RuntimeError:
-            return
+        token = os.environ.get("OAUTH_TOKEN", "").strip()
+        if not _oauth_token_is_fresh(token):
+            try:
+                token = get_databricks_token(host, profile, force_refresh=True)
+            except RuntimeError:
+                return
     output = route_pre_tool_use(
         payload,
         workspace=host,
@@ -1799,8 +1834,7 @@ def _can_launch_from_cached_config(
     model: str | None,
     explicit_provider: str | None,
     enable_smart_routing_flag: bool,
-    workspace: str | None,
-    needs_auto_configure: bool,
+    workspace_url: str | None,
 ) -> bool:
     """Return whether a normal Claude/Codex launch can use its cached config."""
     if tool not in CAN_USE_CACHED_CONFIG_AGENTS:
@@ -1808,6 +1842,10 @@ def _can_launch_from_cached_config(
 
     if refresh or model or explicit_provider is not None:
         return False
+
+    if tool == "codex" and smart_routing_v2.enabled():
+        if not state.get("codex_models") or not state.get("oss_models"):
+            return False
 
     smart_routing_enabled = _ROUTING_AGENTS[tool].smart_routing_enabled(state)
     legacy_smart_routing_enabled = enable_smart_routing_flag or smart_routing_enabled
@@ -1821,11 +1859,19 @@ def _can_launch_from_cached_config(
     if managed_agent_config_enabled():
         return False
 
-    if not (needs_auto_configure or workspace is None):
+    # `_launch_tool` selects an explicit workspace before loading state. A matching workspace here
+    # therefore means its cached state was selected (or it was just auto-configured) and is safe to
+    # launch. Keep rejecting a mismatched state rather than launching against the wrong workspace.
+    if workspace_url is not None and state.get("workspace") != normalize_workspace_url(
+        workspace_url
+    ):
         return False
 
     if tool == "claude":
-        return claude_agent.CLAUDE_SETTINGS_PATH.exists()
+        return (
+            claude_agent.CLAUDE_SETTINGS_PATH.exists()
+            and claude_agent.managed_settings_are_current(state)
+        )
     return codex_agent.has_ucode_config()
 
 
@@ -1835,7 +1881,7 @@ def _launch_tool(
     provider: str | None = None,
     refresh: bool = False,
     skip_preflight: bool = False,
-    workspace: str | None = None,
+    workspace_url: str | None = None,
     enable_smart_routing_flag: bool = False,
     managed: dict | None = None,
     recommendation: dict | None = None,
@@ -1843,15 +1889,20 @@ def _launch_tool(
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
-        # A provider service routes by header and pins no model id, so pairing it with an explicit
-        # model is contradictory — reject rather than silently ignore one.
-        if model and provider:
-            raise RuntimeError("Use either --model or --provider, not both.")
+        # Launchers such as isaac put their harness arguments after `--`, so the harness's own
+        # `--model` lands in ctx.args instead of a ucode option. It still determines the effective
+        # launch model and should therefore win in the launch summary.
+        forwarded_model = (
+            explicit_model_arg_value(ctx.args) if tool in {"claude", "codex"} else None
+        )
+        # `--model` is claude-only (no other launch command exposes it). Under a provider it selects
+        # which tier the service offers to launch on, rather than being rejected — see the provider
+        # branch below.
         # An explicit --workspace targets that workspace for this launch (and
         # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
         # works without a prior `ucode configure`.
-        if workspace:
-            set_current_workspace(normalize_workspace_url(workspace))
+        if workspace_url:
+            set_current_workspace(normalize_workspace_url(workspace_url))
         existing = load_state()
         # Workspaces configured with --use-pat export the profile's PAT as
         # DATABRICKS_BEARER up front so every auth check below (and the
@@ -1878,10 +1929,11 @@ def _launch_tool(
             model=model,
             explicit_provider=explicit_provider,
             enable_smart_routing_flag=enable_smart_routing_flag,
-            workspace=workspace,
-            needs_auto_configure=needs_auto_configure,
+            workspace_url=workspace_url,
         ):
             print_section(_launch_title(tool))
+            if forwarded_model:
+                print_kv("Model", forwarded_model)
             print_success(f"Starting {TOOL_SPECS[tool]['display']}")
             launch_agent(tool, state, ctx.args)
             return
@@ -1923,18 +1975,6 @@ def _launch_tool(
                     f"Your workspace's managed config lists no {TOOL_SPECS[tool]['display']}-servable "
                     f"models ({', '.join(unservable)}); using your discovered models instead."
                 )
-            # The enterprise scope outranks the --settings file ucode writes, so a model pinned
-            # there quietly beats the admin's — point at the file rather than let the mismatch
-            # look like a ucode bug. Suppressed under use_as_global_settings: there ucode itself
-            # authored that managed-settings file, so its model keys are the admin's config, not an
-            # external override.
-            if tool == "claude" and not managed_use_as_global_settings(managed, "claude"):
-                overrides = claude_agent.managed_settings_model_overrides()
-                if overrides is not None:
-                    print_warning(
-                        f"Default models are set in your enterprise managed settings at "
-                        f"{overrides}, which may override your admin's managed config."
-                    )
         elif managed_agent_config_enabled():
             print_note("No managed coding agent config found; using your own settings")
         if managed is not None:
@@ -1996,6 +2036,14 @@ def _launch_tool(
             # provider). Skip model resolution, which would otherwise fail when
             # the workspace has no matching Databricks models.
             resolved_model = None
+            if tool == "claude" and relayed:
+                if model:
+                    print_warning(
+                        "This is a subscription-relay Model Provider Service; the gateway selects "
+                        "the model, so --model is ignored."
+                    )
+            elif tool == "claude" and (model or provider_models):
+                route_root_model = resolve_provider_launch_model(model, provider_models or {})
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
             # in as the explicit model rather than being applied afterwards: for codex the proto has
@@ -2010,6 +2058,7 @@ def _launch_tool(
                 routing_agent is not None
                 and routing_agent.smart_routing_enabled(state)
                 and not first_prompt_routes_claude
+                and not forwarded_model
             ):
                 display = TOOL_SPECS[tool]["display"]
                 with spinner(f"Selecting a {display} model with smart routing..."):
@@ -2041,23 +2090,6 @@ def _launch_tool(
             # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
             if model and tool != "claude":
                 resolved_model = model
-            # Claude Code's enterprise managed-settings scope (e.g. a dbexec install)
-            # outranks the --settings file ucode writes AND can't be excluded with --setting-sources,
-            # so a model pinned there silently wins over `--model`. Warn so a launch that ignores the
-            # requested model looks like the misconfiguration it is, not a ucode bug.
-            # Suppressed when ucode authored the managed-settings file itself (use_as_global_settings)
-            # — the pinned model is then ucode's own, deliberately applied, not a surprise override.
-            managed_owns_claude = managed is not None and managed_use_as_global_settings(
-                managed, "claude"
-            )
-            if model and tool == "claude" and not managed_owns_claude:
-                enterprise = claude_agent.managed_settings_model_overrides()
-                if enterprise is not None:
-                    print_warning(
-                        f"Your enterprise managed settings at {enterprise} pin the Claude model, "
-                        f"which overrides `--model {model}` — Claude Code will launch on the pinned "
-                        "model instead. Edit or remove that file to use --model."
-                    )
         state = configure_tool(
             tool,
             state,
@@ -2066,13 +2098,23 @@ def _launch_tool(
             provider_models=provider_models,
             relayed=relayed,
             route_root_model=route_root_model,
-            custom_model=model if tool == "claude" else None,
+            # Under a provider, --model is honored via route_root_model (above), not custom_model —
+            # the latter pins a raw id into every family alias, which would clobber the service's
+            # per-family target pins.
+            custom_model=model if (tool == "claude" and not provider) else None,
         )
         print_section(_launch_title(tool))
         if managed is not None:
             print_kv("Config", "workspace-managed")
         if provider:
             print_kv("Provider", provider)
+            # The tier the session will start on when it isn't Claude Code's own opus default.
+            if forwarded_model:
+                print_kv("Model", forwarded_model)
+            elif route_root_model:
+                print_kv("Model", route_root_model)
+        elif forwarded_model:
+            print_kv("Model", forwarded_model)
         elif model and tool == "claude":
             # Claude's --model is pinned via the family aliases, not resolved_model/route_root_model.
             print_kv("Model", model)
@@ -2274,7 +2316,7 @@ def _launch_managed_default(
         tool,
         ctx,
         skip_preflight=skip_preflight,
-        workspace=workspace,
+        workspace_url=workspace,
         managed=managed,
         recommendation=recommendation,
     )
@@ -2350,7 +2392,7 @@ def codex_cmd(
         provider=provider,
         refresh=refresh,
         skip_preflight=skip_preflight,
-        workspace=workspace,
+        workspace_url=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
     )
 
@@ -2374,7 +2416,8 @@ def claude_cmd(
             help="Launch on a specific Databricks model id (e.g. a UC "
             "`<catalog>.<schema>.<name>`). Pinned via ANTHROPIC_MODEL so the gateway "
             "resolves it — unlike Claude Code's own --model, which rejects non-catalog ids. "
-            "Pass before any `--` separator; not usable with --provider.",
+            "With --provider, pass a family (opus/sonnet/haiku) or a target the service allows to "
+            "start on that tier instead of Claude Code's opus default. Pass before any `--` separator.",
         ),
     ] = None,
     refresh: Annotated[
@@ -2428,7 +2471,7 @@ def claude_cmd(
         model=model,
         refresh=refresh,
         skip_preflight=skip_preflight,
-        workspace=workspace,
+        workspace_url=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
     )
 
@@ -2700,6 +2743,7 @@ def configure(
         # Set True only in the fully-interactive branch below; gates the optional
         # MCP setup prompt so flag-driven / scripted runs are never interrupted.
         fully_interactive = False
+        combined_optional_setup = False
         if agent is not None:
             tool = normalize_tool(agent)
             install_tool_binary(
@@ -2772,6 +2816,11 @@ def configure(
         else:
             # Tool binaries are installed after the user picks which agents
             # they want, in configure_workspace_command.
+            combined_optional_setup = (
+                not flag_driven_workspace and enable_databricks_ai_tools is None
+            )
+            if combined_optional_setup:
+                skip_kwargs["offer_optional_setup"] = True
             if workspace_entries is None:
                 configure_workspace_command(
                     prompt_optional_updates=prompt_optional_updates,
@@ -2819,11 +2868,12 @@ def configure(
                     "interactive picker."
                 )
             configure_mcp_command(services=services)
-        # Offer MCP setup as the natural next step of interactive configuration,
-        # so users discover it without needing to know `configure mcp` exists.
-        # Skipped in dry-run and non-interactive/flag-driven runs (which stay
-        # scriptable), and when --dry-run is set.
-        if fully_interactive and not dry_run and prompt_yes_no("Configure MCP servers now?"):
+        if (
+            fully_interactive
+            and not combined_optional_setup
+            and not dry_run
+            and prompt_yes_no("Configure MCP servers now?")
+        ):
             configure_mcp_command()
     except typer.Exit:
         # `typer.Exit` subclasses RuntimeError, so it has to be re-raised ahead of the handler
