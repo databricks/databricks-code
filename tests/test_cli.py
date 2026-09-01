@@ -227,6 +227,37 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.kwargs["refresh"] is True
 
+    def test_codex_forwarded_model_is_reported_in_launch_summary(self):
+        state = {
+            **MINIMAL_STATE,
+            "codex_models": ["system.ai.gpt-5-6-luna"],
+        }
+        forwarded_args = ["--model", "system.ai.gpt-5-6-sol"]
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(state, "system.ai.gpt-5-6-luna"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(
+                app,
+                ["codex", "--workspace", "https://example.databricks.com", "--", *forwarded_args],
+            )
+
+        output = _strip_ansi(result.output)
+        assert result.exit_code == 0, result.output
+        assert "Model: system.ai.gpt-5-6-sol" in output
+        assert "Model: system.ai.gpt-5-6-luna" not in output
+        assert mock_launch.call_args.args[2] == forwarded_args
+
     def test_claude_enable_model_discovery_sets_ucode_env(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
             result = runner.invoke(app, ["claude", "--enable-model-discovery"])
@@ -300,6 +331,37 @@ class TestSubcommandRouting:
         assert "Using Unity Gateway Smart Router." in output
         assert "Selected Model : databricks-gpt-5-5" in output
         assert "Reason : Cross-cutting refactor." in output
+
+    @pytest.mark.parametrize("tool", ["claude", "codex"])
+    def test_forwarded_model_skips_legacy_smart_routing(self, tool):
+        model = f"system.ai.{tool}-override"
+        state = {
+            **MINIMAL_STATE,
+            "smart_routing_enabled": True,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+            "codex_models": ["system.ai.gpt-5-6-luna"],
+        }
+        routing_module = "claude_routing" if tool == "claude" else "codex_routing"
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.resolve_launch_model", return_value=(state, "configured-model")),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch(f"ucode.cli.{routing_module}.route_launch_model") as mock_route,
+            patch("ucode.cli.launch_agent"),
+        ):
+            result = runner.invoke(
+                app,
+                [tool, "--workspace", "https://example.databricks.com", "--", "--model", model],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert f"Model: {model}" in _strip_ansi(result.output)
+        mock_route.assert_not_called()
 
     def test_claude_v2_skips_legacy_prelaunch_routing(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
@@ -465,6 +527,44 @@ class TestClaudeModelFlag:
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.kwargs["refresh"] is True
 
+    @pytest.mark.parametrize(
+        "forwarded_args",
+        [
+            ["--model", "system.ai.claude-sonnet-5"],
+            ["--model=system.ai.claude-sonnet-5"],
+            ["-m", "system.ai.claude-sonnet-5"],
+        ],
+    )
+    def test_forwarded_model_is_reported_in_launch_summary(self, forwarded_args):
+        state = {
+            **MINIMAL_STATE,
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+        }
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.ensure_provider_state", return_value=state),
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.resolve_launch_model",
+                return_value=(state, "system.ai.claude-opus-4-8"),
+            ),
+            patch("ucode.cli.configure_tool", return_value=state),
+            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(
+                app,
+                ["claude", "--workspace", "https://example.databricks.com", "--", *forwarded_args],
+            )
+
+        output = _strip_ansi(result.output)
+        assert result.exit_code == 0, result.output
+        assert "Model: system.ai.claude-sonnet-5" in output
+        assert "Model: system.ai.claude-opus-4-8" not in output
+        assert mock_launch.call_args.args[2] == forwarded_args
+
     def test_model_threads_to_claude_as_custom_model(self, monkeypatch):
         monkeypatch.delenv("ENABLE_SMART_ROUTING_V2", raising=False)
         with (
@@ -503,12 +603,81 @@ class TestClaudeModelFlag:
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.args[1]["_claude_launch_model"] == "system.ai.glm-5-2"
 
-    def test_model_and_provider_are_mutually_exclusive(self):
-        result = runner.invoke(
-            app, ["claude", "--model", "cat.schema.m", "--provider", "cat.schema.svc"]
+    @staticmethod
+    def _provider_launch(monkeypatch, argv, provider_models, relayed=False):
+        """Invoke a provider launch with model discovery/config stubbed, returning the
+        configure_tool mock so tests can assert what was threaded to it."""
+        import ucode.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "ensure_bootstrap_dependencies", lambda *a, **k: None)
+        monkeypatch.setattr(cli_mod, "load_state", lambda: MINIMAL_STATE)
+        monkeypatch.setattr(cli_mod, "ensure_provider_state", lambda t: MINIMAL_STATE)
+        monkeypatch.setattr(cli_mod, "configure_shared_state", lambda *a, **k: MINIMAL_STATE)
+        monkeypatch.setattr(cli_mod, "_fetch_managed_config", lambda s: (None, False))
+        monkeypatch.setattr(cli_mod, "_fetch_budget_recommendation", lambda s, m: None)
+        monkeypatch.setattr(cli_mod, "launch_agent", lambda *a, **k: None)
+        monkeypatch.setattr(
+            cli_mod, "resolve_provider_models", lambda t, s, p: (provider_models, None, relayed)
+        )
+        mock_configure = MagicMock(return_value=MINIMAL_STATE)
+        monkeypatch.setattr(cli_mod, "configure_tool", mock_configure)
+        result = runner.invoke(app, argv)
+        return result, mock_configure
+
+    def test_model_and_provider_now_pin_the_launch_tier(self, monkeypatch):
+        # --model under a provider is no longer rejected: a family alias resolves to that tier's
+        # declared target and is threaded as route_root_model (ANTHROPIC_MODEL), not custom_model.
+        result, mock_configure = self._provider_launch(
+            monkeypatch,
+            ["claude", "--model", "haiku", "--provider", "cat.schema.svc"],
+            {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"},
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.kwargs["route_root_model"] == "claude-haiku-4-5"
+        assert mock_configure.call_args.kwargs["custom_model"] is None
+
+    def test_provider_without_opus_auto_picks_best_servable_tier(self, monkeypatch):
+        # No --model, and the service declares no opus target: launch on the most capable tier it
+        # does offer (sonnet) instead of dead-ending on Claude Code's opus default.
+        result, mock_configure = self._provider_launch(
+            monkeypatch,
+            ["claude", "--provider", "cat.schema.svc"],
+            {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"},
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.kwargs["route_root_model"] == "claude-sonnet-5"
+
+    def test_provider_with_opus_keeps_claude_default(self, monkeypatch):
+        # Opus is offered, so Claude Code's own default already works — pin nothing (no ANTHROPIC_MODEL
+        # and no duplicate /model picker row).
+        result, mock_configure = self._provider_launch(
+            monkeypatch,
+            ["claude", "--provider", "cat.schema.svc"],
+            {"opus": "claude-opus-4-8", "sonnet": "claude-sonnet-5"},
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.kwargs["route_root_model"] is None
+
+    def test_model_family_not_offered_by_provider_errors(self, monkeypatch):
+        result, _ = self._provider_launch(
+            monkeypatch,
+            ["claude", "--model", "opus", "--provider", "cat.schema.svc"],
+            {"sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5"},
         )
         assert result.exit_code == 1
-        assert "Use either --model or --provider" in result.output
+        assert "does not offer a 'opus' model" in result.output
+
+    def test_model_ignored_for_relayed_provider(self, monkeypatch):
+        # A relayed (subscription) service selects the model server-side; --model can't be honored.
+        result, mock_configure = self._provider_launch(
+            monkeypatch,
+            ["claude", "--model", "haiku", "--provider", "cat.schema.svc"],
+            None,
+            relayed=True,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_configure.call_args.kwargs["route_root_model"] is None
+        assert "--model is ignored" in _strip_ansi(result.output)
 
     def test_provider_sets_transient_claude_launch_marker(self):
         state = dict(MINIMAL_STATE)
@@ -1117,6 +1286,26 @@ class TestAutoConfigureOnFirstRun:
         mock_ai_tools.assert_not_called()
         mock_launch.assert_called_once()
 
+    def test_workspace_flag_uses_cached_codex_config_without_preflight(self):
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.set_current_workspace") as mock_set_workspace,
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state") as mock_preflight,
+            patch("ucode.cli.configure_tool") as mock_configure,
+            patch("ucode.cli.smart_routing_v2.enabled", return_value=False),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["codex", "--workspace", "https://example.databricks.com/"])
+
+        assert result.exit_code == 0, result.output
+        mock_set_workspace.assert_called_once_with("https://example.databricks.com")
+        mock_preflight.assert_not_called()
+        mock_configure.assert_not_called()
+        mock_launch.assert_called_once()
+
     def test_triggers_when_no_workspace(self):
         """Auto-configure runs when state has no workspace."""
         empty_state = {}
@@ -1217,8 +1406,7 @@ class TestCachedConfigPredicate:
             "model": None,
             "explicit_provider": None,
             "enable_smart_routing_flag": False,
-            "workspace": None,
-            "needs_auto_configure": False,
+            "workspace_url": None,
         }
         kwargs.update(overrides)
         return kwargs
@@ -1271,13 +1459,56 @@ class TestCachedConfigPredicate:
                 is False
             )
 
+    def test_accepts_codex_v2_launch_with_complete_model_cache(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
+        state = {
+            **MINIMAL_STATE,
+            "codex_models": ["system.ai.gpt-5-6-sol"],
+            "oss_models": ["system.ai.glm-5-2"],
+        }
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=True),
+        ):
+            assert cli_mod._can_launch_from_cached_config("codex", state, **self._kwargs()) is True
+
+    @pytest.mark.parametrize(
+        ("incomplete_key", "value"),
+        [
+            ("codex_models", None),
+            ("codex_models", []),
+            ("oss_models", None),
+            ("oss_models", []),
+        ],
+    )
+    def test_rejects_codex_v2_launch_with_incomplete_model_cache(
+        self, monkeypatch, incomplete_key, value
+    ):
+        import ucode.cli as cli_mod
+
+        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
+        state = {
+            **MINIMAL_STATE,
+            "codex_models": ["system.ai.gpt-5-6-sol"],
+            "oss_models": ["system.ai.glm-5-2"],
+        }
+        if value is None:
+            state.pop(incomplete_key)
+        else:
+            state[incomplete_key] = value
+        with patch("ucode.cli.managed_agent_config_enabled", return_value=False):
+            assert cli_mod._can_launch_from_cached_config("codex", state, **self._kwargs()) is False
+
     @pytest.mark.parametrize(
         "override",
         [
             {"refresh": True},
             {"explicit_provider": "catalog.schema.provider"},
             {"enable_smart_routing_flag": True},
-            {"workspace": "https://other.databricks.com"},
+            {"workspace_url": "https://other.databricks.com"},
         ],
     )
     def test_rejects_dynamic_launch_overrides(self, override):

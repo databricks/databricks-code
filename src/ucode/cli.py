@@ -18,6 +18,7 @@ from ucode.agents import (
     configure_tool,
     ensure_bootstrap_dependencies,
     ensure_provider_state,
+    explicit_model_arg_value,
     install_databricks_ai_tools_for_agents,
     install_tool_binary,
     normalize_tool,
@@ -55,6 +56,7 @@ from ucode.databricks import (
     list_tool_provider_services,
     normalize_workspace_url,
     resolve_pat_token,
+    resolve_provider_launch_model,
     run_databricks_login,
 )
 from ucode.managed_budget import (
@@ -1839,8 +1841,7 @@ def _can_launch_from_cached_config(
     model: str | None,
     explicit_provider: str | None,
     enable_smart_routing_flag: bool,
-    workspace: str | None,
-    needs_auto_configure: bool,
+    workspace_url: str | None,
 ) -> bool:
     """Return whether a normal Claude/Codex launch can use its cached config."""
     if tool not in CAN_USE_CACHED_CONFIG_AGENTS:
@@ -1848,6 +1849,10 @@ def _can_launch_from_cached_config(
 
     if refresh or model or explicit_provider is not None:
         return False
+
+    if tool == "codex" and smart_routing_v2.enabled():
+        if not state.get("codex_models") or not state.get("oss_models"):
+            return False
 
     smart_routing_enabled = _ROUTING_AGENTS[tool].smart_routing_enabled(state)
     legacy_smart_routing_enabled = enable_smart_routing_flag or smart_routing_enabled
@@ -1861,7 +1866,12 @@ def _can_launch_from_cached_config(
     if managed_agent_config_enabled():
         return False
 
-    if not (needs_auto_configure or workspace is None):
+    # `_launch_tool` selects an explicit workspace before loading state. A matching workspace here
+    # therefore means its cached state was selected (or it was just auto-configured) and is safe to
+    # launch. Keep rejecting a mismatched state rather than launching against the wrong workspace.
+    if workspace_url is not None and state.get("workspace") != normalize_workspace_url(
+        workspace_url
+    ):
         return False
 
     if tool == "claude":
@@ -1878,7 +1888,7 @@ def _launch_tool(
     provider: str | None = None,
     refresh: bool = False,
     skip_preflight: bool = False,
-    workspace: str | None = None,
+    workspace_url: str | None = None,
     enable_smart_routing_flag: bool = False,
     managed: dict | None = None,
     recommendation: dict | None = None,
@@ -1886,15 +1896,20 @@ def _launch_tool(
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
-        # A provider service routes by header and pins no model id, so pairing it with an explicit
-        # model is contradictory — reject rather than silently ignore one.
-        if model and provider:
-            raise RuntimeError("Use either --model or --provider, not both.")
+        # Launchers such as isaac put their harness arguments after `--`, so the harness's own
+        # `--model` lands in ctx.args instead of a ucode option. It still determines the effective
+        # launch model and should therefore win in the launch summary.
+        forwarded_model = (
+            explicit_model_arg_value(ctx.args) if tool in {"claude", "codex"} else None
+        )
+        # `--model` is claude-only (no other launch command exposes it). Under a provider it selects
+        # which tier the service offers to launch on, rather than being rejected — see the provider
+        # branch below.
         # An explicit --workspace targets that workspace for this launch (and
         # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
         # works without a prior `ucode configure`.
-        if workspace:
-            set_current_workspace(normalize_workspace_url(workspace))
+        if workspace_url:
+            set_current_workspace(normalize_workspace_url(workspace_url))
         existing = load_state()
         # Workspaces configured with --use-pat export the profile's PAT as
         # DATABRICKS_BEARER up front so every auth check below (and the
@@ -1921,10 +1936,11 @@ def _launch_tool(
             model=model,
             explicit_provider=explicit_provider,
             enable_smart_routing_flag=enable_smart_routing_flag,
-            workspace=workspace,
-            needs_auto_configure=needs_auto_configure,
+            workspace_url=workspace_url,
         ):
             print_section(_launch_title(tool))
+            if forwarded_model:
+                print_kv("Model", forwarded_model)
             print_success(f"Starting {TOOL_SPECS[tool]['display']}")
             launch_agent(tool, state, ctx.args)
             return
@@ -2027,6 +2043,14 @@ def _launch_tool(
             # provider). Skip model resolution, which would otherwise fail when
             # the workspace has no matching Databricks models.
             resolved_model = None
+            if tool == "claude" and relayed:
+                if model:
+                    print_warning(
+                        "This is a subscription-relay Model Provider Service; the gateway selects "
+                        "the model, so --model is ignored."
+                    )
+            elif tool == "claude" and (model or provider_models):
+                route_root_model = resolve_provider_launch_model(model, provider_models or {})
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
             # in as the explicit model rather than being applied afterwards: for codex the proto has
@@ -2041,6 +2065,7 @@ def _launch_tool(
                 routing_agent is not None
                 and routing_agent.smart_routing_enabled(state)
                 and not first_prompt_routes_claude
+                and not forwarded_model
             ):
                 display = TOOL_SPECS[tool]["display"]
                 with spinner(f"Selecting a {display} model with smart routing..."):
@@ -2080,13 +2105,23 @@ def _launch_tool(
             provider_models=provider_models,
             relayed=relayed,
             route_root_model=route_root_model,
-            custom_model=model if tool == "claude" else None,
+            # Under a provider, --model is honored via route_root_model (above), not custom_model —
+            # the latter pins a raw id into every family alias, which would clobber the service's
+            # per-family target pins.
+            custom_model=model if (tool == "claude" and not provider) else None,
         )
         print_section(_launch_title(tool))
         if managed is not None:
             print_kv("Config", "workspace-managed")
         if provider:
             print_kv("Provider", provider)
+            # The tier the session will start on when it isn't Claude Code's own opus default.
+            if forwarded_model:
+                print_kv("Model", forwarded_model)
+            elif route_root_model:
+                print_kv("Model", route_root_model)
+        elif forwarded_model:
+            print_kv("Model", forwarded_model)
         elif model and tool == "claude":
             # Claude's --model is pinned via the family aliases, not resolved_model/route_root_model.
             print_kv("Model", model)
@@ -2288,7 +2323,7 @@ def _launch_managed_default(
         tool,
         ctx,
         skip_preflight=skip_preflight,
-        workspace=workspace,
+        workspace_url=workspace,
         managed=managed,
         recommendation=recommendation,
     )
@@ -2364,7 +2399,7 @@ def codex_cmd(
         provider=provider,
         refresh=refresh,
         skip_preflight=skip_preflight,
-        workspace=workspace,
+        workspace_url=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
     )
 
@@ -2388,7 +2423,8 @@ def claude_cmd(
             help="Launch on a specific Databricks model id (e.g. a UC "
             "`<catalog>.<schema>.<name>`). Pinned via ANTHROPIC_MODEL so the gateway "
             "resolves it — unlike Claude Code's own --model, which rejects non-catalog ids. "
-            "Pass before any `--` separator; not usable with --provider.",
+            "With --provider, pass a family (opus/sonnet/haiku) or a target the service allows to "
+            "start on that tier instead of Claude Code's opus default. Pass before any `--` separator.",
         ),
     ] = None,
     refresh: Annotated[
@@ -2442,7 +2478,7 @@ def claude_cmd(
         model=model,
         refresh=refresh,
         skip_preflight=skip_preflight,
-        workspace=workspace,
+        workspace_url=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
     )
 
