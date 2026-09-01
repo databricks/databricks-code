@@ -12,6 +12,7 @@ Tests live in `tests/`.
 - Run the full test suite with `uv run pytest`.
 - Run focused tests with `uv run pytest tests/<file>.py`.
 - Run e2e tests with `UCODE_TEST_WORKSPACE=<db_workspace_url> uv run pytest tests/test_e2e.py -v`.
+- Run the `ucode configure` sandbox with `uv run pytest tests/test_configure_sandbox.py` (each scenario is a `test_configure_scenario[<name>]` case). To drive one scenario by hand, run `python -m tests.sandbox_scenarios <name>` from the repo root.
 - Run lint with `uv run ruff check .`.
 - Run the CLI from the current checkout with `uv run ucode ...`.
 - Reinstall the local checkout as the `ucode` tool with `uv tool install --reinstall .`.
