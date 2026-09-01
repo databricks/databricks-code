@@ -8,6 +8,7 @@ managed-config types, the admin gate, and the per-agent model-config shapes.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
@@ -19,7 +20,7 @@ import ucode.config_io as config_io_mod
 import ucode.managed_config as managed_config_mod
 import ucode.managed_wizard as wizard
 from ucode.cli import app
-from ucode.managed_setup import validate_manifest
+from ucode.managed_setup import serialize_managed_config, validate_manifest
 
 runner = CliRunner()
 
@@ -230,7 +231,8 @@ class TestExistingConfigHandling:
             patch.object(wizard, "prompt_for_selection") as select,
             patch.object(wizard, "print_warning") as warn,
         ):
-            assert wizard._handle_existing_config(WORKSPACE, "token") is True
+            # No published config, so nothing to carry forward.
+            assert wizard._handle_existing_config(WORKSPACE, "token") == (True, None)
         assert not select.called
         assert not warn.called
 
@@ -241,9 +243,32 @@ class TestExistingConfigHandling:
             patch.object(wizard, "prompt_for_selection") as select,
             patch.object(wizard, "print_note") as note,
         ):
-            assert wizard._handle_existing_config(WORKSPACE, "token") is True
+            assert wizard._handle_existing_config(WORKSPACE, "token") == (True, None)
         assert not select.called
         assert note.called
+
+    def test_feature_disabled_blocks_setup_with_an_actionable_error(self):
+        # When the coding-agent-config APIs aren't enabled, the read fails with a FEATURE_DISABLED
+        # 404. Stop before authoring a draft that can never be published.
+        reason = (
+            'HTTP 404 Not Found: {"error_code":"FEATURE_DISABLED",'
+            '"message":"Coding agent config APIs are not enabled for this workspace."}'
+        )
+        with (
+            patch.object(wizard, "get_managed_config", return_value=(None, reason)),
+            patch.object(wizard, "prompt_for_selection") as select,
+            patch.object(wizard, "print_note") as note,
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            wizard._handle_existing_config(WORKSPACE, "token")
+        assert not select.called
+        message = str(exc_info.value)
+        assert message == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
+        assert "`ucode configure`" in message
+        # The raw 404 / JSON body must not leak into the message.
+        assert "404" not in message
+        assert "FEATURE_DISABLED" not in message
+        assert not note.called
 
     def test_choosing_create_continues_authoring(self):
         with (
@@ -254,7 +279,11 @@ class TestExistingConfigHandling:
             ),
             patch.object(wizard, "prompt_for_selection", return_value="create"),
         ):
-            assert wizard._handle_existing_config(WORKSPACE, "token") is True
+            # Continues authoring, and hands back the published config to carry its sections forward.
+            assert wizard._handle_existing_config(WORKSPACE, "token") == (
+                True,
+                {"name": "x", "enabled_agents": {}},
+            )
 
     def test_warning_does_not_itemize_the_existing_config(self):
         # The warning is the same whatever the config holds: an inventory doesn't change what the
@@ -281,8 +310,23 @@ class TestExistingConfigHandling:
             patch.object(wizard, "prompt_yes_no_default", return_value=True),
             patch.object(wizard, "delete_coding_agent_config", return_value=None) as delete,
         ):
-            assert wizard._handle_existing_config(WORKSPACE, "token") is False
+            keep_going, _ = wizard._handle_existing_config(WORKSPACE, "token")
+            assert keep_going is False
         delete.assert_called_once_with(WORKSPACE, "token", "cfg/1")
+
+    def test_choosing_adopt_confirms_and_stops(self):
+        existing = {"name": "cfg/1", "enabled_agents": {"claude": {}}}
+        with (
+            patch.object(wizard, "get_managed_config", return_value=(existing, None)),
+            patch.object(wizard, "prompt_for_selection", return_value="adopt"),
+            patch("ucode.cli._confirm_managed_config_applied") as confirm,
+        ):
+            # Adopting just confirms the config is in force (the launch path applies it) and stops
+            # the wizard — no re-authoring, no local writes.
+            keep_going, published = wizard._handle_existing_config(WORKSPACE, "token")
+            assert keep_going is False
+            assert published == existing
+        confirm.assert_called_once_with(existing, WORKSPACE)
 
     def test_delete_declined_leaves_config_intact(self):
         with (
@@ -296,7 +340,8 @@ class TestExistingConfigHandling:
             patch.object(wizard, "delete_coding_agent_config") as delete,
         ):
             # Still stops the wizard: the admin chose the delete path, not the author path.
-            assert wizard._handle_existing_config(WORKSPACE, "token") is False
+            keep_going, _ = wizard._handle_existing_config(WORKSPACE, "token")
+            assert keep_going is False
         assert not delete.called
 
     def test_delete_failure_raises(self):
@@ -324,6 +369,63 @@ class TestExistingConfigHandling:
             pytest.raises(KeyboardInterrupt),
         ):
             wizard._handle_existing_config(WORKSPACE, "token")
+
+
+class TestStepBanner:
+    """The step headers brand themselves to the invoking command, so a `ucode configure` run
+    doesn't show `ucode setup` headers."""
+
+    def test_defaults_to_ucode_setup(self):
+        with patch.object(wizard, "print_section") as section:
+            wizard._step_banner(1, "Agents")
+        assert section.call_args.args[0].startswith("ucode setup · step 1 of ")
+
+    def test_uses_the_command_label_when_given(self):
+        with patch.object(wizard, "print_section") as section:
+            wizard._step_banner(2, "Models", "ucode configure")
+        assert section.call_args.args[0].startswith("ucode configure · step 2 of ")
+
+
+class TestSetupCommandToken:
+    """A caller (e.g. `ucode configure`) can hand setup a token so its admin gate uses the same
+    identity as the routing decision, instead of fetching a second time."""
+
+    def test_reuses_a_passed_token_and_skips_a_second_fetch(self):
+        seen: list[tuple[str, str]] = []
+        with (
+            patch.object(
+                wizard,
+                "get_databricks_token",
+                side_effect=AssertionError("must not fetch a token when one was passed"),
+            ),
+            patch.object(
+                wizard,
+                "ensure_databricks_auth",
+                side_effect=AssertionError("must not re-authenticate when a token was passed"),
+            ),
+            patch.object(
+                wizard, "_require_admin", side_effect=lambda ws, tok: seen.append((ws, tok))
+            ),
+            # Stop right after the admin gate so the heavy discovery/picker path doesn't run.
+            patch.object(wizard, "_handle_existing_config", return_value=(False, None)),
+        ):
+            code = wizard.setup_command(workspace="https://w", profile=None, token="tok")
+        assert code == 0
+        assert seen == [("https://w", "tok")]
+
+    def test_fetches_its_own_token_when_none_passed(self):
+        seen: list[tuple[str, str]] = []
+        with (
+            patch.object(wizard, "ensure_databricks_auth", return_value=None),
+            patch.object(wizard, "get_databricks_token", return_value="fetched"),
+            patch.object(
+                wizard, "_require_admin", side_effect=lambda ws, tok: seen.append((ws, tok))
+            ),
+            patch.object(wizard, "_handle_existing_config", return_value=(False, None)),
+        ):
+            code = wizard.setup_command(workspace="https://w", profile=None)
+        assert code == 0
+        assert seen == [("https://w", "fetched")]
 
 
 class TestModelPrompting:
@@ -452,7 +554,8 @@ class TestModelPrompting:
 
     def test_single_slot_announces_the_inferred_default(self):
         # The one-option prompt is skipped, but silence reads as a dropped step — the admin has to
-        # learn that the default is set, and to what.
+        # learn that the default was inferred. Announced as a note; the per-agent ✔ (`_confirm_agent`)
+        # in the setup loop carries the final confirmation.
         candidates = {"opus": ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]}
 
         def fake_sel(prompt, options, **kwargs):
@@ -463,14 +566,13 @@ class TestModelPrompting:
         with (
             patch.object(wizard, "_claude_candidates", return_value=candidates),
             patch.object(wizard, "prompt_for_selection", side_effect=fake_sel),
-            patch.object(wizard, "print_note"),
-            patch.object(wizard, "print_success") as success,
+            patch.object(wizard, "print_note") as note,
         ):
             config = wizard._prompt_models_for_agent("claude", STATE, None)
 
         assert config["default_model"] == "system.ai.claude-opus-4-8"
-        assert success.called
-        assert "system.ai.claude-opus-4-8" in success.call_args[0][0]
+        notes = " ".join(str(call.args[0]) for call in note.call_args_list)
+        assert "overall default" in notes
 
     def test_claude_all_families_skipped_still_picks_from_the_candidates(self):
         # Skipping every slot is a legitimate minimal config — `models` is optional and each unset
@@ -500,11 +602,13 @@ class TestModelPrompting:
         assert config == {"default_model": "system.ai.claude-opus-4-8"}
         assert "models" not in config
         assert not text.called, "should pick from candidates, not ask for free text"
-        # The final prompt offers every candidate across all families.
+        # The final prompt offers every candidate across all families (all fit under the picker
+        # limit here), plus the custom-entry row.
         assert set(offered[-1]) == {
             "system.ai.claude-opus-5",
             "system.ai.claude-opus-4-8",
             "system.ai.claude-sonnet-5",
+            wizard._CUSTOM_MODEL,
         }
 
     def test_older_claude_version_passes_validation(self):
@@ -1020,6 +1124,131 @@ OPENAI_SERVICE = {
 }
 
 
+class TestCustomModelEntry:
+    """The hosted-model pickers let an admin type a model service discovery didn't list."""
+
+    def test_single_agent_can_enter_a_verified_custom_model(self):
+        # Selecting the custom row prompts for a path, verifies it exists, and records it so
+        # validation won't reject a model outside the discovered inventory.
+        with (
+            patch.object(wizard, "prompt_for_selection", return_value=wizard._CUSTOM_MODEL),
+            patch.object(wizard, "prompt_for_text", return_value="main.aarushi.gpt-5-custom"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(True, None)) as exists,
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, None)
+        assert config == {
+            "default_model": "main.aarushi.gpt-5-custom",
+            "custom_models": ["main.aarushi.gpt-5-custom"],
+        }
+        exists.assert_called_once_with(WORKSPACE, "tok", "main.aarushi.gpt-5-custom")
+
+    def test_custom_model_reprompts_until_it_exists(self):
+        # A typo shouldn't get baked into a published config — a miss re-asks.
+        with (
+            patch.object(wizard, "prompt_for_selection", return_value=wizard._CUSTOM_MODEL),
+            patch.object(
+                wizard, "prompt_for_text", side_effect=["main.typo.model", "main.real.model"]
+            ),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", side_effect=[(False, None), (True, None)]),
+            patch.object(wizard, "print_err") as err,
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, None)
+        assert config["default_model"] == "main.real.model"
+        assert err.called
+
+    def test_multi_select_agent_can_add_several_custom_models(self):
+        # opencode/pi carry a model list, so the custom row keeps prompting until the admin declines.
+        with (
+            patch.object(wizard, "prompt_for_multi_selection", return_value=[wizard._CUSTOM_MODEL]),
+            patch.object(
+                wizard, "prompt_for_text", side_effect=["main.default.a", "main.default.b"]
+            ),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_for_selection", return_value="main.default.a"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(True, None)),
+        ):
+            config = wizard._prompt_models_for_agent("pi", STATE, None)
+        assert config["models"] == ["main.default.a", "main.default.b"]
+        assert config["custom_models"] == ["main.default.a", "main.default.b"]
+        assert config["default_model"] == "main.default.a"
+
+    def test_short_reason_drops_the_json_body(self):
+        # The warning for an inconclusive check should show the status, not the raw error blob.
+        assert (
+            wizard._short_reason('HTTP 500 Server Error: {"error_code":"INTERNAL"}')
+            == "HTTP 500 Server Error"
+        )
+        assert wizard._short_reason("network error: timed out") == "network error: timed out"
+        assert wizard._short_reason(None) == "unknown error"
+
+    def test_unverifiable_custom_model_is_accepted_with_a_warning(self):
+        # An inconclusive check (transient error / no token) must not block a possibly-valid model.
+        with (
+            patch.object(wizard, "prompt_for_selection", return_value=wizard._CUSTOM_MODEL),
+            patch.object(wizard, "prompt_for_text", return_value="main.aarushi.maybe"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(None, "HTTP 500")),
+            patch.object(wizard, "print_warning") as warn,
+        ):
+            config = wizard._prompt_models_for_agent("codex", STATE, None)
+        assert config["default_model"] == "main.aarushi.maybe"
+        assert warn.called
+
+    def test_picker_offers_all_models_plus_custom(self):
+        # Every discovered model is offered (the searchable picker scrolls), with the custom row last.
+        models = [f"system.ai.gpt-5-{i}" for i in range(10)]
+        state = {**STATE, "codex_models": list(models)}
+        offered: list[list[str]] = []
+
+        def fake_sel(prompt, options, **kwargs):
+            offered.append([v for v, _ in options])
+            return options[0][0]
+
+        with patch.object(wizard, "prompt_for_selection", side_effect=fake_sel):
+            wizard._prompt_models_for_agent("codex", state, None)
+        rows = offered[0]
+        assert rows[-1] == wizard._CUSTOM_MODEL
+        # All 10 discovered ids are offered — no truncation to the old top-few cap.
+        assert set(models) <= set(rows[:-1])
+
+    def test_claude_family_custom_model_slots_and_validates(self):
+        # A custom id chosen for a family lands in that slot, is marked custom, and survives
+        # validation even though discovery never listed it.
+        candidates = {"opus": ["system.ai.claude-opus-5"]}
+
+        def fake_sel(prompt, options, **kwargs):
+            values = [v for v, _ in options]
+            if wizard._CUSTOM_MODEL in values:
+                return wizard._CUSTOM_MODEL
+            return values[0]
+
+        with (
+            patch.object(wizard, "_claude_candidates", return_value=candidates),
+            patch.object(wizard, "prompt_for_selection", side_effect=fake_sel),
+            patch.object(wizard, "prompt_for_text", return_value="main.aarushi.claude-opus-4-5"),
+            patch.object(wizard, "get_databricks_token", lambda *a, **k: "tok"),
+            patch.object(wizard, "model_service_exists", return_value=(True, None)),
+            patch.object(wizard, "print_note"),
+            patch.object(wizard, "print_success"),
+        ):
+            config = wizard._prompt_models_for_agent("claude", STATE, None)
+        assert config["models"]["default_opus_model"] == "main.aarushi.claude-opus-4-5"
+        assert config["custom_models"] == ["main.aarushi.claude-opus-4-5"]
+        assert (
+            validate_manifest(
+                {
+                    "default_agent": "claude",
+                    "enabled_agents": {"claude": {"model_config": config}},
+                },
+                STATE,
+            )
+            == []
+        )
+
+
 class TestProviderServiceSpinner:
     """The MPS listing is cached per workspace, so only the first agent's lookup does any I/O."""
 
@@ -1151,6 +1380,41 @@ class TestProviderServiceSelection:
         offered = [value for value, _ in select.call_args_list[1][0][1]]
         assert offered == ["main.default.lilly-anthropic"]
 
+    def test_relayed_services_are_not_offered_for_claude(self):
+        relayed = {
+            **ANTHROPIC_SERVICE,
+            "name": "main.default.claude-enterprise",
+            "targets": [],
+            "relayed": True,
+        }
+        with (
+            patch.object(
+                wizard,
+                "list_model_provider_services",
+                return_value=([relayed, ANTHROPIC_SERVICE], None),
+            ),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=["mps", "main.default.lilly-anthropic"],
+            ) as select,
+            patch.object(wizard, "all_users_can_use_schema", return_value=True),
+        ):
+            service = wizard._select_provider_service("claude", WORKSPACE, "token")
+        assert service == ANTHROPIC_SERVICE
+        offered = [value for value, _ in select.call_args_list[1][0][1]]
+        assert offered == ["main.default.lilly-anthropic"]
+
+    def test_only_relayed_services_falls_back_to_databricks_for_claude(self):
+        relayed = {**ANTHROPIC_SERVICE, "targets": [], "relayed": True}
+        with (
+            patch.object(wizard, "list_model_provider_services", return_value=([relayed], None)),
+            patch.object(wizard, "prompt_for_selection") as select,
+            patch.object(wizard, "print_note"),
+        ):
+            assert wizard._select_provider_service("claude", WORKSPACE, "token") is None
+        assert not select.called
+
     def test_warns_when_all_users_lack_schema_access(self):
         # The picked MPS's schema isn't granted to all workspace users, so developers who pull the
         # config may hit "does not have USE_SCHEMA"; warn but still return the service (never block).
@@ -1220,30 +1484,42 @@ CLAUDE_ONLY = {"claude": {"model_config": {"default_model": "system.ai.claude-op
 
 
 class TestBudgetPolicy:
-    def test_declining_yields_none(self):
-        with patch.object(wizard, "prompt_yes_no_default", return_value=False):
-            assert wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE) is None
-
-    def test_no_budgets_warns_and_yields_none(self):
+    def test_no_up_front_gate(self):
+        # Running `ucode setup spend-tiers` is the consent, so the flow asks no "set up a policy?"
+        # question — it goes straight to listing budgets. (The only yes/no it asks is "add another
+        # tier?", after a tier is built.)
         with (
-            patch.object(wizard, "prompt_yes_no_default", return_value=True),
+            patch.object(wizard, "prompt_yes_no_default") as ask,
             patch.object(wizard, "list_workspace_budgets", return_value=([], "none found")),
-            patch.object(wizard, "print_warning") as warn,
+            patch.object(wizard, "print_warning_panel"),
+        ):
+            wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        assert not ask.called
+
+    def test_no_budgets_warns_in_a_box_and_skips_the_blurb(self):
+        # No attachable budget: show the dead-end warning as a box and don't explain a feature the
+        # workspace can't use yet.
+        with (
+            patch.object(wizard, "list_workspace_budgets", return_value=([], "none found")),
+            patch.object(wizard, "print_warning_panel") as warn_box,
+            patch.object(wizard, "print_note") as note,
         ):
             assert wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE) is None
-        assert warn.called
+        warning = warn_box.call_args.args[0]
+        assert "only AI Gateway budgets with hard blocks" in warning
+        assert "eligible to be associated with Tiered Spend Policies" in warning
+        assert not note.called  # the BUDGET_POLICY_BLURB note is skipped
 
     def test_no_per_user_block_budgets_warns_and_yields_none(self):
         # Spend routing needs a per-user threshold that hard-blocks; a workspace whose only budgets
         # lack one has nothing usable to attach a policy to.
         budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": False}]
         with (
-            patch.object(wizard, "prompt_yes_no_default", return_value=True),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
-            patch.object(wizard, "print_warning") as warn,
+            patch.object(wizard, "print_warning_panel") as warn_box,
         ):
             assert wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE) is None
-        assert warn.called
+        assert warn_box.called
 
     def test_only_per_user_block_budgets_are_offered(self):
         # The picker hides budgets without a per-user hard block rather than letting the admin pick
@@ -1253,7 +1529,7 @@ class TestBudgetPolicy:
             {"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True},
         ]
         with (
-            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
@@ -1272,7 +1548,7 @@ class TestBudgetPolicy:
     def test_percentages_are_stored_as_fractions(self):
         budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
-            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
@@ -1296,6 +1572,54 @@ class TestBudgetPolicy:
             }
         ]
 
+    def test_shows_per_user_threshold_and_tier_dollars(self):
+        # The admin picks tiers as percentages, so surface the budget's per-user monthly cap and what
+        # each percentage works out to in dollars — otherwise a percentage is a number in a vacuum.
+        budgets = [
+            {
+                "id": BUDGET_ID,
+                "display_name": "eng",
+                "has_per_user_block": True,
+                "per_user_threshold": Decimal("500.00"),
+            }
+        ]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
+            ),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+            patch.object(wizard, "print_note") as note,
+        ):
+            wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        notes = " ".join(str(call.args[0]) for call in note.call_args_list)
+        assert "$500" in notes  # the per-user monthly cap
+        assert "$400" in notes  # 80% of $500
+
+    def test_missing_threshold_skips_the_dollar_hints(self):
+        # A budget whose threshold couldn't be read still works; the prompt just omits the dollars.
+        budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
+        with (
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[False]),
+            patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
+            patch.object(
+                wizard,
+                "prompt_for_selection",
+                side_effect=[BUDGET_ID, "claude", "system.ai.claude-opus-4-8"],
+            ),
+            patch.object(wizard, "prompt_for_text", return_value="tiered"),
+            patch.object(wizard, "prompt_for_percentage", return_value=0.8),
+            patch.object(wizard, "print_note") as note,
+        ):
+            policy = wizard._prompt_budget_policy(WORKSPACE, "token", CLAUDE_ONLY, STATE)
+        notes = " ".join(str(call.args[0]) for call in note.call_args_list)
+        assert "$" not in notes
+        assert policy is not None and policy["tiers"][0]["spending_percentage"] == 0.8
+
     def test_offers_only_the_models_the_agent_was_configured_with(self):
         # Pi's catalog spans every family, so offering the workspace catalog would present four
         # models it was never given — and a tier naming one of them silently misroutes developers.
@@ -1309,7 +1633,7 @@ class TestBudgetPolicy:
         }
         budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
-            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
@@ -1338,7 +1662,7 @@ class TestBudgetPolicy:
         }
         budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
-            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
@@ -1357,7 +1681,7 @@ class TestBudgetPolicy:
         # catalog than nothing at all.
         budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
-            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
@@ -1374,7 +1698,7 @@ class TestBudgetPolicy:
     def test_authored_policy_validates(self):
         budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
-            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
@@ -1394,7 +1718,8 @@ class TestBudgetPolicy:
 
     def test_a_repeated_agent_model_pair_is_rejected_and_re_prompted(self):
         # The highest crossed tier wins, so a second tier on the same agent+model is inert. The loop
-        # must reject the repeat and re-prompt, the way it already does for a repeated percentage.
+        # rejects the repeat and re-asks only the agent/model — the percentage already entered for
+        # this tier is kept, not re-prompted.
         two_models = {
             "claude": {
                 "model_config": {
@@ -1411,7 +1736,7 @@ class TestBudgetPolicy:
         # out and the policy flow returns before the tier loop this test exercises.
         budgets = [{"id": BUDGET_ID, "display_name": "eng", "has_per_user_block": True}]
         with (
-            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, True, False]),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(
                 wizard,
@@ -1421,7 +1746,7 @@ class TestBudgetPolicy:
                     # Tier 1: claude / opus.
                     "claude",
                     "system.ai.claude-opus-4-8",
-                    # Tier 2 first attempt: claude / opus again — rejected, so the loop re-asks.
+                    # Tier 2 first attempt: claude / opus again — rejected, so just agent/model re-ask.
                     "claude",
                     "system.ai.claude-opus-4-8",
                     # Tier 2 retry: a genuine step-down.
@@ -1430,7 +1755,9 @@ class TestBudgetPolicy:
                 ],
             ),
             patch.object(wizard, "prompt_for_text", return_value="tiered"),
-            patch.object(wizard, "prompt_for_percentage", side_effect=[0.5, 0.9, 0.9]),
+            # Percentage asked once per tier: 0.5 for tier 1, 0.9 for tier 2. The combo retry does
+            # not re-ask it.
+            patch.object(wizard, "prompt_for_percentage", side_effect=[0.5, 0.9]),
             patch.object(wizard, "print_err") as err,
         ):
             policy = wizard._prompt_budget_policy(WORKSPACE, "token", two_models, STATE)
@@ -1438,7 +1765,7 @@ class TestBudgetPolicy:
             ("claude", "system.ai.claude-opus-4-8"),
             ("claude", "system.ai.claude-sonnet-4-6"),
         ]
-        assert any("no-op" in call.args[0] for call in err.call_args_list)
+        assert any("do nothing" in call.args[0] for call in err.call_args_list)
 
 
 class TestConfiguredModelsForAgent:
@@ -1514,6 +1841,25 @@ class TestSummary:
         assert "system.ai.gemini-3-flash" in out
         assert "models:" not in out
 
+    def test_scope_label_only_for_global_capable_agents(self, capsys):
+        # Codex retains the legacy scope choice; Claude now always installs managed settings.
+        manifest = {
+            "default_agent": "codex",
+            "enabled_agents": {
+                "codex": {
+                    "model_config": {"default_model": "system.ai.gpt-5"},
+                    "use_as_global_settings": True,
+                },
+                "gemini": {"model_config": {"default_model": "system.ai.gemini-3-flash"}},
+            },
+        }
+        wizard._render_summary(WORKSPACE, manifest)
+        out = capsys.readouterr().out
+        assert "global settings" in out
+        # The gemini line names its model but carries no global-settings/ucode-only scope.
+        gemini_line = next(line for line in out.splitlines() if "gemini-3-flash" in line)
+        assert "ucode-only" not in gemini_line and "global settings" not in gemini_line
+
 
 class TestSetupFromFile:
     def _write(self, tmp_path, payload):
@@ -1571,7 +1917,7 @@ class TestShowCommand:
         with patch.object(wizard, "load_state", return_value={"workspace": WORKSPACE}):
             assert wizard.show_command() == 0
 
-    def test_prints_the_apply_payload(self, capsys):
+    def test_prints_the_publish_payload(self, capsys):
         manifest = {
             "default_agent": "claude",
             "enabled_agents": {
@@ -1582,7 +1928,7 @@ class TestShowCommand:
         with patch.object(wizard, "load_state", return_value={"workspace": WORKSPACE}):
             assert wizard.show_command() == 0
         out = capsys.readouterr().out
-        # The proto enum spelling is what `apply` sends, so it must appear verbatim.
+        # The proto enum spelling is what `publish` sends, so it must appear verbatim.
         assert "CODING_AGENT_CLAUDE_CODE" in out
 
 
@@ -1780,7 +2126,7 @@ class TestSearchablePickers:
             return "system.ai.claude-opus-4-8"
 
         with (
-            patch.object(wizard, "prompt_yes_no_default", side_effect=[True, False]),
+            patch.object(wizard, "prompt_yes_no_default", side_effect=[False]),
             patch.object(wizard, "list_workspace_budgets", return_value=(budgets, None)),
             patch.object(wizard, "prompt_for_selection", side_effect=fake_sel),
             patch.object(wizard, "prompt_for_text", return_value="tiered"),
@@ -1792,7 +2138,291 @@ class TestSearchablePickers:
         assert any("model" in p for p in searchable_prompts), searchable_prompts
 
 
-class TestApplyCommand:
+# A minimal authored manifest (agents + models only), the shape `ucode setup` now writes.
+AGENTS_ONLY = {
+    "default_agent": "claude",
+    "enabled_agents": {"claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}}},
+}
+
+
+class TestCarryForwardSections:
+    def test_all_optional_sections_survive_a_rerun(self):
+        previous = {
+            **AGENTS_ONLY,
+            "mcp_servers": [{"name": "system.ai.github", "type": "mcp-service"}],
+            "skills": {"names": ["main.default"]},
+            "tracing_table": "main.default.traces",
+            "budget_policy": {
+                "budget_id": BUDGET_ID,
+                "tiers": [
+                    {
+                        "spending_percentage": 0.8,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    }
+                ],
+            },
+        }
+        manifest = dict(AGENTS_ONLY)
+        wizard._carry_forward_sections(previous, manifest)
+        assert manifest["mcp_servers"] == previous["mcp_servers"]
+        assert manifest["skills"] == previous["skills"]
+        assert manifest["tracing_table"] == previous["tracing_table"]
+        assert manifest["budget_policy"] == previous["budget_policy"]
+
+    def test_empty_previous_adds_nothing(self):
+        manifest = dict(AGENTS_ONLY)
+        wizard._carry_forward_sections({}, manifest)
+        assert set(manifest) == set(AGENTS_ONLY)
+
+    def test_budget_policy_naming_a_dropped_agent_is_left_out_with_a_warning(self):
+        # The admin re-ran `setup` and de-selected codex; the saved policy still routes to it, which
+        # would fail `validate_manifest` and block the whole save. Drop just the policy, loudly.
+        previous = {
+            **AGENTS_ONLY,
+            "budget_policy": {
+                "budget_id": BUDGET_ID,
+                "tiers": [
+                    {
+                        "spending_percentage": 0.9,
+                        "default_agent": "codex",
+                        "default_model": "system.ai.gpt-5",
+                    }
+                ],
+            },
+        }
+        manifest = dict(AGENTS_ONLY)
+        with patch.object(wizard, "print_warning") as warn:
+            wizard._carry_forward_sections(previous, manifest)
+        assert "budget_policy" not in manifest
+        assert warn.called
+        # The rest of the manifest is untouched and still valid.
+        assert validate_manifest(manifest, None) == []
+
+
+class TestNextSteps:
+    def test_marks_configured_and_unconfigured_sections(self, capsys):
+        manifest = {**AGENTS_ONLY, "skills": {"names": ["main.default"]}}
+        wizard._print_next_steps(manifest)
+        out = capsys.readouterr().out
+        assert "ucode setup mcps" in out
+        assert "ucode setup skills" in out
+        assert "ucode setup spend-tiers" in out
+        assert "ucode publish" in out
+
+    def test_dry_run_says_nothing_was_saved(self, capsys, monkeypatch):
+        monkeypatch.setattr(config_io_mod, "_dry_run", True)
+        wizard._print_next_steps(AGENTS_ONLY)
+        out = capsys.readouterr().out
+        assert "Dry run" in out
+        assert "ucode publish" not in out
+
+
+class TestSectionCommands:
+    """The `ucode setup mcps` / `skills` / `spend-tiers` section commands."""
+
+    @staticmethod
+    def _admin(**overrides):
+        """Patch the auth/admin boundary the section commands resolve through."""
+        defaults = {
+            "load_state": lambda: {"workspace": WORKSPACE, "profile": "p", **STATE},
+            "ensure_databricks_auth": lambda *a, **k: None,
+            "get_databricks_token": lambda *a, **k: "tok",
+            "is_workspace_admin": lambda *a, **k: True,
+            # Decline the end-of-section "publish now?" offer so a section run saves the draft without
+            # trying to publish; the publish path is exercised in TestPublishCommand.
+            "prompt_yes_no_default": lambda *a, **k: False,
+        }
+        defaults.update(overrides)
+        return [patch.object(wizard, name, value) for name, value in defaults.items()]
+
+    def _run(self, fn, *, admin_overrides=None, **patches):
+        import contextlib
+
+        with contextlib.ExitStack() as stack:
+            for p in self._admin(**(admin_overrides or {})):
+                stack.enter_context(p)
+            for name, value in patches.items():
+                stack.enter_context(patch.object(wizard, name, value))
+            return fn()
+
+    def test_mcp_requires_an_authored_config(self):
+        # No manifest on disk → the command can't edit a section that doesn't exist.
+        with pytest.raises(RuntimeError, match="ucode setup"):
+            self._run(wizard.setup_mcp_command)
+
+    def test_mcp_requires_enabled_agents(self):
+        # A launch stores `{}` to mean "no managed config"; that must not count as authored.
+        managed_config_mod.save_managed_state(WORKSPACE, {})
+        with pytest.raises(RuntimeError, match="ucode setup"):
+            self._run(wizard.setup_mcp_command)
+
+    def test_mcp_writes_only_its_section(self):
+        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
+        servers = [{"name": "system.ai.github", "type": "mcp-service"}]
+        # The picker (imported lazily inside the command) registers servers into local state; fake
+        # that by having the before/after reads bracket a change.
+        reads = iter([[], servers])
+        with (
+            patch("ucode.mcp.configure_mcp_command", return_value=0) as picker,
+            patch.object(wizard, "_mcp_servers_from_state", side_effect=lambda *_: next(reads)),
+        ):
+            code = self._run(wizard.setup_mcp_command)
+        assert code == 0
+        assert picker.call_args.kwargs == {"exclude_sources": {"apps"}}
+        saved = managed_config_mod.load_managed_state(WORKSPACE)
+        assert saved["mcp_servers"] == servers
+        assert saved["enabled_agents"] == AGENTS_ONLY["enabled_agents"]
+
+    def test_mcp_cancel_is_a_no_op(self):
+        # Picker cancelled / nothing changed → the section is left exactly as it was.
+        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
+        with (
+            patch("ucode.mcp.configure_mcp_command", return_value=0),
+            patch.object(wizard, "_mcp_servers_from_state", return_value=[]),
+            patch.object(wizard, "save_managed_state") as save,
+        ):
+            code = self._run(wizard.setup_mcp_command)
+        assert code == 0
+        assert not save.called
+
+    def test_mcp_carries_forward_preregistered_servers(self):
+        # An admin who ran `ucode configure mcp` first arrives with those servers already registered,
+        # so the picker leaves local state unchanged (before == after). The manifest doesn't carry them
+        # yet, so `setup mcps` must still save them rather than report "no changes" and drop them.
+        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
+        servers = [{"name": "system.ai.github", "type": "mcp-service"}]
+        with (
+            patch("ucode.mcp.configure_mcp_command", return_value=0),
+            patch.object(wizard, "_mcp_servers_from_state", return_value=servers),
+        ):
+            code = self._run(wizard.setup_mcp_command)
+        assert code == 0
+        assert managed_config_mod.load_managed_state(WORKSPACE)["mcp_servers"] == servers
+
+    def test_mcp_not_admin_raises(self):
+        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
+        with pytest.raises(RuntimeError, match="not an admin"):
+            self._run(
+                wizard.setup_mcp_command,
+                admin_overrides={"is_workspace_admin": lambda *a, **k: False},
+            )
+
+    def test_skills_location_bypasses_the_prompt(self):
+        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
+        with (
+            patch("ucode.mcp.configure_skills_mcp_command", return_value=0) as configure,
+            patch.object(wizard, "_skill_names_from_state", return_value=["main.default"]),
+            patch.object(wizard, "prompt_for_text") as prompt,
+        ):
+            code = self._run(lambda: wizard.setup_skills_command(["main.default"]))
+        assert code == 0
+        assert not prompt.called
+        configure.assert_called_once_with(["main.default"])
+        assert managed_config_mod.load_managed_state(WORKSPACE)["skills"] == {
+            "names": ["main.default"]
+        }
+
+    def test_skills_blank_answer_writes_nothing(self):
+        # A blank answer must not delegate: `configure_skills_mcp_command([])` is not a no-op.
+        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
+        with (
+            patch("ucode.mcp.configure_skills_mcp_command") as configure,
+            patch.object(wizard, "prompt_for_text", return_value=""),
+            patch.object(wizard, "save_managed_state") as save,
+        ):
+            code = self._run(wizard.setup_skills_command)
+        assert code == 0
+        assert not configure.called
+        assert not save.called
+
+    def test_budget_policy_offers_only_the_manifests_agents(self):
+        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
+        captured = {}
+
+        def fake_prompt(workspace, token, enabled_agents, state, **kwargs):
+            captured["agents"] = enabled_agents
+            return None  # decline / dead end → leave the policy unchanged
+
+        with patch.object(wizard, "_prompt_budget_policy", side_effect=fake_prompt):
+            code = self._run(wizard.setup_budget_policy_command)
+        assert code == 0
+        assert captured["agents"] == AGENTS_ONLY["enabled_agents"]
+
+    def test_budget_policy_none_leaves_existing_untouched(self):
+        # A transient budget-listing failure returns None; it must never delete a saved policy.
+        seeded = {
+            **AGENTS_ONLY,
+            "budget_policy": {
+                "budget_id": BUDGET_ID,
+                "tiers": [
+                    {
+                        "spending_percentage": 0.8,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    }
+                ],
+            },
+        }
+        managed_config_mod.save_managed_state(WORKSPACE, seeded)
+        with patch.object(wizard, "_prompt_budget_policy", return_value=None):
+            code = self._run(wizard.setup_budget_policy_command)
+        assert code == 0
+        assert (
+            managed_config_mod.load_managed_state(WORKSPACE)["budget_policy"]
+            == seeded["budget_policy"]
+        )
+
+
+class TestSetupHelp:
+    def test_lists_every_setup_command(self, capsys):
+        wizard.setup_help_command()
+        out = capsys.readouterr().out
+        for command in (
+            "ucode setup",
+            "ucode setup mcps",
+            "ucode setup skills",
+            "ucode setup spend-tiers",
+            "ucode setup show",
+            "ucode publish",
+        ):
+            assert command in out
+
+
+class TestPublishDiff:
+    def test_lists_added_removed_and_changed(self, capsys):
+        existing = {
+            "name": "cfg/1",
+            **AGENTS_ONLY,
+            "mcp_servers": [{"name": "system.ai.slack", "type": "mcp-service"}],
+        }
+        incoming = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-9"}}
+            },
+            "mcp_servers": [{"name": "system.ai.github", "type": "mcp-service"}],
+        }
+        changed = wizard._render_config_diff(existing, incoming, WORKSPACE)
+        out = capsys.readouterr().out
+        assert changed is True
+        assert "CHANGE" in out and "claude-opus-4-8" in out and "claude-opus-4-9" in out
+        assert "ADD" in out and "system.ai.github" in out  # added server
+        assert "DELETE" in out and "system.ai.slack" in out  # removed server
+
+    def test_identical_configs_report_no_change(self, capsys):
+        assert wizard._render_config_diff(AGENTS_ONLY, AGENTS_ONLY, WORKSPACE) is False
+
+    def test_display_name_change_is_detected(self, capsys):
+        existing = {"display_name": "old-name", **AGENTS_ONLY}
+        incoming = {"display_name": "new-name", **AGENTS_ONLY}
+        changed = wizard._render_config_diff(existing, incoming, WORKSPACE)
+        out = capsys.readouterr().out
+        assert changed is True
+        assert "old-name" in out and "new-name" in out
+
+
+class TestPublishCommand:
     MANIFEST = {
         "default_agent": "claude",
         "enabled_agents": {
@@ -1802,7 +2432,7 @@ class TestApplyCommand:
 
     @staticmethod
     def _patches(**overrides):
-        """The network/auth boundary `apply_command` sits behind, with per-test overrides."""
+        """The network/auth boundary `publish_command` sits behind, with per-test overrides."""
         defaults = {
             "load_state": lambda: {"workspace": WORKSPACE, "profile": "p", **STATE},
             "ensure_databricks_auth": lambda *a, **k: None,
@@ -1822,18 +2452,27 @@ class TestApplyCommand:
         defaults.update(overrides)
         return [patch.object(wizard, name, value) for name, value in defaults.items()]
 
-    def _run(self, *, yes=False, **overrides):
+    def _run(self, *, yes=False, file_path=None, **overrides):
         import contextlib
 
         with contextlib.ExitStack() as stack:
             for p in self._patches(**overrides):
                 stack.enter_context(p)
-            return wizard.apply_command(yes=yes)
+            return wizard.publish_command(file_path=file_path, yes=yes)
+
+    @staticmethod
+    def _config_file(tmp_path, manifest, *, workspace=WORKSPACE, spec_version=1, **extra):
+        config = serialize_managed_config(manifest)
+        config.pop("name", None)
+        payload = {"workspace": workspace, "spec_version": spec_version, **config, **extra}
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
 
     def test_unauthored_config_is_an_actionable_error(self):
         with patch.object(wizard, "load_state", return_value={"workspace": WORKSPACE}):
             with pytest.raises(RuntimeError, match="ucode setup"):
-                wizard.apply_command()
+                wizard.publish_command()
 
     def test_creates_when_no_config_exists(self):
         managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
@@ -1875,8 +2514,31 @@ class TestApplyCommand:
         assert updated["name"] == "coding-agent-configs/abc"
         assert created["called"] is False
 
+    def test_no_publish_when_the_published_config_already_matches(self):
+        # Publishing a config identical to what's live is a no-op; say so and skip the write rather
+        # than PATCH the same bytes back.
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
+        # What's live is the manifest normalized the same way `publish` will send it.
+        existing = {
+            "name": "coding-agent-configs/abc",
+            **managed_config_mod.normalize_managed_config(serialize_managed_config(self.MANIFEST)),
+        }
+        updated = {"called": False}
+
+        def fake_update(*a, **k):
+            updated["called"] = True
+            return {}, None
+
+        assert (
+            self._run(
+                get_managed_config=lambda *a, **k: (existing, None),
+                update_coding_agent_config=fake_update,
+            )
+            == 0
+        )
+        assert updated["called"] is False
+
     def test_invalid_manifest_is_not_published(self):
-        # `default_agent` names an agent that isn't enabled.
         managed_config_mod.save_managed_state(
             WORKSPACE, {"default_agent": "codex", "enabled_agents": {"claude": {}}}
         )
@@ -1886,15 +2548,16 @@ class TestApplyCommand:
             created["called"] = True
             return {}, None
 
-        assert self._run(create_coding_agent_config=fake_create) == 1
+        with pytest.raises(RuntimeError, match="not valid"):
+            self._run(create_coding_agent_config=fake_create)
         assert created["called"] is False
 
     def test_an_older_family_version_the_wizard_offered_still_publishes(self):
         # `setup` offers every version of a Claude family, but `claude_models` keeps only the newest
         # per family and the wizard's `all_claude_models` stash is never persisted — so a separate
-        # `apply` process used to reject a model it had just offered:
+        # `publish` process used to reject a model it had just offered:
         #   claude: model 'system.ai.claude-opus-4-1' is not available on this workspace.
-        # `apply` re-fetches the full listing rather than trusting what `setup` left in state.
+        # `publish` re-fetches the full listing rather than trusting what `setup` left in state.
         managed_config_mod.save_managed_state(
             WORKSPACE,
             {
@@ -2001,20 +2664,133 @@ class TestApplyCommand:
             )
         assert created["called"] is False
 
+    def test_feature_disabled_read_uses_the_shared_blocking_message(self):
+        managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
+        created = {"called": False}
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {}, None
+
+        reason = 'HTTP 404 Not Found: {"error_code":"FEATURE_DISABLED"}'
+        with pytest.raises(RuntimeError) as exc_info:
+            self._run(
+                get_managed_config=lambda *a, **k: (None, reason),
+                create_coding_agent_config=fake_create,
+            )
+        assert str(exc_info.value) == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
+        assert "FEATURE_DISABLED" not in str(exc_info.value)
+        assert created["called"] is False
+
     def test_existing_config_without_a_resource_name_is_an_error(self):
         managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         with pytest.raises(RuntimeError, match="resource name"):
             self._run(get_managed_config=lambda *a, **k: ({"enabled_agents": {}}, None))
 
+    def test_file_input_creates_and_sends_spec_version_without_workspace(self, tmp_path):
+        path = self._config_file(tmp_path, self.MANIFEST)
+        created = {}
+
+        def fake_create(workspace, token, payload):
+            created.update(workspace=workspace, payload=payload)
+            return {"name": "coding-agent-configs/new"}, None
+
+        assert self._run(file_path=path, create_coding_agent_config=fake_create) == 0
+        assert created["workspace"] == WORKSPACE
+        assert created["payload"]["spec_version"] == 1
+        assert "workspace" not in created["payload"]
+        assert "name" not in created["payload"]
+        assert created["payload"]["default_agent"] == "CODING_AGENT_CLAUDE_CODE"
+
+    def test_file_input_updates_in_place_and_sends_spec_version(self, tmp_path):
+        path = self._config_file(tmp_path, self.MANIFEST)
+        existing = {"name": "coding-agent-configs/abc", "enabled_agents": {"codex": {}}}
+        updated = {}
+
+        def fake_update(workspace, token, name, payload):
+            updated.update(name=name, payload=payload)
+            return {"name": name}, None
+
+        assert (
+            self._run(
+                file_path=path,
+                get_managed_config=lambda *a, **k: (existing, None),
+                update_coding_agent_config=fake_update,
+            )
+            == 0
+        )
+        assert updated["name"] == "coding-agent-configs/abc"
+        assert updated["payload"]["spec_version"] == 1
+        assert "workspace" not in updated["payload"]
+
+    def test_file_workspace_mismatch_aborts_before_auth_or_mutation(self, tmp_path):
+        path = self._config_file(tmp_path, self.MANIFEST, workspace="https://other.example.com")
+        called = {"auth": False, "create": False}
+
+        def fake_auth(*a, **k):
+            called["auth"] = True
+
+        def fake_create(*a, **k):
+            called["create"] = True
+            return {}, None
+
+        with pytest.raises(RuntimeError, match="configured workspace"):
+            self._run(
+                file_path=path,
+                ensure_databricks_auth=fake_auth,
+                create_coding_agent_config=fake_create,
+            )
+        assert called == {"auth": False, "create": False}
+
+    def test_file_bad_spec_version_aborts_before_auth(self, tmp_path):
+        path = self._config_file(tmp_path, self.MANIFEST, spec_version=2)
+        called = {"auth": False}
+
+        def fake_auth(*a, **k):
+            called["auth"] = True
+
+        with pytest.raises(RuntimeError, match="spec_version"):
+            self._run(file_path=path, ensure_databricks_auth=fake_auth)
+        assert called["auth"] is False
+
+    def test_missing_file_is_actionable(self, tmp_path):
+        with pytest.raises(RuntimeError, match="No config file"):
+            self._run(file_path=str(tmp_path / "absent.json"))
+
+    def test_no_file_publishes_a_hand_entered_custom_model(self):
+        managed_config_mod.save_managed_state(
+            WORKSPACE,
+            {
+                "default_agent": "codex",
+                "enabled_agents": {
+                    "codex": {
+                        "model_config": {
+                            "default_model": "main.custom.model",
+                            "custom_models": ["main.custom.model"],
+                        }
+                    }
+                },
+            },
+        )
+        created = {"called": False}
+
+        def fake_create(*a, **k):
+            created["called"] = True
+            return {"name": "coding-agent-configs/new"}, None
+
+        assert self._run(create_coding_agent_config=fake_create) == 0
+        assert created["called"] is True
+
 
 class TestPublishFailureMessages:
     """The server's error codes, turned into something an admin can act on."""
 
-    def test_feature_disabled_names_the_flag(self):
+    def test_feature_disabled_uses_the_shared_message(self):
         message = wizard._explain_publish_failure(
             'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED","message":"..."}'
         )
-        assert "codingAgentConfigCrudEnabled" in message
+        assert message == wizard.CODING_AGENT_CONFIGS_DISABLED_MESSAGE
+        assert "`ucode configure`" in message
 
     def test_permission_denied_says_admin_is_required(self):
         message = wizard._explain_publish_failure(
@@ -2057,30 +2833,47 @@ class TestCliWiring:
         assert result.exit_code == 0
         assert "show" in result.output
 
-    def test_apply_is_registered(self):
+    def test_publish_is_registered(self):
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        assert "apply" in result.output
+        assert "publish" in result.output
 
-    def test_apply_declares_yes_and_no_dry_run(self):
-        # `--dry-run` was removed: apply always validates before publishing, so a separate
+    def test_publish_declares_yes_and_no_dry_run(self):
+        # `--dry-run` was removed: publish always validates before publishing, so a separate
         # validate-only mode is redundant. Asserted on declared options rather than rendered help,
         # which Rich ellipsizes at narrow widths (see test_setup_help_lists_from_file).
-        command = typer.main.get_command(app).commands["apply"]  # type: ignore[attr-defined]
+        command = typer.main.get_command(app).commands["publish"]  # type: ignore[attr-defined]
         declared = {opt for param in command.params for opt in param.opts}
         assert "--yes" in declared
         assert "--dry-run" not in declared
 
-    def test_apply_error_exits_nonzero_with_a_message(self):
-        with patch.object(cli_mod, "apply_command", side_effect=RuntimeError("no config authored")):
-            result = runner.invoke(app, ["apply"])
+    def test_publish_declares_file_option(self):
+        command = typer.main.get_command(app).commands["publish"]  # type: ignore[attr-defined]
+        declared = {opt for param in command.params for opt in param.opts}
+        assert "--file" in declared
+        assert "-f" in declared
+
+    def test_publish_file_flag_is_forwarded(self):
+        for flag in ("-f", "--file"):
+            with (
+                patch("ucode.cli.install_databricks_cli"),
+                patch.object(cli_mod, "publish_command", return_value=0) as publish,
+            ):
+                runner.invoke(app, ["publish", flag, "/tmp/cfg.json"])
+            assert publish.call_args.kwargs["file_path"] == "/tmp/cfg.json"
+
+    def test_publish_error_exits_nonzero_with_a_message(self):
+        with patch.object(
+            cli_mod, "publish_command", side_effect=RuntimeError("no config authored")
+        ):
+            result = runner.invoke(app, ["publish"])
         assert result.exit_code == 1
 
-    def test_successful_apply_exits_zero(self):
+    def test_successful_publish_exits_zero(self):
         # Same trap as `setup`: `typer.Exit` subclasses RuntimeError, so raising it inside the
         # command's try block would report success as "ERROR 0".
-        with patch.object(cli_mod, "apply_command", return_value=0):
-            result = runner.invoke(app, ["apply"])
+        with patch.object(cli_mod, "publish_command", return_value=0):
+            result = runner.invoke(app, ["publish"])
         assert result.exit_code == 0
         assert "ERROR" not in result.output
 
@@ -2133,6 +2926,68 @@ class TestCliWiring:
         with patch("ucode.cli.show_command", return_value=0):
             result = runner.invoke(app, ["setup", "show"])
         assert result.exit_code == 0
+
+    @pytest.mark.parametrize(
+        ("command", "target"),
+        [
+            ("mcps", "setup_mcp_command"),
+            ("skills", "setup_skills_command"),
+            ("spend-tiers", "setup_budget_policy_command"),
+        ],
+    )
+    def test_section_subcommands_are_registered_and_called(self, command, target):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch(f"ucode.cli.{target}", return_value=0) as fn,
+        ):
+            result = runner.invoke(app, ["setup", command])
+        assert result.exit_code == 0
+        assert fn.called
+        assert "ERROR" not in _out(result)
+
+    def test_setup_skills_declares_location(self):
+        group = typer.main.get_command(app).commands["setup"]  # type: ignore[attr-defined]
+        skills = group.commands["skills"]  # type: ignore[attr-defined]
+        declared = {opt for param in skills.params for opt in param.opts}
+        assert "--location" in declared
+
+    def test_setup_skills_location_is_parsed_to_a_list(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.setup_skills_command", return_value=0) as fn,
+        ):
+            runner.invoke(app, ["setup", "skills", "--location", "main.a,main.b"])
+        assert fn.call_args.args[0] == ["main.a", "main.b"]
+
+    def test_setup_help_needs_no_auth(self):
+        # `ucode setup help` reads the local draft only — it must not shell out to install the CLI.
+        with (
+            patch("ucode.cli.install_databricks_cli") as install,
+            patch("ucode.cli.setup_help_command", return_value=0) as fn,
+        ):
+            result = runner.invoke(app, ["setup", "help"])
+        assert result.exit_code == 0
+        assert fn.called
+        assert not install.called
+
+    def test_section_command_runtime_error_exits_1(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch(
+                "ucode.cli.setup_mcp_command", side_effect=RuntimeError("run `ucode setup` first")
+            ),
+        ):
+            result = runner.invoke(app, ["setup", "mcps"])
+        assert result.exit_code == 1
+        assert "ucode setup" in _out(result)
+
+    def test_section_command_interrupt_exits_130(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.setup_budget_policy_command", side_effect=KeyboardInterrupt),
+        ):
+            result = runner.invoke(app, ["setup", "spend-tiers"])
+        assert result.exit_code == 130
 
 
 def _out(result) -> str:

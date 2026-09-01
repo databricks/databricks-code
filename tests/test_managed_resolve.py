@@ -18,10 +18,11 @@ from ucode.managed_resolve import (
     managed_state_overrides,
     managed_supplies_models,
     managed_unservable_models,
+    managed_use_as_global_settings,
     recommended_agent,
     resolve_state,
 )
-from ucode.state import MANAGED_OVERLAY_KEY
+from ucode.state import MANAGED_OVERLAY_KEY, _without_managed_overlay
 
 WORKSPACE = "https://ws.example.com"
 
@@ -183,6 +184,37 @@ class TestResolveState:
         }
 
 
+class TestGlobalSettings:
+    def test_only_codex_keeps_the_legacy_global_settings_flag(self):
+        from ucode.agents import GLOBAL_SETTINGS_AGENTS
+
+        assert GLOBAL_SETTINGS_AGENTS == frozenset({"codex"})
+
+    def test_claude_no_longer_honors_the_legacy_flag(self):
+        assert managed_use_as_global_settings(MANAGED, "claude") is False
+
+    def test_flag_false_when_not_opted_in(self):
+        # codex is enabled but never marked machine-wide.
+        assert managed_use_as_global_settings(MANAGED, "codex") is False
+
+    def test_flag_ignored_for_unsupported_agent(self):
+        # A hand-written --from-file config can't turn it on for an agent whose token can't refresh.
+        managed = {"enabled_agents": {"gemini": {"use_as_global_settings": True}}}
+        assert managed_use_as_global_settings(managed, "gemini") is False
+
+    def test_resolve_does_not_set_transient_flag_for_claude(self):
+        resolved = resolve_state(MANAGED, _state(), "claude")
+        assert "write_managed_config" not in resolved
+
+    def test_resolve_omits_flag_when_not_opted_in(self):
+        resolved = resolve_state(MANAGED, _state(), "codex")
+        assert "write_managed_config" not in resolved
+
+    def test_removed_claude_flag_is_not_persisted(self):
+        resolved = resolve_state(MANAGED, _state(), "claude")
+        assert "write_managed_config" not in _without_managed_overlay(resolved)
+
+
 class TestStateFileIsNotRewritten:
     """The managed config must win by precedence, not by overwriting the developer's state file.
 
@@ -194,11 +226,20 @@ class TestStateFileIsNotRewritten:
 
     @pytest.fixture
     def real_state_file(self, tmp_path, monkeypatch):
-        """Redirect state.json and the claude settings file into tmp_path, unstubbed."""
+        """Redirect state.json and both Claude settings files into tmp_path, unstubbed."""
         monkeypatch.setattr(config_io, "APP_DIR", tmp_path)
         monkeypatch.setattr(state_mod, "STATE_PATH", tmp_path / "state.json")
         monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", tmp_path / "ucode-settings.json")
         monkeypatch.setattr(claude, "CLAUDE_BACKUP_PATH", tmp_path / "backup.json")
+        managed_settings_path = tmp_path / "managed-settings.json"
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: managed_settings_path)
+        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: True)
+
+        def reconcile_managed_file(path, desired_text, **kwargs):
+            path.write_text(desired_text, encoding="utf-8")
+            return "written"
+
+        monkeypatch.setattr(claude, "reconcile_managed_file", reconcile_managed_file)
         # Seed a developer whose own opus choice differs from the manifest's.
         state_mod.save_state(
             {
@@ -232,6 +273,8 @@ class TestStateFileIsNotRewritten:
 
         env = json.loads((real_state_file / "ucode-settings.json").read_text())["env"]
         assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"].startswith("system.ai.claude-opus-5")
+        managed_env = json.loads((real_state_file / "managed-settings.json").read_text())["env"]
+        assert managed_env["ANTHROPIC_DEFAULT_OPUS_MODEL"].startswith("system.ai.claude-opus-5")
 
     def test_overlay_bookkeeping_never_lands_on_disk(self, real_state_file):
         resolved_state = resolve_state(MANAGED, state_mod.load_state(), "claude")

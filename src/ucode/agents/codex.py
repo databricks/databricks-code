@@ -9,7 +9,8 @@ import sys
 import time
 from pathlib import Path
 
-from ucode.agent_updates import available_npm_package_update
+import tomlkit
+
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -24,10 +25,13 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.launcher import exec_or_spawn
+from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
+    routing_models,
     sync_smart_routing_hooks,
 )
+from ucode.smart_routing.codex_routing import codex_model_id
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.ui import print_warning_err
@@ -46,7 +50,7 @@ MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
 # Shared across agents: one opt-in enables smart routing for every routing-capable
 # tool (codex, claude), so a workspace turns it on once.
 SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
-
+APP_SERVER_SMART_ROUTING_STARTING_MODEL = "gpt-5.6-luna"
 
 SPEC: ToolSpec = {
     "binary": "codex",
@@ -69,12 +73,6 @@ LEGACY_MANAGED_KEYS: list[list[str]] = [
     ["model_providers", CODEX_MODEL_PROVIDER_NAME],
     ["model_providers", CODEX_MODEL_PROVIDER_NAME, "http_headers"],
 ]
-
-_GPT_RE = re.compile(r"(?:databricks-)?gpt-(\d+)(?:[.-](\d+))?(?:[.-](\d+))?(-.+|[a-z].*)?")
-
-
-def is_update_available() -> tuple[str, str] | None:
-    return available_npm_package_update(SPEC["package"])
 
 
 def _parse_version(value: str) -> tuple[int, int, int] | None:
@@ -106,6 +104,21 @@ def _use_legacy_layout() -> bool:
     if parsed is None:
         return False
     return parsed < MINIMUM_CODEX_VERSION
+
+
+def has_ucode_config() -> bool:
+    """Return whether ucode has already written a Codex configuration."""
+    if CODEX_CONFIG_PATH.exists():
+        return True
+    if not LEGACY_CODEX_CONFIG_PATH.exists():
+        return False
+    doc = read_toml_safe(LEGACY_CODEX_CONFIG_PATH)
+    profiles = doc.get("profiles")
+    return (
+        doc.get("profile") == CODEX_PROFILE_NAME
+        and isinstance(profiles, dict)
+        and isinstance(profiles.get(CODEX_PROFILE_NAME), dict)
+    )
 
 
 def _provider_block(
@@ -271,36 +284,13 @@ def revert_legacy_shared_config() -> bool:
     return _strip_legacy_ucode_entries(_legacy_config_path())
 
 
-def _parse_gpt(model: str | None) -> tuple[int, int | None, int | None, str] | None:
-    if not model:
-        return None
-    # Strip the UC model-services prefix so `system.ai.gpt-5` parses for version
-    # selection; the original id is preserved by callers that need it verbatim.
-    tail = model.split("/")[-1]
-    if tail.startswith("system.ai."):
-        tail = tail[len("system.ai.") :]
-    match = _GPT_RE.fullmatch(tail)
-    if not match:
-        return None
-    major, minor, patch, suffix = match.groups()
-    return (
-        int(major),
-        int(minor) if minor is not None else None,
-        int(patch) if patch is not None else None,
-        suffix or "",
-    )
-
-
 def write_tool_config(state: dict, model: str | None = None, provider: str | None = None) -> dict:
     workspace = state["workspace"]
-    # With a Model Provider Service the gateway routes by header and Codex sends
-    # its own canonical model name (e.g. `gpt-5`) — leave `model` unset so no
-    # Databricks endpoint id is pinned. Otherwise pin the discovered endpoint id
-    # verbatim: the gateway routes by that exact name (whether `databricks-gpt-5`
-    # from the AI Gateway listing or `system.ai.gpt-5` from UC model-services), so
-    # rewriting it to an OpenAI id (`gpt-5`) makes the gateway resolve a
-    # non-existent `system.ai.*` alias and 404.
-    chosen_model = None if provider else (model or default_model(state))
+    # Leave model selection to Codex. The gateway still receives the configured
+    # provider and authentication settings, while Codex uses its own default.
+    # A managed default is the sole exception.
+    managed_model = state.get("codex_default_model")
+    chosen_model = managed_model if isinstance(managed_model, str) else None
     databricks_profile = state.get("profile")
 
     if _use_legacy_layout():
@@ -322,12 +312,15 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         )
         doc = read_toml_safe(LEGACY_CODEX_CONFIG_PATH)
         deep_merge_dict(doc, overlay)
-        if provider:
-            # deep_merge can't drop keys, so clear a `model` pinned by an
-            # earlier non-provider run that the provider overlay omits.
-            profiles = doc.get("profiles")
-            if isinstance(profiles, dict) and isinstance(profiles.get(CODEX_PROFILE_NAME), dict):
-                profiles[CODEX_PROFILE_NAME].pop("model", None)
+        # deep_merge can't drop keys, so clear model preferences from an earlier run.
+        profiles = doc.get("profiles")
+        if (
+            chosen_model is None
+            and isinstance(profiles, dict)
+            and isinstance(profiles.get(CODEX_PROFILE_NAME), dict)
+        ):
+            for key in ("model", "model_reasoning_effort"):
+                profiles[CODEX_PROFILE_NAME].pop(key, None)
         write_toml_file(LEGACY_CODEX_CONFIG_PATH, doc)
         state = mark_tool_managed(state, "codex", LEGACY_MANAGED_KEYS)
         save_state(state)
@@ -344,48 +337,101 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     )
     doc = read_toml_safe(CODEX_CONFIG_PATH)
     deep_merge_dict(doc, overlay)
-    if provider:
-        # deep_merge can't drop keys, so clear a `model` pinned by an earlier
-        # non-provider run that the provider overlay omits.
-        doc.pop("model", None)
+    # deep_merge can't drop keys, so clear model preferences from an earlier run.
+    if chosen_model is None:
+        for key in ("model", "model_reasoning_effort"):
+            doc.pop(key, None)
     sync_smart_routing_hooks(
         doc,
         state,
         enabled=smart_routing_enabled(state) and provider is None,
     )
     write_toml_file(CODEX_CONFIG_PATH, doc)
+    # use_as_global_settings: also write the modern overlay to Codex's OS managed config
+    # (/etc/codex/managed_config.toml), the highest-precedence scope a bare `codex` reads — so it
+    # defaults to the gateway without `--profile ucode`. codex auth self-refreshes via
+    # `ucode auth-token`, so the file keeps working. The write goes through the sudo path in
+    # `managed_files`.
+    if state.get("write_managed_config"):
+        _write_managed_config(
+            workspace, None, databricks_profile, bool(state.get("use_pat")), provider
+        )
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
     return state
 
 
-def default_model(state: dict) -> str | None:
-    """Pick the newest GPT model when multiple are available.
+def _is_gpt_family(model: str) -> bool:
+    """Return True if this id is in the GPT family (versioned or OSS variants)."""
+    tail = model.split("/")[-1]
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    return tail.startswith("gpt-")
 
-    A managed config's ``codex_default_model`` takes priority. The discovery list
-    is alphabetically sorted, which can put "databricks-gpt-5" ahead of
-    "databricks-gpt-5-5". Prefer the highest semantic version instead.
 
-    Only GPT-parseable ids are considered. Codex routes the chosen ``model``
-    through the gateway as-is, so a non-GPT entry (e.g. ``moonshotai/kimi-k2.5``)
-    would be rejected with a Unity Catalog endpoint-name error. When no
-    candidate parses as GPT we return None rather than pinning an unroutable id.
+def _managed_config_path() -> Path | None:
+    """OS-level Codex managed config file, or None on unsupported platforms.
+
+    Linux and macOS use ``/etc/codex/managed_config.toml`` (root-owned, highest precedence). See
+    https://learn.chatgpt.com/docs/enterprise/managed-configuration. Codex also supports a
+    ``~/.codex/managed_config.toml`` on Windows, but ucode's write path is sudo/Unix-only
+    (see :func:`managed_files.managed_files_supported`), so Windows returns None here too.
     """
+    if current_os() in (OS.LINUX, OS.MACOS):
+        return Path("/etc/codex/managed_config.toml")
+    return None
+
+
+def _write_managed_config(
+    workspace: str,
+    model: str | None,
+    databricks_profile: str | None,
+    use_pat: bool,
+    provider: str | None,
+) -> None:
+    """Merge the modern overlay into Codex's OS managed_config.toml, preserving any other keys there.
+
+    Written via the sudo path in `managed_files` (drift-suppressed).
+    """
+    path = _managed_config_path()
+    if path is None:
+        print_warning_err(
+            "Machine-wide Codex settings aren't supported on this platform; skipped the managed "
+            "config write."
+        )
+        return
+    overlay = render_overlay(
+        workspace, model, databricks_profile, use_pat=use_pat, provider=provider
+    )
+    doc = read_toml_safe(path)
+    deep_merge_dict(doc, overlay)
+    # deep_merge can't drop keys, so clear a model pinned by an earlier run.
+    doc.pop("model", None)
+    write_managed_file(path, tomlkit.dumps(doc), display="Codex")
+
+
+def default_model(state: dict) -> str | None:
+    """Return a managed Codex model, or leave selection to Codex."""
     if isinstance(state.get("codex_default_model"), str):
-        return state.get("codex_default_model")
-    codex_models = state.get("codex_models") or []
-    parsed: list[tuple[str, tuple[int, int | None, int | None, str]]] = [
-        (mid, gpt) for mid in codex_models if (gpt := _parse_gpt(mid)) is not None
-    ]
-    if not parsed:
-        return None
+        return state["codex_default_model"]
+    clear_model_preferences(state)
+    return None
 
-    def _gpt_version_key(entry: tuple[str, tuple[int, int | None, int | None, str]]):
-        major, minor, patch, suffix = entry[1]
-        base_bonus = 1 if not suffix else 0
-        return (major, minor or 0, patch or 0, base_bonus)
 
-    return max(parsed, key=_gpt_version_key)[0]
+def clear_model_preferences(state: dict) -> bool:
+    """Remove ucode profile model preferences so Codex selects its default."""
+    if isinstance(state.get("codex_default_model"), str):
+        return False
+    doc = read_toml_safe(CODEX_CONFIG_PATH)
+    changed = False
+    for key in ("model", "model_reasoning_effort"):
+        if key in doc:
+            doc.pop(key)
+            changed = True
+    if changed:
+        backup_existing_file(CODEX_CONFIG_PATH, CODEX_BACKUP_PATH)
+        write_toml_file(CODEX_CONFIG_PATH, doc)
+    return changed
 
 
 # codex rejects the global --profile on subcommands that don't accept it
@@ -400,8 +446,30 @@ _PROFILE_REJECTED_MAX_SECONDS = 3.0
 
 
 def launch(state: dict, tool_args: list[str]) -> None:
+    clear_model_preferences(state)
     binary = SPEC["binary"]
     workspace = state.get("workspace")
+    if os.environ.get("ENABLE_SMART_ROUTING_V2") == "1":
+        # V2 imports the WebSocket interposer; keep it out of the legacy import
+        # path so flag-off launches retain their existing dependencies and behavior.
+        from ucode.smart_routing import v2 as smart_routing_v2
+
+        def _app_server_start_model() -> str:
+            managed_model = default_model(state)
+            if managed_model:
+                return managed_model
+            models = routing_models(state)
+            if models:
+                return codex_model_id(models[0])
+            return APP_SERVER_SMART_ROUTING_STARTING_MODEL
+
+        smart_routing_v2.launch_codex(
+            state,
+            tool_args,
+            binary=binary,
+            start_model=_app_server_start_model(),
+            render_overlay=render_overlay,
+        )
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     # Run codex with --profile first — the TUI and runtime subcommands

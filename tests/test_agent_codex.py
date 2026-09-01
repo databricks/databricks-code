@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +23,29 @@ class TestCodexSpec:
 
     def test_display(self):
         assert codex.SPEC["display"] == "Codex"
+
+
+class TestHasUcodeConfig:
+    def test_detects_profile_config(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "ucode.config.toml"
+        legacy_path = tmp_path / "config.toml"
+        legacy_path.write_text(
+            'profile = "ucode"\n\n[profiles.ucode]\nmodel_provider = "ucode-databricks"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
+
+        assert codex.has_ucode_config() is True
+
+    def test_ignores_unrelated_legacy_config(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "ucode.config.toml"
+        legacy_path = tmp_path / "config.toml"
+        legacy_path.write_text('profile = "default"\n', encoding="utf-8")
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "LEGACY_CODEX_CONFIG_PATH", legacy_path)
+
+        assert codex.has_ucode_config() is False
 
 
 class TestRenderOverlay:
@@ -108,13 +132,11 @@ class TestCodexWriteConfig:
 
         doc = read_toml_safe(config_path)
         assert doc["model_provider"] == "ucode-databricks"
-        assert doc["model"] == "gpt-5"
+        assert "model" not in doc
+        assert "model_reasoning_effort" not in doc
         assert "profiles" not in doc
 
-    def test_pins_discovered_databricks_model_id_verbatim(self, tmp_path, monkeypatch):
-        # The gateway routes by the discovered endpoint name, so the id is
-        # written as-is (not rewritten to an OpenAI id like `gpt-5.5`, which the
-        # gateway would resolve to a non-existent `system.ai.*` alias and 404).
+    def test_removes_discovered_model_id(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
         backup_path = tmp_path / "codex-ucode-config.backup.toml"
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
@@ -127,9 +149,9 @@ class TestCodexWriteConfig:
         )
 
         doc = read_toml_safe(config_path)
-        assert doc["model"] == "databricks-gpt-5-5"
+        assert "model" not in doc
 
-    def test_pins_uc_model_services_id_verbatim(self, tmp_path, monkeypatch):
+    def test_removes_uc_model_services_id(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
         backup_path = tmp_path / "codex-ucode-config.backup.toml"
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
@@ -142,7 +164,7 @@ class TestCodexWriteConfig:
         )
 
         doc = read_toml_safe(config_path)
-        assert doc["model"] == "system.ai.gpt-5-5"
+        assert "model" not in doc
 
     def test_provider_writes_header_and_drops_stale_model(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
@@ -152,9 +174,9 @@ class TestCodexWriteConfig:
         monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
         monkeypatch.setattr(codex, "save_state", lambda state: None)
 
-        # An earlier non-provider run pinned a model.
+        # An earlier run pinned a model.
         codex.write_tool_config({"workspace": WS, "codex_models": ["gpt-5"]})
-        assert read_toml_safe(config_path)["model"] == "gpt-5"
+        assert "model" not in read_toml_safe(config_path)
 
         # A provider run must clear it and add the routing header.
         codex.write_tool_config(
@@ -166,6 +188,41 @@ class TestCodexWriteConfig:
         assert "model" not in doc
         headers = doc["model_providers"]["ucode-databricks"]["http_headers"]
         assert headers["Databricks-Model-Provider-Service"] == "main.aarushi.aarushi-openai"
+
+    def test_clears_profile_model_preferences_before_launch(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            'model = "system.ai.gpt-5-6-luna"\nmodel_reasoning_effort = "medium"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
+
+        assert codex.clear_model_preferences({}) is True
+
+        doc = read_toml_safe(config_path)
+        assert "model" not in doc
+        assert "model_reasoning_effort" not in doc
+
+    def test_preserves_profile_without_model_preferences(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text('model_provider = "ucode-databricks"\n', encoding="utf-8")
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
+
+        assert codex.clear_model_preferences({}) is False
+        assert not (tmp_path / "backup.toml").exists()
+
+    def test_preserves_profile_model_for_managed_default(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text('model = "managed-default"\n', encoding="utf-8")
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+
+        assert codex.clear_model_preferences({"codex_default_model": "managed-default"}) is False
+        assert read_toml_safe(config_path)["model"] == "managed-default"
 
     def test_removes_legacy_ucode_profile_from_shared_config(self, tmp_path, monkeypatch):
         config_dir = tmp_path / ".codex"
@@ -215,7 +272,7 @@ class TestCodexWriteConfig:
         doc = read_toml_safe(legacy_path)
         assert doc["profile"] == "ucode"
         assert doc["profiles"]["ucode"]["model_provider"] == "ucode-databricks"
-        assert doc["profiles"]["ucode"]["model"] == "gpt-5"
+        assert "model" not in doc["profiles"]["ucode"]
         provider = doc["model_providers"]["ucode-databricks"]
         assert provider["base_url"] == f"{WS}/ai-gateway/codex/v1"
         assert provider["wire_api"] == "responses"
@@ -241,6 +298,7 @@ class TestCodexWriteConfig:
                 "workspace": WS,
                 "profile": "prod",
                 "codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"],
+                "oss_models": ["system.ai.glm-5-2"],
                 codex.SMART_ROUTING_STATE_KEY: True,
             }
         )
@@ -258,6 +316,7 @@ class TestCodexWriteConfig:
         assert "--host https://example.databricks.com" in route_command
         assert "--profile prod" in route_command
         assert "--model databricks-gpt-5-5" in route_command
+        assert "--model system.ai.glm-5-2" in route_command
 
     def test_provider_launch_removes_routing_hooks(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
@@ -408,6 +467,27 @@ class TestCodexSmartRouting:
         assert decision is None
         assert error is None
 
+    def test_route_launch_model_includes_codex_and_oss_models(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(codex_routing, "get_databricks_token", lambda *args: "token")
+
+        def request(workspace, token, task, models):
+            captured["models"] = models
+            return None, "expected test stop"
+
+        monkeypatch.setattr(codex_routing, "request_routing_decision", request)
+
+        codex_routing.route_launch_model(
+            {
+                "workspace": WS,
+                "codex_models": ["system.ai.gpt-5-6-sol"],
+                "oss_models": ["system.ai.glm-5-2"],
+            },
+            ["Fix the parser"],
+        )
+
+        assert captured["models"] == ["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"]
+
 
 class TestCodexRemoveLegacyProfile:
     def test_drops_provider_block_on_modern_path(self, tmp_path, monkeypatch):
@@ -487,47 +567,30 @@ class TestCodexRevertLegacySharedConfig:
 
 
 class TestCodexDefaultModel:
-    def test_picks_highest_semver_over_alpha(self):
-        state = {"codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"]}
+    @pytest.fixture(autouse=True)
+    def _isolate_profile_config(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", tmp_path / "ucode.config.toml")
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
 
-        assert codex.default_model(state) == "databricks-gpt-5-5"
+    def test_clears_profile_model_preferences(self, tmp_path):
+        codex.CODEX_CONFIG_PATH.write_text(
+            'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "medium"\n', encoding="utf-8"
+        )
 
-    def test_none_when_no_models(self):
+        assert codex.default_model({"codex_models": ["system.ai.gpt-5-6-luna"]}) is None
+        doc = read_toml_safe(codex.CODEX_CONFIG_PATH)
+        assert "model" not in doc
+        assert "model_reasoning_effort" not in doc
+
+    def test_none_when_no_configured_model(self):
         assert codex.default_model({}) is None
 
-    def test_none_when_no_gpt_parseable_models(self):
-        # A workspace whose responses-capable models aren't GPT (e.g. kimi)
-        # must not pin an unroutable id as the Codex model.
-        state = {"codex_models": ["moonshotai/kimi-k2.5", "claude-sonnet-4"]}
-
-        assert codex.default_model(state) is None
-
-    def test_ignores_non_gpt_candidates(self):
-        state = {"codex_models": ["moonshotai/kimi-k2.5", "databricks-gpt-5-5"]}
-
-        assert codex.default_model(state) == "databricks-gpt-5-5"
-
-    def test_prefers_base_over_suffixed_same_version(self):
-        models = ["gpt-5-5-mini", "gpt-5-5", "gpt-5"]
-
-        assert codex.default_model({"codex_models": models}) == "gpt-5-5"
-
-    def test_namespaced_models_use_same_version_parser(self):
-        models = ["served-models/databricks-gpt-5", "served-models/databricks-gpt-5-5"]
-
-        assert codex.default_model({"codex_models": models}) == "served-models/databricks-gpt-5-5"
-
-    def test_codex_default_model_wins_over_allowlist(self):
+    def test_managed_default_model_takes_priority(self):
         state = {
             "codex_default_model": "admin-chosen-default",
             "codex_models": ["databricks-gpt-5-5"],
         }
         assert codex.default_model(state) == "admin-chosen-default"
-
-    def test_default_model_selects_model_services_gpt(self):
-        models = ["system.ai.gpt-5", "system.ai.gpt-5-5", "system.ai.claude-opus-4-8"]
-
-        assert codex.default_model({"codex_models": models}) == "system.ai.gpt-5-5"
 
 
 class TestCodexValidateCmd:
@@ -577,6 +640,7 @@ class TestCodexLaunch:
         monkeypatch.setattr(codex.time, "monotonic", lambda: next(clock))
         monkeypatch.setattr(codex, "exec_or_spawn", lambda argv: fallbacks.append(argv))
         monkeypatch.setattr(codex, "get_databricks_token", lambda workspace, profile=None: "tok")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
         return runs, fallbacks
 
     def test_sets_oauth_token_and_runs_with_profile(self, monkeypatch):
@@ -652,3 +716,56 @@ class TestCodexLaunch:
             codex.launch({"workspace": WS}, [])
         assert exc.value.code == 0
         assert fallbacks == []
+
+
+class TestCodexManagedConfig:
+    """use_as_global_settings: also write Codex's OS managed_config.toml (via sudo, mocked)."""
+
+    def _patch(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        managed_path = tmp_path / "etc-codex" / "managed_config.toml"
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "codex-ucode-config.backup.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+        # Deterministic managed path + a mocked sudo writer that writes straight to disk, so the test
+        # can read the TOML back and NO real sudo/`/etc` write ever happens.
+        monkeypatch.setattr(codex, "_managed_config_path", lambda: managed_path)
+
+        def fake_write_managed(path, text, *, display):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(text, encoding="utf-8")
+            return "written"
+
+        monkeypatch.setattr(codex, "write_managed_file", fake_write_managed)
+        return config_path, managed_path
+
+    def test_writes_managed_config_when_flagged(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
+        codex.write_tool_config(state)
+
+        doc = read_toml_safe(managed_path)
+        assert doc["model_provider"] == "ucode-databricks"
+        assert "model" not in doc
+        assert "ucode-databricks" in doc["model_providers"]
+
+    def test_managed_config_preserves_other_keys(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        managed_path.parent.mkdir(parents=True, exist_ok=True)
+        managed_path.write_text(
+            'model = "my-own"\napproval_policy = "on-request"\n', encoding="utf-8"
+        )
+        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
+        codex.write_tool_config(state)
+
+        doc = read_toml_safe(managed_path)
+        # ucode removes its stale model pin, but other keys already in the managed file survive.
+        assert doc["approval_policy"] == "on-request"
+        assert "model" not in doc
+
+    def test_no_managed_write_by_default(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        state = {"workspace": WS, "codex_models": ["gpt-5"]}
+        codex.write_tool_config(state)
+        assert not managed_path.exists()

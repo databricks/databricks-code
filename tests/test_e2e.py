@@ -25,8 +25,9 @@ import pytest
 from ucode.databricks import (
     build_shared_base_urls,
     build_tool_base_url,
+    discover_model_services,
     discover_sql_warehouses,
-    ensure_ai_gateway_v2,
+    ensure_ai_gateway,
     fetch_ai_gateway_claude_models,
     fetch_codex_models,
     fetch_gemini_models,
@@ -131,13 +132,13 @@ class TestDatabricksAuth:
 
 
 # ---------------------------------------------------------------------------
-# AI Gateway v2 probe
+# AI Gateway probe
 # ---------------------------------------------------------------------------
 
 
-class TestAiGatewayV2:
-    def test_ensure_ai_gateway_v2_does_not_raise(self, e2e_workspace, e2e_token):
-        ensure_ai_gateway_v2(e2e_workspace, e2e_token)
+class TestAiGateway:
+    def test_ensure_ai_gateway_does_not_raise(self, e2e_workspace, e2e_token):
+        ensure_ai_gateway(e2e_workspace, e2e_token)
 
     def test_workspace_hostname_resolves(self, e2e_workspace):
         hostname = workspace_hostname(e2e_workspace)
@@ -316,10 +317,8 @@ class TestConfigureSubset:
         # selection plumbing, not the agent binaries themselves.
         monkeypatch.setattr(cli_mod, "install_tool_binary", lambda tool, **kwargs: True)
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
-        # Answer the interactive prompts (provider picker + AI Tools opt-in) so no
-        # prompt reads stdin under capture; "databricks" keeps the Databricks path.
+        # Answer the provider picker; "databricks" keeps the Databricks path.
         monkeypatch.setattr(cli_mod, "prompt_for_selection", lambda prompt, options: "databricks")
-        monkeypatch.setattr(cli_mod, "prompt_yes_no_default", lambda prompt, *, default: default)
 
         rc = cli_mod.configure_workspace_command()
         assert rc == 0
@@ -351,10 +350,8 @@ class TestConfigureSubset:
         )
         monkeypatch.setattr(cli_mod, "install_tool_binary", lambda tool, **kwargs: True)
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
-        # Answer the interactive prompts (provider picker + AI Tools opt-in) so no
-        # prompt reads stdin under capture; "databricks" keeps the Databricks path.
+        # Answer the provider picker; "databricks" keeps the Databricks path.
         monkeypatch.setattr(cli_mod, "prompt_for_selection", lambda prompt, options: "databricks")
-        monkeypatch.setattr(cli_mod, "prompt_yes_no_default", lambda prompt, *, default: default)
 
         # First run: pick codex.
         monkeypatch.setattr(cli_mod, "prompt_for_tools", lambda available: ["codex"])
@@ -433,6 +430,8 @@ class TestCodexLaunch:
         # ("invalid response from an upstream server"), so the launch fails after codex-cli
         # exhausts its five reconnects. Nothing ucode writes can fix it.
         "gpt-5-3-codex",
+        # Bedrock Grok rejects the Responses tool schema Codex sends (missing nested `function`).
+        "grok",
     )
 
     def _codex_models(self, e2e_state: dict) -> list[str]:
@@ -573,9 +572,14 @@ class TestModelProviderLaunch:
         return names[0]
 
     @staticmethod
-    def _skip_if_no_permission(combined: str, provider: str) -> None:
+    def _skip_if_provider_unusable(combined: str, provider: str) -> None:
+        # Environmental provider-account conditions, not ucode bugs: the test only proves routing
+        # reaches the provider, so skip (rather than fail) when the account lacks a grant on the
+        # connection or has run out of credits — state outside the code under test.
         if "USE CONNECTION" in combined or "EXECUTE" in combined:
             pytest.skip(f"no permission on provider {provider}: {combined[:200]}")
+        if "Credit balance is too low" in combined:
+            pytest.skip(f"provider {provider} account is out of credits: {combined[:200]}")
 
     def test_launch_claude_through_provider(
         self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
@@ -613,7 +617,7 @@ class TestModelProviderLaunch:
         }
         result = _run_agent(claude.validate_cmd("claude"), env=env, timeout=90)
         combined = (result.stdout + result.stderr).strip()
-        self._skip_if_no_permission(combined, provider)
+        self._skip_if_provider_unusable(combined, provider)
         assert result.returncode == 0 and combined, (
             f"provider={provider} rc={result.returncode} "
             f"stdout={result.stdout[:300]!r} stderr={result.stderr[:300]!r}"
@@ -650,7 +654,7 @@ class TestModelProviderLaunch:
         except subprocess.TimeoutExpired:
             pytest.fail(f"provider={provider} timed out after {timeout_seconds}s")
         combined = (result.stdout + result.stderr).strip()
-        self._skip_if_no_permission(combined, provider)
+        self._skip_if_provider_unusable(combined, provider)
         assert result.returncode == 0 and combined, (
             f"provider={provider} rc={result.returncode} "
             f"stdout={result.stdout[:300]!r} stderr={result.stderr[:300]!r}"
@@ -743,7 +747,7 @@ class TestGeminiFreshInstall:
 
 
 class TestOpencodeLaunch:
-    """Run opencode against every available opencode model (anthropic + gemini)."""
+    """Run OpenCode against the available native and OSS model providers."""
 
     # Models that hang opencode well past 180s on the staging gateway with
     # no stderr beyond the initial `> build · <model>` line, while every
@@ -839,6 +843,55 @@ class TestOpencodeLaunch:
 
         assert not failures, "OpenCode launch failures:\n" + "\n".join(failures)
 
+    def test_launch_deepseek_v4_pro(
+        self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
+    ):
+        """Discover and invoke the live versioned DeepSeek V4 Pro model."""
+        import ucode.config_io as config_io_mod
+        from ucode.agents import opencode
+
+        _require_binary("opencode")
+        _, _, _, oss_models, reason = discover_model_services(e2e_workspace, e2e_token)
+        assert reason is None, reason
+        model = next((m for m in oss_models if "deepseek-v4-pro" in m), None)
+        if model is None:
+            pytest.skip("DeepSeek V4 Pro is not available on this workspace")
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        xdg = tmp_path / "opencode-xdg"
+        monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
+        monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", xdg / "opencode" / "opencode.json")
+        monkeypatch.setattr(
+            opencode, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-config.backup.json"
+        )
+        monkeypatch.setattr("ucode.state.save_state", lambda state: None)
+        monkeypatch.setattr(
+            "ucode.agents.opencode.get_databricks_token",
+            lambda workspace, profile=None, **kwargs: e2e_token,
+        )
+
+        state = {
+            **e2e_state,
+            "workspace": e2e_workspace,
+            "oss_models": oss_models,
+            "opencode_models": {
+                **(e2e_state.get("opencode_models") or {}),
+                "oss": oss_models,
+            },
+        }
+        opencode.write_tool_config(state, model, token=e2e_token)
+
+        result = _run_agent(
+            opencode.validate_cmd("opencode"),
+            env=opencode.build_runtime_env(e2e_token),
+            timeout=180,
+        )
+        combined = (result.stdout + result.stderr).strip()
+        assert result.returncode == 0 and combined, (
+            f"DeepSeek model={model} rc={result.returncode} "
+            f"stdout={result.stdout[:300]!r} stderr={result.stderr[:500]!r}"
+        )
+
 
 class TestCopilotLaunch:
     """Run copilot against every Claude/codex model via the MLflow chat-completions gateway.
@@ -859,6 +912,8 @@ class TestCopilotLaunch:
         "gpt-5-5",
         # gpt-5.6 models similarly reject /chat/completions with 404.
         "gpt-5-6",
+        # Bedrock Grok rejects the gateway's llm/v1/chat task type.
+        "grok",
     )
 
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
@@ -922,13 +977,21 @@ class TestPiLaunch:
     test exercises each one end-to-end through the validation path.
     """
 
+    INCOMPATIBLE_MODEL_FRAGMENTS = (
+        # The CI project's upstream OpenAI account cannot serve this snapshot in its geography.
+        "gpt-5-3-codex",
+        # Bedrock Grok currently rejects Pi's OpenAI request with HTTP 400.
+        "grok",
+    )
+
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
         claude_models: dict = e2e_state.get("claude_models") or {}
         for family, model_id in _launchable_model_items(claude_models):
             out.append((f"claude-{family}", model_id))
         for model in e2e_state.get("codex_models") or []:
-            out.append(("codex", model))
+            if not any(fragment in model for fragment in self.INCOMPATIBLE_MODEL_FRAGMENTS):
+                out.append(("codex", model))
         for model in e2e_state.get("gemini_models") or []:
             out.append(("gemini", model))
         return out
@@ -943,14 +1006,17 @@ class TestPiLaunch:
             pytest.skip("No Pi-compatible models available on this workspace")
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        # Pi reads models.json below HOME/.pi/agent. Point both pi's runtime
-        # HOME and our writer at the same isolated tmp home.
+        # Point PI_CODING_AGENT_DIR and ucode's config writer at the same
+        # isolated directory without changing the process HOME.
         pi_home = tmp_path / "pi-home"
         pi_dir = pi_home / ".pi" / "agent"
         config_path = pi_dir / "models.json"
         backup_path = tmp_path / "pi-models.backup.json"
         monkeypatch.setattr(pi, "PI_UCODE_HOME", pi_home)
+        monkeypatch.setattr(pi, "PI_CONFIG_DIR", pi_dir)
         monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_PATH", pi_dir / "settings.json")
+        monkeypatch.setattr(pi, "PI_SETTINGS_BACKUP_PATH", tmp_path / "pi-settings.backup.json")
         monkeypatch.setattr(pi, "PI_BACKUP_PATH", backup_path)
 
         failures = []

@@ -8,8 +8,10 @@ from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
+import questionary
 from rich.console import Console
 
+from ucode import ui as ui_mod
 from ucode.ui import (
     format_duration,
     format_meter,
@@ -298,7 +300,7 @@ class TestRenderBoxTable:
         assert "-" in result
 
 
-class TestPromptForWorkspace:
+class TestPromptForWorkspaceFallbacks:
     """Cover the three things `questionary.select(...).ask()` can return:
     a (host, profile) tuple, None (cancel or "Enter a different URL"),
     or — in some questionary versions — the choice's title string."""
@@ -344,6 +346,107 @@ class TestPromptForWorkspace:
         assert profile is None
 
 
+class _StubQuestion:
+    def __init__(self, answer):
+        self._answer = answer
+
+    def ask(self):
+        return self._answer
+
+
+class TestPromptForWorkspace:
+    """Capture the choices passed to ``questionary.select`` so we can assert on
+    layout (header alignment + duplicate-host preservation) without driving
+    real keyboard I/O."""
+
+    def _capture_select(self, monkeypatch, answer):
+        captured: dict = {}
+
+        def fake_select(message, choices, **kwargs):
+            captured["message"] = message
+            captured["choices"] = choices
+            captured["kwargs"] = kwargs
+            return _StubQuestion(answer)
+
+        monkeypatch.setattr(questionary, "select", fake_select)
+        monkeypatch.setattr(ui_mod.questionary, "select", fake_select)
+        return captured
+
+    def test_shows_header_and_each_profile_row(self, monkeypatch):
+        profiles = [
+            ("https://a.cloud.databricks.com", "alpha"),
+            ("https://b.cloud.databricks.com", "beta-profile-name"),
+        ]
+        captured = self._capture_select(monkeypatch, answer=profiles[0])
+        url, profile = prompt_for_workspace("setup", profiles)
+
+        assert (url, profile) == profiles[0]
+        choices = captured["choices"]
+        # Header (separator), 2 rows, "Enter a different URL" entry.
+        assert len(choices) == 4
+        assert isinstance(choices[0], questionary.Separator)
+        header = choices[0].title
+        assert "Profile Name" in header
+        assert "Workspace URL" in header
+        # Profile names ljust-padded to the longest name (17 chars).
+        name_width = max(len(name) for _, name in profiles)
+        assert "alpha".ljust(name_width) in choices[1].title
+        assert profiles[0][0] in choices[1].title
+        assert "beta-profile-name".ljust(name_width) in choices[2].title
+        assert profiles[1][0] in choices[2].title
+        # Final fallback entry still present.
+        assert choices[3].title == "Enter a different URL"
+
+    def test_keeps_duplicate_hosts_as_separate_rows(self, monkeypatch):
+        profiles = [
+            ("https://shared.cloud.databricks.com", "first"),
+            ("https://shared.cloud.databricks.com", "second"),
+        ]
+        captured = self._capture_select(monkeypatch, answer=profiles[1])
+        url, profile = prompt_for_workspace("setup", profiles)
+
+        assert (url, profile) == profiles[1]
+        # Both rows present — duplicates not collapsed.
+        choices = captured["choices"]
+        # Filter to choices whose value is a (host, profile) tuple — drops the
+        # header separator and the trailing "Enter a different URL" entry.
+        host_choices = [c for c in choices if isinstance(getattr(c, "value", None), tuple)]
+        assert [c.value for c in host_choices] == profiles
+
+    def test_returns_normalized_url_with_profile(self, monkeypatch):
+        # Picker handed back a URL with a trailing slash — normalize_workspace_url
+        # should strip it before returning.
+        profiles = [("https://example.cloud.databricks.com/", "p")]
+        self._capture_select(monkeypatch, answer=profiles[0])
+        url, profile = prompt_for_workspace("setup", profiles)
+        assert url == "https://example.cloud.databricks.com"
+        assert profile == "p"
+
+    # ------------------------------------------------------------------
+    # Long-name display clamping (PR #114 review feedback)
+    # ------------------------------------------------------------------
+
+    def test_long_profile_name_is_truncated_in_display_only(self, monkeypatch):
+        # 60-char name — exceeds the 40-char clamp. The displayed row title
+        # must be truncated with an ellipsis but the value tuple must carry
+        # the full untruncated name through to configure_shared_state.
+        long_name = "x" * 60
+        profiles = [("https://a.cloud.databricks.com", long_name)]
+        captured = self._capture_select(monkeypatch, answer=profiles[0])
+        url, profile = prompt_for_workspace("setup", profiles)
+
+        assert (url, profile) == profiles[0]
+        choices = captured["choices"]
+        # Header + 1 row + "Enter a different URL".
+        assert len(choices) == 3
+        # Display title is truncated to 40 chars (39 of name + "…").
+        row_title = choices[1].title
+        assert long_name not in row_title
+        assert "…" in row_title
+        # Value tuple still carries the full name.
+        assert choices[1].value == profiles[0]
+
+
 class TestFormatUsd:
     def test_rounds_to_cents(self):
         assert format_usd(Decimal("12.345")) == "$12.35"
@@ -381,3 +484,43 @@ class TestFormatMeter:
     def test_width_is_constant(self):
         for fraction in (0.0, 0.13, 0.5, 0.99, 1.0):
             assert len(format_meter(fraction)) == 32
+
+
+class TestChoiceViewportCap:
+    """`_cap_choice_viewport` pins long picker lists to a fixed scrolling window."""
+
+    @staticmethod
+    def _choice_window_height(question):
+        from prompt_toolkit.layout.containers import Window
+        from questionary.prompts.common import InquirerControl
+
+        for window in question.application.layout.find_all_windows():
+            if isinstance(window, Window) and isinstance(window.content, InquirerControl):
+                return window.height
+        raise AssertionError("no InquirerControl window found")
+
+    def test_short_list_keeps_natural_height(self):
+        # At or below the threshold everything fits, so the window is left unbounded (height=None)
+        # rather than padded to a fixed size.
+        n = ui_mod._SCROLL_HINT_THRESHOLD
+        question = questionary.select("p", choices=[f"m{i}" for i in range(n)])
+        ui_mod._cap_choice_viewport(question, n)
+        assert self._choice_window_height(question) is None
+
+    def test_long_list_is_capped_to_the_threshold(self):
+        n = ui_mod._SCROLL_HINT_THRESHOLD + 15
+        question = questionary.select("p", choices=[f"m{i}" for i in range(n)])
+        ui_mod._cap_choice_viewport(question, n)
+        height = self._choice_window_height(question)
+        assert height.max == ui_mod._SCROLL_HINT_THRESHOLD
+        assert height.preferred == ui_mod._SCROLL_HINT_THRESHOLD
+
+    def test_checkbox_list_is_capped_too(self):
+        n = ui_mod._SCROLL_HINT_THRESHOLD + 15
+        question = questionary.checkbox("p", choices=[f"m{i}" for i in range(n)])
+        ui_mod._cap_choice_viewport(question, n)
+        assert self._choice_window_height(question).max == ui_mod._SCROLL_HINT_THRESHOLD
+
+    def test_missing_application_is_a_no_op(self):
+        # Best-effort: a question shape without an application must not raise.
+        ui_mod._cap_choice_viewport(object(), ui_mod._SCROLL_HINT_THRESHOLD + 5)

@@ -13,6 +13,9 @@ from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 import questionary
+from prompt_toolkit.layout.containers import Window
+from prompt_toolkit.layout.dimension import Dimension
+from questionary.prompts.common import InquirerControl
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -21,21 +24,48 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 console = Console(highlight=False)
 err_console = Console(stderr=True, highlight=False)
 
-# questionary scrolls a window over a long choice list, but doesn't advertise it. Past this many
-# options the list can't all be on screen, so the pickers append a "↑/↓ scroll" note to their
-# instruction line. Matches mcp.py's MCP_PICKER_VISIBLE_ROWS so both picker families agree.
+# Past this many options the choice list is pinned to a fixed-height scrolling viewport (see
+# `_cap_choice_viewport`) rather than growing to fill the terminal, and the pickers append a
+# "↑/↓ scroll" note to their instruction line. The value is both the boundary and the number of
+# rows shown at once; matches mcp.py's MCP_PICKER_VISIBLE_ROWS so both picker families agree.
 _SCROLL_HINT_THRESHOLD = 10
 
 
 def _with_scroll_hint(instruction: str, option_count: int) -> str:
     """Append a scroll affordance when the option list is too long to fully show at once.
 
-    The hint is discoverability only — questionary already scrolls; users just can't tell there is
+    The hint is discoverability only — the viewport already scrolls; users just can't tell there is
     more below the fold. Short lists are left alone so the instruction stays terse.
     """
     if option_count > _SCROLL_HINT_THRESHOLD:
         return f"{instruction[:-1]}, ↑/↓ scroll)" if instruction.endswith(")") else instruction
     return instruction
+
+
+def _cap_choice_viewport(question: questionary.Question, option_count: int) -> None:
+    """Pin a long choice list to a fixed ``_SCROLL_HINT_THRESHOLD``-row scrolling window.
+
+    questionary sizes the choice window to its content, bounded only by the terminal, so a tall
+    terminal shows every option and a short one scrolls — the visible count depends on the window
+    size. Capping the window height makes the picker show at most ``_SCROLL_HINT_THRESHOLD`` rows and
+    scroll through the rest, keeping the highlighted row in view (``InquirerControl`` emits a cursor
+    token at the pointer, which prompt_toolkit's ``Window`` tracks). Short lists are left untouched so
+    they render at their natural height with no empty rows.
+
+    Best-effort: it mutates questionary's internal layout, so any shape change (missing application,
+    no ``InquirerControl`` window) leaves the picker as-is rather than raising — the list still works,
+    it just falls back to terminal-fit sizing.
+    """
+    if option_count <= _SCROLL_HINT_THRESHOLD:
+        return
+    application = getattr(question, "application", None)
+    if application is None:
+        return
+    visible = Dimension(preferred=_SCROLL_HINT_THRESHOLD, max=_SCROLL_HINT_THRESHOLD)
+    for window in application.layout.find_all_windows():
+        if isinstance(window, Window) and isinstance(window.content, InquirerControl):
+            window.height = visible
+            return
 
 
 # Output verbosity. "normal" (default) renders decorative panels; "low" trades
@@ -90,6 +120,19 @@ def print_panel(title: str, lines: list[str]) -> None:
     """
     console.print()
     console.print(Panel("\n".join(lines), title=title, style="blue", expand=False))
+
+
+def print_warning_panel(message: str, *, title: str = "Warning") -> None:
+    """Render a warning as a boxed panel, for a blocker that should stand out from inline notes.
+
+    A `!` marker keeps it visually of a kind with :func:`print_warning`, but the box gives a
+    dead-end message (e.g. "no budgets exist, nothing to do") the weight to be read before the flow
+    exits, rather than scrolling past as one more line.
+    """
+    console.print()
+    console.print(
+        Panel(f"[bold yellow]![/bold yellow] {message}", title=title, style="yellow", expand=False)
+    )
 
 
 def print_note(text: str) -> None:
@@ -305,23 +348,47 @@ def prompt_for_workspace(
     """Ask the user for a workspace URL, offering profiles as quick-select.
 
     `profiles` is a list of (host_url, profile_name) tuples. Caller fetches
-    them — `ui.py` stays Databricks-agnostic. Returns ``(url, profile_name)``;
-    profile_name is ``None`` when the user typed a URL manually.
+    them — `ui.py` stays Databricks-agnostic. Duplicate hosts (multiple
+    profiles pointing at the same workspace) are shown separately; the picker
+    returns the exact (host, profile_name) the user selected. Returns
+    ``(url, profile_name)``; profile_name is ``None`` when the user typed a
+    URL manually.
     """
     console.print()
-    console.print(Panel(description, title="ucode setup", style="bold blue", expand=False))
 
     if profiles:
-        choices = [
-            questionary.Choice(title=host, value=(host, profile_name))
-            for host, profile_name in profiles
+        name_header = "Profile Name"
+        url_header = "Workspace URL"
+        # Clamp so a single very long profile name can't push the URL column
+        # off-screen on an 80-col terminal — questionary doesn't wrap row
+        # titles cleanly, and a wrapped row breaks the picker visually.
+        max_name_width = 40
+        name_width = min(
+            max_name_width,
+            max(len(name_header), *(len(name) for _, name in profiles)),
+        )
+        # Match the 2-char cursor gutter so the header line aligns with rows.
+        header_title = f"  {name_header.ljust(name_width)}  {url_header}"
+        choices: list[questionary.Choice | questionary.Separator] = [
+            questionary.Separator(header_title)
         ]
+        for host, profile_name in profiles:
+            display_name = (
+                profile_name
+                if len(profile_name) <= name_width
+                else profile_name[: name_width - 1] + "…"
+            )
+            row_title = f"{display_name.ljust(name_width)}  {host}"
+            # Value carries the full untruncated profile name so downstream
+            # `--profile` calls always use the real name, not the display form.
+            choices.append(questionary.Choice(title=row_title, value=(host, profile_name)))
         choices.append(questionary.Choice(title="Enter a different URL", value=None))
         style = questionary.Style(
             [
                 ("highlighted", "fg:cyan bold"),
                 ("pointer", "fg:cyan bold"),
                 ("answer", "fg:cyan"),
+                ("separator", "fg:white bold"),
             ]
         )
         choice = questionary.select(
@@ -419,7 +486,7 @@ def prompt_for_multi_selection(
     if searchable:
         instruction = "(type to filter, space to toggle, enter to confirm)"
     instruction = _with_scroll_hint(instruction, len(options))
-    answer = questionary.checkbox(
+    question = questionary.checkbox(
         prompt,
         choices=choices,
         style=style,
@@ -428,7 +495,9 @@ def prompt_for_multi_selection(
         instruction=instruction,
         use_search_filter=searchable,
         use_jk_keys=not searchable,
-    ).ask()
+    )
+    _cap_choice_viewport(question, len(options))
+    answer = question.ask()
     return None if answer is None else list(answer)
 
 
@@ -530,7 +599,7 @@ def prompt_for_selection(
     choices = [questionary.Choice(title=label, value=value) for value, label in options]
     instruction = "(type to filter, arrow keys to move)" if searchable else "(use arrow keys)"
     instruction = _with_scroll_hint(instruction, len(options))
-    answer = questionary.select(
+    question = questionary.select(
         prompt,
         choices=choices,
         style=style,
@@ -539,7 +608,9 @@ def prompt_for_selection(
         instruction=instruction,
         use_search_filter=searchable,
         use_jk_keys=not searchable,
-    ).ask()
+    )
+    _cap_choice_viewport(question, len(options))
+    answer = question.ask()
     return answer
 
 

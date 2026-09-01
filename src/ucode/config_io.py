@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 import tomlkit
 import tomlkit.exceptions
@@ -107,10 +107,47 @@ def deep_merge_dict(base: dict, overlay: dict) -> dict:
     return base
 
 
+def prune_key_paths(doc: dict, key_paths: list[list[str]]) -> bool:
+    """Surgically remove each ``key_path`` from a nested dict, dropping emptied parents.
+
+    ``key_paths`` is a list of paths like ``[["env", "ANTHROPIC_BASE_URL"], ["apiKeyHelper"]]``.
+    Only the exact leaves are removed; sibling keys the user set themselves stay untouched, and a
+    parent dict left empty by the removal is dropped too. Returns True if anything changed.
+
+    Used to undo ucode's writes to an agent's *native* config file (which it shares with the
+    user's own settings), where restoring a backup would clobber edits made since ucode first ran.
+    """
+    changed = False
+    for path in key_paths:
+        if _prune_one(doc, list(path)):
+            changed = True
+    return changed
+
+
+def _prune_one(node: object, path: list[str]) -> bool:
+    if not path or not isinstance(node, dict):
+        return False
+    mapping = cast("dict[str, object]", node)
+    key = path[0]
+    if key not in mapping:
+        return False
+    if len(path) == 1:
+        mapping.pop(key, None)
+        return True
+    child = mapping.get(key)
+    removed = _prune_one(child, path[1:])
+    if removed and isinstance(child, dict) and not child:
+        mapping.pop(key, None)
+    return removed
+
+
 def read_json_safe(path: Path) -> dict:
-    if not path.exists():
-        return {}
+    # `path.exists()` is inside the try: stat-ing a file under a root-locked dir (e.g. a
+    # root-owned /etc/codex) raises PermissionError, which must read as "absent/unreadable → {}"
+    # rather than crash a launch that only wanted to merge into it.
     try:
+        if not path.exists():
+            return {}
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
@@ -118,9 +155,11 @@ def read_json_safe(path: Path) -> dict:
 
 
 def read_toml_safe(path: Path) -> tomlkit.TOMLDocument:
-    if not path.exists():
-        return tomlkit.document()
+    # See read_json_safe: keep `path.exists()` inside the try so a PermissionError on a locked
+    # parent directory is treated as an empty document rather than propagating.
     try:
+        if not path.exists():
+            return tomlkit.document()
         return tomlkit.parse(path.read_text(encoding="utf-8"))
     except (OSError, tomlkit.exceptions.TOMLKitError):
         return tomlkit.document()
@@ -142,7 +181,10 @@ def parse_dotenv(path: Path) -> dict[str, str]:
     """Parse a simple KEY=VALUE / KEY="VALUE" .env file, preserving insertion order.
 
     Comments and blank lines are dropped on round-trip. Lines that don't look
-    like KEY=... are skipped.
+    like KEY=... are skipped. Leading whitespace (line indentation and spacing
+    after the ``=``) is trimmed, but the exact characters up to the end of the
+    line are preserved — including any trailing spaces — so a value such as
+    ``token = abc123 `` keeps its trailing space.
     """
     if not path.exists():
         return {}
@@ -152,16 +194,20 @@ def parse_dotenv(path: Path) -> dict[str, str]:
     except OSError:
         return {}
     for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+        # Detect blank / comment lines on the fully-stripped form so trailing
+        # spaces on value lines don't change which lines are skipped.
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
             continue
-        if "=" not in line:
+        if "=" not in stripped:
             continue
-        key, _, val = line.partition("=")
+        # Only strip *leading* whitespace from the line so the characters
+        # between "=" and end-of-line (including trailing spaces) are preserved.
+        key, _, val = raw_line.lstrip().partition("=")
         key = key.strip()
         if not key:
             continue
-        val = val.strip()
+        val = val.lstrip()
         if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
             val = val[1:-1]
         env[key] = val

@@ -582,6 +582,33 @@ class TestValidate:
         errors = validate_manifest(manifest, state)
         assert any("not available on this workspace" in e for e in errors)
 
+    def test_custom_model_is_accepted_via_the_marker(self):
+        # A hand-typed model service outside the discovered inventory is listed in `custom_models`
+        # (it was verified to exist when entered), so the inventory check must not reject it.
+        manifest = {
+            "default_agent": "codex",
+            "enabled_agents": {
+                "codex": {
+                    "model_config": {
+                        "default_model": "main.aarushi.gpt-5-custom",
+                        "custom_models": ["main.aarushi.gpt-5-custom"],
+                    }
+                }
+            },
+        }
+        assert validate_manifest(manifest, STATE) == []
+
+    def test_unmarked_custom_model_is_still_rejected(self):
+        # Without the marker the same id is an unknown model — the marker is what vouches for it.
+        manifest = {
+            "default_agent": "codex",
+            "enabled_agents": {
+                "codex": {"model_config": {"default_model": "main.aarushi.gpt-5-custom"}}
+            },
+        }
+        errors = validate_manifest(manifest, STATE)
+        assert any("not available on this workspace" in e for e in errors)
+
     def test_model_check_skipped_without_state(self):
         manifest = {
             "default_agent": "claude",

@@ -123,7 +123,7 @@ class TestSaveLoadRoundTrip:
 
         persisted = load_full_state()["workspaces"][FAKE_WS]
         assert persisted["codex_models"][0] == "system.ai.gpt-5"
-        assert persisted["agents"]["codex"]["model"] == "system.ai.gpt-5-6-luna"
+        assert "model" not in persisted["agents"]["codex"]
         assert persisted["agents"]["pi"]["model"] == "system.ai.gpt-5"
 
     def test_save_respects_dry_run(self):
@@ -221,7 +221,7 @@ class TestHydrateState:
         # Cross-platform helper, not the old POSIX `if [ -n ... ]` pipeline (#116).
         assert "auth-token" in result["agents"]["claude"]["auth_command"]
         assert "if [ -n" not in result["agents"]["claude"]["auth_command"]
-        assert result["agents"]["codex"]["model"] == "gpt-5"
+        assert "model" not in result["agents"]["codex"]
         assert result["agents"]["codex"]["base_url"] == FAKE_URLS["codex"]
         # Codex runs the helper as argv (command + args), never via `sh -c`.
         codex_auth = result["agents"]["codex"]["auth"]
@@ -289,3 +289,7 @@ class TestMarkToolManaged:
         result = mark_tool_managed(state, "codex", [["profile"]])
         assert "gemini" in result["managed_configs"]
         assert "codex" in result["managed_configs"]
+
+    def test_records_only_keys(self):
+        result = mark_tool_managed({}, "codex", [["model"]])
+        assert result["managed_configs"]["codex"] == {"keys": [["model"]]}

@@ -18,13 +18,13 @@ import subprocess
 
 from ucode.config_io import ToolSpec
 from ucode.databricks import (
-    BEDROCK_PROVIDER_TYPES,
     get_databricks_token,
     install_ai_tools,
     install_databricks_cli,
     map_claude_family_models,
     resolve_provider_service,
 )
+from ucode.managed_files import managed_write_batch
 from ucode.state import get_provider_service, load_state, save_state
 from ucode.telemetry import agent_version
 from ucode.ui import (
@@ -40,6 +40,7 @@ from ucode.ui import (
 )
 
 from . import claude, codex, copilot, gemini, opencode, pi
+from .args import explicit_model_arg_value as explicit_model_arg_value
 
 _MODULES = {
     "codex": codex,
@@ -51,6 +52,7 @@ _MODULES = {
 }
 
 TOOL_SPECS: dict[str, ToolSpec] = {name: module.SPEC for name, module in _MODULES.items()}
+
 
 # Model-routing agents ucode configures end to end. Cursor is deliberately NOT
 # here: it runs models on the user's own Cursor account, so `normalize_tool`
@@ -69,6 +71,11 @@ TOOL_ALIASES = {
 
 DEFAULT_TOOL = "codex"
 BUNDLE_VERSION = 1
+_MANAGED_SETTINGS_TOOLS = {"claude"}
+
+# Codex still honors the legacy managed-config opt-in until its follow-up migration. Claude always
+# reconciles its OS-managed settings and therefore no longer appears in the setup prompt.
+GLOBAL_SETTINGS_AGENTS = frozenset({"codex"})
 
 # ucode tool -> `databricks aitools` agent id. gemini/pi aren't supported.
 AITOOLS_AGENT_TOKENS = {
@@ -79,12 +86,16 @@ AITOOLS_AGENT_TOKENS = {
 }
 
 
-def install_ai_tools_for_agents(tools: list[str], state: dict) -> None:
-    """Install Databricks AI Tools for the coding agents that support them
-    (gemini/pi have no ``aitools`` support and are dropped)."""
+def install_databricks_ai_tools_for_agents(tools: list[str], state: dict) -> None:
+    """Install Databricks AI Tools for supported agents.
+
+    Gemini and Pi have no ``aitools`` support and are dropped.
+    """
     if state.get("databricks_ai_tools_enabled", True) is False:
         return
     agents = [AITOOLS_AGENT_TOKENS[tool] for tool in tools if tool in AITOOLS_AGENT_TOKENS]
+    if not agents:
+        return
     install_ai_tools(agents, state.get("profile"))
 
 
@@ -131,16 +142,6 @@ def _required_update_message(tool: str) -> str | None:
     if not callable(checker):
         return None
     return checker()
-
-
-def _confirm_update_installed_tool_binary(tool: str) -> bool:
-    spec = TOOL_SPECS[tool]
-    update = _MODULES[tool].is_update_available()
-
-    if not update:
-        return False
-    current, latest = update
-    return prompt_yes_no(f"(Optional) Update {spec['display']} from {current} to {latest}?")
 
 
 def _too_new_downgrade(tool: str) -> tuple[str, str] | None:
@@ -200,9 +201,6 @@ def install_tool_binary(
                 print_warning(required_update)
                 if not _update_installed_tool_binary(tool):
                     raise RuntimeError(_minimum_version_error(tool) or required_update)
-            elif prompt_optional_updates and _confirm_update_installed_tool_binary(tool):
-                _update_installed_tool_binary(tool)
-
         version_error = _minimum_version_error(tool)
         if version_error:
             raise RuntimeError(version_error)
@@ -305,7 +303,8 @@ def resolve_launch_model(
     explicit_model: str | None,
 ) -> tuple[dict, str | None]:
     model = explicit_model or default_model_for_tool(tool, state)
-    if not model:
+    # if model is not specified for codex, then launch with harness's default model.
+    if not model and tool != "codex":
         raise RuntimeError(
             f"No models available for {tool}. Run `ucode configure` to set up your workspace."
         )
@@ -318,17 +317,18 @@ def resolve_provider_models(
     """Validate ``provider`` for ``tool`` and return the model ids to pin.
 
     Returns ``(provider_models, error, relayed)``. ``provider_models`` is a ``{family: model_id}``
-    dict for a Bedrock-backed claude service (whose provider-side ids must be pinned explicitly), or
-    None for an Anthropic/canonical service or when ``provider`` is None. ``relayed`` is True for a
-    credential-less Anthropic subscription relay, which the launch path wires with the relayed
-    overlay + refresh proxy. A non-None ``error`` means the provider is invalid for the tool and the
-    caller should not launch.
+    dict re-derived from the service's live targets for a non-relayed claude service — both Bedrock
+    (provider-side slugs) and API-key Anthropic (canonical ids) — so the client sends exactly the ids
+    the MPS allows rather than Claude Code's defaults, which may not match the declared targets. It is
+    None when ``provider`` is None, for a relayed subscription (see below), or for a non-Claude (e.g.
+    codex) service. ``relayed`` is True for a credential-less Anthropic subscription relay, which the
+    launch path wires with the relayed overlay + refresh proxy. A non-None ``error`` means the
+    provider is invalid for the tool and the caller should not launch.
 
-    This is the *developer-configured* path (``ucode configure`` then ``ucode claude``) and its
-    behaviour is deliberately unchanged: only Bedrock pins, re-derived from the service's live
-    targets. The *managed* path pins from the admin's authored manifest slots instead — see
-    ``managed_resolve.managed_provider_family_models`` and its launch call site — so an admin's
-    chosen versions win rather than being re-derived here.
+    This is the *developer-configured* path (``ucode configure`` then ``ucode claude``). The *managed*
+    path pins from the admin's authored manifest slots instead — see
+    ``managed_resolve.managed_provider_family_models`` and its launch call site — so an admin's chosen
+    versions win rather than being re-derived here.
     """
     if not provider:
         return None, None, False
@@ -337,9 +337,11 @@ def resolve_provider_models(
     if error or service is None:
         return None, error, False
     relayed = bool(service.get("relayed"))
-    if service["provider_type"] in BEDROCK_PROVIDER_TYPES:
-        return map_claude_family_models(service.get("targets") or []), None, relayed
-    return None, None, relayed
+    # Relayed (Claude Max/Enterprise subscription) is exempt: the gateway disables
+    # model selection server-side for that tier, so there's nothing to reconcile.
+    if relayed:
+        return None, None, relayed
+    return map_claude_family_models(service.get("targets") or []) or None, None, relayed
 
 
 def configure_tool(
@@ -447,11 +449,11 @@ def configure_single_tool(tool: str, state: dict) -> dict:
             raise RuntimeError(
                 f"{TOOL_SPECS[tool]['display']} is not available on this workspace.{detail}"
             )
-    state = _configure_one(tool, state, provider)
+    with managed_write_batch(_managed_settings_displays([tool])):
+        state = _configure_one(tool, state, provider)
     available_tools = list(set((state.get("available_tools") or []) + [tool]))
     state["available_tools"] = available_tools
     save_state(state)
-    install_ai_tools_for_agents([tool], state)
     return state
 
 
@@ -470,7 +472,9 @@ def _configure_one(tool: str, state: dict, provider: str | None) -> dict:
     return configure_tool(tool, state, model)
 
 
-def configure_selected_tools(state: dict, tools: list[str]) -> dict:
+def configure_selected_tools(
+    state: dict, tools: list[str], *, install_ai_tools: bool = True
+) -> dict:
     """Configure the given tools. Caller is responsible for ensuring each tool
     is available on the workspace.
 
@@ -478,14 +482,20 @@ def configure_selected_tools(state: dict, tools: list[str]) -> dict:
     replacing it, so a previously-configured tool the user didn't pick this
     run is preserved.
     """
-    for tool in tools:
-        state = _configure_one(tool, state, get_provider_service(state, tool))
+    with managed_write_batch(_managed_settings_displays(tools)):
+        for tool in tools:
+            state = _configure_one(tool, state, get_provider_service(state, tool))
 
     existing = state.get("available_tools") or []
     state["available_tools"] = sorted(set(existing) | set(tools))
     save_state(state)
-    install_ai_tools_for_agents(tools, state)
+    if install_ai_tools:
+        install_databricks_ai_tools_for_agents(tools, state)
     return state
+
+
+def _managed_settings_displays(tools: list[str]) -> list[str]:
+    return [TOOL_SPECS[tool]["display"] for tool in tools if tool in _MANAGED_SETTINGS_TOOLS]
 
 
 def configure_all_tools(state: dict) -> dict:

@@ -1,5 +1,5 @@
 """Databricks workspace integration: CLI auth, token retrieval, model
-discovery, AI Gateway v2 enforcement, SQL warehouse discovery, URL builders."""
+discovery, AI Gateway checks, SQL warehouse discovery, URL builders."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import os
 import platform
+import random
 import re
 import shlex
 import shutil
@@ -25,7 +26,7 @@ from concurrent.futures import (
 )
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal, NamedTuple, cast, overload
+from typing import Literal, NamedTuple, NoReturn, cast, overload
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import quote, urlencode, urlparse
@@ -51,9 +52,22 @@ WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
 AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
+ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
+# Substrings the Databricks CLI emits when it loses the token-cache write lock
+# to a concurrent `databricks auth token` (e.g. another ucode helper process or
+# MLflow tracing refreshing the shared ~/.databricks/token-cache.json at the same
+# instant). These are transient — the credential is fine, only the local write
+# raced — so we retry rather than treat them as an expired session.
+_TOKEN_CACHE_LOCK_MARKERS = ("cache update", "exit status 45")
+_TOKEN_FETCH_MAX_ATTEMPTS = 4
+_HTTP_GET_RETRYABLE_STATUS_CODES = frozenset({429})
+_HTTP_GET_RETRY_BASE_SECONDS = 1.0
+_HTTP_GET_RETRY_MAX_SECONDS = 5.0
+_HTTP_GET_RETRY_AFTER_JITTER_SECONDS = 0.25
+_ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES = 2
 
 
 def _debug_enabled() -> bool:
@@ -205,52 +219,100 @@ def _log_auth_diagnostics() -> None:
         _debug(f"databrickscfg ({cfg_path})", f"read error: {exc}")
 
 
+def _http_get_retry_delay(retry_after: str | None, retry_index: int) -> float:
+    if retry_after is not None:
+        try:
+            retry_after_seconds = float(retry_after)
+        except ValueError:
+            pass
+        else:
+            if retry_after_seconds >= 0:
+                return min(retry_after_seconds, _HTTP_GET_RETRY_MAX_SECONDS) + random.uniform(
+                    0, _HTTP_GET_RETRY_AFTER_JITTER_SECONDS
+                )
+
+    backoff = min(
+        _HTTP_GET_RETRY_BASE_SECONDS * (2 ** min(retry_index, 10)),
+        _HTTP_GET_RETRY_MAX_SECONDS,
+    )
+    return backoff + random.uniform(0, min(backoff * 0.25, 0.5))
+
+
 def _http_get_json(
-    url: str, token: str, *, timeout: int = 10
+    url: str,
+    token: str,
+    *,
+    timeout: int = 10,
+    max_retries: int = 0,
 ) -> tuple[dict | list | None, str | None]:
     """GET a JSON endpoint. Returns (payload, None) on success, (None, reason) on failure.
 
+    ``max_retries`` opts individual callers into bounded retries for rate limits
+    and network failures. Other callers retain the original single-attempt
+    behavior.
+
     Honors UCODE_DEBUG=1 to append status + truncated body to ~/.ucode/debug.log.
     """
+    if max_retries < 0:
+        raise ValueError("max_retries must be non-negative")
+
     request = urllib_request.Request(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
-    try:
-        with urllib_request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-        _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
-        if _debug_enabled():
-            _debug("body", body[:4000])
+    for attempt in range(max_retries + 1):
         try:
-            return json.loads(body), None
-        except json.JSONDecodeError as exc:
-            return None, f"response was not valid JSON ({exc.msg})"
-    except urllib_error.HTTPError as exc:
-        body = ""
-        try:
-            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        except Exception:
+            with urllib_request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+            _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
+            if _debug_enabled():
+                _debug("body", body[:4000])
+            try:
+                return json.loads(body), None
+            except json.JSONDecodeError as exc:
+                return None, f"response was not valid JSON ({exc.msg})"
+        except urllib_error.HTTPError as exc:
             body = ""
-        _debug(f"GET {url}", f"HTTP {exc.code} {exc.reason}")
-        if _debug_enabled() and body:
-            _debug("body", body[:4000])
-        reason = f"HTTP {exc.code} {exc.reason}"
-        # Surface the response body too — gateway auth failures return 400
-        # with body `Invalid Token`, which is invisible without this.
-        body_excerpt = body.strip()[:200]
-        if body_excerpt:
-            reason = f"{reason}: {body_excerpt}"
-        return None, reason
-    except urllib_error.URLError as exc:
-        _debug(f"GET {url}", f"URLError: {exc.reason}")
-        return None, f"network error: {exc.reason}"
-    except OSError as exc:
-        # A socket read timeout raises a bare TimeoutError (an OSError), not a
-        # URLError, so it must be caught explicitly or it escapes the whole
-        # discovery flow. Surface it as a reason like every other failure.
-        _debug(f"GET {url}", f"OSError: {exc}")
-        return None, f"network error: {exc}"
+            try:
+                body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+            except Exception:
+                body = ""
+            _debug(f"GET {url}", f"HTTP {exc.code} {exc.reason}")
+            if _debug_enabled() and body:
+                _debug("body", body[:4000])
+            reason = f"HTTP {exc.code} {exc.reason}"
+            # Surface the response body too — gateway auth failures return 400
+            # with body `Invalid Token`, which is invisible without this.
+            body_excerpt = body.strip()[:200]
+            if body_excerpt:
+                reason = f"{reason}: {body_excerpt}"
+            if exc.code not in _HTTP_GET_RETRYABLE_STATUS_CODES or attempt == max_retries:
+                return None, reason
+            retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+        except urllib_error.URLError as exc:
+            _debug(f"GET {url}", f"URLError: {exc.reason}")
+            reason = f"network error: {exc.reason}"
+            if attempt == max_retries:
+                return None, reason
+            retry_after = None
+        except OSError as exc:
+            # A socket read timeout raises a bare TimeoutError (an OSError), not a
+            # URLError, so it must be caught explicitly or it escapes the whole
+            # discovery flow. Surface it as a reason like every other failure.
+            _debug(f"GET {url}", f"OSError: {exc}")
+            reason = f"network error: {exc}"
+            if attempt == max_retries:
+                return None, reason
+            retry_after = None
+
+        delay = _http_get_retry_delay(retry_after, attempt)
+        _debug(
+            f"GET {url}",
+            f"attempt {attempt + 1} failed: {reason}; retrying in {delay:.2f}s",
+        )
+        time.sleep(delay)
+
+    raise AssertionError("unreachable")
 
 
 def _http_send_json(
@@ -369,7 +431,7 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
         return None, f"network error: {exc.reason}"
 
 
-# Workspace group whose members are workspace admins. `ucode setup` / `ucode apply` are restricted
+# Workspace group whose members are workspace admins. `ucode setup` / `ucode publish` are restricted
 # to this group because the coding-agent-config CRUD API enforces the same check server-side.
 WORKSPACE_ADMIN_GROUP = "admins"
 
@@ -428,13 +490,37 @@ def _has_per_user_block(entry: dict) -> bool:
     return False
 
 
+def _per_user_block_threshold(entry: dict) -> Decimal | None:
+    """The dollar amount a per-user hard block trips at, or None when there isn't one.
+
+    Reads ``quantity_threshold`` off the same per-user ``BLOCK_USAGE`` alert that
+    :func:`_has_per_user_block` gates on (``quantity_type`` is ``LIST_PRICE_DOLLARS_USD`` and
+    ``time_period`` is ``MONTH``, so it's a per-user monthly dollar cap). Budget tiers are picked as
+    percentages of this, so surfacing it lets the admin see the dollars a percentage stands for. A
+    block alert without a parseable threshold yields None — the wizard just omits the dollar hint.
+    """
+    for alert in entry.get("alert_configurations") or []:
+        if not isinstance(alert, dict) or alert.get("scope_type") != _PER_USER_ALERT_SCOPE:
+            continue
+        blocks = any(
+            isinstance(action, dict) and action.get("action_type") == _BLOCK_ACTION_TYPE
+            for action in alert.get("action_configurations") or []
+        )
+        if blocks:
+            return _parse_decimal(alert.get("quantity_threshold"))
+    return None
+
+
 def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str | None]:
     """List the AI Gateway budgets that apply to this workspace.
 
-    Returns ``(budgets, reason)`` where each budget is ``{"id", "display_name", "has_per_user_block"}``.
-    ``reason`` is None on success, otherwise it explains why the list is empty. ucode never creates
-    budgets — an admin picks an existing one to attach a spend-routing policy to. ``has_per_user_block``
-    lets the picker hide budgets that can't enforce spend routing (see ``_has_per_user_block``).
+    Returns ``(budgets, reason)`` where each budget is
+    ``{"id", "display_name", "has_per_user_block", "per_user_threshold"}``. ``reason`` is None on
+    success, otherwise it explains why the list is empty. ucode never creates budgets — an admin picks
+    an existing one to attach a spend-routing policy to. ``has_per_user_block`` lets the picker hide
+    budgets that can't enforce spend routing (see ``_has_per_user_block``); ``per_user_threshold`` is
+    the per-user monthly dollar cap (a ``Decimal``, or None when it can't be read) so the tier prompt
+    can show what a tier percentage works out to in dollars.
     """
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}{_WORKSPACE_BUDGETS_API_PATH}"
@@ -459,6 +545,7 @@ def list_workspace_budgets(workspace: str, token: str) -> tuple[list[dict], str 
                 "id": budget_id,
                 "display_name": display_name if isinstance(display_name, str) else "",
                 "has_per_user_block": _has_per_user_block(entry),
+                "per_user_threshold": _per_user_block_threshold(entry),
             }
         )
     if not budgets:
@@ -847,6 +934,11 @@ def list_profile_entries() -> list[dict]:
     """Return raw profile dicts ({"name", "host", "auth_type", ...}) from
     `databricks auth profiles`.
 
+    Each non-PAT profile is returned individually — duplicate hosts (multiple
+    profiles pointing at the same workspace) appear as separate entries so the
+    workspace picker can offer each profile by name. Order matches the CLI's
+    own ordering.
+
     Returns ``[]`` on any failure (CLI missing, timeout, non-zero exit, JSON
     decode error). When ``UCODE_DEBUG=1`` each dropout path logs *why* the
     result was empty so a silently-disappearing workspace picker is
@@ -878,8 +970,7 @@ def get_databricks_profiles() -> list[tuple[str, str]]:
     """Return [(host_url, profile_name), ...] from Databricks CLI profiles."""
     profiles = list_profile_entries()
 
-    # dict dedupes by host (first non-PAT profile wins).
-    out: dict[str, str] = {}
+    out: list[tuple[str, str]] = []
     pat = 0
     for p in profiles:
         host = (p.get("host") or "").rstrip("/")
@@ -889,13 +980,13 @@ def get_databricks_profiles() -> list[tuple[str, str]]:
         if p.get("auth_type") == "pat":
             pat += 1
             continue
-        out.setdefault(host, name)
+        out.append((host, name))
 
     _debug(
         "get_databricks_profiles",
         f"returned={len(out)} total={len(profiles)} pat={pat}",
     )
-    return list(out.items())
+    return out
 
 
 def find_profile_name_for_host(workspace: str) -> str | None:
@@ -1069,7 +1160,8 @@ def get_databricks_token(
         + f" profile={profile or '<none>'}",
     )
 
-    def _fetch() -> str:
+    def _fetch() -> tuple[str, str]:
+        """Return (access_token, stderr). token is '' on any failure."""
         try:
             result = run(
                 cmd,
@@ -1081,12 +1173,32 @@ def get_databricks_token(
             )
             _debug("auth token", _format_subprocess_result(result))
             if result.returncode == 0:
-                return json.loads(result.stdout or "{}").get("access_token", "")
+                return json.loads(result.stdout or "{}").get("access_token", ""), ""
+            return "", result.stderr or ""
         except (subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
             _debug("auth token", f"exception: {type(exc).__name__}: {exc}")
+            return "", str(exc)
+
+    def _fetch_with_lock_retry() -> str:
+        """Mint a token, retrying transient token-cache lock contention.
+
+        Concurrent `databricks auth token` calls racing on the shared cache fail
+        fast with a lock error (see ``_TOKEN_CACHE_LOCK_MARKERS``). The lock is
+        held only for the brief cache write, so a short jittered backoff almost
+        always wins the next attempt. A non-lock failure returns '' immediately
+        so the caller can fall through to the re-auth path."""
+        for attempt in range(_TOKEN_FETCH_MAX_ATTEMPTS):
+            token, stderr = _fetch()
+            if token:
+                return token
+            if not any(marker in stderr.lower() for marker in _TOKEN_CACHE_LOCK_MARKERS):
+                return ""
+            _debug("auth token", f"cache-lock contention (attempt {attempt + 1}); retrying")
+            if attempt < _TOKEN_FETCH_MAX_ATTEMPTS - 1:
+                time.sleep(random.uniform(0.05, 0.1 * (2**attempt)))
         return ""
 
-    token = _fetch()
+    token = _fetch_with_lock_retry()
     if not token:
         # Session may have expired — attempt non-interactive re-auth and retry once.
         _debug("auth token", "empty on first fetch; attempting auth login --no-browser")
@@ -1109,7 +1221,7 @@ def get_databricks_token(
             _debug("auth login", _format_subprocess_result(reauth))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             _debug("auth login", f"exception: {type(exc).__name__}: {exc}")
-        token = _fetch()
+        token = _fetch_with_lock_retry()
 
     if not token:
         profile_name = profile or find_profile_name_for_host(workspace)
@@ -1378,7 +1490,7 @@ _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 
 # Supported OSS chat families, matched by name substring. Add an entry to
 # support a new family.
-_OSS_MODEL_FAMILIES = ("kimi-", "glm-")
+_OSS_MODEL_FAMILIES = ("kimi-", "glm-", "deepseek-")
 
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
@@ -1455,6 +1567,10 @@ def _model_service_id(service: dict) -> str | None:
 # intermittently under load, so each gets a few retries before we give up.
 _MODEL_SERVICES_PAGE_SIZE = 100
 _MODEL_SERVICES_PAGE_RETRIES = 4
+
+# Substrings that mark a failure reason (`HTTP <code> <phrase>: <body>`) as a 404 / NOT_FOUND:
+# the HTTP status line and the Databricks `error_code` carried in the response body.
+_NOT_FOUND_REASON_MARKERS = ("http 404", "not_found")
 
 
 def _get_model_services_page(
@@ -1574,6 +1690,74 @@ def list_model_services(
     return [], last_reason or "model-services listing returned no models"
 
 
+def _is_not_found_reason(reason: str | None) -> bool:
+    """True when an HTTP reason describes a 404 / NOT_FOUND (a resource that isn't there)."""
+    if not reason:
+        return False
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _NOT_FOUND_REASON_MARKERS)
+
+
+def model_service_exists(
+    workspace: str, token: str, full_name: str, *, max_pages: int = 100
+) -> tuple[bool | None, str | None]:
+    """Whether ``<catalog>.<schema>.<model>`` is a UC model service on this workspace.
+
+    Used to quick-check a hand-typed custom model before an admin pins a config to it. Lists the
+    model services in the typed name's own schema (``parent=schemas/<catalog>.<schema>``, the same
+    scoped listing :func:`list_model_services` uses for ``system.ai``) and checks for the name.
+
+    Returns ``(exists, reason)``:
+
+    - ``True`` — the name is a model service in that schema.
+    - ``False`` — the schema exists but has no such service, or the API returned 404/NOT_FOUND (the
+      catalog or schema in the name doesn't exist, so the model can't either). Both are a definitive
+      "no" the caller can re-prompt on.
+    - ``None`` — the check couldn't run: a name that isn't a three-part UC path, or a non-404
+      HTTP/network error. The caller treats this as "couldn't verify" rather than "doesn't exist" so
+      a transient failure never blocks a valid model.
+
+    Never cached: it targets a user schema, not the memoized ``system.ai`` walk.
+    """
+    parts = [part.strip() for part in full_name.split(".")]
+    if len(parts) != 3 or not all(parts):
+        return None, "a model service is named <catalog>.<schema>.<model>"
+    catalog, schema, _model = parts
+    normalized = f"{catalog}.{schema}.{_model}"
+    parent = f"schemas/{catalog}.{schema}"
+    hostname = workspace_hostname(workspace)
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(max_pages):
+        params: dict[str, str] = {"parent": parent, "page_size": str(_MODEL_SERVICES_PAGE_SIZE)}
+        if page_token:
+            params["page_token"] = page_token
+        url = f"https://{hostname}/api/2.1/unity-catalog/model-services?{urlencode(params)}"
+        payload, reason = _get_model_services_page(url, token)
+        if payload is None:
+            # A 404 means the catalog/schema in the typed name doesn't exist on this workspace, so
+            # neither can the model — a definitive "no". Every other failure (auth, 5xx, network) is
+            # inconclusive: don't block a possibly-valid model on a blip.
+            return (False, reason) if _is_not_found_reason(reason) else (None, reason)
+        data = cast(dict, payload) if isinstance(payload, dict) else {}
+        for service in data.get("model_services", []):
+            if not isinstance(service, dict):
+                continue
+            name = service.get("name")
+            if not isinstance(name, str):
+                continue
+            name = name.strip()
+            if name.startswith(_MODEL_SERVICE_NAME_PREFIX):
+                name = name[len(_MODEL_SERVICE_NAME_PREFIX) :]
+            if name == normalized:
+                return True, None
+        page_token = data.get("next_page_token") or None
+        if not page_token or page_token in seen_tokens:
+            break
+        seen_tokens.add(page_token)
+    return False, None
+
+
 def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[str], str | None]:
     """Every `system.ai.claude-*` id on the workspace, unbucketed.
 
@@ -1612,7 +1796,7 @@ def discover_model_services(
     - ``claude_models`` maps ``fable``/``opus``/``sonnet``/``haiku`` to the
       newest matching ``system.ai.claude-*`` id (mirrors
       ``discover_claude_models``).
-    - ``codex_models`` is the list of ``system.ai.*gpt-*`` ids.
+    - ``codex_models`` is the list of ``system.ai.*gpt-*`` ids, newest first.
     - ``gemini_models`` is the list of ``system.ai.*gemini-*`` ids, newest first.
     - ``oss_models`` is the list of OSS-model ``system.ai.*`` ids.
 
@@ -1639,7 +1823,7 @@ def discover_model_services(
     # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
     _prefer_opus_4_8(claude_models, ids)
 
-    codex_models = [m for m in ids if "gpt-" in m]
+    codex_models = sorted([m for m in ids if "gpt-" in m], key=model_version_sort_key)
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
 
     oss_models = [m for m in ids if any(family in m for family in _OSS_MODEL_FAMILIES)]
@@ -1749,6 +1933,7 @@ def fetch_external_model_prices(workspace: str, token: str) -> tuple[list[dict],
 # currently populated, is what lets a re-run *clear* a field the admin removed: the server merges
 # per path, so an omitted path leaves the old value in place.
 MANAGED_CONFIG_UPDATE_MASK_PATHS: tuple[str, ...] = (
+    "spec_version",
     "display_name",
     "default_agent",
     "enabled_agents",
@@ -2247,6 +2432,46 @@ def map_claude_family_models(targets: list[str]) -> dict[str, str]:
     return result
 
 
+# Claude Code starts every session on its opus tier, which the gateway 403s when a Model Provider
+# Service declares no opus target. When opus is missing, fall back to the most capable tier the
+# service does offer. opus > sonnet > haiku.
+_CLAUDE_LAUNCH_TIER_PREFERENCE = ("opus", "sonnet", "haiku")
+
+
+def resolve_provider_launch_model(model: str | None, provider_models: dict[str, str]) -> str | None:
+    """Pick the model a provider-routed Claude session starts on, or None to keep Claude Code's default.
+
+    ``provider_models`` maps the Claude families a service declares to their target ids (see
+    ``map_claude_family_models``). With an explicit ``model`` (``ucode claude --model``) the user's
+    choice wins: a family alias resolves to that tier's declared target (erroring when the service
+    doesn't offer it), any other value is trusted as a raw target id the service allows. Without one,
+    return None when the service offers opus — Claude Code's own default already works, so we avoid
+    setting ANTHROPIC_MODEL and the duplicate ``/model`` picker row it produces — else the most
+    capable tier the service does offer, so the launch doesn't dead-end on an unservable opus.
+    """
+    if model:
+        if model in ANTHROPIC_FAMILIES:
+            target = provider_models.get(model)
+            if not target:
+                available = ", ".join(sorted(provider_models)) or "none"
+                raise RuntimeError(
+                    f"This Model Provider Service does not offer a '{model}' model "
+                    f"(available families: {available})."
+                )
+            return target
+        return model
+    if provider_models.get("opus"):
+        return None
+    return next(
+        (
+            provider_models[fam]
+            for fam in _CLAUDE_LAUNCH_TIER_PREFERENCE
+            if provider_models.get(fam)
+        ),
+        None,
+    )
+
+
 # `list_vector_search_catalog_schemas` walks Vector Search endpoints+indexes.
 # `list_uc_functions_catalog_schemas` walks UC catalogs+schemas in parallel and
 # keeps only schemas with at least one user function.
@@ -2631,6 +2856,41 @@ def list_all_mcp_services(
     return sorted(names), None
 
 
+def _get_anthropic_models_json(workspace: str, token: str) -> tuple[dict | list | None, str | None]:
+    hostname = workspace_hostname(workspace)
+    return _http_get_json(
+        f"https://{hostname}{ANTHROPIC_MODELS_PATH}",
+        token,
+        max_retries=_ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES,
+    )
+
+
+def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """List every model id advertised by AI Gateway's Anthropic endpoint.
+
+    Claude Code's native gateway discovery consumes this same catalog, so callers
+    using that mode must not apply ucode's legacy ``databricks-claude-*`` family
+    validation.
+    """
+    payload, reason = _get_anthropic_models_json(workspace, token)
+    if payload is None:
+        return [], reason
+
+    data = cast(dict, payload) if isinstance(payload, dict) else {}
+    model_ids: list[str] = []
+    seen: set[str] = set()
+    for model in data.get("data", []):
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if isinstance(model_id, str) and model_id and model_id not in seen:
+            seen.add(model_id)
+            model_ids.append(model_id)
+    if model_ids:
+        return model_ids, None
+    return [], "AI Gateway returned no Anthropic model ids"
+
+
 def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], str | None]:
     """Discover Claude families on this workspace's AI Gateway.
 
@@ -2638,8 +2898,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     describes why the dict is empty (HTTP error, network error, or no models
     matching the expected naming convention).
     """
-    hostname = workspace_hostname(workspace)
-    payload, reason = _http_get_json(f"https://{hostname}/ai-gateway/anthropic/v1/models", token)
+    payload, reason = _get_anthropic_models_json(workspace, token)
     if payload is None:
         return {}, reason
 
@@ -2770,7 +3029,11 @@ def discover_gemini_models(workspace: str, token: str) -> tuple[list[str], str |
 
 
 def discover_codex_models(workspace: str, token: str) -> tuple[list[str], str | None]:
-    return discover_endpoints_with_api_type(workspace, token, "openai/v1/responses")
+    # Order newest model version first (like `discover_gemini_models`), so the picker's top choice
+    # and default is e.g. gpt-5-4 rather than the alphabetically-first gpt-5.
+    return discover_endpoints_with_api_type(
+        workspace, token, "openai/v1/responses", sort_key=model_version_sort_key
+    )
 
 
 def fetch_gemini_models(workspace: str, token: str) -> list[str]:
@@ -2783,54 +3046,88 @@ def fetch_codex_models(workspace: str, token: str) -> list[str]:
     return models
 
 
-def ensure_ai_gateway_v2(workspace: str, token: str) -> None:
-    """Probe AI Gateway v2 and raise if unavailable.
-
-    Uses the dedicated v2 listing endpoint `GET /api/ai-gateway/v2/endpoints`:
-    a 200 response (even with an empty list) means v2 is wired up on this
-    workspace — a "no endpoints provisioned" case will surface naturally in
-    downstream discovery. Failure branches:
-
-    - 401 / 403 / 400 with `Invalid Token`: the token is bad for *this*
-      workspace.
-    - 404: AI Gateway V2 is not enabled on this workspace — point at the docs.
-    - other (5xx, network errors): surface the reason verbatim.
-    """
+def _probe_ai_gateway_v2(workspace: str, token: str) -> tuple[bool, str | None]:
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}/api/ai-gateway/v2/endpoints?page_size=1"
     payload, reason = _http_get_json(url, token)
-    if payload is not None:
-        return
-    reason_str = reason or "unknown error"
-    if _looks_like_auth_failure(reason_str):
-        raise RuntimeError(
-            f"Databricks rejected the access token for {workspace} ({reason_str}). "
-            f"Try:\n"
-            f"  databricks auth logout --host {workspace}\n"
-            f"  databricks auth login --host {workspace}"
-        )
-    if "HTTP 404" in reason_str:
-        raise RuntimeError(
-            "Databricks Unity AI Gateway is not enabled on this workspace "
-            f"({reason_str}). See {AI_GATEWAY_V2_DOCS_URL}"
-        )
+    return payload is not None, reason
+
+
+def _probe_ai_gateway_v3(workspace: str, token: str) -> tuple[bool, str | None]:
+    hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}/api/2.1/unity-catalog/model-services?page_size=1"
+    payload, reason = _http_get_json(url, token)
+    return payload is not None, reason
+
+
+def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
     raise RuntimeError(
-        "Databricks Unity AI Gateway probe failed on this workspace "
-        f"({reason_str}). See {AI_GATEWAY_V2_DOCS_URL}"
+        f"Databricks rejected the access token for {workspace} ({reason}). "
+        f"Try:\n"
+        f"  databricks auth logout --host {workspace}\n"
+        f"  databricks auth login --host {workspace}"
     )
 
 
-def _looks_like_auth_failure(reason: str) -> bool:
-    """True when the gateway response signals the token is not accepted.
+def _raise_ai_gateway_v3_permission_failure(
+    workspace: str, v3_reason: str, v2_reason: str | None
+) -> NoReturn:
+    raise RuntimeError(
+        f"Databricks AI Gateway V3 access could not be verified on {workspace} ({v3_reason}). "
+        f"The V2 fallback also failed ({v2_reason or 'unknown error'}). The V3 probe requires "
+        "permission to list Unity Catalog model services. Verify USE CATALOG on `system` and "
+        "USE SCHEMA on `system.ai`."
+    )
 
-    Covers 401/403 directly and the gateway's 400 + `Invalid Token` body
-    (which happens when the bearer is valid but issued for a different
-    workspace)."""
-    if "HTTP 401" in reason or "HTTP 403" in reason:
+
+def _raise_ai_gateway_v2_permission_failure(
+    workspace: str, v2_reason: str, v3_reason: str | None
+) -> NoReturn:
+    raise RuntimeError(
+        f"Databricks AI Gateway V2 access could not be verified on {workspace} ({v2_reason}). "
+        f"The V3 probe also failed ({v3_reason or 'unknown error'}). Verify the caller's "
+        "workspace permissions for the AI Gateway V2 endpoints listing."
+    )
+
+
+def ensure_ai_gateway(workspace: str, token: str) -> None:
+    """Pass if either AI Gateway V2 or V3 is available."""
+    v3_ok, v3_reason = _probe_ai_gateway_v3(workspace, token)
+    if v3_ok:
+        return
+    if v3_reason and _looks_like_definitive_auth_failure(v3_reason):
+        _raise_ai_gateway_auth_failure(workspace, v3_reason)
+
+    v2_ok, v2_reason = _probe_ai_gateway_v2(workspace, token)
+    if v2_ok:
+        return
+    if v2_reason and _looks_like_definitive_auth_failure(v2_reason):
+        _raise_ai_gateway_auth_failure(workspace, v2_reason)
+    if v3_reason and _looks_like_permission_failure(v3_reason):
+        _raise_ai_gateway_v3_permission_failure(workspace, v3_reason, v2_reason)
+    if v2_reason and _looks_like_permission_failure(v2_reason):
+        _raise_ai_gateway_v2_permission_failure(workspace, v2_reason, v3_reason)
+
+    raise RuntimeError(
+        "Databricks AI Gateway is not enabled on this workspace: neither V3 "
+        f"({v3_reason or 'unknown error'}) nor V2 ({v2_reason or 'unknown error'}) is available. "
+        f"See {AI_GATEWAY_V2_DOCS_URL}"
+    )
+
+
+def _looks_like_definitive_auth_failure(reason: str) -> bool:
+    """True when retrying another workspace API cannot rescue this token.
+
+    A 403 can be endpoint-specific authorization, so the version-agnostic
+    preflight must still try V3 before surfacing it as an auth failure.
+    """
+    if "HTTP 401" in reason:
         return True
-    if "HTTP 400" in reason and "invalid token" in reason.lower():
-        return True
-    return False
+    return "HTTP 400" in reason and "invalid token" in reason.lower()
+
+
+def _looks_like_permission_failure(reason: str) -> bool:
+    return "HTTP 403" in reason
 
 
 CODING_AGENT_RECOMMEND_MODEL_PATH = "/api/ai-gateway/v2/coding-agent-configs:recommendModel"

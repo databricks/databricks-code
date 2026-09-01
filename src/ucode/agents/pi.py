@@ -1,4 +1,4 @@
-"""Pi coding agent: writes ~/.pi/agent/models.json with Databricks-backed providers.
+"""Pi coding agent: writes a ucode-private models.json with Databricks-backed providers.
 
 Pi (https://pi.dev) is a multi-provider coding agent. We register three
 providers in its `models.json`, each speaking the API dialect best suited to
@@ -32,7 +32,6 @@ import signal
 import subprocess
 import threading
 
-from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -79,10 +78,6 @@ PROVIDER_KEYS: list[list[str]] = [["providers", name] for name in PROVIDER_NAMES
 LEGACY_PROVIDER_NAMES = ("databricks-anthropic", "databricks-codex", "databricks-oss")
 
 
-def is_update_available() -> tuple[str, str] | None:
-    return available_npm_package_update(SPEC["package"])
-
-
 def _resolve_model_selector(
     model: str,
     claude_models: dict[str, str],
@@ -110,7 +105,7 @@ def render_overlay(
     codex_models: list[str],
     gemini_models: list[str],
 ) -> tuple[dict, list[list[str]]]:
-    """Return (overlay, managed_key_paths) for ~/.pi/agent/models.json."""
+    """Return (overlay, managed_key_paths) for Pi's private agent config."""
     providers: dict = {}
     keys: list[list[str]] = [["model"]]
     # Pi expands header values that match an env var name. Our UA contains
@@ -282,7 +277,7 @@ def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
 def build_runtime_env(token: str) -> dict[str, str]:
     env = os.environ.copy()
     env["OAUTH_TOKEN"] = token
-    env["HOME"] = str(PI_UCODE_HOME)
+    env["PI_CODING_AGENT_DIR"] = str(PI_CONFIG_DIR)
     return env
 
 
