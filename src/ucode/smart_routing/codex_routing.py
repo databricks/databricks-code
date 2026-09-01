@@ -97,7 +97,7 @@ def route_pre_tool_use(
             workspace, token, task, available_models, timeout=timeout
         ),
         default_task_label="Codex subagent task",
-        model_id_mapper=_codex_model_id,
+        model_id_mapper=codex_model_id,
         record_decision=record,
     )
 
@@ -141,7 +141,13 @@ def _model_strength(model: str) -> tuple[int, int, int, int]:
     return major, minor, patch, 1 if not suffix else 0
 
 
-def _codex_model_id(model: str) -> str:
+def codex_model_id(model: str) -> str:
+    """Map a UC GPT service ID to Codex's bundled catalog slug.
+
+    Codex's bundled GPT catalog owns the model metadata for these aliases,
+    while the AI Gateway resolves them back to the matching ``system.ai`` service.
+    Leave non-GPT models unchanged because their metadata comes from the gateway catalog.
+    """
     tail = model.rsplit("/", 1)[-1]
     if tail in {"databricks-gpt-5-2-codex", "databricks-gpt-5-4-nano"}:
         return tail

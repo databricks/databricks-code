@@ -156,23 +156,6 @@ class TestGeminiVersionGating:
         monkeypatch.setattr(gemini, "latest_version_below", lambda pkg, ceiling: None)
         assert gemini.too_new_downgrade() is None
 
-    def test_update_only_offered_toward_working_version(self, monkeypatch):
-        # Installed 0.40.0, latest working 0.44.1 -> offer the upgrade.
-        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.40.0")
-        monkeypatch.setattr(gemini, "latest_version_below", lambda pkg, ceiling: "0.44.1")
-        assert gemini.is_update_available() == ("0.40.0", "0.44.1")
-
-    def test_no_update_when_already_at_working_version(self, monkeypatch):
-        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.44.1")
-        monkeypatch.setattr(gemini, "latest_version_below", lambda pkg, ceiling: "0.44.1")
-        assert gemini.is_update_available() is None
-
-    def test_no_update_offered_toward_broken_version(self, monkeypatch):
-        # Even when a newer 0.45 exists, the target stays below the ceiling.
-        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.44.1")
-        monkeypatch.setattr(gemini, "latest_version_below", lambda pkg, ceiling: "0.44.1")
-        assert gemini.is_update_available() is None
-
 
 class TestGeminiValidateCmd:
     def test_starts_with_binary(self):

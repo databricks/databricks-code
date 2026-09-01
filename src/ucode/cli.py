@@ -81,7 +81,6 @@ from ucode.managed_resolve import (
     managed_provider_service,
     managed_supplies_models,
     managed_unservable_models,
-    managed_use_as_global_settings,
     recommended_agent,
     resolve_state,
 )
@@ -137,7 +136,6 @@ from ucode.ui import (
     prompt_for_tools,
     prompt_for_workspace,
     prompt_yes_no,
-    prompt_yes_no_default,
     set_verbosity,
     spinner,
     status_badge,
@@ -843,6 +841,7 @@ def configure_workspace_command(
     skip_unavailable: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    offer_optional_setup: bool = False,
 ) -> int:
     if tool is not None and selected_tools is not None:
         raise RuntimeError("Use either --agent or --agents, not both.")
@@ -954,17 +953,10 @@ def configure_workspace_command(
         for tool_name in picked:
             state = _maybe_select_provider_service(tool_name, state)
 
-    # Last question in the interactive flow: opt out of AI Tools. When a flag
-    # already decided it, configure_shared_state persisted that; skip the prompt.
-    # The default is the resolved prior choice, so Enter won't undo a past opt-out.
-    if databricks_ai_tools_enabled is None and offer_provider:
-        state["databricks_ai_tools_enabled"] = prompt_yes_no_default(
-            "Install Databricks AI Tools for your coding agents? "
-            "This adds Databricks skills and plugins.",
-            default=state.get("databricks_ai_tools_enabled", True),
-        )
-
-    state = configure_selected_tools(state, picked)
+    if offer_optional_setup:
+        state = configure_selected_tools(state, picked, install_ai_tools=False)
+    else:
+        state = configure_selected_tools(state, picked)
 
     summary_lines = [f"[bold]Workspace:[/bold] [cyan]{state['workspace']}[/cyan]"]
     for tool_name in picked:
@@ -984,11 +976,13 @@ def configure_workspace_command(
 
     if skip_validate:
         print_note("Skipping agent validation (--skip-validate).")
-        return 0
-    # Limit validation to just-configured tools so we don't re-validate
-    # previously-configured tools the user didn't touch this run.
-    validate_state = {**state, "available_tools": picked}
-    validate_all_tools(validate_state)
+    else:
+        # Limit validation to just-configured tools so we don't re-validate
+        # previously-configured tools the user didn't touch this run.
+        validate_state = {**state, "available_tools": picked}
+        validate_all_tools(validate_state)
+    if offer_optional_setup and not is_dry_run():
+        _configure_optional_setup(state, picked)
     return 0
 
 
@@ -1049,6 +1043,13 @@ def status() -> int:
                 ", ".join(tool_mcp_servers) if tool_mcp_servers else "none saved by ucode",
             )
         print_kv("Config file", str(config_path) if config_path.exists() else "missing")
+        if tool == "claude":
+            managed_path, managed_status, backup_status = claude_agent.managed_settings_status(
+                state
+            )
+            print_kv("OS-managed settings", managed_status)
+            print_kv("Managed settings file", str(managed_path) if managed_path else "unsupported")
+            print_kv("Managed settings backup", backup_status)
         console.print()
 
     print_heading("Skills")
@@ -1104,6 +1105,7 @@ def revert() -> int:
     state = load_state()
     managed_configs = state.get("managed_configs") or {}
     mcp_results = revert_mcp_configs(state)
+    claude_managed_result = claude_agent.revert_managed_settings()
 
     results: dict[str, bool] = {
         tool: restore_file(
@@ -1125,6 +1127,7 @@ def revert() -> int:
         print_kv(f"{spec['display']} config", "restored" if results[tool] else "unchanged")
     if legacy_codex_stripped:
         print_kv("Codex shared config", "ucode entries removed")
+    print_kv("Claude Code OS-managed settings", claude_managed_result)
     print_kv("Pi settings", "restored" if pi_settings_restored else "unchanged")
     for client, spec in MCP_CLIENTS.items():
         print_kv(
@@ -1193,6 +1196,17 @@ def _configure_agents_for_mcp(
             )
         configured.add("cursor")
     return configured
+
+
+def _configure_optional_setup(state: dict, tools: list[str]) -> None:
+    enabled = prompt_yes_no("Configure MCP servers, skills, and plugins?")
+    state["databricks_ai_tools_enabled"] = enabled
+    save_state(state)
+    if not enabled:
+        return
+
+    install_databricks_ai_tools_for_agents(tools, state)
+    configure_mcp_command()
 
 
 @mcp_app.command("add")
@@ -1862,7 +1876,10 @@ def _can_launch_from_cached_config(
         return False
 
     if tool == "claude":
-        return claude_agent.CLAUDE_SETTINGS_PATH.exists()
+        return (
+            claude_agent.CLAUDE_SETTINGS_PATH.exists()
+            and claude_agent.managed_settings_are_current(state)
+        )
     return codex_agent.has_ucode_config()
 
 
@@ -1964,18 +1981,6 @@ def _launch_tool(
                     f"Your workspace's managed config lists no {TOOL_SPECS[tool]['display']}-servable "
                     f"models ({', '.join(unservable)}); using your discovered models instead."
                 )
-            # The enterprise scope outranks the --settings file ucode writes, so a model pinned
-            # there quietly beats the admin's — point at the file rather than let the mismatch
-            # look like a ucode bug. Suppressed under use_as_global_settings: there ucode itself
-            # authored that managed-settings file, so its model keys are the admin's config, not an
-            # external override.
-            if tool == "claude" and not managed_use_as_global_settings(managed, "claude"):
-                overrides = claude_agent.managed_settings_model_overrides()
-                if overrides is not None:
-                    print_warning(
-                        f"Default models are set in your enterprise managed settings at "
-                        f"{overrides}, which may override your admin's managed config."
-                    )
         elif managed_agent_config_enabled():
             print_note("No managed coding agent config found; using your own settings")
         if managed is not None:
@@ -2067,23 +2072,6 @@ def _launch_tool(
             # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
             if model and tool != "claude":
                 resolved_model = model
-            # Claude Code's enterprise managed-settings scope (e.g. a dbexec install)
-            # outranks the --settings file ucode writes AND can't be excluded with --setting-sources,
-            # so a model pinned there silently wins over `--model`. Warn so a launch that ignores the
-            # requested model looks like the misconfiguration it is, not a ucode bug.
-            # Suppressed when ucode authored the managed-settings file itself (use_as_global_settings)
-            # — the pinned model is then ucode's own, deliberately applied, not a surprise override.
-            managed_owns_claude = managed is not None and managed_use_as_global_settings(
-                managed, "claude"
-            )
-            if model and tool == "claude" and not managed_owns_claude:
-                enterprise = claude_agent.managed_settings_model_overrides()
-                if enterprise is not None:
-                    print_warning(
-                        f"Your enterprise managed settings at {enterprise} pin the Claude model, "
-                        f"which overrides `--model {model}` — Claude Code will launch on the pinned "
-                        "model instead. Edit or remove that file to use --model."
-                    )
         state = configure_tool(
             tool,
             state,
@@ -2734,6 +2722,7 @@ def configure(
         # Set True only in the fully-interactive branch below; gates the optional
         # MCP setup prompt so flag-driven / scripted runs are never interrupted.
         fully_interactive = False
+        combined_optional_setup = False
         if agent is not None:
             tool = normalize_tool(agent)
             install_tool_binary(
@@ -2806,6 +2795,11 @@ def configure(
         else:
             # Tool binaries are installed after the user picks which agents
             # they want, in configure_workspace_command.
+            combined_optional_setup = (
+                not flag_driven_workspace and enable_databricks_ai_tools is None
+            )
+            if combined_optional_setup:
+                skip_kwargs["offer_optional_setup"] = True
             if workspace_entries is None:
                 configure_workspace_command(
                     prompt_optional_updates=prompt_optional_updates,
@@ -2853,11 +2847,12 @@ def configure(
                     "interactive picker."
                 )
             configure_mcp_command(services=services)
-        # Offer MCP setup as the natural next step of interactive configuration,
-        # so users discover it without needing to know `configure mcp` exists.
-        # Skipped in dry-run and non-interactive/flag-driven runs (which stay
-        # scriptable), and when --dry-run is set.
-        if fully_interactive and not dry_run and prompt_yes_no("Configure MCP servers now?"):
+        if (
+            fully_interactive
+            and not combined_optional_setup
+            and not dry_run
+            and prompt_yes_no("Configure MCP servers now?")
+        ):
             configure_mcp_command()
     except typer.Exit:
         # `typer.Exit` subclasses RuntimeError, so it has to be re-raised ahead of the handler

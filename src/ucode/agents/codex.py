@@ -11,7 +11,6 @@ from pathlib import Path
 
 import tomlkit
 
-from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -30,8 +29,10 @@ from ucode.managed_files import OS, current_os, write_managed_file
 from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
+    routing_models,
     sync_smart_routing_hooks,
 )
+from ucode.smart_routing.codex_routing import codex_model_id
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.ui import print_warning_err
@@ -47,6 +48,7 @@ MINIMUM_CODEX_VERSION = (0, 134, 0)
 MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
 # Retained only to identify and remove state written by the legacy persisted opt-in.
 SMART_ROUTING_STATE_KEY = smart_routing_v2.LEGACY_STATE_KEY
+APP_SERVER_SMART_ROUTING_STARTING_MODEL = "gpt-5.6-luna"
 
 SPEC: ToolSpec = {
     "binary": "codex",
@@ -69,10 +71,6 @@ LEGACY_MANAGED_KEYS: list[list[str]] = [
     ["model_providers", CODEX_MODEL_PROVIDER_NAME],
     ["model_providers", CODEX_MODEL_PROVIDER_NAME, "http_headers"],
 ]
-
-
-def is_update_available() -> tuple[str, str] | None:
-    return available_npm_package_update(SPEC["package"])
 
 
 def _parse_version(value: str) -> tuple[int, int, int] | None:
@@ -446,11 +444,20 @@ def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if smart_routing_v2.enabled():
+        def _app_server_start_model() -> str:
+            managed_model = default_model(state)
+            if managed_model:
+                return managed_model
+            models = routing_models(state)
+            if models:
+                return codex_model_id(models[0])
+            return APP_SERVER_SMART_ROUTING_STARTING_MODEL
+
         smart_routing_v2.launch_codex(
             state,
             tool_args,
             binary=binary,
-            start_model=default_model(state),
+            start_model=_app_server_start_model(),
             render_overlay=render_overlay,
         )
     if workspace:

@@ -185,15 +185,13 @@ class TestResolveState:
 
 
 class TestGlobalSettings:
-    def test_only_claude_and_codex_support_global_settings(self):
-        # This set gates both the write path AND the `ucode setup` machine-wide prompt. Adding an
-        # agent whose token can't self-refresh here would re-introduce a config that breaks in ~1h.
+    def test_only_codex_keeps_the_legacy_global_settings_flag(self):
         from ucode.agents import GLOBAL_SETTINGS_AGENTS
 
-        assert GLOBAL_SETTINGS_AGENTS == frozenset({"claude", "codex"})
+        assert GLOBAL_SETTINGS_AGENTS == frozenset({"codex"})
 
-    def test_flag_true_for_opted_in_supported_agent(self):
-        assert managed_use_as_global_settings(MANAGED, "claude") is True
+    def test_claude_no_longer_honors_the_legacy_flag(self):
+        assert managed_use_as_global_settings(MANAGED, "claude") is False
 
     def test_flag_false_when_not_opted_in(self):
         # codex is enabled but never marked machine-wide.
@@ -204,17 +202,15 @@ class TestGlobalSettings:
         managed = {"enabled_agents": {"gemini": {"use_as_global_settings": True}}}
         assert managed_use_as_global_settings(managed, "gemini") is False
 
-    def test_resolve_sets_transient_write_managed_config(self):
+    def test_resolve_does_not_set_transient_flag_for_claude(self):
         resolved = resolve_state(MANAGED, _state(), "claude")
-        assert resolved["write_managed_config"] is True
+        assert "write_managed_config" not in resolved
 
     def test_resolve_omits_flag_when_not_opted_in(self):
         resolved = resolve_state(MANAGED, _state(), "codex")
         assert "write_managed_config" not in resolved
 
-    def test_write_managed_config_is_not_persisted(self):
-        # It lives only for the config-write; save_state (via _without_managed_overlay) drops it so
-        # a later non-managed launch never writes the managed settings file.
+    def test_removed_claude_flag_is_not_persisted(self):
         resolved = resolve_state(MANAGED, _state(), "claude")
         assert "write_managed_config" not in _without_managed_overlay(resolved)
 
@@ -237,12 +233,13 @@ class TestStateFileIsNotRewritten:
         monkeypatch.setattr(claude, "CLAUDE_BACKUP_PATH", tmp_path / "backup.json")
         managed_settings_path = tmp_path / "managed-settings.json"
         monkeypatch.setattr(claude, "_managed_settings_path", lambda: managed_settings_path)
+        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: True)
 
-        def write_managed_file(path, desired_text, *, display):
+        def reconcile_managed_file(path, desired_text, **kwargs):
             path.write_text(desired_text, encoding="utf-8")
             return "written"
 
-        monkeypatch.setattr(claude, "write_managed_file", write_managed_file)
+        monkeypatch.setattr(claude, "reconcile_managed_file", reconcile_managed_file)
         # Seed a developer whose own opus choice differs from the manifest's.
         state_mod.save_state(
             {
