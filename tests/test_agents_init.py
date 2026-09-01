@@ -536,7 +536,7 @@ class TestConfigureSelectedTools:
 
         configure_selected_tools({}, ["codex", "claude"])
 
-        assert batches == [["Claude Code"]]
+        assert batches == [["Codex", "Claude Code"]]
 
     def test_merges_with_existing_available_tools(self, monkeypatch):
         """Configuring a new tool should not drop previously-configured tools

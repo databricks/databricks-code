@@ -1,12 +1,11 @@
 """Loopback proxy for Claude gateway model discovery.
 
-The proxy refreshes the Databricks credential, streams inference responses
-verbatim, and rewrites model discovery responses when needed.
+The proxy forwards Claude Code's apiKeyHelper credential, streams inference
+responses verbatim, and rewrites model discovery responses when needed.
 
 Security invariants (mirroring `databricks.py` token handling):
   - Binds 127.0.0.1 only; never exposed off-host.
-  - Never logs header values or bodies. The Databricks token lives in memory
-    and is refreshed off the request path.
+  - Never logs header values or bodies.
 """
 
 from __future__ import annotations
@@ -26,13 +25,9 @@ import httpx
 from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import _http_get_retry_delay
 from ucode.gateway_proxy import (
-    AI_GATEWAY_TOKEN_HEADER,
     HOP_BY_HOP_HEADERS,
     UPSTREAM_TIMEOUT,
-    TokenCache,
-    forwarded_request_headers,
     log_proxy_diagnostic,
-    log_token_refresh_failure,
 )
 
 # Claude Code abandons model discovery after roughly three seconds. One retry
@@ -42,9 +37,7 @@ _ANTHROPIC_MODEL_DISCOVERY_MAX_RETRIES = 1
 
 class _ProxyHandler(BaseHTTPRequestHandler):
     # Set by the server factory.
-    cache: TokenCache
     client: httpx.Client
-    token_header = AI_GATEWAY_TOKEN_HEADER
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -87,7 +80,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 delay_ms=round(delay * 1000),
             )
             time.sleep(delay)
-            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in HOP_BY_HOP_HEADERS
+            }
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
                     "model_discovery_upstream_headers",
@@ -118,8 +115,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             path=self.path.split("?", 1)[0],
         )
         try:
-            # First attempt with the current token.
-            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in HOP_BY_HOP_HEADERS
+            }
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
                 log_proxy_diagnostic(
                     "model_discovery_upstream_headers",
@@ -139,27 +139,6 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                         retry_after,
                     )
                     return
-                if resp.status_code not in (401, 403):
-                    self._relay_response(resp, diagnostic_id=diagnostic_id, started=started)
-                    return
-                # Auth rejected. Drain the (small) error body so the pooled
-                # connection can be reused, then fall through to one retry.
-                resp.read()
-            # Force-refresh the Databricks token and retry once.
-            try:
-                self.cache.refresh()
-            except RuntimeError as exc:
-                # Still retry with the existing token after reporting the failure.
-                log_token_refresh_failure(exc)
-            headers = forwarded_request_headers(self, self.cache.token, self.token_header)
-            with self.client.stream(self.command, url, headers=headers, content=body) as resp:
-                log_proxy_diagnostic(
-                    "model_discovery_upstream_headers",
-                    request_id=diagnostic_id,
-                    attempt=2,
-                    status=resp.status_code,
-                    elapsed_ms=round((time.monotonic() - started) * 1000),
-                )
                 self._relay_response(resp, diagnostic_id=diagnostic_id, started=started)
         except (BrokenPipeError, ConnectionResetError):
             # Client closed before/while we relayed headers — routine on cancel.
@@ -366,18 +345,10 @@ class _AnthropicModelDiscoveryHandler(_ProxyHandler):
 
 def start_proxy(
     workspace: str,
-    profile: str | None,
     port: int,
-    token_header: str,
-    force_refresh_near_expiry: bool,
-) -> tuple[ThreadingHTTPServer, TokenCache, httpx.Client]:
-    """Start the Anthropic model discovery proxy and token refresher."""
+) -> tuple[ThreadingHTTPServer, httpx.Client]:
+    """Start the Anthropic model discovery proxy."""
     upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
-    cache = TokenCache(
-        workspace,
-        profile,
-        force_refresh_near_expiry=force_refresh_near_expiry,
-    )
     client = httpx.Client(base_url=upstream_base, timeout=UPSTREAM_TIMEOUT, follow_redirects=False)
     handler = cast(
         type[BaseHTTPRequestHandler],
@@ -385,9 +356,7 @@ def start_proxy(
             "BoundProxyHandler",
             (_AnthropicModelDiscoveryHandler,),
             {
-                "cache": cache,
                 "client": client,
-                "token_header": token_header,
                 "anthropic_model_aliases": _AnthropicModelAliases(),
             },
         ),
@@ -397,6 +366,4 @@ def start_proxy(
     except OSError:
         server = ThreadingHTTPServer((LOOPBACK_HOST, 0), handler)
 
-    refresher = threading.Thread(target=cache.run_refresher, daemon=True)
-    refresher.start()
-    return server, cache, client
+    return server, client

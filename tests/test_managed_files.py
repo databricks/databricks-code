@@ -25,76 +25,12 @@ def _supported(monkeypatch):
     monkeypatch.setattr(managed_files.sys.stdin, "isatty", lambda: True)
 
 
-def _capture_sudo(monkeypatch):
-    calls: list = []
-    monkeypatch.setattr(
-        managed_files, "_sudo_replace", lambda path, text: calls.append((str(path), text))
-    )
-    return calls
-
-
 @pytest.fixture
 def backup_dir(tmp_path, monkeypatch):
     path = tmp_path / "managed-backups"
     monkeypatch.setattr(managed_files, "MANAGED_BACKUP_DIR", path)
     monkeypatch.setattr(managed_files, "MANAGED_BACKUP_MANIFEST_PATH", path / "manifest.json")
     return path
-
-
-class TestWriteManagedFile:
-    def test_unchanged_content_does_not_sudo(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed.json"
-        path.write_text("same", encoding="utf-8")
-        calls = _capture_sudo(monkeypatch)
-        assert managed_files.write_managed_file(path, "same", display="X") == "unchanged"
-        # The whole point: an unchanged file never prompts for a password.
-        assert calls == []
-
-    def test_changed_content_sudo_writes(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed.json"
-        path.write_text("old", encoding="utf-8")
-        calls = _capture_sudo(monkeypatch)
-        assert managed_files.write_managed_file(path, "new", display="X") == "written"
-        assert calls == [(str(path), "new")]
-
-    def test_absent_file_sudo_writes(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed.json"
-        calls = _capture_sudo(monkeypatch)
-        assert managed_files.write_managed_file(path, "new", display="X") == "written"
-        assert calls == [(str(path), "new")]
-
-    def test_dry_run_does_not_sudo(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed.json"
-        calls = _capture_sudo(monkeypatch)
-        config_io.set_dry_run(True)
-        assert managed_files.write_managed_file(path, "new", display="X") == "written"
-        assert calls == []
-
-    def test_unsupported_platform_skips(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(managed_files, "managed_files_supported", lambda: False)
-        calls = _capture_sudo(monkeypatch)
-        path = tmp_path / "managed.json"
-        assert managed_files.write_managed_file(path, "new", display="X") == "skipped"
-        assert calls == []
-
-    def test_permission_error_is_skipped_not_raised(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed.json"
-
-        def boom(path, text):
-            raise PermissionError("no root")
-
-        monkeypatch.setattr(managed_files, "_sudo_replace", boom)
-        # Never raises — the launch proceeds; the private ucode config still works.
-        assert managed_files.write_managed_file(path, "new", display="X") == "skipped"
-
-    def test_sudo_failure_is_skipped_not_raised(self, tmp_path, monkeypatch):
-        path = tmp_path / "managed.json"
-
-        def boom(path, text):
-            raise subprocess.CalledProcessError(1, ["/usr/bin/sudo", "cp"], stderr="denied")
-
-        monkeypatch.setattr(managed_files, "_sudo_replace", boom)
-        assert managed_files.write_managed_file(path, "new", display="X") == "skipped"
 
 
 class TestClearImmutableStatDenied:
@@ -155,6 +91,58 @@ class TestImmutableFlags:
 
 
 class TestManagedFileLifecycle:
+    def test_dry_run_does_not_write_or_backup(self, tmp_path, backup_dir, monkeypatch):
+        path = tmp_path / "managed.json"
+        config_io.set_dry_run(True)
+        monkeypatch.setattr(
+            managed_files, "_sudo_replace", lambda *args: pytest.fail("must not write")
+        )
+
+        result = managed_files.reconcile_managed_file(
+            path,
+            '{"ucode": true}\n',
+            tool="claude",
+            display="Claude Code",
+            owned_paths=[["ucode"]],
+        )
+
+        assert result == "written"
+        assert not backup_dir.exists()
+
+    def test_unsupported_platform_skips(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(managed_files, "managed_files_supported", lambda: False)
+        monkeypatch.setattr(
+            managed_files, "_sudo_replace", lambda *args: pytest.fail("must not write")
+        )
+
+        result = managed_files.reconcile_managed_file(
+            tmp_path / "managed.json",
+            '{"ucode": true}\n',
+            tool="claude",
+            display="Claude Code",
+            owned_paths=[["ucode"]],
+        )
+
+        assert result == "unsupported"
+
+    def test_permission_failure_is_actionable(self, tmp_path, backup_dir, monkeypatch):
+        path = tmp_path / "managed.json"
+
+        def deny_write(path, text):
+            raise PermissionError("no root")
+
+        monkeypatch.setattr(managed_files, "_sudo_replace", deny_write)
+
+        with pytest.raises(RuntimeError, match="could not update"):
+            managed_files.reconcile_managed_file(
+                path,
+                '{"ucode": true}\n',
+                tool="claude",
+                display="Claude Code",
+                owned_paths=[["ucode"]],
+            )
+        assert (backup_dir / "manifest.json").exists()
+
     def test_reconcile_refuses_symlink_target(self, tmp_path, backup_dir, monkeypatch):
         target = tmp_path / "real.json"
         target.write_text("{}", encoding="utf-8")

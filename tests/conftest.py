@@ -28,6 +28,7 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     import ucode.databricks as databricks_mod
     import ucode.managed_files as managed_files_mod
     import ucode.state as state_mod
+    from ucode.agents import codex as codex_mod
 
     state_dir = tmp_path / ".ucode"
     state_dir.mkdir()
@@ -38,6 +39,7 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     monkeypatch.setattr(
         managed_files_mod, "MANAGED_BACKUP_MANIFEST_PATH", backup_dir / "manifest.json"
     )
+    monkeypatch.setattr(codex_mod, "_managed_config_path", lambda: None)
 
     def reject_privileged_write(path, _desired_text):
         pytest.fail(

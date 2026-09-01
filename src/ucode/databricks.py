@@ -795,6 +795,38 @@ def ensure_databricks_cli_version() -> None:
         ensure_databricks_cli_version()
 
 
+def databricks_cli_version() -> tuple[int, int, int] | None:
+    """Return the installed Databricks CLI's (major, minor, patch), or None if
+    the CLI is absent or its version can't be read/parsed. Unlike
+    ``ensure_databricks_cli_version`` this only reports — it never upgrades — so
+    ``ucode doctor`` can decide what to recommend."""
+    if not shutil.which("databricks"):
+        return None
+    try:
+        result = run(
+            ["databricks", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    raw = result.stdout or result.stderr or ""
+    output = (raw if isinstance(raw, str) else raw.decode(errors="replace")).strip()
+    return _parse_databricks_cli_version(output)
+
+
+def upgrade_databricks_cli() -> bool:
+    """Upgrade an already-installed Databricks CLI to the latest release.
+    Returns True on success, False if the installer failed."""
+    try:
+        _run_databricks_cli_installer(brew_subcommand="upgrade")
+    except RuntimeError:
+        return False
+    return True
+
+
 def install_databricks_cli() -> None:
     if shutil.which("databricks"):
         ensure_databricks_cli_version()

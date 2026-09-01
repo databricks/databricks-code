@@ -31,6 +31,34 @@ class TestClaudeSpec:
         assert claude.SPEC["display"] == "Claude Code"
 
 
+class TestMinimumVersion:
+    @pytest.mark.parametrize("version", ["2.1.248", "2.1.250", "3.0.0"])
+    def test_supported_version(self, monkeypatch, version):
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: version)
+
+        assert claude.minimum_version_error() is None
+        assert claude.required_update_message() is None
+
+    def test_older_version_requires_update(self, monkeypatch):
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247 (Claude Code)")
+
+        assert claude.minimum_version_error() == (
+            "Claude Code 2.1.247 (Claude Code) is too old for gateway model discovery. "
+            "Claude Code must be updated to 2.1.248 or newer; run "
+            "`npm install -g @anthropic-ai/claude-code` or `ucode configure`."
+        )
+        assert claude.required_update_message() == (
+            "Claude Code 2.1.247 (Claude Code) is older than required 2.1.248; "
+            "updating Claude Code is required for gateway model discovery."
+        )
+
+    def test_unknown_version_does_not_block(self, monkeypatch):
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "unknown")
+
+        assert claude.minimum_version_error() is None
+        assert claude.required_update_message() is None
+
+
 class TestRenderOverlay:
     def test_long_context_suffix_supports_major_only_claude_versions(self):
         assert claude._maybe_add_1m_suffix("system.ai.claude-sonnet-5") == (
@@ -752,6 +780,78 @@ class TestRegisterWebSearchMcp:
 
 
 class TestClaudeLaunch:
+    def test_relayed_launch_uses_refresh_proxy_not_discovery_proxy(self, monkeypatch):
+        calls: list[tuple] = []
+
+        class Server:
+            server_address = ("127.0.0.1", 12345)
+
+            def serve_forever(self):
+                calls.append(("serve",))
+
+            def shutdown(self):
+                calls.append(("shutdown",))
+
+        class Cache:
+            def stop(self):
+                calls.append(("stop",))
+
+        class Client:
+            def close(self):
+                calls.append(("close",))
+
+        class Process:
+            def __init__(self, argv):
+                calls.append(("popen", argv))
+
+            def wait(self):
+                return 0
+
+        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+            calls.append(
+                (
+                    "proxy",
+                    workspace,
+                    profile,
+                    port,
+                    token_header,
+                    force_refresh_near_expiry,
+                )
+            )
+            return Server(), Cache(), Client()
+
+        monkeypatch.setattr(claude, "_managed_relayed_conflicts", lambda: None)
+        monkeypatch.setattr(claude, "_ensure_subscription_login", lambda: None)
+        monkeypatch.setattr(claude.gateway_proxy, "start_proxy", start_proxy)
+        monkeypatch.setattr(
+            claude,
+            "start_anthropic_model_discovery_proxy",
+            lambda *_args: pytest.fail("relayed auth must not use the discovery proxy"),
+        )
+        monkeypatch.setattr(claude.subprocess, "Popen", Process)
+
+        with pytest.raises(SystemExit) as exc:
+            claude.launch(
+                {
+                    "workspace": WS,
+                    "profile": "test",
+                    "claude_relayed": True,
+                    "relayed_proxy_port": 12345,
+                },
+                ["--debug"],
+            )
+
+        assert exc.value.code == 0
+        assert calls[0] == (
+            "proxy",
+            WS,
+            "test",
+            12345,
+            claude.gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
+            False,
+        )
+        assert calls[-3:] == [("stop",), ("shutdown",), ("close",)]
+
     def test_smart_routing_on_windows_is_not_supported(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude.os, "name", "nt")
@@ -879,12 +979,6 @@ class TestClaudeLaunch:
             def shutdown(self):
                 calls.append(("shutdown",))
 
-        class Cache:
-            token = "fresh-token"
-
-            def stop(self):
-                calls.append(("stop",))
-
         class Client:
             def close(self):
                 calls.append(("close",))
@@ -896,24 +990,20 @@ class TestClaudeLaunch:
             def wait(self):
                 return 0
 
-        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
-            calls.append(
-                (
-                    "proxy",
-                    workspace,
-                    profile,
-                    port,
-                    token_header,
-                    force_refresh_near_expiry,
-                )
-            )
-            return Server(), Cache(), Client()
+        def start_proxy(workspace, port):
+            calls.append(("proxy", workspace, port))
+            return Server(), Client()
 
         monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
+        monkeypatch.setattr(
+            claude,
+            "get_databricks_token",
+            lambda *_args: pytest.fail("model discovery must rely on apiKeyHelper"),
+        )
         monkeypatch.setattr(
             claude,
             "start_anthropic_model_discovery_proxy",
@@ -925,12 +1015,12 @@ class TestClaudeLaunch:
             claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
 
         assert exc.value.code == 0
-        assert os.environ["OAUTH_TOKEN"] == "fresh-token"
-        assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "fresh-token"
+        assert "OAUTH_TOKEN" not in os.environ
+        assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
         assert os.environ["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
         assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
         assert calls[:2] == [
-            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True),
+            ("proxy", WS, 0),
             ("serve",),
         ]
         assert calls[2][0] == "popen"
@@ -938,11 +1028,7 @@ class TestClaudeLaunch:
         assert argv[:2] == ["claude", "--settings"]
         assert json.loads(argv[2])["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
         assert argv[3:] == ["--debug"]
-        assert calls[3:] == [
-            ("stop",),
-            ("shutdown",),
-            ("close",),
-        ]
+        assert calls[3:] == [("shutdown",), ("close",)]
 
     def test_smart_routing_uses_anthropic_proxy(self, monkeypatch):
         calls: list[tuple] = []
@@ -957,27 +1043,21 @@ class TestClaudeLaunch:
             def shutdown(self):
                 calls.append(("shutdown",))
 
-        class Cache:
-            token = "fresh-token"
-
-            def stop(self):
-                calls.append(("stop",))
-
         class Client:
             def close(self):
                 calls.append(("close",))
 
-        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
-            calls.append(
-                ("proxy", workspace, profile, port, token_header, force_refresh_near_expiry)
-            )
-            return Server(), Cache(), Client()
+        def start_proxy(workspace, port):
+            calls.append(("proxy", workspace, port))
+            return Server(), Client()
 
         def launch_v2(state, tool_args, **kwargs):
             captured["settings"] = kwargs["compose_settings"](["--debug"])
             raise SystemExit(0)
 
         monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.delenv("OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
         monkeypatch.setattr(claude, "start_anthropic_model_discovery_proxy", start_proxy)
         monkeypatch.setattr(
             claude,
@@ -990,14 +1070,16 @@ class TestClaudeLaunch:
             claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
 
         assert exc.value.code == 0
+        assert "OAUTH_TOKEN" not in os.environ
+        assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
         assert calls[:2] == [
-            ("proxy", WS, "test", 0, claude.AUTHORIZATION_HEADER, True),
+            ("proxy", WS, 0),
             ("serve",),
         ]
         settings, remaining = captured["settings"]
         assert settings["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
         assert remaining == ["--debug"]
-        assert calls[2:] == [("stop",), ("shutdown",), ("close",)]
+        assert calls[2:] == [("shutdown",), ("close",)]
 
 
 class TestWriteToolConfigPrunesStaleModelEnv:

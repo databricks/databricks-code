@@ -619,9 +619,10 @@ class TestCodexLaunch:
         # and points at codex's own error so it doesn't read as their mistake.
         assert "ucode's `--profile`" in err
         assert "error above" in err
-        # Names the fallback config and that Databricks routing is lost.
+        # Names both config scopes Codex will resolve without the ucode profile.
         assert str(codex.LEGACY_CODEX_CONFIG_PATH) in err
-        assert "NOT the Databricks gateway" in err
+        assert "OS-managed settings" in err
+        assert "instead of the ucode profile" in err
         assert captured.out == ""
 
     def test_slow_failure_does_not_retry(self, monkeypatch):
@@ -644,7 +645,7 @@ class TestCodexLaunch:
 
 
 class TestCodexManagedConfig:
-    """use_as_global_settings: also write Codex's OS managed_config.toml (via sudo, mocked)."""
+    """Every normal configuration also reconciles Codex's OS-managed config."""
 
     def _patch(self, tmp_path, monkeypatch):
         config_path = tmp_path / ".codex" / "ucode.config.toml"
@@ -653,21 +654,22 @@ class TestCodexManagedConfig:
         monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "codex-ucode-config.backup.toml")
         monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
         monkeypatch.setattr(codex, "save_state", lambda state: None)
+        monkeypatch.setattr(codex, "managed_writes_allowed", lambda: True)
         # Deterministic managed path + a mocked sudo writer that writes straight to disk, so the test
         # can read the TOML back and NO real sudo/`/etc` write ever happens.
         monkeypatch.setattr(codex, "_managed_config_path", lambda: managed_path)
 
-        def fake_write_managed(path, text, *, display):
+        def fake_write_managed(path, text, **kwargs):
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             Path(path).write_text(text, encoding="utf-8")
             return "written"
 
-        monkeypatch.setattr(codex, "write_managed_file", fake_write_managed)
+        monkeypatch.setattr(codex, "reconcile_managed_file", fake_write_managed)
         return config_path, managed_path
 
-    def test_writes_managed_config_when_flagged(self, tmp_path, monkeypatch):
+    def test_writes_managed_config_by_default(self, tmp_path, monkeypatch):
         _, managed_path = self._patch(tmp_path, monkeypatch)
-        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
+        state = {"workspace": WS, "codex_models": ["gpt-5"]}
         codex.write_tool_config(state)
 
         doc = read_toml_safe(managed_path)
@@ -681,7 +683,7 @@ class TestCodexManagedConfig:
         managed_path.write_text(
             'model = "my-own"\napproval_policy = "on-request"\n', encoding="utf-8"
         )
-        state = {"workspace": WS, "codex_models": ["gpt-5"], "write_managed_config": True}
+        state = {"workspace": WS, "codex_models": ["gpt-5"]}
         codex.write_tool_config(state)
 
         doc = read_toml_safe(managed_path)
@@ -689,8 +691,41 @@ class TestCodexManagedConfig:
         assert doc["approval_policy"] == "on-request"
         assert "model" not in doc
 
-    def test_no_managed_write_by_default(self, tmp_path, monkeypatch):
+    def test_noninteractive_uses_local_config_when_managed_config_is_compatible(
+        self, tmp_path, monkeypatch
+    ):
         _, managed_path = self._patch(tmp_path, monkeypatch)
+        monkeypatch.setattr(codex, "managed_writes_allowed", lambda: False)
         state = {"workspace": WS, "codex_models": ["gpt-5"]}
         codex.write_tool_config(state)
         assert not managed_path.exists()
+
+    def test_noninteractive_preserves_unrelated_managed_config(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        managed_path.parent.mkdir(parents=True, exist_ok=True)
+        original = 'approval_policy = "on-request"\n'
+        managed_path.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(codex, "managed_writes_allowed", lambda: False)
+
+        codex.write_tool_config({"workspace": WS, "codex_models": ["gpt-5"]})
+
+        assert managed_path.read_text(encoding="utf-8") == original
+
+    def test_noninteractive_fails_when_managed_config_conflicts(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        managed_path.parent.mkdir(parents=True, exist_ok=True)
+        managed_path.write_text('model_provider = "enterprise"\n', encoding="utf-8")
+        monkeypatch.setattr(codex, "managed_writes_allowed", lambda: False)
+
+        with pytest.raises(RuntimeError, match="cannot be applied non-interactively"):
+            codex.write_tool_config({"workspace": WS, "codex_models": ["gpt-5"]})
+
+    def test_invalid_managed_toml_is_not_modified(self, tmp_path, monkeypatch):
+        _, managed_path = self._patch(tmp_path, monkeypatch)
+        managed_path.parent.mkdir(parents=True, exist_ok=True)
+        managed_path.write_text("[invalid", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="Cannot safely update Codex managed settings"):
+            codex.write_tool_config({"workspace": WS, "codex_models": ["gpt-5"]})
+
+        assert managed_path.read_text(encoding="utf-8") == "[invalid"

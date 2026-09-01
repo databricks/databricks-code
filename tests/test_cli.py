@@ -1213,6 +1213,20 @@ class TestRevert:
         assert "Claude Code MCP config: restored" in result.output
 
 
+class TestDoctorCommand:
+    def test_invokes_doctor(self):
+        with patch("ucode.doctor.doctor", return_value=0) as mock_doctor:
+            result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        mock_doctor.assert_called_once_with()
+
+    def test_reports_runtime_error(self):
+        with patch("ucode.doctor.doctor", side_effect=RuntimeError("boom")):
+            result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        assert "boom" in _strip_ansi(result.output)
+
+
 class TestAutoConfigureOnFirstRun:
     def test_uses_existing_claude_settings_without_preflight(self, tmp_path):
         from pathlib import Path
@@ -1384,10 +1398,21 @@ class TestCachedConfigPredicate:
         with (
             patch("ucode.cli.managed_agent_config_enabled", return_value=False),
             patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=True),
         ):
             assert (
                 cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
                 is True
+            )
+
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=False),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
+                is False
             )
 
     def test_accepts_claude_only_when_managed_settings_are_verified(self, tmp_path):
@@ -1427,6 +1452,7 @@ class TestCachedConfigPredicate:
         with (
             patch("ucode.cli.managed_agent_config_enabled", return_value=False),
             patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=True),
         ):
             assert cli_mod._can_launch_from_cached_config("codex", state, **self._kwargs()) is True
 

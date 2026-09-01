@@ -16,6 +16,7 @@ import json
 import shutil
 import subprocess
 
+from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import ToolSpec
 from ucode.databricks import (
     get_databricks_token,
@@ -71,11 +72,7 @@ TOOL_ALIASES = {
 
 DEFAULT_TOOL = "codex"
 BUNDLE_VERSION = 1
-_MANAGED_SETTINGS_TOOLS = {"claude"}
-
-# Codex still honors the legacy managed-config opt-in until its follow-up migration. Claude always
-# reconciles its OS-managed settings and therefore no longer appears in the setup prompt.
-GLOBAL_SETTINGS_AGENTS = frozenset({"codex"})
+_MANAGED_SETTINGS_TOOLS = {"claude", "codex"}
 
 # ucode tool -> `databricks aitools` agent id. gemini/pi aren't supported.
 AITOOLS_AGENT_TOKENS = {
@@ -244,6 +241,38 @@ def ensure_tool_binary_available(tool: str) -> None:
         f"Install it with `npm install -g {spec['package']}` or run "
         f"`ucode configure` to try automatic installation."
     )
+
+
+def tool_binary_installed(tool: str) -> bool:
+    """True when the agent's CLI binary is on PATH. Read-only — for ``ucode doctor``."""
+    return bool(shutil.which(TOOL_SPECS[tool]["binary"]))
+
+
+def tool_update_available(tool: str) -> tuple[str, str] | None:
+    """Return ``(current, latest)`` when a newer agent CLI is published, else None.
+    Read-only wrapper over the npm update check — for ``ucode doctor``."""
+    return available_npm_package_update(TOOL_SPECS[tool]["package"])
+
+
+def update_tool_binary(tool: str) -> bool:
+    """Install the latest agent CLI, returning True on success. Public entry
+    point over the internal updater so ``ucode doctor`` can apply the fix."""
+    return _update_installed_tool_binary(tool)
+
+
+def tracing_mlflow_ok() -> bool:
+    """True when the `mlflow` CLI that Claude tracing needs is installed and in
+    the supported version range. Read-only — for ``ucode doctor``."""
+    current = claude._installed_mlflow_version()
+    return bool(
+        current and claude.MINIMUM_MLFLOW_VERSION <= current < claude.MAXIMUM_MLFLOW_VERSION
+    )
+
+
+def ensure_tracing_mlflow_cli() -> bool:
+    """Install/repair the pinned `mlflow` CLI for Claude tracing, returning True
+    on success. Public entry point so ``ucode doctor`` can apply the fix."""
+    return claude._ensure_mlflow_cli()
 
 
 def ensure_bootstrap_dependencies(
