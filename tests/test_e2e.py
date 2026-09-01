@@ -317,10 +317,8 @@ class TestConfigureSubset:
         # selection plumbing, not the agent binaries themselves.
         monkeypatch.setattr(cli_mod, "install_tool_binary", lambda tool, **kwargs: True)
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
-        # Answer the interactive prompts (provider picker + AI Tools opt-in) so no
-        # prompt reads stdin under capture; "databricks" keeps the Databricks path.
+        # Answer the provider picker; "databricks" keeps the Databricks path.
         monkeypatch.setattr(cli_mod, "prompt_for_selection", lambda prompt, options: "databricks")
-        monkeypatch.setattr(cli_mod, "prompt_yes_no_default", lambda prompt, *, default: default)
 
         rc = cli_mod.configure_workspace_command()
         assert rc == 0
@@ -352,10 +350,8 @@ class TestConfigureSubset:
         )
         monkeypatch.setattr(cli_mod, "install_tool_binary", lambda tool, **kwargs: True)
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
-        # Answer the interactive prompts (provider picker + AI Tools opt-in) so no
-        # prompt reads stdin under capture; "databricks" keeps the Databricks path.
+        # Answer the provider picker; "databricks" keeps the Databricks path.
         monkeypatch.setattr(cli_mod, "prompt_for_selection", lambda prompt, options: "databricks")
-        monkeypatch.setattr(cli_mod, "prompt_yes_no_default", lambda prompt, *, default: default)
 
         # First run: pick codex.
         monkeypatch.setattr(cli_mod, "prompt_for_tools", lambda available: ["codex"])
