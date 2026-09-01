@@ -123,6 +123,14 @@ def _installed_version_status() -> tuple[str, bool] | None:
     return version, parsed < MINIMUM_CLAUDE_VERSION
 
 
+def _minimum_version_requirement_message(version: str) -> str:
+    feature = "Smart routing" if smart_routing_v2.enabled() else "Model discovery"
+    return (
+        f"{feature} requires Claude Code {MINIMUM_CLAUDE_VERSION_TEXT} or newer. "
+        f"Your current version is Claude Code {version}."
+    )
+
+
 def minimum_version_error() -> str | None:
     status = _installed_version_status()
     if status is None:
@@ -130,11 +138,7 @@ def minimum_version_error() -> str | None:
     version, is_too_old = status
     if not is_too_old:
         return None
-    return (
-        f"Claude Code {version} is too old for gateway model discovery. "
-        f"Claude Code must be updated to {MINIMUM_CLAUDE_VERSION_TEXT} or newer; "
-        f"run `npm install -g {SPEC['package']}` or `ucode configure`."
-    )
+    return _minimum_version_requirement_message(version)
 
 
 def required_update_message() -> str | None:
@@ -144,10 +148,7 @@ def required_update_message() -> str | None:
     version, is_too_old = status
     if not is_too_old:
         return None
-    return (
-        f"Claude Code {version} is older than required {MINIMUM_CLAUDE_VERSION_TEXT}; "
-        "updating Claude Code is required for gateway model discovery."
-    )
+    return _minimum_version_requirement_message(version)
 
 
 def _resolve_web_search_model(state: dict) -> str | None:

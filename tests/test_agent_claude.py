@@ -42,24 +42,34 @@ class TestMinimumVersion:
 
     def test_older_version_requires_update(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
-        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247 (Claude Code)")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() == (
-            "Claude Code 2.1.247 (Claude Code) is too old for gateway model discovery. "
-            "Claude Code must be updated to 2.1.248 or newer; run "
-            "`npm install -g @anthropic-ai/claude-code` or `ucode configure`."
+            "Smart routing requires Claude Code 2.1.248 or newer. "
+            "Your current version is Claude Code 2.1.247."
         )
         assert claude.required_update_message() == (
-            "Claude Code 2.1.247 (Claude Code) is older than required 2.1.248; "
-            "updating Claude Code is required for gateway model discovery."
+            "Smart routing requires Claude Code 2.1.248 or newer. "
+            "Your current version is Claude Code 2.1.247."
         )
 
     def test_older_version_requires_update_for_model_discovery(self, monkeypatch):
         monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
-        assert claude.minimum_version_error() is not None
-        assert claude.required_update_message() is not None
+        expected = (
+            "Model discovery requires Claude Code 2.1.248 or newer. "
+            "Your current version is Claude Code 2.1.247."
+        )
+        assert claude.minimum_version_error() == expected
+        assert claude.required_update_message() == expected
+
+    def test_smart_routing_message_wins_when_both_features_are_enabled(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
+
+        assert claude.minimum_version_error().startswith("Smart routing requires")
 
     def test_unknown_version_does_not_block(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
