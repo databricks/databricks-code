@@ -444,6 +444,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if smart_routing_v2.enabled():
+
         def _app_server_start_model() -> str:
             managed_model = default_model(state)
             if managed_model:
