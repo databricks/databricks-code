@@ -24,8 +24,6 @@ MANIFEST = {
         "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}},
         "codex": {"model_config": {"default_model": "system.ai.gpt-5-6"}},
     },
-    "mcp_servers": [{"name": "system.ai.slack", "type": "mcp-service"}],
-    "skills": {"names": ["main.default"]},
 }
 
 
@@ -137,6 +135,16 @@ class TestParsePublishPayload:
     def test_unknown_top_level_field_is_rejected(self):
         with pytest.raises(RuntimeError, match="does not recognize"):
             parse_publish_payload(_payload(bogus="value"), WORKSPACE)
+
+    def test_legacy_mcp_and_skills_are_ignored_not_rejected(self):
+        payload = _payload(
+            mcp_servers=[{"name": "system.ai.slack", "type": "MCP_SERVER_TYPE_UC_SERVICE"}],
+            skills={"names": ["main.default"]},
+        )
+        manifest, api_payload = parse_publish_payload(payload, WORKSPACE)
+        assert "mcp_servers" not in manifest and "skills" not in manifest
+        assert "mcp_servers" not in api_payload and "skills" not in api_payload
+        assert manifest["default_agent"] == "claude"
 
     def test_nested_unknown_field_is_rejected(self):
         payload = _payload()
