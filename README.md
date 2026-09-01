@@ -44,22 +44,17 @@ ucode codex --full-auto
 
 All agents route through Databricks AI Gateway using your workspace credentials — no API keys required.
 
-Smart routing is opt-in for Codex and Claude Code. Enabling it asks the AI Gateway router
-to select the root-session model before launch and installs profile-scoped hooks that route
-future subagent calls. Codex may require one-time review of the installed hooks through `/hooks`.
+Smart routing is opt-in for Codex and Claude Code. Enabling it for a launch asks the AI Gateway
+router to select models for that session and its subagents. Codex may require one-time review of
+the launch-scoped hooks through `/hooks`.
 
 ```bash
 ucode codex --enable-smart-routing
 ucode claude --enable-smart-routing
 ```
 
-The setting persists per workspace for each agent. Disable and remove only ucode's routing
-hooks with:
-
-```bash
-ucode codex --disable-smart-routing
-ucode claude --disable-smart-routing
-```
+The flag applies only to that launch; later launches use normal model selection unless the flag is
+passed again.
 
 To configure all tools at once:
 
@@ -346,10 +341,8 @@ The output looks like:
 | `ucode configure --profiles DEFAULT` | Configure using existing Databricks CLI profiles (hosts come from `~/.databrickscfg`) |
 | `ucode configure --profiles DEFAULT --use-pat` | Authenticate with the profile's personal access token — no browser login |
 | `ucode codex --enable-smart-routing` | Enable AI Gateway routing for Codex sessions and subagents |
-| `ucode codex --disable-smart-routing` | Disable routing and remove ucode's Codex routing hooks |
 | `ucode codex --refresh` | Re-check Databricks, refresh models/configuration, and launch Codex |
 | `ucode claude --enable-smart-routing` | Enable AI Gateway routing for Claude Code sessions and subagents |
-| `ucode claude --disable-smart-routing` | Disable routing and remove ucode's Claude Code routing hooks |
 | `ucode claude --refresh` | Re-check Databricks, refresh models/configuration, and launch Claude Code |
 | `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
 | `ucode configure --agents claude,codex,pi --skip-unavailable` | Configure the requested agents that are available; skip the rest with a warning |
