@@ -35,6 +35,7 @@ from ucode.ui import (
     print_heading,
     print_note,
     print_warning,
+    prompt_for_selection,
     prompt_yes_no_default,
     render_box_table,
     spinner,
@@ -503,7 +504,13 @@ class ToolUsageTotals(NamedTuple):
     cost: Decimal | None
 
 
-TOOL_MODEL_TABLE_HEADERS = ["Model", "Requests", "Input (incl. cache)", "Output", "Cost (USD)"]
+TOOL_MODEL_TABLE_HEADERS = [
+    "Model",
+    "Requests",
+    "Input (incl. cache)",
+    "Output",
+    "Est. Cost (USD)",
+]
 
 
 def aggregate_tool_model_usage(records: list[dict[str, object]], tool: str) -> list[ModelUsage]:
@@ -653,7 +660,7 @@ def render_usage_summary(
             key=lambda u: (-u.total, u.name.lower()),
         )[:3]
         models_text = ", ".join(usage.name for usage in top_models)
-        lines.append(f"{label('Top models this week:')} {value(models_text)}")
+        lines.append(f"{label('Top models last 7 days:')} {value(models_text)}")
         weekly_cost = sum(
             (
                 model_usage_cost(usage, price_lookup) or Decimal(0)
@@ -689,6 +696,49 @@ def run_query_on_first_working_warehouse(
             print_warning(f"SQL warehouse `{warehouse.label}` is unusable: {exc}")
             continue
         return warehouse.http_path, columns, rows
+    raise last_error or RuntimeError("No SQL warehouse could run the usage query.")
+
+
+def select_sql_warehouse(candidates: list[SqlWarehouse]) -> SqlWarehouse | None:
+    """Ask which discovered warehouse should run the detailed usage query."""
+    selected_path = prompt_for_selection(
+        "Select a SQL warehouse for the usage query:",
+        [
+            (warehouse.http_path, f"{warehouse.label} ({warehouse.state})")
+            for warehouse in candidates
+        ],
+    )
+    return next(
+        (warehouse for warehouse in candidates if warehouse.http_path == selected_path),
+        None,
+    )
+
+
+def select_and_run_usage_query(
+    workspace: str,
+    token: str,
+    candidates: list[SqlWarehouse],
+    query: str,
+) -> tuple[str, list[str], list[tuple]] | None:
+    """Let the user choose warehouses until one runs the query or they cancel.
+
+    A failed warehouse is removed before the picker is shown again so the user cannot
+    accidentally retry the same unusable option forever. Returns ``None`` when the picker
+    is cancelled and raises the final warehouse error when no candidates remain.
+    """
+    remaining = list(candidates)
+    last_error: RuntimeError | None = None
+    while remaining:
+        selected = select_sql_warehouse(remaining)
+        if selected is None:
+            return None
+        try:
+            return run_query_on_first_working_warehouse(workspace, token, [selected], query)
+        except RuntimeError as exc:
+            last_error = exc
+            remaining = [
+                warehouse for warehouse in remaining if warehouse.http_path != selected.http_path
+            ]
     raise last_error or RuntimeError("No SQL warehouse could run the usage query.")
 
 
@@ -746,10 +796,18 @@ def usage(warehouse_id: str | None = None) -> int:
 
     with spinner("Discovering SQL warehouse..."):
         candidates = discover_sql_warehouses(workspace, token, warehouse_id=warehouse_id)
-
-    resolved_http_path, columns, rows = run_query_on_first_working_warehouse(
-        workspace, token, candidates, build_usage_report_query()
-    )
+    if warehouse_id is None:
+        query_result = select_and_run_usage_query(
+            workspace, token, candidates, build_usage_report_query()
+        )
+        if query_result is None:
+            print_note("Usage details cancelled.")
+            return 0
+        resolved_http_path, columns, rows = query_result
+    else:
+        resolved_http_path, columns, rows = run_query_on_first_working_warehouse(
+            workspace, token, candidates, build_usage_report_query()
+        )
     records = parse_usage_rows(columns, rows)
     requester_name = find_requester_name(workspace, resolved_http_path, token, records)
 
@@ -793,6 +851,6 @@ def usage(warehouse_id: str | None = None) -> int:
         console.print(f"{label('Requests:')} {value(f'{totals.requests:,}')}")
         console.print(f"{label('Total tokens:')} {value(f'{totals.tokens:,}')}")
         if totals.cost is not None:
-            console.print(f"{label('Cost (USD):')} {value(format_cost_usd(totals.cost))}")
+            console.print(f"{label('Est. Cost (USD):')} {value(format_cost_usd(totals.cost))}")
         console.print(render_box_table(TOOL_MODEL_TABLE_HEADERS, rows, max_widths=table_widths))
     return 0
