@@ -18,11 +18,10 @@ from ucode.managed_resolve import (
     managed_state_overrides,
     managed_supplies_models,
     managed_unservable_models,
-    managed_use_as_global_settings,
     recommended_agent,
     resolve_state,
 )
-from ucode.state import MANAGED_OVERLAY_KEY, _without_managed_overlay
+from ucode.state import MANAGED_OVERLAY_KEY
 
 WORKSPACE = "https://ws.example.com"
 
@@ -32,7 +31,6 @@ MANAGED = {
     "default_agent": "claude",
     "enabled_agents": {
         "claude": {
-            "use_as_global_settings": True,
             "model_config": {
                 "default_model": "system.ai.claude-opus-5",
                 "models": {
@@ -182,37 +180,6 @@ class TestResolveState:
             "claude": "main.default.keep",
             "codex": "main.default.managed",
         }
-
-
-class TestGlobalSettings:
-    def test_only_codex_keeps_the_legacy_global_settings_flag(self):
-        from ucode.agents import GLOBAL_SETTINGS_AGENTS
-
-        assert GLOBAL_SETTINGS_AGENTS == frozenset({"codex"})
-
-    def test_claude_no_longer_honors_the_legacy_flag(self):
-        assert managed_use_as_global_settings(MANAGED, "claude") is False
-
-    def test_flag_false_when_not_opted_in(self):
-        # codex is enabled but never marked machine-wide.
-        assert managed_use_as_global_settings(MANAGED, "codex") is False
-
-    def test_flag_ignored_for_unsupported_agent(self):
-        # A hand-written --from-file config can't turn it on for an agent whose token can't refresh.
-        managed = {"enabled_agents": {"gemini": {"use_as_global_settings": True}}}
-        assert managed_use_as_global_settings(managed, "gemini") is False
-
-    def test_resolve_does_not_set_transient_flag_for_claude(self):
-        resolved = resolve_state(MANAGED, _state(), "claude")
-        assert "write_managed_config" not in resolved
-
-    def test_resolve_omits_flag_when_not_opted_in(self):
-        resolved = resolve_state(MANAGED, _state(), "codex")
-        assert "write_managed_config" not in resolved
-
-    def test_removed_claude_flag_is_not_persisted(self):
-        resolved = resolve_state(MANAGED, _state(), "claude")
-        assert "write_managed_config" not in _without_managed_overlay(resolved)
 
 
 class TestStateFileIsNotRewritten:
@@ -408,7 +375,7 @@ class TestManagedSuppliesModels:
 
     def test_false_when_the_config_names_no_models(self):
         # Discovery still has to run, or the launch has nothing to pin.
-        managed = {"enabled_agents": {"claude": {"use_as_global_settings": True}}}
+        managed = {"enabled_agents": {"claude": {}}}
         assert managed_supplies_models(managed, "claude") is False
 
     def test_false_for_an_agent_the_config_does_not_cover(self):

@@ -3,15 +3,14 @@
 ## Summary
 
 Claude Code and Codex give OS-managed settings higher precedence than user settings. Previously,
-ucode wrote only its local configuration unless an administrator enabled
-`use_as_global_settings`. An existing machine-managed file could therefore silently override the
-gateway endpoint, authentication helper, provider headers, or model selected by ucode.
+ucode could write only its local configuration while an existing machine-managed file silently
+overrode the gateway endpoint, authentication helper, provider headers, or model.
 
 The two stacked PRs make precedence handling deterministic:
 
 1. The Claude PR adds the shared managed-file lifecycle and applies it to Claude Code.
-2. The Codex PR reuses that lifecycle for TOML, applies it to Codex, and removes
-   `use_as_global_settings`.
+2. The Codex PR reuses that lifecycle for TOML, applies it to Codex, and removes the old optional
+   managed-settings path.
 
 After both PRs merge, interactive configuration reconciles the agent's OS-managed file by default.
 Non-interactive and CI execution never elevates privileges and instead uses local settings when the
@@ -59,7 +58,7 @@ request administrator permission. A first-time non-interactive launch remains lo
 For each agent, ucode:
 
 1. Strictly parses the existing managed JSON or TOML document.
-2. Produces the desired document by applying the same overlay used for the local ucode file.
+2. Produces the desired document by applying the same gateway overlay used for the local ucode file.
 3. Preserves settings outside the paths owned by ucode.
 4. Preserves enterprise Claude permission-deny entries while adding ucode-required entries.
 5. Records the original baseline before the first change.
@@ -204,19 +203,6 @@ Write, verification, parse, symlink, and managed-conflict failures block the age
 information always identifies the file and recommends either an interactive configure/revert or
 administrator help.
 
-## Removal of `use_as_global_settings`
-
-The final behavior has no managed-config scope choice:
-
-- Claude and Codex reconcile OS-managed settings automatically during interactive configuration.
-- Other agents continue using their existing local configuration because they do not have the same
-  supported self-refreshing managed-file path.
-- The Codex PR removes `use_as_global_settings` from schemas, resolution, setup prompts, summaries,
-  documentation, and tests.
-
-The Claude PR temporarily leaves Codex's legacy interpretation in place so that the first PR is
-independently safe. The stacked Codex PR removes the remaining field and transitional code.
-
 ## PR Boundaries
 
 ### PR 1: Claude Code
@@ -227,7 +213,7 @@ independently safe. The stacked Codex PR removes the remaining field and transit
 - Add non-interactive local fallback with conflict detection.
 - Add Claude relay-specific safety checks.
 - Add Claude managed status and revert output.
-- Remove Claude from the legacy `use_as_global_settings` setup choice.
+- Remove Claude's old managed-settings scope choice.
 
 ### PR 2: Codex
 
@@ -235,4 +221,6 @@ independently safe. The stacked Codex PR removes the remaining field and transit
 - Make interactive Codex configuration reconcile OS-managed TOML by default.
 - Add non-interactive local fallback with conflict detection.
 - Add Codex fingerprinted cached launches, status, and revert behavior.
-- Remove all remaining `use_as_global_settings` code and documentation.
+- Keep opt-in smart-routing hooks in the local Codex config rather than adding them by default to
+  machine-managed policy.
+- Remove the remaining managed-settings scope schema, resolution, setup prompt, summary, and tests.

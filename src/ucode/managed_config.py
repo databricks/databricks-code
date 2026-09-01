@@ -150,8 +150,6 @@ def _normalize_enabled_agent(entry: object) -> tuple[str, dict] | None:
         return None
     config_in = _as_dict(entry_dict.get("config"))
     agent_config: dict = {}
-    if isinstance(config_in.get("use_as_global_settings"), bool):
-        agent_config["use_as_global_settings"] = config_in["use_as_global_settings"]
     headers = config_in.get("custom_headers")
     if isinstance(headers, dict):
         clean = {
