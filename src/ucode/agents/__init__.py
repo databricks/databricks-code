@@ -16,6 +16,7 @@ import json
 import shutil
 import subprocess
 
+from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import ToolSpec
 from ucode.databricks import (
     get_databricks_token,
@@ -253,8 +254,8 @@ def tool_binary_installed(tool: str) -> bool:
 
 def tool_update_available(tool: str) -> tuple[str, str] | None:
     """Return ``(current, latest)`` when a newer agent CLI is published, else None.
-    Read-only wrapper over the per-agent update check — for ``ucode doctor``."""
-    return _MODULES[tool].is_update_available()
+    Read-only wrapper over the npm update check — for ``ucode doctor``."""
+    return available_npm_package_update(TOOL_SPECS[tool]["package"])
 
 
 def update_tool_binary(tool: str) -> bool:

@@ -336,7 +336,7 @@ The output looks like:
 |---------|-------------|
 | `ucode status` | Show current workspace, base URLs, managed config files, and selected models |
 | `ucode export` | Print the workspace's managed config as portable JSON (`--file <file>` / `-f` to write a file) |
-| `ucode doctor` | Diagnose the local setup (uv, npm, Databricks CLI, workspace, credentials, agent CLIs, tracing) and offer to fix any problems found |
+| `ucode doctor` | Diagnose local issues (uv, npm, Databricks CLI, workspace, credentials, agent CLIs, tracing) and offer to fix any problems found |
 | `ucode usage` | Show AI Gateway usage summary, plus your budget spend against its alert threshold when the workspace reports one |
 | `ucode usage --warehouse-id <id>` | Query a specific SQL warehouse instead of discovering one |
 | `ucode revert` | Clear saved state and restore backed-up config files |
