@@ -1396,7 +1396,15 @@ def auth_token_cmd(
             )
             raise typer.Exit(1)
     try:
-        token = get_databricks_token(workspace, profile)
+        # force_refresh: this helper is re-invoked by Claude Code's apiKeyHelper
+        # (and Codex's auth command) on the CLAUDE_CODE_API_KEY_HELPER_TTL_MS
+        # interval (15 min). Forcing a refresh each cycle hands back a token with
+        # a full fresh lifetime, so a long session never dies at the original
+        # token's ~1h expiry. Without it, `databricks auth token` only refreshes
+        # when it independently judges the cached token "close to expiry", which
+        # can lapse between invocations. Mirrors the force_refresh=True used by
+        # the gemini/opencode/copilot/pi background refreshers.
+        token = get_databricks_token(workspace, profile, force_refresh=True)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

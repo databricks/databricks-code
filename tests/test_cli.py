@@ -701,7 +701,9 @@ class TestAuthTokenCommand:
         # Nothing but the bare token (plus trailing newline) may reach stdout,
         # or the consuming agent will treat the noise as part of the token.
         assert result.stdout == "tok-123\n"
-        fetch.assert_called_once_with("https://ws", None)
+        # force_refresh=True so each 15-min apiKeyHelper cycle yields a token with
+        # a full fresh lifetime (long sessions otherwise die at ~1h expiry).
+        fetch.assert_called_once_with("https://ws", None, force_refresh=True)
 
     def test_host_and_profile_override_state(self):
         with (
@@ -712,7 +714,7 @@ class TestAuthTokenCommand:
                 app, ["auth-token", "--host", "https://override", "--profile", "prod"]
             )
         assert result.exit_code == 0
-        fetch.assert_called_once_with("https://override", "prod")
+        fetch.assert_called_once_with("https://override", "prod", force_refresh=True)
 
     def test_errors_without_workspace(self):
         with patch("ucode.cli.load_state", return_value={}):
@@ -734,7 +736,9 @@ class TestAuthTokenCommand:
             patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
             patch(
                 "ucode.cli.get_databricks_token",
-                side_effect=lambda w, p: os.environ.get("DATABRICKS_BEARER", ""),
+                side_effect=lambda w, p, *, force_refresh=False: os.environ.get(
+                    "DATABRICKS_BEARER", ""
+                ),
             ),
         ):
             result = runner.invoke(app, ["auth-token", "--use-pat", "--profile", "p"])
@@ -750,7 +754,9 @@ class TestAuthTokenCommand:
             patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
             patch(
                 "ucode.cli.get_databricks_token",
-                side_effect=lambda w, p: os.environ.get("DATABRICKS_BEARER", ""),
+                side_effect=lambda w, p, *, force_refresh=False: os.environ.get(
+                    "DATABRICKS_BEARER", ""
+                ),
             ),
         ):
             result = runner.invoke(app, ["auth-token", "--use-pat", "--profile", "p"])
@@ -780,7 +786,9 @@ class TestAuthTokenCommand:
             patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
             patch(
                 "ucode.cli.get_databricks_token",
-                side_effect=lambda w, p: os.environ.get("DATABRICKS_BEARER", ""),
+                side_effect=lambda w, p, *, force_refresh=False: os.environ.get(
+                    "DATABRICKS_BEARER", ""
+                ),
             ),
         ):
             result = runner.invoke(app, ["auth-token", "--use-pat", "--profile", "p"])
