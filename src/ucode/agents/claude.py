@@ -111,10 +111,7 @@ def _parse_version(value: str) -> tuple[int, int, int] | None:
 
 
 def _installed_version_status() -> tuple[str, bool] | None:
-    if (
-        os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) != "1"
-        and not smart_routing_v2.enabled()
-    ):
+    if os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) != "1" and not smart_routing_v2.enabled():
         return None
     version = agent_version(SPEC["binary"])
     parsed = _parse_version(version)
