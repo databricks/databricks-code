@@ -33,6 +33,7 @@ from ucode.smart_routing.codex_hooks import merge_pre_tool_use_hooks, routing_mo
 from ucode.ui import print_note
 
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
+LEGACY_STATE_KEY = "smart_routing_enabled"
 
 CODEX_INTERPOSER_LOG = APP_DIR / "codex-v2-interposer.log"
 

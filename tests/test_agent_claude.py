@@ -763,7 +763,6 @@ class TestClaudeLaunch:
         [
             ["--print", "say hi"],
             ["doctor"],
-            ["--", "fix this bug"],
         ],
     )
     def test_v2_noninteractive_launch_bypasses_first_prompt_routing(self, monkeypatch, tool_args):
@@ -777,6 +776,18 @@ class TestClaudeLaunch:
 
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]]
         v2.launch_claude.assert_not_called()
+
+    @pytest.mark.parametrize("tool_args", [["fix this bug"], ["--", "fix this bug"]])
+    def test_v2_positional_prompt_uses_first_prompt_routing(self, monkeypatch, tool_args):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        launch_v2 = Mock()
+        monkeypatch.setattr(claude, "_launch_claude_with_gateway_proxy", launch_v2)
+
+        claude.launch({"workspace": WS}, tool_args)
+
+        launch_v2.assert_called_once_with(
+            {"workspace": WS}, "claude", tool_args, smart_routing=True
+        )
 
     def test_v2_does_not_treat_option_value_as_positional_argument(self):
         assert claude._uses_interactive_tui(["--name", "doctor"]) is True
@@ -1136,27 +1147,29 @@ class TestClaudeSmartRouting:
         monkeypatch.setattr(claude, "save_state", lambda state: None)
         monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
 
-    def test_enable_sets_state_key(self):
-        state = claude.enable_smart_routing({})
-        assert state[claude.SMART_ROUTING_STATE_KEY] is True
-
-    def test_enabled_reads_state_key(self):
-        assert claude.smart_routing_enabled({claude.SMART_ROUTING_STATE_KEY: True})
-        assert not claude.smart_routing_enabled({})
-
-    def test_write_config_installs_routing_hooks(self, monkeypatch):
+    def test_write_config_removes_legacy_routing_hooks(self, monkeypatch):
         written: list = []
-        self._capture_write(monkeypatch, {}, written)
+        existing = {
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"command": "user-policy"}]},
+                    {
+                        "matcher": "Agent|Task",
+                        "hooks": [{"command": "ucode claude-router-hook route-subagent"}],
+                    },
+                ]
+            }
+        }
+        self._capture_write(monkeypatch, existing, written)
         state = {
             "workspace": WS,
             "claude_models": {"opus": "system.ai.claude-opus-4-8"},
             claude.SMART_ROUTING_STATE_KEY: True,
         }
         claude.write_tool_config(state, "system.ai.claude-opus-4-8", route_root_model=None)
-        hooks = written[0]["hooks"]
-        assert set(hooks) == {"PreToolUse", "SessionStart", "SubagentStart"}
-        commands = [hook["command"] for group in hooks["PreToolUse"] for hook in group["hooks"]]
-        assert any("claude-router-hook" in command for command in commands)
+        assert written[0]["hooks"]["PreToolUse"] == [
+            {"matcher": "Bash", "hooks": [{"command": "user-policy"}]}
+        ]
 
     def test_root_model_pins_anthropic_model(self, monkeypatch):
         written: list = []

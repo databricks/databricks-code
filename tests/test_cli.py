@@ -14,7 +14,6 @@ import pytest
 from typer.testing import CliRunner
 
 from ucode.cli import app
-from ucode.smart_routing.routing import RoutingDecision
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -221,12 +220,33 @@ class TestSubcommandRouting:
         mock_set.assert_not_called()
 
     def test_codex_enable_smart_routing_is_consumed_by_ucode(self):
-        with patch("ucode.cli._launch_tool") as mock_launch:
+        enabled_during_launch = []
+        with patch(
+            "ucode.cli._launch_tool",
+            side_effect=lambda *_args, **_kwargs: enabled_during_launch.append(
+                os.environ.get("ENABLE_SMART_ROUTING_V2")
+            ),
+        ) as mock_launch:
             result = runner.invoke(app, ["codex", "--enable-smart-routing"])
 
         assert result.exit_code == 0, result.output
-        assert mock_launch.call_args.kwargs["enable_smart_routing_flag"] is True
+        assert enabled_during_launch == ["1"]
+        assert "ENABLE_SMART_ROUTING_V2" not in os.environ
         assert mock_launch.call_args.args[1].args == []
+
+    def test_claude_enable_smart_routing_forwards_positional_prompt_to_v2(self):
+        captured = []
+
+        def capture(_tool, ctx, **_kwargs):
+            captured.append((os.environ.get("ENABLE_SMART_ROUTING_V2"), ctx.args))
+
+        with patch("ucode.cli._launch_tool", side_effect=capture):
+            result = runner.invoke(
+                app, ["claude", "--enable-smart-routing", "--", "fix the parser"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured == [("1", ["fix the parser"])]
 
     def test_codex_refresh_is_consumed_by_ucode(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
@@ -302,92 +322,43 @@ class TestSubcommandRouting:
         assert result.exit_code == 1
         assert "Use only one" in result.output
 
-    def test_enabled_codex_launch_uses_routed_root_model(self):
-        state = {
-            **MINIMAL_STATE,
-            "smart_routing_enabled": True,
-            "codex_models": ["databricks-gpt-5", "databricks-gpt-5-5"],
-        }
-        decision = RoutingDecision(
-            model="databricks-gpt-5-5",
-            raw_model="gpt-5-6-sol",
-            rationale="Cross-cutting refactor.",
-        )
-        with (
-            patch("ucode.cli.ensure_bootstrap_dependencies"),
-            patch("ucode.cli.load_state", return_value=state),
-            patch("ucode.cli.ensure_provider_state", return_value=state),
-            patch("ucode.cli.configure_shared_state", return_value=state),
-            patch(
-                "ucode.cli.resolve_launch_model",
-                return_value=(state, "databricks-gpt-5"),
-            ),
-            patch(
-                "ucode.cli.codex_routing.route_launch_model",
-                return_value=(decision, None),
-            ),
-            patch("ucode.cli.configure_tool", return_value=state) as mock_configure,
-            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
-            patch("ucode.cli.launch_agent"),
-        ):
-            result = runner.invoke(app, ["codex"])
+    @pytest.mark.parametrize("tool", ["codex", "claude"])
+    def test_disable_smart_routing_is_hidden(self, tool):
+        result = runner.invoke(app, [tool, "--help"])
 
         assert result.exit_code == 0, result.output
-        assert mock_configure.call_args.args[2] == "databricks-gpt-5-5"
-        # The launch notice surfaces both the routed model and the rationale.
-        output = _strip_ansi(result.output)
-        assert "Using Unity Gateway Smart Router." in output
-        assert "Selected Model : databricks-gpt-5-5" in output
-        assert "Reason : Cross-cutting refactor." in output
+        assert "--disable-smart-routing" not in result.output
 
-    @pytest.mark.parametrize("tool", ["claude", "codex"])
-    def test_forwarded_model_skips_legacy_smart_routing(self, tool):
-        model = f"system.ai.{tool}-override"
+    def test_legacy_opt_in_migrates_both_agents(self):
+        from ucode.cli import _migrate_legacy_smart_routing
+
+        state = {**MINIMAL_STATE, "smart_routing_enabled": True}
+        with (
+            patch("ucode.cli.codex_agent.disable_smart_routing") as disable_codex,
+            patch("ucode.cli.claude_agent.disable_smart_routing") as disable_claude,
+        ):
+            migrated = _migrate_legacy_smart_routing(state)
+
+        assert migrated is state
+        disable_codex.assert_called_once_with(state)
+        disable_claude.assert_called_once_with(state)
+
+    def test_claude_v2_skips_legacy_prelaunch_routing(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
         state = {
             **MINIMAL_STATE,
-            "smart_routing_enabled": True,
             "claude_models": {"opus": "system.ai.claude-opus-4-8"},
-            "codex_models": ["system.ai.gpt-5-6-luna"],
         }
-        routing_module = "claude_routing" if tool == "claude" else "codex_routing"
         with (
             patch("ucode.cli.ensure_bootstrap_dependencies"),
             patch("ucode.cli.load_state", return_value=state),
             patch("ucode.cli.ensure_provider_state", return_value=state),
             patch("ucode.cli._can_launch_from_cached_config", return_value=False),
             patch("ucode.cli.configure_shared_state", return_value=state),
-            patch("ucode.cli.resolve_launch_model", return_value=(state, "configured-model")),
-            patch("ucode.cli.configure_tool", return_value=state),
-            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
-            patch(f"ucode.cli.{routing_module}.route_launch_model") as mock_route,
-            patch("ucode.cli.launch_agent"),
-        ):
-            result = runner.invoke(
-                app,
-                [tool, "--workspace", "https://example.databricks.com", "--", "--model", model],
-            )
-
-        assert result.exit_code == 0, result.output
-        assert f"Model: {model}" in _strip_ansi(result.output)
-        mock_route.assert_not_called()
-
-    def test_claude_v2_skips_legacy_prelaunch_routing(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
-        state = {
-            **MINIMAL_STATE,
-            "smart_routing_enabled": True,
-            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
-        }
-        with (
-            patch("ucode.cli.ensure_bootstrap_dependencies"),
-            patch("ucode.cli.load_state", return_value=state),
-            patch("ucode.cli.ensure_provider_state", return_value=state),
-            patch("ucode.cli.configure_shared_state", return_value=state),
             patch(
                 "ucode.cli.resolve_launch_model",
                 return_value=(state, "system.ai.claude-opus-4-8"),
             ),
-            patch("ucode.cli.claude_routing.route_launch_model") as mock_route,
             patch("ucode.cli.configure_tool", return_value=state) as mock_configure,
             patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
             patch("ucode.cli.launch_agent") as mock_launch,
@@ -395,7 +366,6 @@ class TestSubcommandRouting:
             result = runner.invoke(app, ["claude"])
 
         assert result.exit_code == 0, result.output
-        mock_route.assert_not_called()
         assert mock_configure.call_args.kwargs["route_root_model"] is None
         assert "_claude_launch_model" not in mock_launch.call_args.args[1]
 
@@ -441,7 +411,7 @@ class TestSubcommandRouting:
                     "system.ai.gpt-5-6-sol",
                 ],
                 input='{"tool_name":"collaboration.spawn_agent","tool_input":{"message":"fix it"}}',
-                env=token_env,
+                env={"ENABLE_SMART_ROUTING_V2": "1", **token_env},
             )
 
         assert result.exit_code == 0, result.output
@@ -497,7 +467,6 @@ class TestSubcommandRouting:
                 "ucode.cli.smart_routing_v2.route_claude_pre_tool_use",
                 return_value=routed,
             ) as mock_v2_route,
-            patch("ucode.cli.claude_routing.route_pre_tool_use") as mock_legacy_route,
         ):
             result = runner.invoke(
                 app,
@@ -516,7 +485,6 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert json.loads(result.output) == routed
         mock_v2_route.assert_called_once()
-        mock_legacy_route.assert_not_called()
 
 
 class TestClaudeModelFlag:
@@ -1453,7 +1421,6 @@ class TestCachedConfigPredicate:
             "refresh": False,
             "model": None,
             "explicit_provider": None,
-            "enable_smart_routing_flag": False,
             "workspace_url": None,
         }
         kwargs.update(overrides)
@@ -1518,7 +1485,6 @@ class TestCachedConfigPredicate:
         [
             {"refresh": True},
             {"explicit_provider": "catalog.schema.provider"},
-            {"enable_smart_routing_flag": True},
             {"workspace_url": "https://other.databricks.com"},
         ],
     )

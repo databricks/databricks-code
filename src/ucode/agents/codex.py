@@ -27,6 +27,7 @@ from ucode.databricks import (
 )
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import OS, current_os, write_managed_file
+from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
@@ -44,11 +45,8 @@ LEGACY_CODEX_BACKUP_PATH = APP_DIR / "codex-config.backup.toml"
 CODEX_MODEL_PROVIDER_NAME = "ucode-databricks"
 MINIMUM_CODEX_VERSION = (0, 134, 0)
 MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
-MINIMUM_ROUTING_CODEX_VERSION = (0, 145, 0)
-MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
-# Shared across agents: one opt-in enables smart routing for every routing-capable
-# tool (codex, claude), so a workspace turns it on once.
-SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
+# Retained only to identify and remove state written by the legacy persisted opt-in.
+SMART_ROUTING_STATE_KEY = smart_routing_v2.LEGACY_STATE_KEY
 
 SPEC: ToolSpec = {
     "binary": "codex",
@@ -296,10 +294,6 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     databricks_profile = state.get("profile")
 
     if _use_legacy_layout():
-        if smart_routing_enabled(state) and provider is None:
-            raise RuntimeError(
-                f"Codex smart routing requires Codex {MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer."
-            )
         # Codex < 0.134.0 only reads ~/.codex/config.toml. Write the shared
         # config with [profiles.ucode] + shared [model_providers.ucode-databricks]
         # and skip the per-profile-file cleanup that would normally strip
@@ -346,7 +340,7 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
     sync_smart_routing_hooks(
         doc,
         state,
-        enabled=smart_routing_enabled(state) and provider is None,
+        enabled=False,
     )
     write_toml_file(CODEX_CONFIG_PATH, doc)
     # use_as_global_settings: also write the modern overlay to Codex's OS managed config
@@ -451,11 +445,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
     clear_model_preferences(state)
     binary = SPEC["binary"]
     workspace = state.get("workspace")
-    if os.environ.get("ENABLE_SMART_ROUTING_V2") == "1":
-        # V2 imports the WebSocket interposer; keep it out of the legacy import
-        # path so flag-off launches retain their existing dependencies and behavior.
-        from ucode.smart_routing import v2 as smart_routing_v2
-
+    if smart_routing_v2.enabled():
         smart_routing_v2.launch_codex(
             state,
             tool_args,
@@ -500,24 +490,6 @@ def launch(state: dict, tool_args: list[str]) -> None:
         exec_or_spawn([binary, *tool_args])
         return  # unreachable in production (exec replaces the process)
     sys.exit(returncode)
-
-
-def smart_routing_enabled(state: dict) -> bool:
-    """Return whether the current workspace opted into Codex routing."""
-    return state.get(SMART_ROUTING_STATE_KEY) is True
-
-
-def enable_smart_routing(state: dict) -> dict:
-    """Persist the current workspace's Codex smart-routing opt-in."""
-    parsed = _parse_version(agent_version(SPEC["binary"]))
-    if parsed is not None and parsed < MINIMUM_ROUTING_CODEX_VERSION:
-        raise RuntimeError(
-            "Codex smart routing requires Codex "
-            f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found "
-            f"{agent_version(SPEC['binary'])}."
-        )
-    state[SMART_ROUTING_STATE_KEY] = True
-    return state
 
 
 def disable_smart_routing(state: dict) -> bool:

@@ -18,9 +18,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ucode.config_io import APP_DIR
-from ucode.databricks import get_databricks_token
 from ucode.smart_routing import routing
-from ucode.smart_routing.codex_hooks import routing_models
 from ucode.smart_routing.routing import RoutingDecision
 
 ROUTER_NAME = routing.ROUTER_NAME
@@ -34,66 +32,6 @@ DECISIONS_PATH = APP_DIR / "codex-smart-routing-decisions.jsonl"
 _GPT_RE = re.compile(r"gpt-(\d+)(?:[.-](\d+))?(?:[.-](\d+))?(-.+|[a-z].*)?")
 
 _normalize_model = routing.normalize_model
-
-
-def route_launch_model(state: dict, tool_args: list[str]):
-    """Route a root Codex launch on the launch-time prompt, if there is one.
-
-    Returns (None, None) when the launch carries no prompt (a bare interactive
-    session): with no task signal the router can only return its floor arm, so
-    routing would just add a round-trip and silently override the user's default
-    model. In that case we don't route and keep the configured default. Routing
-    on a typed-in first prompt is out of scope — no hook/MCP can retarget the
-    root model once the session is running.
-    """
-    task = _launch_routing_task(tool_args)
-    if task is None:
-        return None, None
-    workspace = state.get("workspace")
-    models = routing_models(state)
-    if not isinstance(workspace, str) or not models:
-        return None, "workspace model metadata is unavailable"
-    try:
-        token = get_databricks_token(workspace, state.get("profile"))
-    except RuntimeError as exc:
-        return None, f"could not authenticate the routing request: {exc}"
-    return request_routing_decision(workspace, token, task, models)
-
-
-# Codex CLI options that consume a following value (from `codex --help`); their
-# values must not be mistaken for the seed prompt when parsing launch args.
-_CODEX_VALUE_OPTIONS = frozenset(
-    {
-        "-c",
-        "--config",
-        "-i",
-        "--image",
-        "-m",
-        "--model",
-        "-p",
-        "--profile",
-        "-s",
-        "--sandbox",
-        "-a",
-        "--ask-for-approval",
-        "-C",
-        "--cd",
-        "--add-dir",
-        "--enable",
-        "--disable",
-        "--local-provider",
-        "--remote",
-        "--remote-auth-token-env",
-    }
-)
-
-
-def _launch_routing_task(tool_args: list[str]) -> str | None:
-    # The routing task is the user's real first prompt when it's on the command
-    # line (`codex "<prompt>"`, `codex exec "<prompt>"`, or after `--`). A bare
-    # interactive launch has no prompt yet → None, and the caller skips routing
-    # (the root model can't be re-routed once the TUI is running).
-    return routing.extract_seed_prompt(tool_args, _CODEX_VALUE_OPTIONS)
 
 
 def request_routing_decision(

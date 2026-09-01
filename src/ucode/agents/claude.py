@@ -69,16 +69,13 @@ SPEC: ToolSpec = {
     "backup_path": CLAUDE_BACKUP_PATH,
 }
 
-# Per-workspace opt-in flag for Claude Code smart routing (state key).
-# Shared across agents: one opt-in enables smart routing for every routing-capable
-# tool (codex, claude), so a workspace turns it on once. Kept identical to
-# codex.SMART_ROUTING_STATE_KEY on purpose.
-SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
-# Claude Code settings.json hook events ucode manages when routing is enabled;
-# marked managed so they're tracked/reverted with the rest of ucode's config.
-CLAUDE_ROUTING_HOOK_EVENTS = ("PreToolUse", "SessionStart", "SubagentStart")
+# Retained only to identify and remove state written by the legacy persisted opt-in.
+SMART_ROUTING_STATE_KEY = smart_routing_v2.LEGACY_STATE_KEY
 CLAUDE_NONINTERACTIVE_FLAGS = frozenset(
     {"-p", "--print", "--bg", "--background", "--cloud", "-h", "--help", "-v", "--version"}
+)
+CLAUDE_SUBCOMMANDS = frozenset(
+    {"agents", "auth", "config", "doctor", "install", "mcp", "plugin", "setup-token", "update"}
 )
 CLAUDE_OPTIONAL_VALUE_OPTIONS = frozenset(
     {
@@ -502,17 +499,6 @@ def _unregister_web_search_mcp() -> None:
             pass
 
 
-def smart_routing_enabled(state: dict) -> bool:
-    """Return whether the current workspace opted into Claude Code routing."""
-    return state.get(SMART_ROUTING_STATE_KEY) is True
-
-
-def enable_smart_routing(state: dict) -> dict:
-    """Persist the current workspace's Claude Code smart-routing opt-in."""
-    state[SMART_ROUTING_STATE_KEY] = True
-    return state
-
-
 def disable_smart_routing(state: dict) -> bool:
     """Disable routing and remove only ucode's Claude Code routing hooks."""
     state.pop(SMART_ROUTING_STATE_KEY, None)
@@ -573,13 +559,9 @@ def write_tool_config(
                 "to install the Claude Stop hook — traces won't be emitted. Re-run "
                 "`ucode configure tracing`."
             )
-    # Smart-routing hooks: install ucode's PreToolUse/SessionStart/SubagentStart hooks when routing
-    # is enabled (and not under a provider, which pins no Databricks model), else surgically strip
-    # only ucode's own. Applied per file inside _compose_claude_settings.
-    routing_enabled = smart_routing_enabled(state) and provider is None
-    if routing_enabled:
-        managed_keys = managed_keys + [["hooks", event] for event in CLAUDE_ROUTING_HOOK_EVENTS]
 
+    # V2 installs routing hooks in a transient per-launch settings file. Persistent settings must
+    # contain no ucode routing hooks; surgically strip legacy ones while preserving user hooks.
     def _compose(base: dict) -> dict:
         # deepcopy the overlay per file so merging into one base can't alias nested dicts into
         # the other (deep_merge_dict grafts overlay's own dict objects onto a base missing the key).
@@ -609,7 +591,7 @@ def write_tool_config(
             # longer writes.
             for key in CLAUDE_REMOVED_ENV_KEYS:
                 merged_env.pop(key, None)
-        sync_smart_routing_hooks(merged, state, enabled=routing_enabled)
+        sync_smart_routing_hooks(merged, state, enabled=False)
         return merged
 
     write_json_file(CLAUDE_SETTINGS_PATH, _compose(read_json_safe(CLAUDE_SETTINGS_PATH)))
@@ -974,7 +956,7 @@ def _uses_interactive_tui(tool_args: list[str]) -> bool:
     while index < len(tool_args):
         arg = tool_args[index]
         if arg == "--":
-            return index == len(tool_args) - 1
+            return True
         if arg in CLAUDE_VALUE_OPTIONS:
             index += 2
             continue
@@ -987,7 +969,9 @@ def _uses_interactive_tui(tool_args: list[str]) -> bool:
         if arg.startswith("-"):
             index += 1
             continue
-        return False
+        # Claude accepts an initial prompt positionally and still opens the TUI.
+        # Keep prompts inside the V2 PTY while bypassing utility subcommands.
+        return arg not in CLAUDE_SUBCOMMANDS
     return True
 
 
