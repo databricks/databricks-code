@@ -468,9 +468,9 @@ def launch_codex(
     os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, profile)
     available_models = _cached_routing_models(state)
     if not available_models:
-        raise RuntimeError(
-            "Smart routing v2 has no cached Unity Catalog model services; "
-            "run `ucode configure codex` to refresh them."
+        print_note(
+            "Smart routing model metadata is unavailable; starting Codex on gpt-5.6-luna "
+            "without automatic model switching. Run `ucode configure codex` to enable routing."
         )
     overlay = render_overlay(
         workspace,
