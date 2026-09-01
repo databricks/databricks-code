@@ -46,6 +46,8 @@ LEGACY_CODEX_BACKUP_PATH = APP_DIR / "codex-config.backup.toml"
 CODEX_MODEL_PROVIDER_NAME = "ucode-databricks"
 MINIMUM_CODEX_VERSION = (0, 134, 0)
 MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
+MINIMUM_ROUTING_CODEX_VERSION = (0, 145, 0)
+MINIMUM_ROUTING_CODEX_VERSION_TEXT = "0.145.0"
 # Retained only to identify and remove state written by the legacy persisted opt-in.
 SMART_ROUTING_STATE_KEY = smart_routing_v2.LEGACY_STATE_KEY
 APP_SERVER_SMART_ROUTING_STARTING_MODEL = "gpt-5.6-luna"
@@ -444,6 +446,13 @@ def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if smart_routing_v2.enabled():
+        version_text = agent_version(binary)
+        parsed_version = _parse_version(version_text)
+        if parsed_version is not None and parsed_version < MINIMUM_ROUTING_CODEX_VERSION:
+            raise RuntimeError(
+                "Codex smart routing requires Codex "
+                f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version_text}."
+            )
 
         def _app_server_start_model() -> str:
             managed_model = default_model(state)
