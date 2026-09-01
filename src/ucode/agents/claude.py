@@ -111,6 +111,8 @@ def _parse_version(value: str) -> tuple[int, int, int] | None:
 
 
 def _installed_version_status() -> tuple[str, bool] | None:
+    if not smart_routing_v2.enabled():
+        return None
     version = agent_version(SPEC["binary"])
     parsed = _parse_version(version)
     if parsed is None:

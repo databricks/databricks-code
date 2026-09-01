@@ -34,12 +34,14 @@ class TestClaudeSpec:
 class TestMinimumVersion:
     @pytest.mark.parametrize("version", ["2.1.248", "2.1.250", "3.0.0"])
     def test_supported_version(self, monkeypatch, version):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: version)
 
         assert claude.minimum_version_error() is None
         assert claude.required_update_message() is None
 
     def test_older_version_requires_update(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247 (Claude Code)")
 
         assert claude.minimum_version_error() == (
@@ -53,7 +55,15 @@ class TestMinimumVersion:
         )
 
     def test_unknown_version_does_not_block(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "unknown")
+
+        assert claude.minimum_version_error() is None
+        assert claude.required_update_message() is None
+
+    def test_older_version_is_not_validated_without_smart_routing_v2(self, monkeypatch):
+        monkeypatch.delenv(v2.ENV_VAR, raising=False)
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() is None
         assert claude.required_update_message() is None
