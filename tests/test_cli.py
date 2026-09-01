@@ -1334,6 +1334,26 @@ class TestAutoConfigureOnFirstRun:
         mock_ai_tools.assert_not_called()
         mock_launch.assert_called_once()
 
+    def test_workspace_flag_uses_cached_codex_config_without_preflight(self):
+        with (
+            patch("ucode.cli.ensure_bootstrap_dependencies"),
+            patch("ucode.cli.set_current_workspace") as mock_set_workspace,
+            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
+            patch("ucode.cli.configure_shared_state") as mock_preflight,
+            patch("ucode.cli.configure_tool") as mock_configure,
+            patch("ucode.cli.smart_routing_v2.enabled", return_value=False),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.launch_agent") as mock_launch,
+        ):
+            result = runner.invoke(app, ["codex", "--workspace", "https://example.databricks.com/"])
+
+        assert result.exit_code == 0, result.output
+        mock_set_workspace.assert_called_once_with("https://example.databricks.com")
+        mock_preflight.assert_not_called()
+        mock_configure.assert_not_called()
+        mock_launch.assert_called_once()
+
     def test_triggers_when_no_workspace(self):
         """Auto-configure runs when state has no workspace."""
         empty_state = {}
@@ -1434,8 +1454,7 @@ class TestCachedConfigPredicate:
             "model": None,
             "explicit_provider": None,
             "enable_smart_routing_flag": False,
-            "workspace": None,
-            "needs_auto_configure": False,
+            "workspace_url": None,
         }
         kwargs.update(overrides)
         return kwargs
@@ -1500,7 +1519,7 @@ class TestCachedConfigPredicate:
             {"refresh": True},
             {"explicit_provider": "catalog.schema.provider"},
             {"enable_smart_routing_flag": True},
-            {"workspace": "https://other.databricks.com"},
+            {"workspace_url": "https://other.databricks.com"},
         ],
     )
     def test_rejects_dynamic_launch_overrides(self, override):

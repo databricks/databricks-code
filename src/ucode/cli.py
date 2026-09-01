@@ -1820,8 +1820,7 @@ def _can_launch_from_cached_config(
     model: str | None,
     explicit_provider: str | None,
     enable_smart_routing_flag: bool,
-    workspace: str | None,
-    needs_auto_configure: bool,
+    workspace_url: str | None,
 ) -> bool:
     """Return whether a normal Claude/Codex launch can use its cached config."""
     if tool not in CAN_USE_CACHED_CONFIG_AGENTS:
@@ -1846,7 +1845,12 @@ def _can_launch_from_cached_config(
     if managed_agent_config_enabled():
         return False
 
-    if not (needs_auto_configure or workspace is None):
+    # `_launch_tool` selects an explicit workspace before loading state. A matching workspace here
+    # therefore means its cached state was selected (or it was just auto-configured) and is safe to
+    # launch. Keep rejecting a mismatched state rather than launching against the wrong workspace.
+    if workspace_url is not None and state.get("workspace") != normalize_workspace_url(
+        workspace_url
+    ):
         return False
 
     if tool == "claude":
@@ -1860,7 +1864,7 @@ def _launch_tool(
     provider: str | None = None,
     refresh: bool = False,
     skip_preflight: bool = False,
-    workspace: str | None = None,
+    workspace_url: str | None = None,
     enable_smart_routing_flag: bool = False,
     managed: dict | None = None,
     recommendation: dict | None = None,
@@ -1880,8 +1884,8 @@ def _launch_tool(
         # An explicit --workspace targets that workspace for this launch (and
         # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
         # works without a prior `ucode configure`.
-        if workspace:
-            set_current_workspace(normalize_workspace_url(workspace))
+        if workspace_url:
+            set_current_workspace(normalize_workspace_url(workspace_url))
         existing = load_state()
         # Workspaces configured with --use-pat export the profile's PAT as
         # DATABRICKS_BEARER up front so every auth check below (and the
@@ -1908,8 +1912,7 @@ def _launch_tool(
             model=model,
             explicit_provider=explicit_provider,
             enable_smart_routing_flag=enable_smart_routing_flag,
-            workspace=workspace,
-            needs_auto_configure=needs_auto_configure,
+            workspace_url=workspace_url,
         ):
             print_section(_launch_title(tool))
             if forwarded_model:
@@ -2325,7 +2328,7 @@ def _launch_managed_default(
         tool,
         ctx,
         skip_preflight=skip_preflight,
-        workspace=workspace,
+        workspace_url=workspace,
         managed=managed,
         recommendation=recommendation,
     )
@@ -2401,7 +2404,7 @@ def codex_cmd(
         provider=provider,
         refresh=refresh,
         skip_preflight=skip_preflight,
-        workspace=workspace,
+        workspace_url=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
     )
 
@@ -2480,7 +2483,7 @@ def claude_cmd(
         model=model,
         refresh=refresh,
         skip_preflight=skip_preflight,
-        workspace=workspace,
+        workspace_url=workspace,
         enable_smart_routing_flag=enable_smart_routing_flag,
     )
 
