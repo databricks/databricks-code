@@ -1447,6 +1447,7 @@ class TestCachedConfigPredicate:
                 cli_mod._can_launch_from_cached_config("claude", MINIMAL_STATE, **self._kwargs())
                 is False
             )
+
     def test_accepts_codex_v2_launch_with_complete_model_cache(self, monkeypatch):
         import ucode.cli as cli_mod
 
@@ -1488,6 +1489,7 @@ class TestCachedConfigPredicate:
             state[incomplete_key] = value
         with patch("ucode.cli.managed_agent_config_enabled", return_value=False):
             assert cli_mod._can_launch_from_cached_config("codex", state, **self._kwargs()) is False
+
     @pytest.mark.parametrize(
         "override",
         [
