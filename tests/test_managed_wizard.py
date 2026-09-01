@@ -2205,9 +2205,9 @@ class TestNextSteps:
         manifest = {**AGENTS_ONLY, "skills": {"names": ["main.default"]}}
         wizard._print_next_steps(manifest)
         out = capsys.readouterr().out
-        assert "ucode setup mcps" in out
-        assert "ucode setup skills" in out
-        assert "ucode setup spend-tiers" in out
+        assert "ucode configure mcp" in out
+        assert "ucode configure skills" in out
+        assert "ucode configure spend-tiers" in out
         assert "ucode publish" in out
 
     def test_dry_run_says_nothing_was_saved(self, capsys, monkeypatch):
@@ -2380,9 +2380,9 @@ class TestSetupHelp:
         out = capsys.readouterr().out
         for command in (
             "ucode setup",
-            "ucode setup mcps",
-            "ucode setup skills",
-            "ucode setup spend-tiers",
+            "ucode configure mcp",
+            "ucode configure skills",
+            "ucode configure spend-tiers",
             "ucode setup show",
             "ucode publish",
         ):

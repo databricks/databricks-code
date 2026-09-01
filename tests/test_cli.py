@@ -1065,6 +1065,144 @@ class TestConfigureSkillsCommand:
         mock_download.assert_not_called()
 
 
+class TestConfigureSpendTiersCommand:
+    """`ucode configure spend-tiers` authors the managed config's tiered spend policy (admin)."""
+
+    def test_registered_and_calls_the_wizard(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.setup_budget_policy_command", return_value=0) as fn,
+        ):
+            result = runner.invoke(app, ["configure", "spend-tiers"])
+        assert result.exit_code == 0, result.output
+        assert fn.called
+        assert "ERROR" not in _strip_ansi(result.output)
+
+    def test_runtime_error_exits_1(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch(
+                "ucode.cli.setup_budget_policy_command",
+                side_effect=RuntimeError("not an admin"),
+            ),
+        ):
+            result = runner.invoke(app, ["configure", "spend-tiers"])
+        assert result.exit_code == 1
+
+    def test_interrupt_exits_130(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.setup_budget_policy_command", side_effect=KeyboardInterrupt),
+        ):
+            result = runner.invoke(app, ["configure", "spend-tiers"])
+        assert result.exit_code == 130
+
+    def test_nonzero_wizard_code_propagates(self):
+        # `setup_budget_policy_command` returns a process exit code; a non-zero one must surface as
+        # the command's exit code, not be swallowed into a success.
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.setup_budget_policy_command", return_value=3),
+        ):
+            result = runner.invoke(app, ["configure", "spend-tiers"])
+        assert result.exit_code == 3
+
+
+class TestConfigureMcpSkillsRoleAware:
+    """`ucode configure mcp`/`skills` are role-aware: an admin (with the flag set) authors the
+    managed config; a developer configures their own tools. Gated by ENABLE_MANAGED_AGENT_CONFIG."""
+
+    def _role(self, monkeypatch, *, is_admin):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr(
+            "ucode.cli.load_state", lambda: {"workspace": "https://w", "profile": None}
+        )
+        monkeypatch.setattr("ucode.cli.ensure_databricks_auth", lambda *a, **k: None)
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda *a, **k: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda *a, **k: is_admin)
+
+    def test_admin_authors_managed_mcp(self, monkeypatch):
+        self._role(monkeypatch, is_admin=True)
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.setup_mcp_command", return_value=0) as author,
+            patch("ucode.cli.configure_mcp_command") as local,
+        ):
+            result = runner.invoke(app, ["configure", "mcp"])
+        assert result.exit_code == 0, result.output
+        assert author.called
+        assert not local.called
+
+    def test_admin_check_authenticates_quietly(self, monkeypatch):
+        self._role(monkeypatch, is_admin=True)
+        with (
+            patch("ucode.cli.ensure_databricks_auth") as auth,
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.setup_mcp_command", return_value=0),
+        ):
+            result = runner.invoke(app, ["configure", "mcp"])
+        assert result.exit_code == 0, result.output
+        assert auth.call_args.kwargs.get("quiet") is True
+
+    def test_developer_configures_local_mcp(self, monkeypatch):
+        self._role(monkeypatch, is_admin=False)
+        with (
+            patch("ucode.cli.setup_mcp_command") as author,
+            patch("ucode.cli.configure_mcp_command") as local,
+        ):
+            result = runner.invoke(app, ["configure", "mcp"])
+        assert result.exit_code == 0, result.output
+        assert local.called
+        assert not author.called
+
+    def test_flag_off_stays_local_mcp(self, monkeypatch):
+        # No ENABLE_MANAGED_AGENT_CONFIG -> never an admin check, always the developer flow.
+        monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
+        with (
+            patch("ucode.cli.setup_mcp_command") as author,
+            patch("ucode.cli.configure_mcp_command") as local,
+        ):
+            result = runner.invoke(app, ["configure", "mcp"])
+        assert result.exit_code == 0, result.output
+        assert local.called
+        assert not author.called
+
+    def test_admin_authors_managed_skills(self, monkeypatch):
+        self._role(monkeypatch, is_admin=True)
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.setup_skills_command", return_value=0) as author,
+            patch("ucode.cli.configure_skills_mcp_command") as local_mcp,
+            patch("ucode.cli.configure_skills_download_command") as local_dl,
+        ):
+            result = runner.invoke(app, ["configure", "skills"])
+        assert result.exit_code == 0, result.output
+        assert author.called
+        assert not local_mcp.called
+        assert not local_dl.called
+
+    def test_admin_skills_forwards_location(self, monkeypatch):
+        self._role(monkeypatch, is_admin=True)
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.setup_skills_command", return_value=0) as author,
+        ):
+            result = runner.invoke(app, ["configure", "skills", "--location", "main.a,main.b"])
+        assert result.exit_code == 0, result.output
+        assert author.call_args.args[0] == ["main.a", "main.b"]
+
+    def test_developer_configures_local_skills(self, monkeypatch):
+        self._role(monkeypatch, is_admin=False)
+        with (
+            patch("ucode.cli.setup_skills_command") as author,
+            patch("ucode.cli.configure_skills_mcp_command") as local_mcp,
+        ):
+            result = runner.invoke(app, ["configure", "skills"])
+        assert result.exit_code == 0, result.output
+        assert local_mcp.called
+        assert not author.called
+
+
 class TestApplyManagedSkills:
     """The launch path both registers the skills MCP connection and downloads bundles to disk."""
 

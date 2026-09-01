@@ -1400,10 +1400,10 @@ def setup_from_file(path: str) -> int:
 # The sections that have their own `ucode setup <thing>` command, in the order the checklist lists
 # them: the command, the label the summary uses, and how to tell whether the manifest has one.
 SETUP_SECTIONS: list[tuple[str, str, Callable[[dict], bool]]] = [
-    ("ucode setup mcps", "MCP servers", lambda m: bool(m.get("mcp_servers"))),
-    ("ucode setup skills", "Skills", lambda m: bool((m.get("skills") or {}).get("names"))),
+    ("ucode configure mcp", "MCP servers", lambda m: bool(m.get("mcp_servers"))),
+    ("ucode configure skills", "Skills", lambda m: bool((m.get("skills") or {}).get("names"))),
     (
-        "ucode setup spend-tiers",
+        "ucode configure spend-tiers",
         "Tiered Spend Policy",
         lambda m: isinstance(m.get("budget_policy"), dict),
     ),
