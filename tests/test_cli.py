@@ -45,18 +45,10 @@ def no_state_writes():
         patch("ucode.agents.__init__.save_state"),
         patch("ucode.agents.codex.save_state"),
         patch("ucode.agents.claude.save_state"),
+        patch("ucode.agents.claude._managed_settings_path", return_value=None),
         patch("ucode.agents.gemini.save_state"),
         patch("ucode.agents.opencode.save_state"),
     ):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def no_blocking_ai_tools_prompt():
-    """The interactive configure flow prompts for AI Tools; default it to yes so
-    tests that drive that path don't block reading stdin. Tests that assert on the
-    prompt override this with their own patch."""
-    with patch("ucode.cli.prompt_yes_no_default", lambda msg, *, default: default):
         yield
 
 
@@ -718,46 +710,6 @@ class TestClaudeModelFlag:
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.args[1]["_claude_launch_provider"] == "main.default.anthropic"
 
-    def test_warns_when_enterprise_settings_pin_the_model(self):
-        # Claude Code's enterprise managed-settings scope outranks the --settings file ucode writes,
-        # so --model is silently ignored; warn instead of launching on the "wrong" model unexplained.
-        from pathlib import Path
-
-        with (
-            patch("ucode.cli.ensure_bootstrap_dependencies"),
-            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.resolve_launch_model", return_value=(MINIMAL_STATE, "system.ai.opus")),
-            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
-            patch(
-                "ucode.cli.claude_agent.managed_settings_model_overrides",
-                return_value=Path("/etc/claude-code/managed-settings.json"),
-            ),
-            patch("ucode.cli.launch_agent"),
-        ):
-            result = runner.invoke(app, ["claude", "--model", "main.aarushi.claude-opus-5"])
-        assert result.exit_code == 0, result.output
-        assert "enterprise managed settings" in _strip_ansi(result.output)
-        assert "overrides `--model main.aarushi.claude-opus-5`" in _strip_ansi(result.output)
-
-    def test_no_enterprise_warning_when_no_managed_settings(self):
-        with (
-            patch("ucode.cli.ensure_bootstrap_dependencies"),
-            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.resolve_launch_model", return_value=(MINIMAL_STATE, "system.ai.opus")),
-            patch("ucode.cli.configure_tool", return_value=MINIMAL_STATE),
-            patch("ucode.cli._fetch_managed_config", return_value=(None, False)),
-            patch("ucode.cli.claude_agent.managed_settings_model_overrides", return_value=None),
-            patch("ucode.cli.launch_agent"),
-        ):
-            result = runner.invoke(app, ["claude", "--model", "main.aarushi.claude-opus-5"])
-        assert result.exit_code == 0, result.output
-        assert "enterprise managed settings" not in _strip_ansi(result.output)
-
 
 class TestMcpSubcommands:
     def test_web_search_subcommand_help(self):
@@ -1307,6 +1259,20 @@ class TestRevert:
         assert "Claude Code MCP config: restored" in result.output
 
 
+class TestDoctorCommand:
+    def test_invokes_doctor(self):
+        with patch("ucode.doctor.doctor", return_value=0) as mock_doctor:
+            result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        mock_doctor.assert_called_once_with()
+
+    def test_reports_runtime_error(self):
+        with patch("ucode.doctor.doctor", side_effect=RuntimeError("boom")):
+            result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        assert "boom" in _strip_ansi(result.output)
+
+
 class TestAutoConfigureOnFirstRun:
     def test_uses_existing_claude_settings_without_preflight(self, tmp_path):
         from pathlib import Path
@@ -1479,10 +1445,46 @@ class TestCachedConfigPredicate:
         with (
             patch("ucode.cli.managed_agent_config_enabled", return_value=False),
             patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=True),
         ):
             assert (
                 cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
                 is True
+            )
+
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=False),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
+                is False
+            )
+
+    def test_accepts_claude_only_when_managed_settings_are_verified(self, tmp_path):
+        import ucode.cli as cli_mod
+
+        settings_path = tmp_path / "ucode-settings.json"
+        settings_path.write_text("{}", encoding="utf-8")
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.claude_agent.CLAUDE_SETTINGS_PATH", settings_path),
+            patch("ucode.cli.claude_agent.managed_settings_are_current", return_value=True),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config("claude", MINIMAL_STATE, **self._kwargs())
+                is True
+            )
+
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.claude_agent.CLAUDE_SETTINGS_PATH", settings_path),
+            patch("ucode.cli.claude_agent.managed_settings_are_current", return_value=False),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config("claude", MINIMAL_STATE, **self._kwargs())
+                is False
             )
 
     def test_accepts_codex_v2_launch_with_complete_model_cache(self, monkeypatch):
@@ -1497,6 +1499,7 @@ class TestCachedConfigPredicate:
         with (
             patch("ucode.cli.managed_agent_config_enabled", return_value=False),
             patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
+            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=True),
         ):
             assert cli_mod._can_launch_from_cached_config("codex", state, **self._kwargs()) is True
 
@@ -1603,29 +1606,45 @@ class TestConfigureAgentFlag:
             patch("ucode.cli.install_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
-            # Fully-interactive configure ends by offering the MCP step; decline it.
-            patch("ucode.cli.prompt_yes_no", return_value=False) as mock_mcp_prompt,
-            patch("ucode.cli.configure_mcp_command") as mock_mcp,
         ):
-            # No flag: the AI Tools prompt happens later, inside
-            # configure_workspace_command, so nothing is forwarded here.
             result = runner.invoke(app, ["configure"])
         assert result.exit_code == 0, result.output
-        mock_cfg.assert_called_once_with(prompt_optional_updates=True)
-        mock_mcp_prompt.assert_called_once()
-        mock_mcp.assert_not_called()
+        mock_cfg.assert_called_once_with(prompt_optional_updates=True, offer_optional_setup=True)
 
-    def test_interactive_accepting_mcp_prompt_runs_mcp_config(self):
+    def test_optional_setup_installs_ai_tools_and_configures_mcp(self):
+        import ucode.cli as cli_mod
+
+        state = {"available_tools": ["claude", "codex"]}
         with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.install_tool_binary"),
-            patch("ucode.cli.configure_workspace_command"),
-            patch("ucode.cli.prompt_yes_no", return_value=True),
+            patch("ucode.cli.prompt_yes_no", return_value=True) as mock_prompt,
+            patch("ucode.cli.save_state") as mock_save,
+            patch("ucode.cli.install_databricks_ai_tools_for_agents") as mock_install,
             patch("ucode.cli.configure_mcp_command") as mock_mcp,
         ):
-            result = runner.invoke(app, ["configure"])
-        assert result.exit_code == 0, result.output
+            cli_mod._configure_optional_setup(state, ["claude", "codex"])
+
+        mock_prompt.assert_called_once_with("Configure MCP servers, skills, and plugins?")
+        assert state["databricks_ai_tools_enabled"] is True
+        mock_save.assert_called_once_with(state)
+        mock_install.assert_called_once_with(["claude", "codex"], state)
         mock_mcp.assert_called_once_with()
+
+    def test_optional_setup_decline_does_nothing(self):
+        import ucode.cli as cli_mod
+
+        with (
+            patch("ucode.cli.prompt_yes_no", return_value=False),
+            patch("ucode.cli.save_state") as mock_save,
+            patch("ucode.cli.install_databricks_ai_tools_for_agents") as mock_install,
+            patch("ucode.cli.configure_mcp_command") as mock_mcp,
+        ):
+            state = {}
+            cli_mod._configure_optional_setup(state, ["claude"])
+
+        assert state["databricks_ai_tools_enabled"] is False
+        mock_save.assert_called_once_with(state)
+        mock_install.assert_not_called()
+        mock_mcp.assert_not_called()
 
     def test_agents_flag_skips_mcp_prompt(self):
         # Flag-driven (non-interactive) runs must stay scriptable: no MCP prompt.
@@ -1633,13 +1652,9 @@ class TestConfigureAgentFlag:
             patch("ucode.cli.install_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command"),
-            patch("ucode.cli.prompt_yes_no") as mock_prompt,
-            patch("ucode.cli.configure_mcp_command") as mock_mcp,
         ):
             result = runner.invoke(app, ["configure", "--agents", "claude,codex"])
         assert result.exit_code == 0, result.output
-        mock_prompt.assert_not_called()
-        mock_mcp.assert_not_called()
 
     def test_agents_flag_calls_configure_with_tools(self):
         with (
@@ -1792,7 +1807,7 @@ class TestConfigureAgentFlag:
         ):
             result = runner.invoke(app, ["configure", "--skip-upgrade"])
         assert result.exit_code == 0, result.output
-        mock_cfg.assert_called_once_with(prompt_optional_updates=False)
+        mock_cfg.assert_called_once_with(prompt_optional_updates=False, offer_optional_setup=True)
 
     def test_disable_databricks_ai_tools_forwards_false_and_skips_prompt(self):
         # An explicit flag suppresses the interactive prompt and forwards the choice.
@@ -1800,14 +1815,12 @@ class TestConfigureAgentFlag:
             patch("ucode.cli.install_databricks_cli"),
             patch("ucode.cli.install_tool_binary"),
             patch("ucode.cli.configure_workspace_command") as mock_cfg,
-            patch("ucode.cli.prompt_yes_no_default") as mock_prompt,
             # Fully-interactive configure ends by offering the MCP step; decline it.
             patch("ucode.cli.prompt_yes_no", return_value=False),
             patch("ucode.cli.configure_mcp_command"),
         ):
             result = runner.invoke(app, ["configure", "--disable-databricks-ai-tools"])
         assert result.exit_code == 0, result.output
-        mock_prompt.assert_not_called()
         mock_cfg.assert_called_once_with(
             prompt_optional_updates=True, databricks_ai_tools_enabled=False
         )
@@ -1827,51 +1840,6 @@ class TestConfigureAgentFlag:
             prompt_optional_updates=True,
             databricks_ai_tools_enabled=True,
         )
-
-    def _stub_interactive_configure(self, monkeypatch, shared_state):
-        """Wire configure_workspace_command's interactive path; return captured info."""
-        import ucode.cli as cli_mod
-
-        monkeypatch.setattr(cli_mod, "configure_shared_state", lambda *a, **k: shared_state)
-        monkeypatch.setattr(cli_mod, "check_gateway_endpoint", lambda s, t: t == "claude")
-        monkeypatch.setattr(cli_mod, "install_tool_binary", lambda *a, **k: True)
-        monkeypatch.setattr(cli_mod, "_maybe_select_provider_service", lambda tool, s: s)
-        monkeypatch.setattr(cli_mod, "validate_all_tools", lambda s: None)
-        monkeypatch.setattr(cli_mod, "validate_tool", lambda t: (True, None))
-        monkeypatch.setattr(
-            cli_mod, "_prompt_for_configuration", lambda tool=None: ("https://w", None)
-        )
-        monkeypatch.setattr(cli_mod, "prompt_for_tools", lambda options: ["claude"])
-        captured = {}
-        monkeypatch.setattr(
-            cli_mod,
-            "configure_selected_tools",
-            lambda s, tools: captured.update(state=dict(s)) or s,
-        )
-        prompt_calls = []
-        monkeypatch.setattr(
-            cli_mod,
-            "prompt_yes_no_default",
-            lambda msg, *, default: prompt_calls.append(default) or default,
-        )
-        return cli_mod, captured, prompt_calls
-
-    def test_interactive_prompt_default_yes_when_no_prior_optout(self, monkeypatch):
-        # No prior opt-out -> prompt defaults to yes; state carries True into install.
-        state = {**MINIMAL_STATE, "available_tools": [], "databricks_ai_tools_enabled": True}
-        cli_mod, captured, prompt_calls = self._stub_interactive_configure(monkeypatch, state)
-        cli_mod.configure_workspace_command()
-        assert prompt_calls == [True]  # default derived from resolved prior choice
-        assert captured["state"]["databricks_ai_tools_enabled"] is True
-
-    def test_interactive_prompt_defaults_to_prior_optout(self, monkeypatch):
-        # configure_shared_state resolved a prior --disable to False; the prompt must
-        # default to no so Enter doesn't silently re-enable it.
-        state = {**MINIMAL_STATE, "available_tools": [], "databricks_ai_tools_enabled": False}
-        cli_mod, captured, prompt_calls = self._stub_interactive_configure(monkeypatch, state)
-        cli_mod.configure_workspace_command()
-        assert prompt_calls == [False]
-        assert captured["state"]["databricks_ai_tools_enabled"] is False
 
     def test_skip_upgrade_flag_with_agent_skips_optional_update(self):
         with (

@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
-from ucode.agent_updates import available_npm_package_update
+from ucode import gateway_proxy
 from ucode.anthropic_model_discovery_proxy import (
     start_proxy as start_anthropic_model_discovery_proxy,
 )
@@ -33,12 +33,19 @@ from ucode.databricks import (
     build_tool_base_url,
     get_databricks_token,
 )
-from ucode.gateway_proxy import (
-    AI_GATEWAY_TOKEN_HEADER,
-    AUTHORIZATION_HEADER,
-)
 from ucode.launcher import exec_or_spawn
-from ucode.managed_files import OS, current_os, write_managed_file
+from ucode.managed_files import (
+    OS,
+    current_os,
+    managed_file_conflicts,
+    managed_file_is_verified,
+    managed_file_status,
+    managed_writes_allowed,
+    mark_managed_file_verified,
+    read_managed_file,
+    reconcile_managed_file,
+    revert_managed_file,
+)
 from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.claude_hooks import (
     remove_smart_routing_hooks,
@@ -48,7 +55,7 @@ from ucode.smart_routing.claude_routing import CLAUDE_VALUE_OPTIONS
 from ucode.state import get_provider_service, mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
-from ucode.ui import print_err, print_note, print_success, print_warning
+from ucode.ui import print_note, print_success, print_warning
 
 from .args import has_explicit_model_arg
 
@@ -60,6 +67,8 @@ CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
 CLAUDE_USER_SETTINGS_PATH = CLAUDE_CONFIG_DIR / "settings.json"
 CLAUDE_BACKUP_PATH = APP_DIR / "claude-ucode-settings.backup.json"
 WEB_SEARCH_MCP_STATE_KEY = "claude_web_search_mcp"
+MINIMUM_CLAUDE_VERSION = (2, 1, 248)
+MINIMUM_CLAUDE_VERSION_TEXT = "2.1.248"
 
 SPEC: ToolSpec = {
     "binary": "claude",
@@ -96,8 +105,47 @@ CLAUDE_OPTIONAL_VALUE_OPTIONS = frozenset(
 )
 
 
-def is_update_available() -> tuple[str, str] | None:
-    return available_npm_package_update(SPEC["package"])
+def _parse_version(value: str) -> tuple[int, int, int] | None:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
+    if not match:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
+def _installed_version_status() -> tuple[str, bool] | None:
+    version = agent_version(SPEC["binary"])
+    parsed = _parse_version(version)
+    if parsed is None:
+        return None
+    return version, parsed < MINIMUM_CLAUDE_VERSION
+
+
+def minimum_version_error() -> str | None:
+    status = _installed_version_status()
+    if status is None:
+        return None
+    version, is_too_old = status
+    if not is_too_old:
+        return None
+    return (
+        f"Claude Code {version} is too old for gateway model discovery. "
+        f"Claude Code must be updated to {MINIMUM_CLAUDE_VERSION_TEXT} or newer; "
+        f"run `npm install -g {SPEC['package']}` or `ucode configure`."
+    )
+
+
+def required_update_message() -> str | None:
+    status = _installed_version_status()
+    if status is None:
+        return None
+    version, is_too_old = status
+    if not is_too_old:
+        return None
+    return (
+        f"Claude Code {version} is older than required {MINIMUM_CLAUDE_VERSION_TEXT}; "
+        "updating Claude Code is required for gateway model discovery."
+    )
 
 
 def _resolve_web_search_model(state: dict) -> str | None:
@@ -177,19 +225,62 @@ def _managed_settings_path() -> Path | None:
     return None
 
 
-def _managed_relayed_conflicts() -> tuple[Path, list[str]] | None:
-    """Enterprise managed-settings keys that would break relayed auth, if any.
-    The managed scope always wins (per key) over the --settings file and
-    subscription OAuth, so a managed value here overrides what ucode writes:
-    'apiKeyHelper' shadows the subscription login, 'env.ANTHROPIC_BASE_URL'
-    clobbers our loopback proxy URL, and 'env.ANTHROPIC_CUSTOM_HEADERS' drops
-    the Databricks-Model-Provider-Service routing headers — each sends traffic
-    somewhere the relayed token swap can't reach or route correctly.
-    Returns (path, conflicting-key-labels) or None when there's no conflict."""
+def _parse_managed_settings(text: str) -> dict:
+    try:
+        settings = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
+    if not isinstance(settings, dict):
+        raise RuntimeError("the top-level JSON value must be an object")
+    return settings
+
+
+def _dump_managed_settings(settings: dict) -> str:
+    return json.dumps(settings, indent=2) + "\n"
+
+
+def managed_settings_are_current(state: dict) -> bool:
     path = _managed_settings_path()
-    if path is None or not path.is_file():
-        return None
-    settings = read_json_safe(path)
+    if path is None:
+        return True
+    if state.get("claude_relayed"):
+        required_scope = "relay-compatible"
+    elif managed_writes_allowed():
+        required_scope = "managed"
+    else:
+        required_scope = None
+    return managed_file_is_verified(state, "claude", path, required_scope=required_scope)
+
+
+def managed_settings_status(state: dict) -> tuple[Path | None, str, str]:
+    path = _managed_settings_path()
+    status, backup = managed_file_status(state, "claude", path, parser=_parse_managed_settings)
+    return path, status, backup
+
+
+def revert_managed_settings() -> str:
+    return revert_managed_file(
+        "claude",
+        display="Claude Code",
+        parser=_parse_managed_settings,
+        dumper=_dump_managed_settings,
+    )
+
+
+def _managed_relayed_conflicts(path: Path) -> list[str]:
+    """Return managed settings that would override Claude subscription relay auth."""
+    text = read_managed_file(path)
+    if text is None:
+        return []
+    try:
+        settings = _parse_managed_settings(text)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Cannot safely inspect Claude Code managed settings at {path}: {exc}. Repair the "
+            "file or contact your administrator."
+        ) from exc
     conflicts: list[str] = []
     if settings.get("apiKeyHelper"):
         conflicts.append("apiKeyHelper")
@@ -199,45 +290,7 @@ def _managed_relayed_conflicts() -> tuple[Path, list[str]] | None:
             conflicts.append("env.ANTHROPIC_BASE_URL")
         if env.get("ANTHROPIC_CUSTOM_HEADERS"):
             conflicts.append("env.ANTHROPIC_CUSTOM_HEADERS")
-    return (path, conflicts) if conflicts else None
-
-
-def _managed_pinned_model() -> tuple[Path, str] | None:
-    """Model that enterprise managed settings force Claude Code to launch with,
-    if any. Only `ANTHROPIC_MODEL` sets the launch model — the
-    `ANTHROPIC_DEFAULT_*` family aliases just remap what each tier resolves to
-    when selected, so they don't change the default. Doesn't break relayed auth,
-    but silently overrides Claude Code's model, so we surface it. Returns
-    (path, model_id) or None when the file is absent or `ANTHROPIC_MODEL` is unset."""
-    path = _managed_settings_path()
-    if path is None or not path.is_file():
-        return None
-    settings = read_json_safe(path)
-    env = settings.get("env")
-    if not isinstance(env, dict) or not env.get("ANTHROPIC_MODEL"):
-        return None
-    return (path, str(env["ANTHROPIC_MODEL"]))
-
-
-def managed_settings_model_overrides() -> Path | None:
-    """Path to enterprise managed settings when they pin a model ucode selects with, else None.
-
-    The enterprise scope outranks the ``--settings`` file ucode passes, so a model set there wins
-    over the one an admin published in the workspace's managed config — and unlike the user and
-    project scopes it can't be excluded with ``--setting-sources``. Callers surface this as a warning
-    so a developer whose models don't match their admin's config knows where to look.
-
-    Only the keys ucode actually writes count. The ``_NAME`` companions in
-    :data:`CLAUDE_MANAGED_MODEL_ENV_KEYS` are picker labels that select nothing, so an enterprise
-    value there can't override anything and warning about it would be noise."""
-    path = _managed_settings_path()
-    if path is None or not path.is_file():
-        return None
-    env = read_json_safe(path).get("env")
-    if not isinstance(env, dict):
-        return None
-    selecting_keys = (key for key in CLAUDE_MANAGED_MODEL_ENV_KEYS if not key.endswith("_NAME"))
-    return path if any(env.get(key) for key in selecting_keys) else None
+    return conflicts
 
 
 def relayed_proxy_base_url(state: dict) -> str:
@@ -579,6 +632,16 @@ def write_tool_config(
     routing_enabled = smart_routing_enabled(state) and provider is None
     if routing_enabled:
         managed_keys = managed_keys + [["hooks", event] for event in CLAUDE_ROUTING_HOOK_EVENTS]
+    managed_file_keys = list(managed_keys)
+    for path in (
+        [["env", key] for key in CLAUDE_MANAGED_MODEL_ENV_KEYS]
+        + [["env", key] for key in CLAUDE_REMOVED_ENV_KEYS]
+        + [["env", key] for key in CLAUDE_TRACING_ENV_KEYS]
+        + [["hooks", "Stop"]]
+        + [["hooks", event] for event in CLAUDE_ROUTING_HOOK_EVENTS]
+    ):
+        if path not in managed_file_keys:
+            managed_file_keys.append(path)
 
     def _compose(base: dict) -> dict:
         # deepcopy the overlay per file so merging into one base can't alias nested dicts into
@@ -614,8 +677,7 @@ def write_tool_config(
 
     write_json_file(CLAUDE_SETTINGS_PATH, _compose(read_json_safe(CLAUDE_SETTINGS_PATH)))
 
-    if state.get("write_managed_config"):
-        _write_managed_settings(_compose, relayed)
+    _reconcile_managed_settings(state, _compose, managed_file_keys, relayed)
 
     if web_search_model:
         web_search_entry = _web_search_mcp_entry(
@@ -643,34 +705,90 @@ def write_tool_config(
     return state
 
 
-def _write_managed_settings(compose: Callable[[dict], dict], relayed: bool) -> None:
-    """Write ucode's config into Claude Code's OS managed-settings.json so a bare `claude` works.
+def _reconcile_managed_settings(
+    state: dict,
+    compose: Callable[[dict], dict],
+    owned_paths: list[list[str]],
+    relayed: bool,
+) -> None:
+    """Reconcile Claude Code's OS-managed settings so a bare ``claude`` uses the gateway.
 
-    Runs only under use_as_global_settings. The managed file is root-owned and the highest-precedence
-    scope, so it applies whether or not `ucode` launches `claude`. The same compose (merge overlay +
-    prune stale keys) that produced the private file is applied to the existing managed file, so any
-    real IT-authored keys already there survive. The write goes through the sudo path in
-    `managed_files` (drift-suppressed, so no password prompt when unchanged).
+    The managed file is root-owned and the highest-precedence scope, so every normal Claude
+    configuration mirrors ucode's settings there. The same compose operation that produced the
+    private file is applied to the existing managed file, preserving unrelated IT-authored keys.
 
     Relayed launches are skipped: they depend on a per-session loopback refresh proxy that only runs
     during `ucode claude`, so a bare `claude` could not reach the gateway anyway.
     """
-    if relayed:
-        print_warning(
-            "Claude subscription-relay launches use a per-session proxy a bare `claude` can't "
-            "reach, so ucode did not write the managed settings file. Launch with `ucode claude` "
-            "to use the relay."
-        )
-        return
     path = _managed_settings_path()
     if path is None:
         print_warning(
             "Machine-wide Claude settings aren't supported on this platform; skipped the managed "
-            "settings write."
+            "settings."
         )
         return
-    desired = json.dumps(compose(read_json_safe(path)), indent=2)
-    write_managed_file(path, desired, display="Claude Code")
+    if path.is_symlink():
+        raise RuntimeError(
+            f"Refusing to use Claude Code managed settings through symlink {path}. Replace it "
+            "with a regular file or contact your administrator."
+        )
+    if relayed:
+        conflicts = _managed_relayed_conflicts(path)
+        if conflicts:
+            raise RuntimeError(
+                "Claude subscription relay cannot start because enterprise managed settings "
+                f"define {', '.join(conflicts)} at {path}. Ask your administrator to remove "
+                "those entries or use standard Databricks authentication. If ucode previously "
+                "created them, run `ucode revert` from an interactive terminal first."
+            )
+        mark_managed_file_verified(state, "claude", path, scope="relay-compatible")
+        return
+
+    current_text = read_managed_file(path)
+    try:
+        existing = _parse_managed_settings(current_text) if current_text is not None else {}
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Cannot safely update Claude Code managed settings at {path}: {exc}. "
+            "ucode did not modify the file. Repair it or contact your administrator."
+        ) from exc
+    managed_before = copy.deepcopy(existing)
+    desired_settings = compose(existing)
+    _preserve_permission_denies(managed_before, desired_settings)
+    if not managed_writes_allowed():
+        conflicts = managed_file_conflicts(managed_before, desired_settings, owned_paths)
+        if conflicts:
+            raise RuntimeError(
+                "Claude Code configuration cannot be applied non-interactively because "
+                f"OS-managed settings at {path} override ucode values: {', '.join(conflicts)}. "
+                "Run `ucode configure --agent claude` from an interactive terminal or contact "
+                "your administrator."
+            )
+        mark_managed_file_verified(state, "claude", path, scope="local-compatible")
+        return
+    reconcile_managed_file(
+        path,
+        _dump_managed_settings(desired_settings),
+        tool="claude",
+        display="Claude Code",
+        owned_paths=owned_paths,
+    )
+    mark_managed_file_verified(state, "claude", path)
+
+
+def _preserve_permission_denies(existing: dict, desired: dict) -> None:
+    existing_permissions = existing.get("permissions")
+    desired_permissions = desired.get("permissions")
+    if not isinstance(existing_permissions, dict) or not isinstance(desired_permissions, dict):
+        return
+    existing_denies = existing_permissions.get("deny")
+    desired_denies = desired_permissions.get("deny")
+    if not isinstance(existing_denies, list) or not isinstance(desired_denies, list):
+        return
+    desired_permissions["deny"] = [
+        *existing_denies,
+        *(rule for rule in desired_denies if rule not in existing_denies),
+    ]
 
 
 def _is_tracing_stop_hook(hook: object) -> bool:
@@ -1095,36 +1213,17 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     """Relayed launch: sign into the Claude subscription, start the loopback
     refresh proxy, then run Claude Code alongside it (the proxy must outlive the
     exec, so we spawn-and-wait rather than replacing the process)."""
-    conflict = _managed_relayed_conflicts()
-    if conflict is not None:
-        managed_path, keys = conflict
-        print_err(
-            "Enterprise managed settings are present, which Claude Code always "
-            "applies over relayed (Claude Max/Enterprise) auth. Remove "
-            f"{', '.join(keys)} from {managed_path} file before running relayed auth."
-        )
-        raise SystemExit(1)
-
-    pinned_model = _managed_pinned_model()
-    if pinned_model is not None:
-        managed_path, model_id = pinned_model
-        print_warning(
-            f"Default model ANTHROPIC_MODEL: {model_id} is set in your "
-            f"enterprise-managed settings ({managed_path}) and may override ucode "
-            "settings. Remove this entry if you encounter issues."
-        )
-
     _ensure_subscription_login()
     workspace = state["workspace"]
     port = state.get("relayed_proxy_port")
     if not isinstance(port, int):
         raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
 
-    server, cache, client = start_anthropic_model_discovery_proxy(
+    server, cache, client = gateway_proxy.start_proxy(
         workspace,
         state.get("profile"),
         port,
-        token_header=AI_GATEWAY_TOKEN_HEADER,
+        token_header=gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
         force_refresh_near_expiry=False,
     )
     # start_proxy falls back to an OS-assigned port when the cached one is taken
@@ -1153,18 +1252,9 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
 def _launch_claude_with_gateway_proxy(
     state: dict, binary: str, tool_args: list[str], *, smart_routing: bool
 ) -> None:
-    """Launch Claude through a refreshing gateway proxy."""
+    """Launch Claude through the gateway model-alias proxy."""
     workspace = state["workspace"]
-    server, cache, client = start_anthropic_model_discovery_proxy(
-        workspace,
-        state.get("profile"),
-        0,
-        token_header=AUTHORIZATION_HEADER,
-        force_refresh_near_expiry=True,
-    )
-    token = cache.token
-    os.environ["OAUTH_TOKEN"] = token
-    os.environ["ANTHROPIC_AUTH_TOKEN"] = token
+    server, client = start_anthropic_model_discovery_proxy(workspace, 0)
     os.environ["ANTHROPIC_BASE_URL"] = f"http://{LOOPBACK_HOST}:{server.server_address[1]}"
     os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
 
@@ -1199,7 +1289,6 @@ def _launch_claude_with_gateway_proxy(
             proc.send_signal(signal.SIGINT)
             returncode = proc.wait()
     finally:
-        cache.stop()
         server.shutdown()
         client.close()
     raise SystemExit(returncode)
