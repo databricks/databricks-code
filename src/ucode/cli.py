@@ -1918,7 +1918,11 @@ def _launch_tool(
         needs_auto_configure = not existing.get("workspace") or tool not in (
             existing.get("available_tools") or []
         )
-        ensure_bootstrap_dependencies(tool, update_existing=needs_auto_configure)
+        ensure_bootstrap_dependencies(
+            tool,
+            update_existing=needs_auto_configure,
+            skip_cli_version_check=skip_preflight,
+        )
         if needs_auto_configure:
             _auto_configure_tool(tool)
         state = ensure_provider_state(tool)
@@ -2176,15 +2180,17 @@ def _launch_tool(
 
 # Launch-only escape hatch for managed/headless launchers (e.g. omnigent) that
 # have already run `ucode configure`: skip the ~5-10s per-launch auth + AI
-# Gateway re-validation. Distinct from the configure-only `--skip-validate`,
-# which skips the model smoke test, and from `--skip-managed-config`, which
-# controls whether the workspace's managed config is applied.
+# Gateway re-validation, plus the Databricks CLI minimum-version check (whose
+# `databricks aitools` floor otherwise false-positives on a usable public-preview
+# build). Distinct from the configure-only `--skip-validate`, which skips the
+# model smoke test, and from `--skip-managed-config`, which controls whether the
+# workspace's managed config is applied.
 SkipPreflightOption = Annotated[
     bool,
     typer.Option(
         "--skip-preflight",
-        help="Skip the per-launch Databricks auth + AI Gateway re-validation, trusting a "
-        "prior `ucode configure`.",
+        help="Skip the per-launch Databricks auth + AI Gateway re-validation (and the "
+        "Databricks CLI minimum-version check), trusting a prior `ucode configure`.",
     ),
 ]
 
@@ -2291,7 +2297,7 @@ def _launch_managed_default(
         return
     if workspace:
         set_current_workspace(normalize_workspace_url(workspace))
-    install_databricks_cli()
+    install_databricks_cli(skip_version_check=skip_preflight)
     state = load_state()
     current = state.get("workspace")
     if not current:

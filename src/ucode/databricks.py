@@ -827,9 +827,17 @@ def upgrade_databricks_cli() -> bool:
     return True
 
 
-def install_databricks_cli() -> None:
+def install_databricks_cli(*, skip_version_check: bool = False) -> None:
+    """Ensure the Databricks CLI is installed and (unless skipped) new enough.
+
+    ``skip_version_check`` is set on ``--skip-preflight`` launches: they trust a
+    prior ``ucode configure`` and must not re-run the minimum-version gate, whose
+    ``databricks aitools`` floor (v1.0.0) rejects a perfectly usable public-preview
+    build (e.g. v0.299.2) as a false positive. A missing CLI is still installed —
+    only the version *check* is bypassed."""
     if shutil.which("databricks"):
-        ensure_databricks_cli_version()
+        if not skip_version_check:
+            ensure_databricks_cli_version()
         return
 
     print_section("Bootstrap")
@@ -840,7 +848,8 @@ def install_databricks_cli() -> None:
         raise RuntimeError(
             "Databricks CLI install completed, but `databricks` is still not on PATH."
         )
-    ensure_databricks_cli_version()
+    if not skip_version_check:
+        ensure_databricks_cli_version()
 
 
 def install_ai_tools(agent_tokens: list[str], profile: str | None = None) -> None:

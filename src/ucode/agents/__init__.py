@@ -280,8 +280,9 @@ def ensure_bootstrap_dependencies(
     *,
     update_existing: bool = False,
     prompt_optional_updates: bool = True,
+    skip_cli_version_check: bool = False,
 ) -> None:
-    install_databricks_cli()
+    install_databricks_cli(skip_version_check=skip_cli_version_check)
     install_tool_binary(
         tool,
         strict=True,

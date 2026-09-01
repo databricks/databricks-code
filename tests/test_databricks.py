@@ -34,6 +34,7 @@ from ucode.databricks import (
     get_databricks_profiles,
     get_databricks_token,
     install_ai_tools,
+    install_databricks_cli,
     list_databricks_apps,
     list_databricks_connections,
     list_genie_spaces,
@@ -2218,6 +2219,43 @@ class TestEnsureDatabricksCliVersion:
         monkeypatch.setattr("os.environ", env)
         with pytest.raises(RuntimeError, match="Could not parse"):
             ensure_databricks_cli_version()
+
+
+class TestInstallDatabricksCli:
+    def test_checks_version_when_present(self, monkeypatch):
+        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: "/usr/bin/databricks")
+        checked = []
+        monkeypatch.setattr(db_mod, "ensure_databricks_cli_version", lambda: checked.append(True))
+        install_databricks_cli()
+        assert checked == [True]
+
+    def test_skip_version_check_bypasses_version_gate(self, monkeypatch):
+        """`--skip-preflight` sets skip_version_check: an already-installed CLI is
+        trusted without the minimum-version gate, so a public-preview build is no
+        longer a false positive."""
+        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: "/usr/bin/databricks")
+        checked = []
+        monkeypatch.setattr(db_mod, "ensure_databricks_cli_version", lambda: checked.append(True))
+        install_databricks_cli(skip_version_check=True)
+        assert checked == []
+
+    def test_skip_version_check_still_installs_when_missing(self, monkeypatch):
+        """A missing CLI is installed even under skip_version_check — only the
+        version *check* is bypassed, not the install."""
+        present = {"databricks": None}
+        monkeypatch.setattr(db_mod.shutil, "which", lambda cmd: present.get(cmd))
+        installed = []
+
+        def fake_installer(brew_subcommand="install"):
+            present["databricks"] = "/usr/bin/databricks"
+            installed.append(brew_subcommand)
+
+        monkeypatch.setattr(db_mod, "_run_databricks_cli_installer", fake_installer)
+        checked = []
+        monkeypatch.setattr(db_mod, "ensure_databricks_cli_version", lambda: checked.append(True))
+        install_databricks_cli(skip_version_check=True)
+        assert installed == ["install"]
+        assert checked == []
 
 
 class TestDatabricksCliVersion:
