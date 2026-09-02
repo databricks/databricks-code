@@ -1935,9 +1935,6 @@ class TestProbeUnityGatewayCapabilities:
         ]
 
     def test_empty_first_page_follows_cursor_to_accessible_model_service(self, monkeypatch):
-        # UC applies page_size before ACL filtering, so an early page can come
-        # back empty (only a next_page_token) while accessible rows remain behind
-        # the cursor (ES-2185388). The probe must page before reporting empty.
         calls: list[str] = []
         responses = iter(
             [
@@ -2105,9 +2102,6 @@ class TestProbeUnityGatewayCapabilities:
         assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50"]
 
     def test_missing_scope_403_on_both_paths_routes_to_reauth_not_grants(self, monkeypatch):
-        # A missing-scope 403 is only conclusive once the legacy fallback also
-        # fails on it: the fix is re-login, not a UC grant. It must probe the
-        # fallback first and must not reach the grant-hint message.
         calls: list[str] = []
 
         def fake_get(url, token):
@@ -2132,8 +2126,6 @@ class TestProbeUnityGatewayCapabilities:
         ]
 
     def test_model_service_scope_403_succeeds_when_legacy_reachable(self, monkeypatch):
-        # A token scoped for the legacy endpoint but not for model services must
-        # still succeed via the fallback rather than surfacing the scope 403.
         calls: list[str] = []
 
         def fake_get(url, token):
@@ -2157,8 +2149,6 @@ class TestProbeUnityGatewayCapabilities:
         ]
 
     def test_probe_v3_later_page_error_is_reachable_not_empty(self, monkeypatch):
-        # A later-page error leaves the listing un-walked, so the probe must not
-        # conclude nothing is accessible.
         responses = iter(
             [
                 ({"next_page_token": "cursor-1"}, None),
@@ -2172,8 +2162,6 @@ class TestProbeUnityGatewayCapabilities:
         )
 
     def test_probe_v3_page_cap_with_pending_cursor_is_reachable_not_empty(self, monkeypatch):
-        # Exhausting the page cap while a cursor is still pending is inconclusive,
-        # not empty.
         calls: list[str] = []
 
         def fake_get(url, token):
@@ -2190,8 +2178,6 @@ class TestProbeUnityGatewayCapabilities:
     def test_inconclusive_model_service_probe_does_not_hard_fail_when_legacy_unavailable(
         self, monkeypatch
     ):
-        # A reachable-but-inconclusive v3 result means the API is enabled, so an
-        # unavailable legacy fallback must not report the gateway as missing.
         v3_responses = iter(
             [
                 ({"next_page_token": "cursor-1"}, None),
@@ -2211,8 +2197,6 @@ class TestProbeUnityGatewayCapabilities:
         )
 
     def test_scope_failure_matches_oauth_token_but_not_pat(self):
-        # OAuth-token scope 403 -> re-login; a PAT permission 403 (no "OAuth
-        # token") must not match, so it falls through to the grant guidance.
         assert db_mod._looks_like_scope_failure(
             "HTTP 403 Forbidden: Provided OAuth token does not have required scopes: unity-catalog"
         )

@@ -3050,9 +3050,6 @@ class GatewayProbe(NamedTuple):
     reachable: bool
     detail: str
     resource_available: bool = False
-    # False when the probe reached the API but couldn't reach a verdict on
-    # accessibility (e.g. a later-page error or the page cap). Distinguishes
-    # "reachable, confirmed no accessible resource" from "reachable, unknown".
     conclusive: bool = True
 
 
@@ -3087,10 +3084,6 @@ def _probe_ai_gateway_v2(workspace: str, token: str) -> GatewayProbe:
     )
 
 
-# The model-services listing applies `page_size` before ACL filtering, so an
-# early page can come back empty (only a `next_page_token`) while accessible
-# rows remain further in. Follow the cursor before concluding nothing is
-# accessible, or a caller with many services still reads as empty.
 _MODEL_SERVICE_PROBE_PAGE_SIZE = 50
 _MODEL_SERVICE_PROBE_MAX_PAGES = 20
 _MODEL_SERVICE_EMPTY_DETAIL = (
@@ -3113,17 +3106,12 @@ def _probe_ai_gateway_v3(workspace: str, token: str) -> GatewayProbe:
                 return GatewayProbe(
                     False, _version_neutral_gateway_detail(reason or "unknown error")
                 )
-            # A later page failed: reachable, but the listing was not walked to
-            # the end, so we can't claim nothing is accessible.
             return GatewayProbe(True, "reachable", conclusive=False)
         if isinstance(payload, dict) and payload.get("model_services"):
             return GatewayProbe(True, "reachable, accessible model service returned", True)
         page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
         if not page_token:
-            # Walked the whole listing without an accessible model service.
             return GatewayProbe(True, _MODEL_SERVICE_EMPTY_DETAIL)
-    # Hit the page cap with a cursor still pending: reachable but inconclusive,
-    # so don't assert the listing is empty.
     return GatewayProbe(True, "reachable", conclusive=False)
 
 
@@ -3181,15 +3169,10 @@ def probe_unity_gateway_capabilities(workspace: str, token: str) -> GatewayProbe
     legacy_endpoint_probe = _probe_ai_gateway_v2(workspace, token)
     if legacy_endpoint_probe.reachable:
         return model_service_probe
-    # The model-services API answered but the listing couldn't be walked to a
-    # verdict (later-page error or page cap): it is reachable, hence enabled, so
-    # don't let the unavailable fallback report the gateway as missing.
     if model_service_probe.reachable and not model_service_probe.conclusive:
         return model_service_probe
     if _looks_like_definitive_auth_failure(legacy_endpoint_probe.detail):
         _raise_ai_gateway_auth_failure(workspace, legacy_endpoint_probe.detail)
-    # A missing-scope 403 that survived the fallback is a token problem, not a
-    # UC grant, so surface re-login guidance before the permission hints.
     if _looks_like_scope_failure(model_service_probe.detail):
         _raise_ai_gateway_scope_failure(workspace, model_service_probe.detail)
     if _looks_like_scope_failure(legacy_endpoint_probe.detail):
