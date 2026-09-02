@@ -1001,7 +1001,7 @@ class TestRegisterWebSearchMcp:
 
 
 class TestClaudeLaunch:
-    def test_relayed_launch_uses_refresh_proxy_not_discovery_proxy(self, monkeypatch):
+    def test_relayed_launch_uses_refresh_proxy(self, monkeypatch):
         calls: list[tuple] = []
 
         class Server:
@@ -1044,11 +1044,6 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "_managed_relayed_conflicts", lambda: None)
         monkeypatch.setattr(claude, "_ensure_subscription_login", lambda: None)
         monkeypatch.setattr(claude.gateway_proxy, "start_proxy", start_proxy)
-        monkeypatch.setattr(
-            claude,
-            "start_anthropic_model_discovery_proxy",
-            lambda *_args: pytest.fail("relayed auth must not use the discovery proxy"),
-        )
         monkeypatch.setattr(claude.subprocess, "Popen", Process)
 
         with pytest.raises(SystemExit) as exc:
@@ -1172,12 +1167,20 @@ class TestClaudeLaunch:
     def test_v2_positional_prompt_uses_first_prompt_routing(self, monkeypatch, tool_args):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         launch_v2 = Mock()
-        monkeypatch.setattr(claude, "_launch_claude_with_gateway_proxy", launch_v2)
+        monkeypatch.setattr(claude, "_original_launch_model", lambda _state: None)
+        monkeypatch.setattr(v2, "launch_claude", launch_v2)
 
         claude.launch({"workspace": WS}, tool_args)
 
         launch_v2.assert_called_once_with(
-            {"workspace": WS}, "claude", tool_args, smart_routing=True
+            {"workspace": WS},
+            tool_args,
+            binary="claude",
+            user_settings_path=claude.CLAUDE_USER_SETTINGS_PATH,
+            launch_model=None,
+            compose_settings=claude._compose_v2_settings,
+            launch_model_args=claude._launch_model_args,
+            model_name=claude._maybe_add_1m_suffix,
         )
 
     def test_v2_does_not_treat_option_value_as_positional_argument(self):
@@ -1186,123 +1189,19 @@ class TestClaudeLaunch:
     def test_v2_treats_optional_option_value_as_interactive(self):
         assert claude._uses_interactive_tui(["--resume", "session-id"]) is True
 
-    def test_gateway_discovery_uses_anthropic_proxy(self, monkeypatch):
-        calls: list[tuple] = []
-
+    def test_gateway_discovery_uses_direct_gateway(self, monkeypatch):
+        calls: list[list[str]] = []
         monkeypatch.delenv(v2.ENV_VAR, raising=False)
-
-        class Server:
-            server_address = ("127.0.0.1", 12345)
-
-            def serve_forever(self):
-                calls.append(("serve",))
-
-            def shutdown(self):
-                calls.append(("shutdown",))
-
-        class Client:
-            def close(self):
-                calls.append(("close",))
-
-        class Process:
-            def __init__(self, argv):
-                calls.append(("popen", argv))
-
-            def wait(self):
-                return 0
-
-        def start_proxy(workspace, port):
-            calls.append(("proxy", workspace, port))
-            return Server(), Client()
-
         monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
-        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-        monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
-        monkeypatch.setattr(
-            claude,
-            "get_databricks_token",
-            lambda *_args: pytest.fail("model discovery must rely on apiKeyHelper"),
-        )
-        monkeypatch.setattr(
-            claude,
-            "start_anthropic_model_discovery_proxy",
-            start_proxy,
-        )
-        monkeypatch.setattr(claude.subprocess, "Popen", Process)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        with pytest.raises(SystemExit) as exc:
-            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
 
-        assert exc.value.code == 0
-        assert "OAUTH_TOKEN" not in os.environ
-        assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
-        assert os.environ["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
-        assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
+        assert os.environ["OAUTH_TOKEN"] == "token"
         assert os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
-        assert calls[:2] == [
-            ("proxy", WS, 0),
-            ("serve",),
-        ]
-        assert calls[2][0] == "popen"
-        argv = calls[2][1]
-        assert argv[:2] == ["claude", "--settings"]
-        assert json.loads(argv[2])["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
-        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in json.loads(argv[2])["env"]
-        assert argv[3:] == ["--debug"]
-        assert calls[3:] == [("shutdown",), ("close",)]
-
-    def test_smart_routing_uses_anthropic_proxy(self, monkeypatch):
-        calls: list[tuple] = []
-        captured: dict = {}
-
-        class Server:
-            server_address = ("127.0.0.1", 12345)
-
-            def serve_forever(self):
-                calls.append(("serve",))
-
-            def shutdown(self):
-                calls.append(("shutdown",))
-
-        class Client:
-            def close(self):
-                calls.append(("close",))
-
-        def start_proxy(workspace, port):
-            calls.append(("proxy", workspace, port))
-            return Server(), Client()
-
-        def launch_v2(state, tool_args, **kwargs):
-            captured["settings"] = kwargs["compose_settings"](["--debug"])
-            raise SystemExit(0)
-
-        monkeypatch.setenv(v2.ENV_VAR, "1")
-        monkeypatch.delenv("OAUTH_TOKEN", raising=False)
-        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-        monkeypatch.setattr(claude, "start_anthropic_model_discovery_proxy", start_proxy)
-        monkeypatch.setattr(
-            claude,
-            "_compose_v2_settings",
-            lambda args: ({"env": {"ANTHROPIC_BASE_URL": "https://direct"}}, args),
-        )
-        monkeypatch.setattr(v2, "launch_claude", launch_v2)
-
-        with pytest.raises(SystemExit) as exc:
-            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
-
-        assert exc.value.code == 0
-        assert "OAUTH_TOKEN" not in os.environ
-        assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
-        assert calls[:2] == [
-            ("proxy", WS, 0),
-            ("serve",),
-        ]
-        settings, remaining = captured["settings"]
-        assert settings["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
-        assert remaining == ["--debug"]
-        assert calls[2:] == [("shutdown",), ("close",)]
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
 
 
 class TestWriteToolConfigPrunesStaleModelEnv:
