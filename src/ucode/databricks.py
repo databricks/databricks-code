@@ -24,6 +24,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, cast, overload
@@ -1492,11 +1493,21 @@ _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 # support a new family.
 _OSS_MODEL_FAMILIES = ("kimi-", "glm-", "deepseek-")
 
+# Models served through the OpenAI Responses route. Keep gpt-oss out: it is
+# chat-completions-only and belongs to the MLflow provider.
+_CODEX_MODEL_FAMILIES = ("gpt-", "grok-")
+
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
 # support a new family in both discovery paths (`claude-<family>-*` via the
 # model-services listing and `databricks-claude-<family>-*` via the AI Gateway).
 ANTHROPIC_FAMILIES = ("fable", "opus", "sonnet", "haiku")
+
+
+def _is_codex_model(model_id: str) -> bool:
+    """Return whether a model id belongs on the OpenAI Responses route."""
+    lowered = model_id.lower()
+    return any(family in lowered for family in _CODEX_MODEL_FAMILIES) and "gpt-oss" not in lowered
 
 
 def classify_model_family(model_id: str) -> str | None:
@@ -1507,14 +1518,15 @@ def classify_model_family(model_id: str) -> str | None:
     one of ``ANTHROPIC_FAMILIES``, ``"codex"``, ``"gemini"``, or ``"oss"``. Matching is by name
     substring because neither the listing nor the config records a model's API dialect.
     """
+    lowered = model_id.lower()
     for family in ANTHROPIC_FAMILIES:
-        if f"claude-{family}-" in model_id:
+        if f"claude-{family}-" in lowered:
             return family
-    if "gpt-" in model_id:
+    if _is_codex_model(model_id):
         return "codex"
-    if "gemini-" in model_id:
+    if "gemini-" in lowered:
         return "gemini"
-    if any(oss in model_id for oss in _OSS_MODEL_FAMILIES):
+    if any(oss in lowered for oss in _OSS_MODEL_FAMILIES):
         return "oss"
     return None
 
@@ -1542,6 +1554,135 @@ def model_token_limits(model_id: str) -> dict[str, int] | None:
         if family in model_id:
             return dict(limits)
     return None
+
+
+# Gateway ids are custom models to Pi, so their limits cannot be inherited
+# from Pi's built-in vendor catalogue. Entries are ordered most-specific first.
+_GPT_TOKEN_LIMITS: tuple[tuple[str, dict[str, int]], ...] = (
+    # Grok's output ceiling is not exposed structurally; retain the conservative
+    # Responses fallback while preserving its documented 500K context window.
+    ("grok-4-6", {"context": 500_000, "output": 16_384}),
+    ("gpt-5-6-sol", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-6-terra", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-6-luna", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-5-pro", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-4-pro", {"context": 1_050_000, "output": 128_000}),
+    ("gpt-5-5", {"context": 272_000, "output": 128_000}),
+    ("gpt-5-4-mini", {"context": 400_000, "output": 128_000}),
+    ("gpt-5-4-nano", {"context": 400_000, "output": 128_000}),
+    ("gpt-5-4", {"context": 272_000, "output": 128_000}),
+    ("gpt-5", {"context": 400_000, "output": 128_000}),
+    ("gpt-4-1", {"context": 1_047_576, "output": 32_768}),
+    ("gpt-4o", {"context": 128_000, "output": 16_384}),
+    ("gpt-4-turbo", {"context": 128_000, "output": 4_096}),
+    ("gpt-4", {"context": 8_192, "output": 8_192}),
+)
+_GPT_FALLBACK_LIMITS = {"context": 128_000, "output": 16_384}
+
+
+def _normalized_foundation_model_id(model_id: str) -> str:
+    """Strip route prefixes case-insensitively and normalize dotted versions."""
+    tail = model_id.split("/")[-1].lower()
+    if tail.startswith("system.ai."):
+        tail = tail[len("system.ai.") :]
+    if tail.startswith("databricks-"):
+        tail = tail[len("databricks-") :]
+    return tail.replace(".", "-")
+
+
+def gpt_model_token_limits(model_id: str) -> dict[str, int]:
+    """Return Pi metadata limits for a Responses gateway model."""
+    tail = _normalized_foundation_model_id(model_id)
+    for family, limits in _GPT_TOKEN_LIMITS:
+        if tail == family or tail.startswith(f"{family}-"):
+            return dict(limits)
+    return dict(_GPT_FALLBACK_LIMITS)
+
+
+def preferred_gpt_model(model_ids: list[str]) -> str | None:
+    """Prefer the newest numeric GPT id, then another Responses model."""
+    eligible = [
+        model_id
+        for model_id in model_ids
+        if not _normalized_foundation_model_id(model_id).startswith("gpt-oss")
+    ]
+    numeric_gpt = [
+        model_id
+        for model_id in eligible
+        if re.match(r"^gpt-\d(?:-|$)", _normalized_foundation_model_id(model_id))
+    ]
+    if numeric_gpt:
+        return min(
+            numeric_gpt,
+            key=lambda model_id: model_version_sort_key(_normalized_foundation_model_id(model_id)),
+        )
+    return eligible[0] if eligible else None
+
+
+@dataclass(frozen=True)
+class ClaudeModelCapabilities:
+    context: int
+    output: int
+    supports_1m: bool = False
+    force_adaptive_thinking: bool = False
+    supports_xhigh_thinking: bool = False
+
+
+_CLAUDE_FALLBACK_CAPABILITIES = ClaudeModelCapabilities(context=200_000, output=64_000)
+_CLAUDE_MODEL_RE = re.compile(r"^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?")
+
+
+def claude_model_capabilities(model_id: str) -> ClaudeModelCapabilities:
+    """Return context, output, and thinking capabilities for a Claude model.
+
+    Opus gained the opt-in 1M window in 4.6; Sonnet gained it in 4.5.
+    Fable 5 uses a 1M default window and therefore needs no ``[1m]`` suffix.
+    Extended thinking levels are explicit allowlists because later versions do
+    not necessarily retain a predecessor's accepted values.
+    """
+    tail = _normalized_foundation_model_id(model_id)
+    match = _CLAUDE_MODEL_RE.match(tail)
+    if not match:
+        return _CLAUDE_FALLBACK_CAPABILITIES
+    family, major_raw, minor_raw = match.groups()
+    version = (int(major_raw), int(minor_raw or 0))
+    if family == "opus" and version >= (4, 6):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=128_000,
+            supports_1m=True,
+            force_adaptive_thinking=True,
+            supports_xhigh_thinking=version in {(4, 7), (4, 8)},
+        )
+    if family == "sonnet" and version >= (4, 6):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=64_000,
+            supports_1m=True,
+            force_adaptive_thinking=True,
+            supports_xhigh_thinking=version == (5, 0),
+        )
+    if family == "sonnet" and version >= (4, 5):
+        return ClaudeModelCapabilities(context=1_000_000, output=64_000, supports_1m=True)
+    if family == "fable" and version >= (5, 0):
+        return ClaudeModelCapabilities(
+            context=1_000_000,
+            output=128_000,
+            force_adaptive_thinking=True,
+            supports_xhigh_thinking=version == (5, 0),
+        )
+    return _CLAUDE_FALLBACK_CAPABILITIES
+
+
+def claude_model_supports_1m(model_id: str) -> bool:
+    """Whether Claude Code should request the model's opt-in ``[1m]`` tier."""
+    return claude_model_capabilities(model_id).supports_1m
+
+
+def claude_model_token_limits(model_id: str) -> dict[str, int]:
+    """Return Pi metadata limits from the shared Claude capability policy."""
+    capabilities = claude_model_capabilities(model_id)
+    return {"context": capabilities.context, "output": capabilities.output}
 
 
 def _model_service_id(service: dict) -> str | None:
@@ -1796,7 +1937,7 @@ def discover_model_services(
     - ``claude_models`` maps ``fable``/``opus``/``sonnet``/``haiku`` to the
       newest matching ``system.ai.claude-*`` id (mirrors
       ``discover_claude_models``).
-    - ``codex_models`` is the list of ``system.ai.*gpt-*`` ids, newest first.
+    - ``codex_models`` is the list of Responses-model ids, newest first.
     - ``gemini_models`` is the list of ``system.ai.*gemini-*`` ids, newest first.
     - ``oss_models`` is the list of OSS-model ``system.ai.*`` ids.
 
@@ -1823,7 +1964,7 @@ def discover_model_services(
     # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
     _prefer_opus_4_8(claude_models, ids)
 
-    codex_models = sorted([m for m in ids if "gpt-" in m], key=model_version_sort_key)
+    codex_models = sorted([m for m in ids if _is_codex_model(m)], key=model_version_sort_key)
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
 
     oss_models = [m for m in ids if any(family in m for family in _OSS_MODEL_FAMILIES)]
@@ -3362,7 +3503,7 @@ def build_pi_base_urls(workspace: str) -> dict[str, str]:
     # only (MLflow rejects `store` and `tools[].function.strict`).
     return {
         "claude": build_tool_base_url("claude", workspace),
-        "openai": build_tool_base_url("codex", workspace),
+        "openai": f"{workspace}/ai-gateway/openai/v1",
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
     }
 

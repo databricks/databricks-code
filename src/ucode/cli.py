@@ -585,6 +585,10 @@ def configure_shared_state(
         state.pop("fable_enabled", None)
     state["databricks_ai_tools_enabled"] = databricks_ai_tools_enabled
     state["base_urls"] = build_shared_base_urls(workspace)
+    # Refresh Pi's supplemental Claude inventory after discovery or a workspace
+    # change rather than carrying stale model ids into the next config write.
+    if not skip_preflight or previous_workspace != workspace:
+        state.pop("pi_claude_models", None)
 
     if skip_preflight:
         # A prior `ucode configure` created the profile; resolve it locally (no
