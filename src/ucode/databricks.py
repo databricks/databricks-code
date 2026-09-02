@@ -1777,8 +1777,8 @@ def list_model_services(
     ``system.ai`` schema (``parent=schemas/system.ai``) with a bounded
     ``page_size`` (the endpoint 499s without one) and returns the de-duplicated,
     sorted list of ``system.ai.<model-name>`` ids. Returns (ids, reason); reason
-    is None on success, otherwise it describes why the list is empty (HTTP/network
-    error or no services). Scoping matters: the unscoped metastore listing walks
+    is None on a complete success, otherwise it describes an HTTP/network error
+    or an empty or incomplete listing. Scoping matters: the unscoped metastore listing walks
     every schema across dozens of ~2s pages (~50s on a busy workspace) only to
     keep the same ``system.ai.*`` subset — see ``_MODEL_SERVICE_PARENT_SCHEMA``.
 
@@ -1806,25 +1806,44 @@ def list_model_services(
         payload, reason = _get_model_services_page(url, token)
         if payload is None:
             # Surface the failure only if we have nothing yet; a mid-pagination
-            # blip still returns whatever we collected.
+            # blip still returns whatever we collected, but marks it incomplete
+            # so consumers can retry or use a fallback inventory.
             last_reason = reason
             break
-        data = cast(dict, payload) if isinstance(payload, dict) else {}
-        for service in data.get("model_services", []):
+        if not isinstance(payload, dict):
+            last_reason = "model-services listing returned invalid JSON"
+            break
+        data = cast(dict, payload)
+        raw_services = data.get("model_services", [])
+        if not isinstance(raw_services, list):
+            last_reason = "model-services listing returned invalid model_services"
+            break
+        for service in raw_services:
             if isinstance(service, dict):
                 model_id = _model_service_id(service)
                 if model_id:
                     ids.append(model_id)
-        page_token = data.get("next_page_token") or None
-        if not page_token:
+        next_page_token = data.get("next_page_token")
+        if next_page_token is None or next_page_token == "":
             last_reason = None
             break
-        if page_token in seen_tokens:
+        if not isinstance(next_page_token, str):
+            last_reason = "model-services listing returned an invalid page token"
             break
-        seen_tokens.add(page_token)
+        if next_page_token in seen_tokens:
+            last_reason = "model-services listing repeated a page token"
+            break
+        seen_tokens.add(next_page_token)
+        page_token = next_page_token
+    else:
+        last_reason = "model-services listing exceeded the page limit"
 
     deduped = sorted(set(ids))
     if deduped:
+        # Do not cache an incomplete walk: callers that need the full inventory
+        # can fall back to the legacy gateway listing or retry the UC walk.
+        if last_reason is not None:
+            return deduped, last_reason
         if use_cache:
             _MODEL_SERVICES_CACHE[workspace] = list(deduped)
         return deduped, None
@@ -1899,18 +1918,76 @@ def model_service_exists(
     return False, None
 
 
+_ANTHROPIC_MODELS_MAX_PAGES = 50
+
+
+def _discover_claude_gateway_ids(workspace: str, token: str) -> tuple[list[str], str | None]:
+    """Return all Claude model ids from the legacy AI Gateway listing.
+
+    Uses the retrying Anthropic-models request helper so transient rate limits
+    and network blips don't empty the Claude inventory."""
+    ids: list[str] = []
+    after_id: str | None = None
+    seen_cursors: set[str] = set()
+    for _ in range(_ANTHROPIC_MODELS_MAX_PAGES):
+        payload, reason = _get_anthropic_models_json(workspace, token, after_id=after_id)
+        if payload is None:
+            return [], reason
+        if not isinstance(payload, dict):
+            return [], "AI Gateway returned invalid Claude model data"
+        data = cast(dict, payload)
+        # `data` is required on every page. Defaulting a missing member to an
+        # empty list would let a shape-regressed later page end the walk and
+        # report the ids gathered so far as a COMPLETE inventory.
+        raw_models = data.get("data")
+        if not isinstance(raw_models, list):
+            return [], "AI Gateway returned invalid Claude model data"
+        ids.extend(
+            model["id"]
+            for model in raw_models
+            if isinstance(model, dict)
+            and isinstance(model.get("id"), str)
+            and not model["id"].endswith("-anthropic")
+        )
+        if not data.get("has_more"):
+            if ids:
+                return ids, None
+            return [], "AI Gateway returned no Claude model ids"
+        cursor = data.get("last_id")
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            return [], "AI Gateway returned an invalid or repeated Claude model cursor"
+        seen_cursors.add(cursor)
+        after_id = cursor
+    # Page-budget exhaustion, unlike a malformed page, leaves every id we did
+    # read trustworthy — just not provably complete. Return the partial walk
+    # WITH a reason, matching `list_model_services` and the other paginated
+    # walkers in this module; a non-None reason already marks it incomplete so
+    # callers can union it with another view instead of losing the inventory.
+    return ids, f"AI Gateway Claude model listing exceeded {_ANTHROPIC_MODELS_MAX_PAGES} pages"
+
+
 def discover_claude_models_unbucketed(workspace: str, token: str) -> tuple[list[str], str | None]:
-    """Every `system.ai.claude-*` id on the workspace, unbucketed.
+    """Every Claude model id on the workspace, unbucketed.
 
     `discover_model_services` keeps only the newest id per family because the launch path pins one
     model per Claude family alias. An admin authoring a managed config needs the alternatives too
     (see `managed_setup.claude_family_candidates`), so this returns the full set without disturbing
-    that shape.
+    that shape. When UC model-services is unavailable, fall back to the legacy AI Gateway listing
+    so Pi and managed setup can still see all gateway models.
     """
     ids, reason = list_model_services(workspace, token)
-    if not ids:
-        return [], reason
-    return [m for m in ids if "claude-" in m.lower()], None
+    uc_claude = [model for model in ids if "claude-" in model.lower()]
+    # A non-Claude UC result, or a partial UC walk, must not hide models from
+    # the legacy gateway inventory. Union both successful views when available.
+    if uc_claude and reason is None:
+        return uc_claude, None
+    gateway_ids, gateway_reason = _discover_claude_gateway_ids(workspace, token)
+    gateway_claude = [model for model in gateway_ids if "claude-" in model.lower()]
+    if gateway_claude:
+        return sorted(set(uc_claude) | set(gateway_claude)), None
+    if uc_claude:
+        return uc_claude, None
+    return [], gateway_reason or reason
 
 
 def _prefer_opus_4_8(models: dict[str, str], all_ids: list[str]) -> None:
@@ -1963,6 +2040,14 @@ def discover_model_services(
     # routing works with the currently-deployed task_v1 router. Revert to
     # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
     _prefer_opus_4_8(claude_models, ids)
+    if reason is not None:
+        # A partial UC walk may omit an entire Claude family. Supplement the
+        # shared map too, not only Pi's unbucketed picker, so every agent gets
+        # the same routing-safe family inventory when the legacy listing works.
+        gateway_claude, _ = discover_claude_models(workspace, token)
+        for family, model in gateway_claude.items():
+            claude_models.setdefault(family, model)
+        _prefer_opus_4_8(claude_models, [*ids, *gateway_claude.values()])
 
     codex_models = sorted([m for m in ids if _is_codex_model(m)], key=model_version_sort_key)
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
@@ -2997,10 +3082,18 @@ def list_all_mcp_services(
     return sorted(names), None
 
 
-def _get_anthropic_models_json(workspace: str, token: str) -> tuple[dict | list | None, str | None]:
+def _get_anthropic_models_json(
+    workspace: str,
+    token: str,
+    *,
+    after_id: str | None = None,
+) -> tuple[dict | list | None, str | None]:
     hostname = workspace_hostname(workspace)
+    url = f"https://{hostname}{ANTHROPIC_MODELS_PATH}"
+    if after_id is not None:
+        url = f"{url}?{urlencode({'after_id': after_id})}"
     return _http_get_json(
-        f"https://{hostname}{ANTHROPIC_MODELS_PATH}",
+        url,
         token,
         max_retries=_ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES,
     )
@@ -3039,17 +3132,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     describes why the dict is empty (HTTP error, network error, or no models
     matching the expected naming convention).
     """
-    payload, reason = _get_anthropic_models_json(workspace, token)
-    if payload is None:
-        return {}, reason
-
-    data = cast(dict, payload) if isinstance(payload, dict) else {}
-    raw_ids = [
-        m["id"]
-        for m in data.get("data", [])
-        if isinstance(m.get("id"), str) and not m["id"].endswith("-anthropic")
-    ]
-
+    raw_ids, reason = _discover_claude_gateway_ids(workspace, token)
     result: dict[str, str] = {}
     for family in ANTHROPIC_FAMILIES:
         candidates = sorted(
@@ -3063,7 +3146,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     if result:
         return result, None
     if not raw_ids:
-        return {}, "AI Gateway returned no Claude model ids"
+        return {}, reason or "AI Gateway returned no Claude model ids"
     sample = ", ".join(raw_ids[:5])
     families = ",".join(ANTHROPIC_FAMILIES)
     return {}, (
