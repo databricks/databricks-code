@@ -420,6 +420,57 @@ class TestRenderOverlayUserAgent:
         assert "\n" in self._ua(monkeypatch)
 
 
+class TestMergeAnthropicCustomHeaders:
+    def test_merges_existing_settings_with_ucode_managed_headers(self):
+        headers_from_existing_settings = "\n".join(
+            [
+                "X-User-Header: keep-me",
+                "user-agent: custom-agent",
+            ]
+        )
+        headers_managed_by_ucode = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/1.0 claude/2.0",
+            ]
+        )
+
+        merged_headers = claude._merge_anthropic_custom_headers(
+            headers_from_existing_settings, headers_managed_by_ucode
+        )
+
+        assert merged_headers.splitlines() == [
+            "X-User-Header: keep-me",  # Preserved from existing settings.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
+        ]
+
+    def test_preserves_existing_header_order(self):
+        headers_from_existing_settings = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/0.1.0+41.gd09c080 claude/2.1.258",
+                "meep: lala",
+            ]
+        )
+        headers_managed_by_ucode = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/1.0 claude/2.0",
+            ]
+        )
+
+        merged_headers = claude._merge_anthropic_custom_headers(
+            headers_from_existing_settings, headers_managed_by_ucode
+        )
+
+        assert merged_headers.splitlines() == [
+            "x-databricks-use-coding-agent-mode: true",  # From ucode; overwrites existing.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "meep: lala",  # Preserved from existing settings in its original position.
+        ]
+
+
 class TestRenderOverlayWebSearchDisable:
     def test_settings_overlay_never_includes_mcp_servers(self):
         # MCP servers belong in ~/.claude.json, not settings.json.
@@ -656,6 +707,7 @@ class TestWriteToolConfigManagedSettings:
             str(FAKE_MANAGED_PATH): stale,
         }
         self._patch(monkeypatch, private_writes, managed_writes, existing)
+
         state = {"workspace": WS, "codex_models": []}
 
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
@@ -665,6 +717,29 @@ class TestWriteToolConfigManagedSettings:
             "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
             not in json.loads(managed_writes[0][1])["env"]
         )
+
+    def test_managed_file_merges_anthropic_custom_headers(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        existing_managed_settings = {
+            str(FAKE_MANAGED_PATH): {
+                "env": {"ANTHROPIC_CUSTOM_HEADERS": "X-Enterprise-Header: retain\nUser-Agent: old"}
+            }
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing_managed_settings)
+        monkeypatch.setattr(claude, "ucode_version", lambda: "1.0")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.0")
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        _, text = managed_writes[0]
+        merged_headers = json.loads(text)["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+        assert merged_headers.splitlines() == [
+            "X-Enterprise-Header: retain",  # Preserved from existing managed settings.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
+        ]
 
     def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []

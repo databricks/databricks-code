@@ -199,6 +199,14 @@ CLAUDE_CONDITIONAL_ENV_KEYS = ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",)
 # Env keys ucode used to write but no longer does; stripped from the managed
 # settings file on every launch so stale values never linger.
 CLAUDE_REMOVED_ENV_KEYS = ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",)
+ANTHROPIC_CUSTOM_HEADERS_ENV_KEY = "ANTHROPIC_CUSTOM_HEADERS"
+CLAUDE_MANAGED_CUSTOM_HEADER_NAMES = frozenset(
+    {
+        "x-databricks-use-coding-agent-mode",
+        "user-agent",
+        "databricks-model-provider-service",
+    }
+)
 CLAUDE_TRACING_STOP_HOOK_SUFFIX = " autolog claude stop-hook"
 # Tracing is driven by an `mlflow autolog claude stop-hook` Stop hook, run by
 # the `mlflow` CLI on each session end. Pin to 3.11.x: 3.12 dropped the Unity
@@ -634,9 +642,17 @@ def write_tool_config(
     # V2 installs routing hooks in a transient per-launch settings file. Persistent settings must
     # contain no ucode routing hooks; surgically strip legacy ones while preserving user hooks.
     def _compose(base: dict) -> dict:
+        base_env = base.get("env")
+        existing_custom_headers = (
+            base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY) if isinstance(base_env, dict) else None
+        )
         # deepcopy the overlay per file so merging into one base can't alias nested dicts into
         # the other (deep_merge_dict grafts overlay's own dict objects onto a base missing the key).
         merged = deep_merge_dict(base, copy.deepcopy(overlay))
+        overlay_custom_headers = overlay["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
+        merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
+            existing_custom_headers, overlay_custom_headers
+        )
         # Drop any apiKeyHelper a prior non-relayed launch left in the file; relayed
         # must not carry one (it would outrank the subscription OAuth).
         if relayed:
@@ -696,6 +712,54 @@ def write_tool_config(
     state = mark_tool_managed(state, "claude", managed_keys)
     save_state(state)
     return state
+
+
+def _merge_anthropic_custom_headers(existing: object, ucode_headers: str) -> str:
+    """Preserve user headers while replacing the header names managed by ucode.
+
+    Claude's ``ANTHROPIC_CUSTOM_HEADERS`` value is a newline-delimited string. To merge it, we:
+
+    1. Split the existing custom headers by newline into individual header items.
+    2. Split each item on ``:`` to identify its header name.
+    3. Replace headers in ``CLAUDE_MANAGED_CUSTOM_HEADER_NAMES`` with ucode's values in their
+       existing positions, while preserving all other existing headers.
+    4. Append any ucode-managed headers that were not already present.
+
+    Header names are compared case-insensitively. Non-header lines are also preserved to avoid
+    silently discarding user configuration we do not understand.
+    """
+
+    if not isinstance(existing, str) or not existing:
+        return ucode_headers
+
+    ucode_lines_by_name: dict[str, str] = {}
+    ucode_header_names: list[str] = []
+    for line in ucode_headers.splitlines():
+        name, separator, _value = line.partition(":")
+        normalized_name = name.strip().casefold()
+        if separator and normalized_name not in ucode_lines_by_name:
+            ucode_header_names.append(normalized_name)
+        if separator:
+            ucode_lines_by_name[normalized_name] = line
+
+    merged: list[str] = []
+    replaced_names: set[str] = set()
+    for line in existing.splitlines():
+        name, separator, _value = line.partition(":")
+        normalized_name = name.strip().casefold()
+        if separator and normalized_name in CLAUDE_MANAGED_CUSTOM_HEADER_NAMES:
+            replacement = ucode_lines_by_name.get(normalized_name)
+            if replacement is not None and normalized_name not in replaced_names:
+                merged.append(replacement)
+                replaced_names.add(normalized_name)
+            continue
+        if line:
+            merged.append(line)
+
+    for name in ucode_header_names:
+        if name not in replaced_names:
+            merged.append(ucode_lines_by_name[name])
+    return "\n".join(merged)
 
 
 def _reconcile_managed_settings(
