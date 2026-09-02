@@ -117,6 +117,26 @@ class TestRenderOverlay:
             overlay["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-7[1m]"
         )
 
+    def test_adds_1m_suffix_for_sonnet_4_5(self):
+        overlay, _ = claude.render_overlay(
+            WS, "s4", claude_models={"sonnet": "databricks-claude-sonnet-4-5"}
+        )
+        assert (
+            overlay["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-5[1m]"
+        )
+
+    def test_does_not_add_1m_suffix_for_sonnet_4_4(self):
+        overlay, _ = claude.render_overlay(
+            WS, "s4", claude_models={"sonnet": "databricks-claude-sonnet-4-4"}
+        )
+        assert overlay["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "databricks-claude-sonnet-4-4"
+
+    def test_does_not_add_1m_suffix_for_opus_4_5(self):
+        overlay, _ = claude.render_overlay(
+            WS, "s4", claude_models={"opus": "databricks-claude-opus-4-5"}
+        )
+        assert overlay["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "databricks-claude-opus-4-5"
+
     def test_does_not_add_1m_suffix_for_haiku(self):
         overlay, _ = claude.render_overlay(
             WS, "s4", claude_models={"haiku": "databricks-claude-haiku-4-6"}
@@ -168,6 +188,19 @@ class TestRenderOverlay:
             WS, "s4", claude_models={}, custom_model="main.x.m", fable_enabled=True
         )[0]["env"]
         assert with_fable["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "main.x.m"
+
+    @pytest.mark.parametrize(
+        ("model_id", "expected"),
+        [
+            ("system.ai.claude-opus-5", "system.ai.claude-opus-5[1m]"),
+            ("databricks-claude-sonnet-5", "databricks-claude-sonnet-5[1m]"),
+            ("system.ai.claude-opus-4-5", "system.ai.claude-opus-4-5"),
+            ("system.ai.claude-fable-5", "system.ai.claude-fable-5"),
+            ("not-a-claude-model", "not-a-claude-model"),
+        ],
+    )
+    def test_suffix_uses_shared_capability_policy(self, model_id, expected):
+        assert claude._maybe_add_1m_suffix(model_id) == expected
 
     def test_sets_anthropic_base_url(self):
         overlay, _ = claude.render_overlay(WS, "s4")

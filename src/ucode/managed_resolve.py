@@ -87,13 +87,33 @@ def managed_state_overrides(managed: dict, tool: str) -> dict[str, object]:
     return overrides
 
 
+def managed_unclassifiable_models(managed: dict, tool: str) -> list[str]:
+    """Models ignored because a name-based provider family cannot be identified.
+
+    De-duplicated in first-seen order: a manifest may legitimately repeat an id,
+    and the caller warns once per returned entry.
+    """
+    if tool not in ("opencode", "pi"):
+        return []
+    models = _manifest_models(managed, tool)
+    if not isinstance(models, list):
+        return []
+    seen: set[str] = set()
+    unclassifiable: list[str] = []
+    for model in models:
+        if classify_model_family(model) is None and model not in seen:
+            seen.add(model)
+            unclassifiable.append(model)
+    return unclassifiable
+
+
 def managed_unservable_models(managed: dict, tool: str) -> list[str]:
     """The models the manifest names for ``tool`` when it has no provider to serve any of them.
 
     Only non-empty when *every* named model is unservable, which is when the translation yields
     nothing and the developer's own models stand — so the caller can say why the admin's list had no
-    effect. opencode has no OpenAI provider and pi has no OSS provider, so each can be handed a
-    valid model FQN it cannot route.
+    effect. An agent can be handed a valid model FQN that none of its own
+    providers route, so the manifest names models it cannot serve.
     """
     if tool not in ("opencode", "pi"):
         return []
@@ -131,15 +151,17 @@ def _manifest_models(managed: dict, tool: str) -> dict | list | None:
 def _bucket_by_provider(models: list[str]) -> dict[str, list[str]]:
     """Group model FQNs into OpenCode's provider buckets, mirroring how discovery builds them.
 
-    Discovery derives these from the per-family lists (claude -> anthropic, and gemini/oss as-is), so
-    the same family classification recovers them from a flat manifest list. Models whose family
-    can't be identified are dropped.
+    Discovery derives these from the per-family lists (claude -> anthropic, codex -> openai, and
+    gemini/oss as-is), so the same family classification recovers them from a flat manifest list.
+    Models whose family can't be identified are dropped.
     """
     buckets: dict[str, list[str]] = {}
     for model in models:
         family = classify_model_family(model)
         if family in ANTHROPIC_FAMILIES:
             buckets.setdefault("anthropic", []).append(model)
+        elif family == "codex":
+            buckets.setdefault("openai", []).append(model)
         elif family in ("gemini", "oss"):
             buckets.setdefault(family, []).append(model)
     return buckets

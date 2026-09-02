@@ -17,6 +17,7 @@ from ucode.managed_resolve import (
     managed_provider_service,
     managed_state_overrides,
     managed_supplies_models,
+    managed_unclassifiable_models,
     managed_unservable_models,
     recommended_agent,
     resolve_state,
@@ -406,6 +407,7 @@ class TestManagedStateOverrides:
                     "model_config": {
                         "models": [
                             "system.ai.claude-opus-4-8",
+                            "system.ai.gpt-5",
                             "system.ai.gemini-3-flash",
                             "system.ai.kimi-k2-7-code",
                         ]
@@ -416,6 +418,7 @@ class TestManagedStateOverrides:
         assert managed_state_overrides(managed, "opencode") == {
             "opencode_models": {
                 "anthropic": ["system.ai.claude-opus-4-8"],
+                "openai": ["system.ai.gpt-5"],
                 "gemini": ["system.ai.gemini-3-flash"],
                 "oss": ["system.ai.kimi-k2-7-code"],
             }
@@ -430,6 +433,14 @@ class TestManagedStateOverrides:
         buckets = managed_state_overrides(managed, "opencode")["opencode_models"]
         assert opencode._resolve_model_selector("system.ai.claude-opus-4-8", buckets) == (
             "databricks-anthropic/system.ai.claude-opus-4-8"
+        )
+
+        gpt_managed = {
+            "enabled_agents": {"opencode": {"model_config": {"models": ["system.ai.gpt-5"]}}}
+        }
+        gpt_buckets = managed_state_overrides(gpt_managed, "opencode")["opencode_models"]
+        assert opencode._resolve_model_selector("system.ai.gpt-5", gpt_buckets) == (
+            "databricks-openai/system.ai.gpt-5"
         )
 
     @pytest.mark.parametrize("tool", ["pi", "copilot"])
@@ -460,6 +471,44 @@ class TestManagedStateOverrides:
         assert managed_state_overrides(managed, "opencode") == {
             "opencode_models": {"anthropic": ["system.ai.claude-opus-4-8"]}
         }
+
+    def test_unclassifiable_models_are_reported_without_affecting_known_families(self):
+        managed = {
+            "enabled_agents": {
+                "opencode": {
+                    "model_config": {
+                        "models": ["system.ai.future-chat-1", "system.ai.claude-opus-4-8"]
+                    }
+                }
+            }
+        }
+
+        assert managed_unclassifiable_models(managed, "opencode") == ["system.ai.future-chat-1"]
+        assert managed_state_overrides(managed, "opencode") == {
+            "opencode_models": {"anthropic": ["system.ai.claude-opus-4-8"]}
+        }
+
+    def test_repeated_unclassifiable_model_is_reported_once(self):
+        # A manifest may legitimately repeat an id; the caller warns per entry, so
+        # duplicates here would mean duplicate identical warnings.
+        managed = {
+            "enabled_agents": {
+                "opencode": {
+                    "model_config": {
+                        "models": [
+                            "system.ai.future-chat-1",
+                            "system.ai.future-chat-1",
+                            "system.ai.other-unknown",
+                        ]
+                    }
+                }
+            }
+        }
+
+        assert managed_unclassifiable_models(managed, "opencode") == [
+            "system.ai.future-chat-1",
+            "system.ai.other-unknown",
+        ]
 
     def test_no_override_when_nothing_is_servable(self):
         # An all-unservable list must not replace the developer's buckets with an empty dict —
@@ -529,10 +578,9 @@ class TestManagedUnservableModels:
             self._managed("pi", ["system.ai.kimi-k2-7-code"]), "pi"
         ) == ["system.ai.kimi-k2-7-code"]
 
-    def test_opencode_gpt_only_is_unservable(self):
-        # OpenCode has no OpenAI provider block.
+    def test_opencode_gpt_only_is_servable(self):
         managed = self._managed("opencode", ["system.ai.gpt-5"])
-        assert managed_unservable_models(managed, "opencode") == ["system.ai.gpt-5"]
+        assert managed_unservable_models(managed, "opencode") == []
 
     @pytest.mark.parametrize(
         ("tool", "models"),

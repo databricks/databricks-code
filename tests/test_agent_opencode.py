@@ -14,6 +14,7 @@ def _base_urls() -> dict[str, str]:
     return {
         "anthropic": f"{WS}/ai-gateway/anthropic/v1",
         "gemini": f"{WS}/ai-gateway/gemini/v1beta",
+        "openai": f"{WS}/ai-gateway/openai/v1",
         "oss": f"{WS}/ai-gateway/mlflow/v1",
     }
 
@@ -63,6 +64,12 @@ class TestRenderOverlay:
         )
         assert overlay["provider"]["databricks-oss"]["npm"] == "@ai-sdk/openai"
 
+    def test_oss_provider_disables_unsupported_prompt_cache_key(self):
+        models = {"oss": ["system.ai.gpt-oss-120b"]}
+        overlay, _ = opencode.render_overlay("system.ai.gpt-oss-120b", "tok", _base_urls(), models)
+        options = overlay["provider"]["databricks-oss"]["options"]
+        assert options["setCacheKey"] is False
+
     def test_deepseek_uses_oss_provider(self):
         model = "system.ai.deepseek-v4-pro"
 
@@ -106,15 +113,111 @@ class TestRenderOverlay:
         overlay, _ = opencode.render_overlay("system.ai.glm-5-2", "tok", _base_urls(), models)
         glm = overlay["provider"]["databricks-oss"]["models"]["system.ai.glm-5-2"]
         # OpenCode's schema requires both context and output on `limit`.
-        assert glm["limit"] == {"context": 200000, "output": 25000}
+        # Probed 2026-07-16: glm-5-2 is 1M context / 65536 output.
+        assert glm["limit"] == {"context": 1_000_000, "output": 65_536}
 
-    def test_non_glm_oss_model_has_no_output_cap(self):
+    def test_kimi_gets_token_limits(self):
+        # kimi is now a capped OSS family (128k context / 65536 output).
         models = {"oss": ["system.ai.kimi-k2-7-code"]}
         overlay, _ = opencode.render_overlay(
             "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
         )
         kimi = overlay["provider"]["databricks-oss"]["models"]["system.ai.kimi-k2-7-code"]
-        assert "limit" not in kimi
+        assert kimi["limit"] == {"context": 128_000, "output": 65_536}
+
+    def test_uncapped_oss_model_has_no_limit(self):
+        # A model outside the limits table gets no `limit` (client default).
+        models = {"oss": ["system.ai.mystery-7b"]}
+        overlay, _ = opencode.render_overlay("system.ai.mystery-7b", "tok", _base_urls(), models)
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.mystery-7b"]
+        assert "limit" not in entry
+        assert "reasoning" not in entry
+
+    def test_dynamic_full_spec_sets_reasoning_and_limits(self):
+        models = {"oss": ["system.ai.qwen35-122b-a10b"]}
+        specs = [
+            {
+                "id": "system.ai.qwen35-122b-a10b",
+                "reasoning": True,
+                "context_window": 262_144,
+                "max_tokens": 25_000,
+            }
+        ]
+        overlay, _ = opencode.render_overlay(
+            "system.ai.qwen35-122b-a10b", "tok", _base_urls(), models, specs
+        )
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.qwen35-122b-a10b"]
+        assert entry["reasoning"] is True
+        assert entry["limit"] == {"context": 262_144, "output": 25_000}
+
+    def test_dynamic_reasoning_false_is_respected(self):
+        models = {"oss": ["system.ai.glm-5-2"]}
+        specs = [
+            {
+                "id": "system.ai.glm-5-2",
+                "reasoning": False,
+                "context_window": None,
+                "max_tokens": None,
+            }
+        ]
+        overlay, _ = opencode.render_overlay(
+            "system.ai.glm-5-2", "tok", _base_urls(), models, specs
+        )
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.glm-5-2"]
+        assert entry["reasoning"] is False
+        assert entry["limit"] == {"context": 1_000_000, "output": 65_536}
+
+    def test_unknown_dynamic_spec_gets_safe_complete_limit_pair(self):
+        models = {"oss": ["system.ai.deepseek-v3"]}
+        specs = [
+            {
+                "id": "system.ai.deepseek-v3",
+                "reasoning": False,
+                "context_window": None,
+                "max_tokens": None,
+            }
+        ]
+        overlay, _ = opencode.render_overlay(
+            "system.ai.deepseek-v3", "tok", _base_urls(), models, specs
+        )
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.deepseek-v3"]
+        assert entry["reasoning"] is False
+        assert entry["limit"] == {"context": 128_000, "output": 8_192}
+
+    def test_partial_dynamic_limit_is_completed_as_valid_pair(self):
+        models = {"oss": ["system.ai.inkling"]}
+        specs = [
+            {
+                "id": "system.ai.inkling",
+                "reasoning": True,
+                "context_window": None,
+                "max_tokens": 65_536,
+            }
+        ]
+        overlay, _ = opencode.render_overlay(
+            "system.ai.inkling", "tok", _base_urls(), models, specs
+        )
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.inkling"]
+        assert entry["limit"] == {"context": 128_000, "output": 65_536}
+
+    def test_malformed_dynamic_spec_is_ignored_safely(self):
+        models = {"oss": ["system.ai.mystery-7b"]}
+        specs = [
+            None,
+            {"id": 12, "reasoning": True},
+            {
+                "id": "system.ai.mystery-7b",
+                "reasoning": "true",
+                "context_window": 0,
+                "max_tokens": True,
+            },
+        ]
+        overlay, _ = opencode.render_overlay(
+            "system.ai.mystery-7b", "tok", _base_urls(), models, specs
+        )
+        entry = overlay["provider"]["databricks-oss"]["models"]["system.ai.mystery-7b"]
+        assert "reasoning" not in entry
+        assert "limit" not in entry
 
     def test_token_in_api_key(self):
         models = {"anthropic": ["claude-sonnet"]}
@@ -208,6 +311,81 @@ class TestRenderOverlay:
             "system.ai.kimi-k2-7-code", "tok", _base_urls(), models
         )
         assert overlay["model"] == "databricks-oss/system.ai.kimi-k2-7-code"
+
+
+class TestOpenAIProvider:
+    """OpenCode uses the native Responses route for GPT and Grok models."""
+
+    def test_openai_provider_added_when_codex_models_present(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        assert "databricks-openai" in overlay["provider"]
+
+    def test_openai_provider_uses_native_sdk_and_gateway(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        provider = overlay["provider"]["databricks-openai"]
+        assert provider["npm"] == "@ai-sdk/openai"
+        assert provider["options"]["baseURL"] == f"{WS}/ai-gateway/openai/v1"
+        assert provider["options"]["headers"]["Authorization"] == "Bearer tok"
+
+    def test_use_responses_api_set_on_every_codex_model(self):
+        model_ids = ["databricks-gpt-5-6-sol", "system.ai.grok-4-6"]
+        overlay, _ = opencode.render_overlay(
+            model_ids[0], "tok", _base_urls(), {"openai": model_ids}
+        )
+        entries = overlay["provider"]["databricks-openai"]["models"]
+        assert all(entry["options"]["useResponsesApi"] is True for entry in entries.values())
+        assert entries["databricks-gpt-5-6-sol"]["limit"] == {
+            "context": 1_050_000,
+            "output": 128_000,
+        }
+        assert entries["system.ai.grok-4-6"]["limit"]["context"] == 500_000
+
+    def test_live_responses_context_overrides_static_fallback(self):
+        model = "system.ai.future-coder-1"
+        specs = [{"id": model, "context_window": 750_000}]
+        overlay, _ = opencode.render_overlay(
+            model, "tok", _base_urls(), {"openai": [model]}, [], specs
+        )
+        entry = overlay["provider"]["databricks-openai"]["models"][model]
+        assert entry["limit"] == {"context": 750_000, "output": 16_384}
+
+    def test_openai_user_agent_header(self, monkeypatch):
+        monkeypatch.setattr(opencode, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(opencode, "agent_version", lambda binary: "0.74.0")
+        model = "databricks-gpt-5-6-sol"
+        overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), {"openai": [model]})
+        entry = overlay["provider"]["databricks-openai"]["models"][model]
+        assert entry["headers"]["User-Agent"] == "ucode/0.1.0 opencode/0.74.0"
+
+    def test_selector_and_managed_keys_use_openai_provider(self):
+        model = "databricks-gpt-5-6-sol"
+        overlay, keys = opencode.render_overlay(model, "tok", _base_urls(), {"openai": [model]})
+        assert overlay["model"] == f"databricks-openai/{model}"
+        assert ["provider", "databricks-openai"] in keys
+        assert ["provider", "databricks-openai"] in opencode.PROVIDER_KEYS
+
+    def test_already_prefixed_openai_model_is_preserved(self):
+        model = "databricks-gpt-5-6-sol"
+        selector = f"databricks-openai/{model}"
+        overlay, _ = opencode.render_overlay(selector, "tok", _base_urls(), {"openai": [model]})
+        assert overlay["model"] == selector
+
+    def test_all_four_providers_can_coexist(self):
+        models = {
+            "anthropic": ["claude-sonnet"],
+            "gemini": ["gemini-2"],
+            "openai": ["databricks-gpt-5-6-sol"],
+            "oss": ["system.ai.kimi-k2-7-code"],
+        }
+        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        assert set(overlay["provider"]) == {
+            "databricks-anthropic",
+            "databricks-google",
+            "databricks-openai",
+            "databricks-oss",
+        }
 
 
 class TestMcpServerConfig:
@@ -318,6 +496,28 @@ class TestOpencodeDefaultModel:
         state = {"opencode_models": {"anthropic": ["claude-sonnet"], "gemini": ["gemini-2"]}}
         assert opencode.default_model(state) == "claude-sonnet"
 
+    def test_falls_back_to_openai_before_gemini(self):
+        state = {
+            "opencode_models": {
+                "anthropic": [],
+                "openai": ["databricks-gpt-5-6-sol"],
+                "gemini": ["gemini-2"],
+            }
+        }
+        assert opencode.default_model(state) == "databricks-gpt-5-6-sol"
+
+    def test_openai_fallback_chooses_newest_gpt(self):
+        state = {
+            "opencode_models": {
+                "openai": ["databricks-gpt-4-1", "databricks-gpt-5-5", "databricks-gpt-5-4"]
+            }
+        }
+        assert opencode.default_model(state) == "databricks-gpt-5-5"
+
+    def test_gpt_oss_is_not_selected_for_responses(self):
+        state = {"opencode_models": {"openai": ["gpt-oss-120b"], "gemini": ["gemini-2"]}}
+        assert opencode.default_model(state) == "gemini-2"
+
     def test_falls_back_to_gemini(self):
         state = {"opencode_models": {"anthropic": [], "gemini": ["gemini-2"]}}
         assert opencode.default_model(state) == "gemini-2"
@@ -423,3 +623,33 @@ class TestWriteToolConfigStaleProviderCleanup:
 
         written = json.loads(config_file.read_text())
         assert written["model"] == "databricks-anthropic/claude-sonnet"
+
+    def test_state_oss_specs_reach_written_model_entry(self, tmp_path, monkeypatch):
+        import ucode.agents.opencode as oc_mod
+
+        config_file = tmp_path / "opencode.json"
+        monkeypatch.setattr(oc_mod, "OPENCODE_CONFIG_PATH", config_file)
+        monkeypatch.setattr(oc_mod, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-backup.json")
+        state = {
+            "workspace": WS,
+            "base_urls": {"opencode": _base_urls()},
+            "opencode_models": {"oss": ["system.ai.inkling"]},
+            "oss_model_specs": [
+                {
+                    "id": "system.ai.inkling",
+                    "reasoning": True,
+                    "context_window": 256_000,
+                    "max_tokens": 65_536,
+                }
+            ],
+            "managed_configs": {},
+        }
+
+        with patch("ucode.agents.opencode.save_state"):
+            oc_mod.write_tool_config(state, "system.ai.inkling", token="tok")
+
+        entry = json.loads(config_file.read_text())["provider"]["databricks-oss"]["models"][
+            "system.ai.inkling"
+        ]
+        assert entry["reasoning"] is True
+        assert entry["limit"] == {"context": 256_000, "output": 65_536}

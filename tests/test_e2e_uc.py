@@ -2,8 +2,8 @@
 
 Verifies that `configure_shared_state` discovers models via UC model-services
 (`system.ai.*`) by default, falls back to the legacy per-family AI Gateway
-listings when UC model-services are absent, and surfaces only `system.ai.*`
-entries from the UC primitives.
+listings when UC model-services are absent, and surfaces only `system.ai.*` UC
+names or `databricks-*` gateway endpoint names from the discovery primitives.
 
 Run with:
     UCODE_TEST_WORKSPACE=https://your-workspace.databricks.com \
@@ -36,17 +36,17 @@ def _all_resolved_model_ids(state: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# UC discovery primitives — verify the endpoints return only `system.ai.*`
-# entries (the per-family/connection filters drop everything else).
+# Model discovery returns UC `system.ai.*` names plus gateway-only
+# `databricks-*` endpoint names; per-family filters must drop everything else.
 # ---------------------------------------------------------------------------
 
 
 class TestDiscoverModelServicesE2E:
-    def test_returns_only_system_ai_models(self, e2e_workspace, e2e_token):
+    def test_returns_only_uc_or_gateway_models(self, e2e_workspace, e2e_token):
         claude, codex, gemini, oss, reason = discover_model_services(e2e_workspace, e2e_token)
         if not (claude or codex or gemini or oss):
-            pytest.skip(f"No system.ai.* model services on workspace: {reason}")
-        non_system = sorted(
+            pytest.skip(f"No model services on workspace: {reason}")
+        unrelated = sorted(
             {
                 m
                 for m in _all_resolved_model_ids(
@@ -57,10 +57,10 @@ class TestDiscoverModelServicesE2E:
                         "oss_models": oss,
                     }
                 )
-                if not m.startswith("system.ai.")
+                if not (m.startswith("system.ai.") or m.startswith("databricks-"))
             }
         )
-        assert not non_system, f"Non-system.ai entries leaked through: {non_system[:5]}"
+        assert not unrelated, f"Unrelated model entries leaked through: {unrelated[:5]}"
 
 
 class TestListMcpServicesE2E:
