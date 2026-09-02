@@ -27,7 +27,6 @@ from ucode.databricks import (
     build_tool_base_url,
     discover_model_services,
     discover_sql_warehouses,
-    ensure_ai_gateway,
     fetch_ai_gateway_claude_models,
     fetch_codex_models,
     fetch_gemini_models,
@@ -35,6 +34,7 @@ from ucode.databricks import (
     is_model_provider_feature_unavailable,
     list_model_provider_services,
     list_tool_provider_services,
+    probe_unity_gateway_capabilities,
     service_usable_for_tool,
     workspace_hostname,
 )
@@ -137,8 +137,8 @@ class TestDatabricksAuth:
 
 
 class TestAiGateway:
-    def test_ensure_ai_gateway_does_not_raise(self, e2e_workspace, e2e_token):
-        ensure_ai_gateway(e2e_workspace, e2e_token)
+    def test_probe_unity_gateway_capabilities_does_not_raise(self, e2e_workspace, e2e_token):
+        probe_unity_gateway_capabilities(e2e_workspace, e2e_token)
 
     def test_workspace_hostname_resolves(self, e2e_workspace):
         hostname = workspace_hostname(e2e_workspace)
@@ -890,6 +890,51 @@ class TestOpencodeLaunch:
         assert result.returncode == 0 and combined, (
             f"DeepSeek model={model} rc={result.returncode} "
             f"stdout={result.stdout[:300]!r} stderr={result.stderr[:500]!r}"
+        )
+
+    def test_recovers_from_rejected_initial_token(
+        self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
+    ):
+        """Exercise the real OpenCode plugin's 401 refresh-and-retry path."""
+        import ucode.config_io as config_io_mod
+        from ucode.agents import opencode
+
+        _require_binary("opencode")
+        models = self._all_models(e2e_state)
+        if not models:
+            pytest.skip("No OpenCode models available on this workspace")
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        xdg = tmp_path / "opencode-xdg"
+        monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
+        monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", xdg / "opencode" / "opencode.json")
+        monkeypatch.setattr(
+            opencode, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-config.backup.json"
+        )
+        monkeypatch.setattr("ucode.state.save_state", lambda s: None)
+
+        _, model = models[0]
+        rejected_token = "ucode-intentionally-rejected-token"
+        opencode.write_tool_config(
+            {**e2e_state, "workspace": e2e_workspace},
+            model,
+            token=rejected_token,
+        )
+
+        env = opencode.build_runtime_env(rejected_token)
+        # CI authenticates this way; the helper subprocess inherits it and
+        # returns the known-good token after OpenCode's first request gets 401.
+        env["DATABRICKS_BEARER"] = e2e_token
+        result = _run_agent(
+            opencode.validate_cmd("opencode"),
+            env=env,
+            timeout=180,
+        )
+        combined = (result.stdout + result.stderr).strip()
+        assert result.returncode == 0 and combined, (
+            "OpenCode did not recover after its initial token was rejected: "
+            f"rc={result.returncode} stdout={result.stdout[:300]!r} "
+            f"stderr={result.stderr[:500]!r}"
         )
 
 

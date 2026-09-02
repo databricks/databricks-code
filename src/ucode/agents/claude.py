@@ -49,7 +49,7 @@ from ucode.smart_routing.claude_hooks import (
     sync_smart_routing_hooks,
 )
 from ucode.smart_routing.claude_routing import CLAUDE_VALUE_OPTIONS
-from ucode.state import get_provider_service, mark_tool_managed, save_state
+from ucode.state import MANAGED_OVERLAY_KEY, get_provider_service, mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_note, print_success, print_warning
@@ -176,9 +176,8 @@ CLAUDE_TRACING_ENV_KEYS = (
     "MLFLOW_EXPERIMENT_ID",
     "MLFLOW_TRACING_SQL_WAREHOUSE_ID",
 )
-# Model-selection env keys ucode owns end-to-end. Anything in this tuple that
-# isn't written by render_overlay gets actively pruned from settings.json on
-# every launch, so stale values from older ucode versions never linger.
+# Model-selection env keys ucode manages. Existing family defaults in the enterprise-managed file
+# are preserved unless Coding Agent Config explicitly supplies that family.
 CLAUDE_MANAGED_MODEL_ENV_KEYS = (
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_FABLE_MODEL",
@@ -190,6 +189,12 @@ CLAUDE_MANAGED_MODEL_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
 )
+CLAUDE_DEFAULT_MODEL_ENV_KEYS = {
+    "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+}
 # Launch-scoped feature flags that ucode may write into Claude settings. These
 # must be removed again when the corresponding launch flag is absent.
 CLAUDE_CONDITIONAL_ENV_KEYS = ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",)
@@ -509,6 +514,32 @@ def _maybe_add_1m_suffix(model: str) -> str:
     return f"{model}[1m]" if should_suffix else model
 
 
+def _enforce_model_default_hierarchy(
+    family: str,
+    *,
+    coding_agent_config_defaults: dict[str, str],
+    settings_file_existing_defaults: dict[str, str],
+    ucode_defaults: dict[str, str],
+) -> str | None:
+    """Apply managed-file model precedence for one Claude family."""
+    coding_agent_config_default_model = coding_agent_config_defaults.get(family)
+    settings_file_existing_default_model = settings_file_existing_defaults.get(family)
+    ucode_default_model = ucode_defaults.get(family)
+
+    if coding_agent_config_default_model is not None:
+        selected_default_model = coding_agent_config_default_model
+    elif settings_file_existing_default_model is not None:
+        return settings_file_existing_default_model
+    else:
+        selected_default_model = ucode_default_model
+
+    if selected_default_model is None:
+        return None
+    if family in ("opus", "sonnet"):
+        return _maybe_add_1m_suffix(selected_default_model)
+    return selected_default_model
+
+
 def _register_web_search_mcp(workspace: str, search_model: str, profile: str | None = None) -> bool:
     """Register (or replace) the web_search MCP server in Claude Code's user
     scope via `claude mcp add-json`. Removes any prior entry first so re-runs
@@ -589,6 +620,7 @@ def write_tool_config(
     relayed: bool = False,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    coding_agent_config_defaults: dict[str, str] | None = None,
 ) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
     web_search_model = _resolve_web_search_model(state)
@@ -638,15 +670,44 @@ def write_tool_config(
 
     # V2 installs routing hooks in a transient per-launch settings file. Persistent settings must
     # contain no ucode routing hooks; surgically strip legacy ones while preserving user hooks.
-    def _compose(base: dict) -> dict:
+    def _compose(base: dict, *, enforce_model_default_hierarchy: bool) -> dict:
         base_env = base.get("env")
         existing_custom_headers = (
             base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY) if isinstance(base_env, dict) else None
         )
-        # deepcopy the overlay per file so merging into one base can't alias nested dicts into
-        # the other (deep_merge_dict grafts overlay's own dict objects onto a base missing the key).
-        merged = deep_merge_dict(base, copy.deepcopy(overlay))
-        overlay_custom_headers = overlay["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
+        # Copy the overlay per file so merging into one base cannot affect the other.
+        overlay_for_merge = copy.deepcopy(overlay)
+        if enforce_model_default_hierarchy:
+            settings_file_env = base_env if isinstance(base_env, dict) else {}
+            target_env = overlay_for_merge["env"]
+            configured_defaults = coding_agent_config_defaults or {}
+            settings_file_existing_defaults = {
+                family: model
+                for family, key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.items()
+                if isinstance((model := settings_file_env.get(key)), str)
+            }
+            managed_overlay = state.get(MANAGED_OVERLAY_KEY, {})
+            ucode_defaults = (
+                managed_overlay.get("claude_models") or state.get("claude_models") or {}
+            )
+
+            for family, key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.items():
+                if family == "fable" and not state.get("fable_enabled"):
+                    target_env.pop(key, None)
+                    continue
+
+                selected_default_model = _enforce_model_default_hierarchy(
+                    family,
+                    coding_agent_config_defaults=configured_defaults,
+                    settings_file_existing_defaults=settings_file_existing_defaults,
+                    ucode_defaults=ucode_defaults,
+                )
+                if selected_default_model is None:
+                    target_env.pop(key, None)
+                else:
+                    target_env[key] = selected_default_model
+        merged = deep_merge_dict(base, overlay_for_merge)
+        overlay_custom_headers = overlay_for_merge["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
         merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
             existing_custom_headers, overlay_custom_headers
         )
@@ -665,7 +726,7 @@ def write_tool_config(
             _remove_tracing_stop_hook(merged)
         # Prune ucode-managed model env keys we deliberately don't write this run
         # (e.g. ANTHROPIC_MODEL — see render_overlay).
-        overlay_env = overlay.get("env", {})
+        overlay_env = overlay_for_merge.get("env", {})
         merged_env = merged.get("env")
         if isinstance(merged_env, dict):
             for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
@@ -681,9 +742,17 @@ def write_tool_config(
         sync_smart_routing_hooks(merged, state, enabled=False)
         return merged
 
-    write_json_file(CLAUDE_SETTINGS_PATH, _compose(read_json_safe(CLAUDE_SETTINGS_PATH)))
+    write_json_file(
+        CLAUDE_SETTINGS_PATH,
+        _compose(read_json_safe(CLAUDE_SETTINGS_PATH), enforce_model_default_hierarchy=False),
+    )
 
-    _reconcile_managed_settings(state, _compose, managed_file_keys, relayed)
+    _reconcile_managed_settings(
+        state,
+        lambda base: _compose(base, enforce_model_default_hierarchy=True),
+        managed_file_keys,
+        relayed,
+    )
 
     if web_search_model:
         web_search_entry = _web_search_mcp_entry(

@@ -11,6 +11,7 @@ import pytest
 
 from ucode.agents import claude
 from ucode.smart_routing import claude_routing, v2
+from ucode.state import MANAGED_OVERLAY_KEY
 
 WS = "https://example.databricks.com"
 
@@ -692,6 +693,51 @@ class TestWriteToolConfigManagedSettings:
 
         monkeypatch.setattr(claude, "reconcile_managed_file", fake_write_managed)
 
+    def _write_managed_model_defaults(
+        self,
+        monkeypatch,
+        *,
+        coding_agent_config_defaults: dict[str, str],
+        managed_settings_defaults: dict[str, str],
+        ucode_defaults: dict[str, str],
+        fable_enabled: bool,
+    ) -> dict[str, str]:
+        private_writes: list = []
+        managed_writes: list = []
+        managed_settings_env = {
+            claude.CLAUDE_DEFAULT_MODEL_ENV_KEYS[family]: model
+            for family, model in managed_settings_defaults.items()
+        }
+        self._patch(
+            monkeypatch,
+            private_writes,
+            managed_writes,
+            {str(FAKE_MANAGED_PATH): {"env": managed_settings_env}},
+        )
+        resolved_defaults = coding_agent_config_defaults or ucode_defaults
+        state = {
+            "workspace": WS,
+            "codex_models": [],
+            "claude_models": resolved_defaults,
+            "fable_enabled": fable_enabled,
+        }
+        if coding_agent_config_defaults:
+            state[MANAGED_OVERLAY_KEY] = {"claude_models": ucode_defaults}
+
+        claude.write_tool_config(
+            state,
+            next(iter(resolved_defaults.values()), "test-model"),
+            coding_agent_config_defaults=coding_agent_config_defaults,
+        )
+
+        _, text = managed_writes[0]
+        written_env = json.loads(text)["env"]
+        return {
+            family: written_env[key]
+            for family, key in claude.CLAUDE_DEFAULT_MODEL_ENV_KEYS.items()
+            if key in written_env
+        }
+
     def test_writes_managed_file_by_default(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
@@ -758,6 +804,39 @@ class TestWriteToolConfigManagedSettings:
             "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
             "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
         ]
+
+    def test_managed_file_applies_model_default_precedence(self, monkeypatch):
+        managed_defaults = self._write_managed_model_defaults(
+            monkeypatch,
+            coding_agent_config_defaults={"opus": "system.ai.claude-opus-4-8"},
+            managed_settings_defaults={
+                "opus": "system.ai.claude-opus-5",
+                "sonnet": "system.ai.claude-sonnet-4-6",
+            },
+            ucode_defaults={
+                "opus": "system.ai.claude-opus-5",
+                "sonnet": "system.ai.claude-sonnet-5",
+                "haiku": "system.ai.claude-haiku-5",
+            },
+            fable_enabled=False,
+        )
+
+        assert managed_defaults == {
+            "opus": "system.ai.claude-opus-4-8[1m]",  # Coding Agent Config took priority.
+            "sonnet": "system.ai.claude-sonnet-4-6",  # Existing managed setting took priority.
+            "haiku": "system.ai.claude-haiku-5",  # Ucode default took priority.
+        }
+
+    def test_managed_file_removes_fable_default_when_fable_is_disabled(self, monkeypatch):
+        managed_defaults = self._write_managed_model_defaults(
+            monkeypatch,
+            coding_agent_config_defaults={"fable": "coding-agent-config-fable"},
+            managed_settings_defaults={"fable": "managed-settings-fable"},
+            ucode_defaults={"fable": "ucode-fable"},
+            fable_enabled=False,
+        )
+
+        assert "fable" not in managed_defaults
 
     def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []
@@ -1185,8 +1264,6 @@ class TestWriteToolConfigPrunesStaleModelEnv:
         assert env["MY_CUSTOM_VAR"] == "keep-me"
 
     def test_prunes_unused_family_default_when_models_change(self, monkeypatch):
-        # Earlier launch wrote a sonnet default; the new state only has opus.
-        # The stale sonnet keys should be removed.
         existing = {
             "env": {
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-4-6[1m]",

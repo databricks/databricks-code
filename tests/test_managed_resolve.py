@@ -236,7 +236,15 @@ class TestStateFileIsNotRewritten:
     def test_settings_file_gets_the_managed_model(self, real_state_file):
         # The other half of the contract: precedence must actually reach the generated file.
         resolved_state = resolve_state(MANAGED, state_mod.load_state(), "claude")
-        claude.write_tool_config(resolved_state, None)
+        claude.write_tool_config(
+            resolved_state,
+            None,
+            coding_agent_config_defaults={
+                "opus": "system.ai.claude-opus-5",
+                "sonnet": "system.ai.claude-sonnet-4-6",
+                "haiku": "system.ai.claude-haiku-4-5",
+            },
+        )
 
         env = json.loads((real_state_file / "ucode-settings.json").read_text())["env"]
         assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"].startswith("system.ai.claude-opus-5")

@@ -81,6 +81,20 @@ class TestToolSpecs:
     def test_default_tool_is_codex(self):
         assert DEFAULT_TOOL == "codex"
 
+    def test_tool_update_available_uses_agent_override(self, monkeypatch):
+        monkeypatch.setattr(
+            agents_mod.opencode,
+            "is_update_available",
+            lambda: ("1.18.15", "1.18.16"),
+        )
+        monkeypatch.setattr(
+            agents_mod,
+            "available_npm_package_update",
+            lambda _package: (_ for _ in ()).throw(AssertionError("should use override")),
+        )
+
+        assert agents_mod.tool_update_available("opencode") == ("1.18.15", "1.18.16")
+
 
 class TestInstallAiToolsForAgents:
     def _capture(self, monkeypatch):
@@ -404,6 +418,8 @@ class TestInstallToolBinary:
             "ucode.agents.prompt_yes_no",
             lambda prompt: (_ for _ in ()).throw(AssertionError("should not prompt")),
         )
+        monkeypatch.setattr("ucode.agents._required_update_message", lambda _: None)
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: None)
 
         assert install_tool_binary("opencode", strict=False, update_existing=True) is True
         assert calls == []
@@ -435,7 +451,7 @@ class TestInstallToolBinary:
             )
             is True
         )
-        assert calls and calls[0][:3] == ["npm", "install", "-g"]
+        assert calls == [["npm", "install", "-g", "opencode-ai@1"]]
 
     def test_too_new_tool_warns_and_downgrades_on_confirm(self, monkeypatch, capsys):
         """An installed build past its supported ceiling is offered as a

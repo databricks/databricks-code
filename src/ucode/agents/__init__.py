@@ -251,6 +251,9 @@ def tool_binary_installed(tool: str) -> bool:
 def tool_update_available(tool: str) -> tuple[str, str] | None:
     """Return ``(current, latest)`` when a newer agent CLI is published, else None.
     Read-only wrapper over the npm update check — for ``ucode doctor``."""
+    checker = getattr(_MODULES[tool], "is_update_available", None)
+    if callable(checker):
+        return checker()
     return available_npm_package_update(TOOL_SPECS[tool]["package"])
 
 
@@ -350,6 +353,7 @@ def configure_tool(
     relayed: bool = False,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    coding_agent_config_defaults: dict[str, str] | None = None,
 ) -> dict:
     result: dict | tuple[dict, str]
     if tool == "codex":
@@ -368,6 +372,7 @@ def configure_tool(
             relayed=relayed,
             route_root_model=route_root_model,
             custom_model=custom_model,
+            coding_agent_config_defaults=coding_agent_config_defaults,
         )
     else:
         # provider routing is claude/codex-only; every other tool needs a model.
