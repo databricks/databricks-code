@@ -728,17 +728,6 @@ class TestAuthTokenCommand:
         assert result.exit_code == 0
         fetch.assert_called_once_with("https://override", "prod", force_refresh=True)
 
-    def test_preset_bearer_does_not_force_oauth_refresh(self, monkeypatch):
-        monkeypatch.setenv("DATABRICKS_BEARER", "preset-token")
-        with (
-            patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
-            patch("ucode.cli.get_databricks_token", return_value="preset-token") as fetch,
-        ):
-            result = runner.invoke(app, ["auth-token"])
-        assert result.exit_code == 0
-        assert result.stdout == "preset-token\n"
-        fetch.assert_called_once_with("https://ws", None)
-
     def test_errors_without_workspace(self):
         with patch("ucode.cli.load_state", return_value={}):
             result = runner.invoke(app, ["auth-token"])

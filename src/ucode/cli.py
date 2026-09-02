@@ -1383,7 +1383,6 @@ def auth_token_cmd(
         raise typer.Exit(1)
     profile = profile or state.get("profile")
     use_static_token = bool(use_pat or state.get("use_pat"))
-    preset_bearer = bool(os.environ.get("DATABRICKS_BEARER", "").strip())
     if use_static_token:
         # --use-pat explicitly means "serve the profile's static PAT". Fail
         # closed if it can't be read rather than falling through to OAuth —
@@ -1398,7 +1397,7 @@ def auth_token_cmd(
             )
             raise typer.Exit(1)
     try:
-        if use_static_token or preset_bearer:
+        if use_static_token:
             token = get_databricks_token(workspace, profile)
         else:
             token = get_databricks_token(workspace, profile, force_refresh=True)
