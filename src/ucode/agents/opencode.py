@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import threading
+from urllib.parse import urlsplit, urlunsplit
 
 from ucode.config_io import (
     APP_DIR,
@@ -16,7 +17,6 @@ from ucode.config_io import (
     write_json_file,
 )
 from ucode.databricks import (
-    TOKEN_REFRESH_INTERVAL_SECONDS,
     build_opencode_base_urls,
     get_databricks_token,
     model_token_limits,
@@ -155,14 +155,19 @@ def write_tool_config(
     token: str | None = None,
     *,
     force_refresh: bool = False,
+    base_urls: dict[str, str] | None = None,
 ) -> tuple[dict, str]:
     backup_existing_file(OPENCODE_CONFIG_PATH, OPENCODE_BACKUP_PATH)
     if token is None:
         token = get_databricks_token(
             state["workspace"], state.get("profile"), force_refresh=force_refresh
         )
-    opencode_base_urls = state.get("base_urls", {}).get("opencode") or build_opencode_base_urls(
-        state["workspace"]
+    # ``base_urls`` lets launch() point providers at the loopback refresh proxy
+    # without persisting per-session 127.0.0.1:<port> URLs into workspace state.
+    opencode_base_urls = (
+        base_urls
+        or state.get("base_urls", {}).get("opencode")
+        or build_opencode_base_urls(state["workspace"])
     )
     overlay, managed_keys = render_overlay(
         model,
@@ -236,20 +241,17 @@ def default_model(state: dict) -> str | None:
     return oss[0] if oss else None
 
 
-def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> str:
-    model = default_model(state)
-    if not model:
-        raise RuntimeError("No OpenCode model is configured.")
-    _, token = write_tool_config(state, model, force_refresh=force_refresh)
-    return token
-
-
-def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
-    while not stop_event.wait(TOKEN_REFRESH_INTERVAL_SECONDS):
-        try:
-            _refresh_token_once(state, force_refresh=True)
-        except RuntimeError:
-            continue
+def _loopback_base_urls(real_base_urls: dict[str, str], port: int) -> dict[str, str]:
+    """Rewrite each provider base URL's scheme+host to the loopback proxy, keeping
+    the gateway path so the proxy forwards it verbatim to the workspace host. All
+    OpenCode provider paths share the workspace host, so one proxy serves them all.
+    """
+    loopback = f"127.0.0.1:{port}"
+    out: dict[str, str] = {}
+    for provider, url in real_base_urls.items():
+        parts = urlsplit(url)
+        out[provider] = urlunsplit(("http", loopback, parts.path, parts.query, parts.fragment))
+    return out
 
 
 def build_runtime_env(token: str, state: dict | None = None) -> dict[str, str]:
@@ -260,17 +262,37 @@ def build_runtime_env(token: str, state: dict | None = None) -> dict[str, str]:
 
 
 def launch(state: dict, tool_args: list[str]) -> None:
-    """Launch opencode with background token refresh (same pattern as Gemini)."""
-    token = _refresh_token_once(state)
+    """Launch opencode behind the loopback refresh proxy.
+
+    OpenCode resolves opencode.json once at process start and never re-reads it, so
+    a token baked into the config goes stale at the ~1h OAuth expiry and the session
+    dies mid-run. Point every provider baseURL at the loopback proxy, which rewrites
+    the Authorization header with a freshly-minted token on every request (the proxy
+    owns its own background refresher). Mirrors claude.py::_launch_relayed.
+    """
+    from ucode.opencode_proxy import start_proxy
+
+    model = default_model(state)
+    if not model:
+        raise RuntimeError("No OpenCode model is configured.")
+
+    workspace = state["workspace"]
+    real_base_urls = state.get("base_urls", {}).get("opencode") or build_opencode_base_urls(
+        workspace
+    )
+
+    # One proxy for all providers (they share the workspace host); it overwrites
+    # Authorization with a freshly-minted token on every request.
+    server, cache = start_proxy(workspace, state.get("profile"))
+    port = server.server_address[1]
+
+    # opencode.json points at the proxy; the token in the file is only a bootstrap
+    # the proxy replaces per request, so it never goes stale mid-session.
+    _, token = write_tool_config(state, model, base_urls=_loopback_base_urls(real_base_urls, port))
     env = build_runtime_env(token, state)
 
-    stop_event = threading.Event()
-    refresher = threading.Thread(
-        target=_refresh_forever,
-        args=(state, stop_event),
-        daemon=True,
-    )
-    refresher.start()
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
 
     proc = subprocess.Popen([SPEC["binary"], *tool_args], env=env)
     try:
@@ -279,8 +301,8 @@ def launch(state: dict, tool_args: list[str]) -> None:
         proc.send_signal(signal.SIGINT)
         returncode = proc.wait()
     finally:
-        stop_event.set()
-        refresher.join(timeout=1)
+        cache.stop()
+        server.shutdown()
 
     raise SystemExit(returncode)
 
