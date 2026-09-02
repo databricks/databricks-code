@@ -715,7 +715,7 @@ class TestAuthTokenCommand:
         # Nothing but the bare token (plus trailing newline) may reach stdout,
         # or the consuming agent will treat the noise as part of the token.
         assert result.stdout == "tok-123\n"
-        fetch.assert_called_once_with("https://ws", None)
+        fetch.assert_called_once_with("https://ws", None, force_refresh=True)
 
     def test_host_and_profile_override_state(self):
         with (
@@ -726,7 +726,18 @@ class TestAuthTokenCommand:
                 app, ["auth-token", "--host", "https://override", "--profile", "prod"]
             )
         assert result.exit_code == 0
-        fetch.assert_called_once_with("https://override", "prod")
+        fetch.assert_called_once_with("https://override", "prod", force_refresh=True)
+
+    def test_preset_bearer_does_not_force_oauth_refresh(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_BEARER", "preset-token")
+        with (
+            patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
+            patch("ucode.cli.get_databricks_token", return_value="preset-token") as fetch,
+        ):
+            result = runner.invoke(app, ["auth-token"])
+        assert result.exit_code == 0
+        assert result.stdout == "preset-token\n"
+        fetch.assert_called_once_with("https://ws", None)
 
     def test_errors_without_workspace(self):
         with patch("ucode.cli.load_state", return_value={}):

@@ -1382,7 +1382,9 @@ def auth_token_cmd(
         print_err("No workspace configured. Run `ucode configure` first.")
         raise typer.Exit(1)
     profile = profile or state.get("profile")
-    if use_pat or state.get("use_pat"):
+    use_static_token = bool(use_pat or state.get("use_pat"))
+    preset_bearer = bool(os.environ.get("DATABRICKS_BEARER", "").strip())
+    if use_static_token:
         # --use-pat explicitly means "serve the profile's static PAT". Fail
         # closed if it can't be read rather than falling through to OAuth —
         # `auth token` cannot serve a PAT-only profile, so that path would
@@ -1396,7 +1398,10 @@ def auth_token_cmd(
             )
             raise typer.Exit(1)
     try:
-        token = get_databricks_token(workspace, profile)
+        if use_static_token or preset_bearer:
+            token = get_databricks_token(workspace, profile)
+        else:
+            token = get_databricks_token(workspace, profile, force_refresh=True)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
