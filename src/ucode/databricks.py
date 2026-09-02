@@ -2104,7 +2104,7 @@ def build_skills_mcp_url(workspace: str, locations: list[str]) -> str:
 # produced by `_provider_type_tag` (e.g. `amazon_bedrock`).
 _TOOL_PROVIDER_TYPES: dict[str, tuple[str, ...]] = {
     "claude": ("anthropic", "amazon_bedrock"),
-    "codex": ("openai",),
+    "codex": ("openai", "amazon_bedrock"),
     "gemini": ("gemini_enterprise",),
 }
 
@@ -2333,12 +2333,13 @@ def service_usable_for_tool(tool: str, service: dict) -> bool:
     Beyond the provider-type match, a Bedrock service is only usable for claude
     if it exposes at least one Claude model in its targets — otherwise there's no
     routable model id to pin. (Anthropic services use canonical names, so any
-    match is usable.)
+    match is usable.) Codex uses the OpenAI-compatible Bedrock endpoint, so any
+    Bedrock service is usable for it regardless of declared targets.
     """
     provider_type = service.get("provider_type", "")
     if not tool_supports_provider_type(tool, provider_type):
         return False
-    if provider_type in BEDROCK_PROVIDER_TYPES:
+    if tool == "claude" and provider_type in BEDROCK_PROVIDER_TYPES:
         return bool(map_claude_family_models(service.get("targets") or []))
     return True
 
@@ -2379,8 +2380,10 @@ def resolve_provider_service(
             f"Model provider service '{service_name}' is a '{provider_type}' provider, "
             f"which {tool} can't route to (supported: {supported})."
         )
-    if provider_type in BEDROCK_PROVIDER_TYPES and not map_claude_family_models(
-        match.get("targets") or []
+    if (
+        tool == "claude"
+        and provider_type in BEDROCK_PROVIDER_TYPES
+        and not map_claude_family_models(match.get("targets") or [])
     ):
         return None, (
             f"Model provider service '{service_name}' exposes no Claude models — "
