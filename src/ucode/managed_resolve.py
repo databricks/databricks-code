@@ -87,6 +87,26 @@ def managed_state_overrides(managed: dict, tool: str) -> dict[str, object]:
     return overrides
 
 
+def managed_unclassifiable_models(managed: dict, tool: str) -> list[str]:
+    """Models ignored because a name-based provider family cannot be identified.
+
+    De-duplicated in first-seen order: a manifest may legitimately repeat an id,
+    and the caller warns once per returned entry.
+    """
+    if tool not in ("opencode", "pi"):
+        return []
+    models = _manifest_models(managed, tool)
+    if not isinstance(models, list):
+        return []
+    seen: set[str] = set()
+    unclassifiable: list[str] = []
+    for model in models:
+        if classify_model_family(model) is None and model not in seen:
+            seen.add(model)
+            unclassifiable.append(model)
+    return unclassifiable
+
+
 def managed_unservable_models(managed: dict, tool: str) -> list[str]:
     """The models the manifest names for ``tool`` when it has no provider to serve any of them.
 

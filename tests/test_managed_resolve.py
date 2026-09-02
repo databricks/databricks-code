@@ -17,6 +17,7 @@ from ucode.managed_resolve import (
     managed_provider_service,
     managed_state_overrides,
     managed_supplies_models,
+    managed_unclassifiable_models,
     managed_unservable_models,
     recommended_agent,
     resolve_state,
@@ -460,6 +461,44 @@ class TestManagedStateOverrides:
         assert managed_state_overrides(managed, "opencode") == {
             "opencode_models": {"anthropic": ["system.ai.claude-opus-4-8"]}
         }
+
+    def test_unclassifiable_models_are_reported_without_affecting_known_families(self):
+        managed = {
+            "enabled_agents": {
+                "opencode": {
+                    "model_config": {
+                        "models": ["system.ai.future-chat-1", "system.ai.claude-opus-4-8"]
+                    }
+                }
+            }
+        }
+
+        assert managed_unclassifiable_models(managed, "opencode") == ["system.ai.future-chat-1"]
+        assert managed_state_overrides(managed, "opencode") == {
+            "opencode_models": {"anthropic": ["system.ai.claude-opus-4-8"]}
+        }
+
+    def test_repeated_unclassifiable_model_is_reported_once(self):
+        # A manifest may legitimately repeat an id; the caller warns per entry, so
+        # duplicates here would mean duplicate identical warnings.
+        managed = {
+            "enabled_agents": {
+                "opencode": {
+                    "model_config": {
+                        "models": [
+                            "system.ai.future-chat-1",
+                            "system.ai.future-chat-1",
+                            "system.ai.other-unknown",
+                        ]
+                    }
+                }
+            }
+        }
+
+        assert managed_unclassifiable_models(managed, "opencode") == [
+            "system.ai.future-chat-1",
+            "system.ai.other-unknown",
+        ]
 
     def test_no_override_when_nothing_is_servable(self):
         # An all-unservable list must not replace the developer's buckets with an empty dict —
