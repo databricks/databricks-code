@@ -1606,18 +1606,30 @@ class TestAutoConfigureOnFirstRun:
 @pytest.mark.parametrize(
     ("tool", "expected"),
     [
-        ("claude", "Launching Claude Code with ug"),
-        ("codex", "Launching Codex with ug"),
-        ("gemini", "Launching Gemini CLI with ug"),
-        ("opencode", "Launching OpenCode with ug"),
-        ("copilot", "Launching GitHub Copilot CLI with ug"),
-        ("pi", "Launching Pi with ug"),
+        ("claude", "Launching Claude Code with Unity Gateway"),
+        ("codex", "Launching Codex with Unity Gateway"),
+        ("gemini", "Launching Gemini CLI with Unity Gateway"),
+        ("opencode", "Launching OpenCode with Unity Gateway"),
+        ("copilot", "Launching GitHub Copilot CLI with Unity Gateway"),
+        ("pi", "Launching Pi with Unity Gateway"),
     ],
 )
 def test_launch_title(tool, expected):
     from ucode.cli import _launch_title
 
     assert _launch_title(tool) == expected
+
+
+def test_cursor_launch_uses_unity_gateway_branding():
+    with (
+        patch("ucode.cli.shutil.which", return_value="/usr/local/bin/cursor-agent"),
+        patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+        patch("ucode.agents.cursor.launch"),
+    ):
+        result = runner.invoke(app, ["cursor"])
+
+    assert result.exit_code == 0, result.output
+    assert "Unity Gateway with Cursor" in result.output
 
 
 class TestCachedConfigPredicate:

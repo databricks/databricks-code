@@ -1858,7 +1858,7 @@ def _fetch_budget_recommendation(state: dict, managed: dict | None) -> dict | No
 
 
 def _launch_title(tool: str) -> str:
-    return f"Launching {TOOL_SPECS[tool]['display']} with ug"
+    return f"Launching {TOOL_SPECS[tool]['display']} with Unity Gateway"
 
 
 def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = None) -> None:
@@ -2686,7 +2686,7 @@ def cursor_cmd(ctx: typer.Context) -> None:
                 f"`{cursor.CURSOR_BINARY}` was not found on PATH. Install Cursor Agent "
                 "(https://cursor.com/cli), then re-run `ug cursor`."
             )
-        print_section("ug with Cursor")
+        print_section("Unity Gateway with Cursor")
         print_note(
             "Cursor runs models on your Cursor account; its Databricks MCP servers "
             "authenticate through `ug mcp-proxy`."
