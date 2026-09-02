@@ -1940,7 +1940,7 @@ class TestEnsureAiGateway:
             f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
         ]
 
-    def test_empty_v3_response_is_reachable_but_not_reported_as_accessible(self, monkeypatch):
+    def test_empty_v3_response_includes_permission_hint(self, monkeypatch):
         monkeypatch.setattr(
             db_mod,
             "_http_get_json",
@@ -1950,7 +1950,9 @@ class TestEnsureAiGateway:
         capabilities = db_mod.ensure_ai_gateway(WS, "fake-token")
 
         assert capabilities.v3 == db_mod.GatewayProbe(
-            True, "reachable, no accessible model services returned"
+            True,
+            "reachable, no accessible model services returned; check USE CATALOG on system, and "
+            "USE SCHEMA and EXECUTE on system.ai",
         )
 
     def test_v2_only_workspace_succeeds_after_v3_probe(self, monkeypatch):

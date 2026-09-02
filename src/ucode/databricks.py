@@ -3061,13 +3061,17 @@ def _gateway_probe_result(
     reason: str | None,
     collection_key: str,
     resource_name: str,
+    empty_hint: str | None = None,
 ) -> GatewayProbe:
     if payload is None:
         return GatewayProbe(False, reason or "unknown error")
     resources = payload.get(collection_key) if isinstance(payload, dict) else None
     if resources:
         return GatewayProbe(True, f"reachable, accessible {resource_name} returned")
-    return GatewayProbe(True, f"reachable, no accessible {resource_name}s returned")
+    detail = f"reachable, no accessible {resource_name}s returned"
+    if empty_hint:
+        detail = f"{detail}; {empty_hint}"
+    return GatewayProbe(True, detail)
 
 
 def _probe_ai_gateway_v2(workspace: str, token: str) -> GatewayProbe:
@@ -3081,7 +3085,13 @@ def _probe_ai_gateway_v3(workspace: str, token: str) -> GatewayProbe:
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}/api/2.1/unity-catalog/model-services?page_size=1"
     payload, reason = _http_get_json(url, token)
-    return _gateway_probe_result(payload, reason, "model_services", "model service")
+    return _gateway_probe_result(
+        payload,
+        reason,
+        "model_services",
+        "model service",
+        "check USE CATALOG on system, and USE SCHEMA and EXECUTE on system.ai",
+    )
 
 
 def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
