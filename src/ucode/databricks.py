@@ -3126,7 +3126,7 @@ def _raise_ai_gateway_v2_permission_failure(
 
 
 def ensure_ai_gateway(workspace: str, token: str) -> GatewayCapabilities:
-    """Return gateway probe results, checking V2 only when V3 has no accessible resource."""
+    """Probe model services first, falling back to legacy endpoints when needed."""
     v3 = _probe_ai_gateway_v3(workspace, token)
     if not v3.reachable and _looks_like_definitive_auth_failure(v3.detail):
         _raise_ai_gateway_auth_failure(workspace, v3.detail)
@@ -3134,9 +3134,8 @@ def ensure_ai_gateway(workspace: str, token: str) -> GatewayCapabilities:
         return GatewayCapabilities(v3=v3, v2=None)
 
     v2 = _probe_ai_gateway_v2(workspace, token)
-    capabilities = GatewayCapabilities(v3=v3, v2=v2)
     if v3.reachable or v2.reachable:
-        return capabilities
+        return GatewayCapabilities(v3=v3, v2=v2)
     if _looks_like_definitive_auth_failure(v2.detail):
         _raise_ai_gateway_auth_failure(workspace, v2.detail)
     if _looks_like_permission_failure(v3.detail):
