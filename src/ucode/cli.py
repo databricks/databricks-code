@@ -45,7 +45,6 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
-    ensure_ai_gateway,
     ensure_databricks_auth,
     ensure_pat_bearer,
     find_profile_name_for_host,
@@ -57,6 +56,7 @@ from ucode.databricks import (
     list_profile_entries,
     list_tool_provider_services,
     normalize_workspace_url,
+    probe_unity_gateway_capabilities,
     resolve_pat_token,
     resolve_provider_launch_model,
     run_databricks_login,
@@ -517,7 +517,7 @@ def configure_shared_state(
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
 ) -> dict:
-    """Log into Databricks, enforce AI Gateway v2, fetch model lists, persist state.
+    """Log into Databricks, verify AI Gateway, fetch model lists, persist state.
 
     If tools is provided, only fetch models for those tools. Otherwise fetch all.
     If force_login is True, always run databricks auth login (used by explicit configure).
@@ -636,8 +636,9 @@ def configure_shared_state(
             state["profile"] = profile
     with spinner("Verifying Unity AI Gateway..."):
         token = get_databricks_token(workspace, profile)
-        ensure_ai_gateway(workspace, token)
+        model_service_probe = probe_unity_gateway_capabilities(workspace, token)
     print_success("Unity AI Gateway detected")
+    print_kv("Model service", model_service_probe.detail)
 
     want_claude = (
         fetch_all or "claude" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools

@@ -51,7 +51,7 @@ UNIX_DATABRICKS_INSTALL_URL = (
 WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
-AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
+AI_GATEWAY_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
 ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
@@ -3046,18 +3046,58 @@ def fetch_codex_models(workspace: str, token: str) -> list[str]:
     return models
 
 
-def _probe_ai_gateway_v2(workspace: str, token: str) -> tuple[bool, str | None]:
+class GatewayProbe(NamedTuple):
+    reachable: bool
+    detail: str
+    resource_available: bool = False
+
+
+def _version_neutral_gateway_detail(detail: str) -> str:
+    detail = re.sub(r"\bv3\b", "model service", detail, flags=re.IGNORECASE)
+    return re.sub(r"\bv2\b", "legacy endpoint", detail, flags=re.IGNORECASE)
+
+
+def _gateway_probe_result(
+    payload: dict | list | None,
+    reason: str | None,
+    collection_key: str,
+    resource_name: str,
+    empty_hint: str | None = None,
+) -> GatewayProbe:
+    if payload is None:
+        return GatewayProbe(False, _version_neutral_gateway_detail(reason or "unknown error"))
+    resources = payload.get(collection_key) if isinstance(payload, dict) else None
+    if resources:
+        return GatewayProbe(True, f"reachable, accessible {resource_name} returned", True)
+    detail = f"reachable, no accessible {resource_name}s returned"
+    if empty_hint:
+        detail = f"{detail}; {empty_hint}"
+    return GatewayProbe(True, detail)
+
+
+def _probe_ai_gateway_v2(workspace: str, token: str) -> GatewayProbe:
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}/api/ai-gateway/v2/endpoints?page_size=1"
     payload, reason = _http_get_json(url, token)
-    return payload is not None, reason
+    return _gateway_probe_result(
+        payload=payload,
+        reason=reason,
+        collection_key="endpoints",
+        resource_name="endpoint",
+    )
 
 
-def _probe_ai_gateway_v3(workspace: str, token: str) -> tuple[bool, str | None]:
+def _probe_ai_gateway_v3(workspace: str, token: str) -> GatewayProbe:
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}/api/2.1/unity-catalog/model-services?page_size=1"
     payload, reason = _http_get_json(url, token)
-    return payload is not None, reason
+    return _gateway_probe_result(
+        payload=payload,
+        reason=reason,
+        collection_key="model_services",
+        resource_name="model service",
+        empty_hint="check USE CATALOG on system, and USE SCHEMA and EXECUTE on system.ai",
+    )
 
 
 def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
@@ -3069,57 +3109,65 @@ def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
     )
 
 
-def _raise_ai_gateway_v3_permission_failure(
-    workspace: str, v3_reason: str, v2_reason: str | None
+def _raise_model_service_permission_failure(
+    workspace: str, model_service_reason: str, legacy_endpoint_reason: str
 ) -> NoReturn:
     raise RuntimeError(
-        f"Databricks AI Gateway V3 access could not be verified on {workspace} ({v3_reason}). "
-        f"The V2 fallback also failed ({v2_reason or 'unknown error'}). The V3 probe requires "
-        "permission to list Unity Catalog model services. Verify USE CATALOG on `system` and "
-        "USE SCHEMA on `system.ai`."
+        "Databricks Unity AI Gateway model service access could not be verified on "
+        f"{workspace} ({model_service_reason}). The legacy endpoint fallback also failed "
+        f"({legacy_endpoint_reason}). The model service probe requires permission to list "
+        "Unity Catalog model services. Verify USE CATALOG on `system`, and USE SCHEMA and "
+        "EXECUTE on `system.ai`."
     )
 
 
-def _raise_ai_gateway_v2_permission_failure(
-    workspace: str, v2_reason: str, v3_reason: str | None
+def _raise_legacy_endpoint_permission_failure(
+    workspace: str, legacy_endpoint_reason: str, model_service_reason: str
 ) -> NoReturn:
     raise RuntimeError(
-        f"Databricks AI Gateway V2 access could not be verified on {workspace} ({v2_reason}). "
-        f"The V3 probe also failed ({v3_reason or 'unknown error'}). Verify the caller's "
-        "workspace permissions for the AI Gateway V2 endpoints listing."
+        "Databricks Unity AI Gateway legacy endpoint access could not be verified on "
+        f"{workspace} ({legacy_endpoint_reason}). The model service probe also failed "
+        f"({model_service_reason}). Verify the caller's workspace permissions for the legacy "
+        "endpoints listing."
     )
 
 
-def ensure_ai_gateway(workspace: str, token: str) -> None:
-    """Pass if either AI Gateway V2 or V3 is available."""
-    v3_ok, v3_reason = _probe_ai_gateway_v3(workspace, token)
-    if v3_ok:
-        return
-    if v3_reason and _looks_like_definitive_auth_failure(v3_reason):
-        _raise_ai_gateway_auth_failure(workspace, v3_reason)
+def probe_unity_gateway_capabilities(workspace: str, token: str) -> GatewayProbe:
+    """Return the model service probe after verifying an available gateway path."""
+    model_service_probe = _probe_ai_gateway_v3(workspace, token)
+    if not model_service_probe.reachable and _looks_like_definitive_auth_failure(
+        model_service_probe.detail
+    ):
+        _raise_ai_gateway_auth_failure(workspace, model_service_probe.detail)
+    if model_service_probe.resource_available:
+        return model_service_probe
 
-    v2_ok, v2_reason = _probe_ai_gateway_v2(workspace, token)
-    if v2_ok:
-        return
-    if v2_reason and _looks_like_definitive_auth_failure(v2_reason):
-        _raise_ai_gateway_auth_failure(workspace, v2_reason)
-    if v3_reason and _looks_like_permission_failure(v3_reason):
-        _raise_ai_gateway_v3_permission_failure(workspace, v3_reason, v2_reason)
-    if v2_reason and _looks_like_permission_failure(v2_reason):
-        _raise_ai_gateway_v2_permission_failure(workspace, v2_reason, v3_reason)
+    legacy_endpoint_probe = _probe_ai_gateway_v2(workspace, token)
+    if legacy_endpoint_probe.reachable:
+        return model_service_probe
+    if _looks_like_definitive_auth_failure(legacy_endpoint_probe.detail):
+        _raise_ai_gateway_auth_failure(workspace, legacy_endpoint_probe.detail)
+    if _looks_like_permission_failure(model_service_probe.detail):
+        _raise_model_service_permission_failure(
+            workspace, model_service_probe.detail, legacy_endpoint_probe.detail
+        )
+    if _looks_like_permission_failure(legacy_endpoint_probe.detail):
+        _raise_legacy_endpoint_permission_failure(
+            workspace, legacy_endpoint_probe.detail, model_service_probe.detail
+        )
 
     raise RuntimeError(
-        "Databricks AI Gateway is not enabled on this workspace: neither V3 "
-        f"({v3_reason or 'unknown error'}) nor V2 ({v2_reason or 'unknown error'}) is available. "
-        f"See {AI_GATEWAY_V2_DOCS_URL}"
+        "Databricks Unity AI Gateway is not enabled on this workspace: neither model services "
+        f"({model_service_probe.detail}) nor legacy endpoints ({legacy_endpoint_probe.detail}) "
+        f"are available. See {AI_GATEWAY_DOCS_URL}"
     )
 
 
 def _looks_like_definitive_auth_failure(reason: str) -> bool:
     """True when retrying another workspace API cannot rescue this token.
 
-    A 403 can be endpoint-specific authorization, so the version-agnostic
-    preflight must still try V3 before surfacing it as an auth failure.
+    A 403 can be endpoint-specific authorization, so the preflight must still
+    try the fallback before surfacing it as an auth failure.
     """
     if "HTTP 401" in reason:
         return True

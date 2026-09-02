@@ -2857,8 +2857,11 @@ class TestCliWiring:
             assert publish.call_args.kwargs["file_path"] == "/tmp/cfg.json"
 
     def test_publish_error_exits_nonzero_with_a_message(self):
-        with patch.object(
-            cli_mod, "publish_command", side_effect=RuntimeError("no config authored")
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch.object(
+                cli_mod, "publish_command", side_effect=RuntimeError("no config authored")
+            ),
         ):
             result = runner.invoke(app, ["publish"])
         assert result.exit_code == 1
@@ -2866,7 +2869,10 @@ class TestCliWiring:
     def test_successful_publish_exits_zero(self):
         # Same trap as `setup`: `typer.Exit` subclasses RuntimeError, so raising it inside the
         # command's try block would report success as "ERROR 0".
-        with patch.object(cli_mod, "publish_command", return_value=0):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch.object(cli_mod, "publish_command", return_value=0),
+        ):
             result = runner.invoke(app, ["publish"])
         assert result.exit_code == 0
         assert "ERROR" not in result.output
