@@ -1240,6 +1240,25 @@ def get_databricks_token(
     return token
 
 
+def create_databricks_user_token(
+    workspace: str,
+    auth_token: str,
+    *,
+    lifetime_seconds: int,
+) -> str:
+    payload, reason = _http_post_json(
+        f"{workspace.rstrip('/')}/api/2.0/token/create",
+        auth_token,
+        {"lifetime_seconds": lifetime_seconds},
+    )
+    if reason:
+        raise RuntimeError(f"Failed to create a short-lived Databricks token: {reason}")
+    token = payload.get("token_value") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("Databricks returned no token_value for the short-lived token.")
+    return token
+
+
 def _extract_connection_page(payload: object) -> tuple[list[dict], str | None]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)], None

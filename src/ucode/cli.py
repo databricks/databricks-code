@@ -41,6 +41,7 @@ from ucode.config_io import is_dry_run, restore_file, set_dry_run
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
+    create_databricks_user_token,
     discover_claude_models,
     discover_codex_models,
     discover_gemini_models,
@@ -1401,6 +1402,7 @@ def auth_token_cmd(
             token = get_databricks_token(workspace, profile)
         else:
             token = get_databricks_token(workspace, profile, force_refresh=True)
+            token = create_databricks_user_token(workspace, token, lifetime_seconds=10)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
