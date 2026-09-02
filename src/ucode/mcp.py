@@ -2210,3 +2210,22 @@ def register_schemaless_skills_connection(
     ``--mcp`` ``skill_locations`` and otherwise registers the bare schema-less
     route (utility tools only)."""
     _update_skills_mcp(state, workspace, profile, clients, _skill_mcp_locations(state))
+
+
+def _union_locations(base: list[str], new: list[str]) -> list[str]:
+    have = set(base)
+    merged = list(base)
+    for location in new:
+        if location not in have:
+            merged.append(location)
+            have.add(location)
+    return merged
+
+
+def add_skills_command(locations: list[str]) -> int:
+    """Add ``locations`` to the skills MCP connection's scope, keeping any already configured."""
+    state = load_state()
+    workspace, profile, clients = setup_mcp_clients(state, "Add Skills MCP")
+    merged = _union_locations(_skill_mcp_locations(state), locations)
+    _update_skills_mcp(state, workspace, profile, clients, merged)
+    return 0

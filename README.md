@@ -212,17 +212,35 @@ ucode configure skills --location main.default,ml.prod --mcp
   same.
 - **Download mode** (with `--location`, no `--mcp`) writes each skill flat as `<leaf>/SKILL.md`
   (plus its bundled files) into both `.claude/skills/` and `.agents/skills/`. `--path` (an existing
-  absolute directory) is optional; when omitted, skills are written under your home directory. Any
-  pre-existing skill dir prompts before it's overwritten. It then registers a schema-less skills
-  MCP connection, leaving any prior `--mcp` scope untouched. `--skill <name>[,<name>…]` narrows the
-  download to the named skills (by leaf name) from the schema instead of all of them; requested
-  names not found in the schema warn and are skipped. `--skill` requires a single `--location`, is
-  download-only, and is rejected with `--mcp`.
+  absolute project directory) is optional; when omitted, skills are written to user-level skill
+  directories. Any pre-existing skill dir prompts before it's overwritten. It then registers a
+  schema-less skills MCP connection, leaving any prior `--mcp` scope untouched.
+  `--skill <name>[,<name>…]` narrows the download to the named skills (by leaf name) from the schema
+  instead of all of them; requested names not found in the schema warn and are skipped. `--skill`
+  requires a single `--location`, is download-only, and is rejected with `--mcp`.
 - **MCP mode** (`--location … --mcp`) sets the connection's location set to exactly `<list>`
   (override-only) and rebuilds its `?schema=` URL; no files are downloaded and `--path` is rejected.
 
 Each run prints the registered server, its URL, the configured agents, and its tools, and reminds
 you to run `ucode <agent>` (existing agent sessions need a restart before the MCP tools load).
+
+#### Add skill scopes without replacing existing ones
+
+`ucode skill add` registers skills additively, keeping anything already configured. With `--mcp` it
+adds the schemas to the connection's scope, otherwise it downloads their skills to disk. `--skills`
+narrows a download to a subset of one schema's skills.
+
+```bash
+# Add schemas to the skills MCP scope, keeping any already configured.
+ucode skill add --location main.default,ml.prod --mcp
+
+# Download a schema's skills to disk, keeping existing downloads.
+ucode skill add --location main.default
+
+# Download a named subset, by bare name (with --location) or fully-qualified name.
+ucode skill add --location main.default --skills my-skill,other-skill
+ucode skill add --skills main.default.my-skill,main.default.other-skill
+```
 
 ### Managed config for a workspace (admins)
 
@@ -358,6 +376,9 @@ The output looks like:
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
 | `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
+| `ucode skill add --location main.default --mcp` | Add schemas to the skills MCP scope, keeping any already configured (additive; never replaces) |
+| `ucode skill add --location main.default` | Download a schema's skills to disk without removing existing downloads |
+| `ucode skill add --skills main.default.my-skill` | Download a named subset of skills (bare names need `--location`; fully-qualified names stand alone) |
 | `ucode setup` | Author the managed config's agents and models (workspace admins only) |
 | `ucode setup mcps` | Add or change the managed config's MCP servers |
 | `ucode setup skills [--location a.b,c.d]` | Add or change the managed config's skills |

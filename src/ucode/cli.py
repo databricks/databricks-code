@@ -99,6 +99,7 @@ from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
     add_mcp_command,
+    add_skills_command,
     apply_managed_mcp_servers,
     apply_managed_skills,
     configure_mcp_command,
@@ -1164,6 +1165,8 @@ configure_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(configure_app, name="configure", help="Configure workspace and tool settings.")
 mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
+skill_app = typer.Typer(add_completion=False, no_args_is_help=True)
+app.add_typer(skill_app, name="skill", help="Databricks Skills for your coding tools.")
 setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(
     setup_app,
@@ -1315,6 +1318,119 @@ def mcp_web_search_cmd() -> None:
     from ucode.mcp_web_search import serve
 
     serve()
+
+
+@skill_app.command("add")
+def skills_add(
+    location: Annotated[
+        str | None,
+        typer.Option(
+            "--location", help="Comma-separated `<catalog>.<schema>` skill scopes to add."
+        ),
+    ] = None,
+    mcp: Annotated[
+        bool,
+        typer.Option(
+            "--mcp",
+            help="Add the schemas to the skills MCP connection's scope instead of downloading.",
+        ),
+    ] = False,
+    path: Annotated[
+        str | None,
+        typer.Option(
+            "--path",
+            help="(download) Existing absolute project directory to download into; defaults "
+            "to user-level skill directories.",
+        ),
+    ] = None,
+    skills: Annotated[
+        str | None,
+        typer.Option(
+            "--skills",
+            help="(download) Download only this comma-separated subset of skills instead of "
+            "every skill in the schema. Bare securable names (e.g. `my-skill`) need a single "
+            "--location; fully-qualified `<catalog>.<schema>.<name>` names work on their own. "
+            "Not valid with --mcp.",
+        ),
+    ] = None,
+) -> None:
+    """Add Databricks Skills to your coding tools, keeping any already configured.
+
+    With ``--mcp``, adds the given schemas to the skills MCP connection's scope.
+    Otherwise downloads each schema's skills to project-level skill directories under
+    ``--path``, or to user-level skill directories when omitted, keeping
+    already-downloaded skills. ``--skills`` narrows a download to a subset of one
+    schema's skills, by bare name (with ``--location``) or fully-qualified
+    ``<catalog>.<schema>.<name>``.
+    """
+    try:
+        locations = _parse_skill_locations(location)
+        requested_skills = (
+            None if skills is None else {s.strip() for s in skills.split(",") if s.strip()}
+        )
+        if mcp and path is not None:
+            raise RuntimeError("--path is not supported when using --mcp")
+        if mcp and requested_skills is not None:
+            raise RuntimeError("--skills is not supported when using --mcp")
+        qualified_skill_parts: dict[str, list[str]] = {}
+        invalid_skills: list[str] = []
+        for skill in requested_skills or set():
+            if "." not in skill:
+                continue
+            parts = skill.split(".")
+            if len(parts) != 3 or any(not part or part != part.strip() for part in parts):
+                invalid_skills.append(skill)
+            else:
+                qualified_skill_parts[skill] = parts
+        if invalid_skills:
+            raise RuntimeError(
+                "--skills entries must be bare names or fully qualified "
+                "`<catalog>.<schema>.<name>` values "
+                f"(invalid: {', '.join(sorted(invalid_skills))})."
+            )
+        if requested_skills is not None and not locations:
+            schemas = {".".join(parts[:2]) for parts in qualified_skill_parts.values()}
+            bare = sorted(skill for skill in requested_skills if skill not in qualified_skill_parts)
+            if bare:
+                raise RuntimeError(
+                    "--skills short names need --location (or pass full names like "
+                    f"`<catalog>.<schema>.<name>`): {', '.join(bare)}"
+                )
+            if len(schemas) != 1:
+                raise RuntimeError(
+                    "--skills without --location must all share one `<catalog>.<schema>` "
+                    f"(got: {', '.join(sorted(schemas)) or 'none'}); pass --location instead."
+                )
+            locations = list(schemas)
+        if not locations:
+            raise RuntimeError("--location is required for `ucode skill add`.")
+        if requested_skills is not None and len(locations) != 1:
+            raise RuntimeError(
+                f"--skills requires a single --location (got: {', '.join(locations)})."
+            )
+        mismatched_skills = sorted(
+            skill
+            for skill, parts in qualified_skill_parts.items()
+            if ".".join(parts[:2]) != locations[0]
+        )
+        if mismatched_skills:
+            raise RuntimeError(
+                f"--skills entries must match --location `{locations[0]}` "
+                f"(got: {', '.join(mismatched_skills)})."
+            )
+        selected_skills = (
+            None if requested_skills is None else {s.split(".")[-1] for s in requested_skills}
+        )
+        if mcp:
+            add_skills_command(locations)
+        else:
+            configure_skills_download_command(locations, path=path, skills=selected_skills)
+    except (RuntimeError, ValueError) as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
 
 
 @app.command("mcp-proxy", hidden=True)
