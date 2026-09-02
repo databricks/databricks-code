@@ -2495,14 +2495,14 @@ class TestConfigureSharedStateUsePat:
         assert state["use_pat"] is True
         assert saved and saved[-1]["use_pat"] is True
 
-    def test_happy_path_prints_no_gateway_output(self, monkeypatch, capsys):
+    def test_happy_path_prints_success_without_model_service_detail(self, monkeypatch, capsys):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
 
         cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
 
         output = _strip_ansi(capsys.readouterr().out)
+        assert "Unity AI Gateway connected" in output
         assert "Model service:" not in output
-        assert "Unity AI Gateway detected" not in output
 
     @pytest.mark.parametrize(
         ("responses", "expected_model_service"),
@@ -2543,7 +2543,7 @@ class TestConfigureSharedStateUsePat:
 
         output = " ".join(_strip_ansi(capsys.readouterr().out).split())
         assert f"Model service: {expected_model_service}" in output
-        assert "Unity AI Gateway detected" not in output
+        assert "Unity AI Gateway connected" not in output
         assert "(Legacy) endpoints:" not in output
         assert "V2" not in output
         assert "V3" not in output
@@ -2591,7 +2591,7 @@ class TestConfigureSharedStateUsePat:
             cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
 
         output = _strip_ansi(capsys.readouterr().out)
-        assert "Unity AI Gateway detected" not in output
+        assert "Unity AI Gateway connected" not in output
         message = str(excinfo.value)
         assert "v2" not in message.lower()
         assert "v3" not in message.lower()

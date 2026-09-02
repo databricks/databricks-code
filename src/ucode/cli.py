@@ -637,7 +637,9 @@ def configure_shared_state(
     with spinner("Verifying Unity AI Gateway..."):
         token = get_databricks_token(workspace, profile)
         model_service_probe = probe_unity_gateway_capabilities(workspace, token)
-    if not model_service_probe.resource_available:
+    if model_service_probe.resource_available:
+        print_success("Unity AI Gateway connected")
+    else:
         print_warning(f"Model service: {model_service_probe.detail}")
 
     want_claude = (
