@@ -104,6 +104,7 @@ from ucode.mcp import (
     configure_skills_mcp_command,
     purge_cross_workspace_mcp_residue,
     remove_mcp_command,
+    remove_skills_command,
     revert_mcp_configs,
     skill_locations_for_client,
 )
@@ -1115,9 +1116,7 @@ def status() -> int:
     print_note(
         "Use `ucode configure mcp` to add Databricks MCP servers to configured coding tools."
     )
-    print_note(
-        "Use `ucode configure skills` to set up Unity Catalog Skills for configured coding tools."
-    )
+    print_note("Use `ucode skill add` and `ucode skill remove --mcp` to manage UC Skills.")
     print_note("Use `ucode configure tracing` to log coding sessions to an MLflow experiment.")
     print_note("Use `ucode revert` to clear managed configs and restore prior files.")
     return 0
@@ -1444,6 +1443,48 @@ def skills_add(
         else:
             configure_skills_download_command(locations, path=path, skills=selected_skills)
     except (RuntimeError, ValueError) as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+
+
+@skill_app.command("remove")
+def skills_remove(
+    mcp: Annotated[
+        bool,
+        typer.Option(
+            "--mcp",
+            help="Remove schemas from the skills MCP connection instead of downloaded files.",
+        ),
+    ] = False,
+    agents: Annotated[
+        str | None,
+        typer.Option(
+            "--agents",
+            help="Comma-separated coding agents to remove selected schemas from.",
+        ),
+    ] = None,
+) -> None:
+    """Remove Databricks Skill schemas from coding tools.
+
+    MCP removal is interactive and can be scoped to specific configured agents.
+    Removing downloaded skills is not supported yet.
+    """
+    try:
+        if not mcp:
+            raise RuntimeError(
+                "Removing downloaded skills is not supported yet. Pass --mcp to remove "
+                "schemas from the skills MCP connection."
+            )
+        requested_agents = (
+            None
+            if agents is None
+            else ({agent.strip().lower() for agent in agents.split(",") if agent.strip()} or None)
+        )
+        remove_skills_command(agents=requested_agents)
+    except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
     except KeyboardInterrupt:
@@ -3052,7 +3093,7 @@ def configure_mcp(
         raise typer.Exit(130) from None
 
 
-@configure_app.command("skills")
+@configure_app.command("skills", deprecated=True)
 def configure_skills(
     location: Annotated[
         str | None,
@@ -3091,6 +3132,10 @@ def configure_skills(
     download to a named subset of a single schema's skills (requires exactly one
     ``--location``).
     """
+    print_warning(
+        "`ucode configure skills` is deprecated. Use `ucode skill add` to download "
+        "skills or add MCP scopes, and `ucode skill remove --mcp` to remove MCP scopes."
+    )
     try:
         locations = _parse_skill_locations(location)
         # `--skill` absent -> None (whole schema); present (even empty) -> the
