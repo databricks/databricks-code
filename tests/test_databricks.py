@@ -1931,7 +1931,64 @@ class TestProbeUnityGatewayCapabilities:
             True, "reachable, accessible model service returned", True
         )
         assert calls == [
-            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
+        ]
+
+    def test_empty_first_page_follows_cursor_to_accessible_model_service(self, monkeypatch):
+        calls: list[str] = []
+        responses = iter(
+            [
+                ({"next_page_token": "cursor-1"}, None),
+                ({"model_services": [{"name": "model-services/system.ai.gpt-5"}]}, None),
+            ]
+        )
+
+        def fake_get(url, token):
+            calls.append(url)
+            return next(responses)
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        model_service_probe = db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
+
+        assert model_service_probe == db_mod.GatewayProbe(
+            True, "reachable, accessible model service returned", True
+        )
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50"
+            "&page_token=cursor-1",
+        ]
+
+    def test_empty_pages_exhaust_cursor_before_reporting_no_model_service(self, monkeypatch):
+        calls: list[str] = []
+        responses = iter(
+            [
+                ({"next_page_token": "cursor-1"}, None),
+                ({"model_services": []}, None),
+            ]
+        )
+
+        def fake_get(url, token):
+            calls.append(url)
+            if "/api/ai-gateway/v2/endpoints" in url:
+                return {"endpoints": []}, None
+            return next(responses)
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        model_service_probe = db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
+
+        assert model_service_probe == db_mod.GatewayProbe(
+            True,
+            "reachable, no accessible model services returned; check USE CATALOG on system, and "
+            "USE SCHEMA and EXECUTE on system.ai",
+        )
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50"
+            "&page_token=cursor-1",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
         ]
 
     def test_empty_model_service_response_includes_permission_hint(self, monkeypatch):
@@ -1964,7 +2021,7 @@ class TestProbeUnityGatewayCapabilities:
 
         assert model_service_probe == db_mod.GatewayProbe(False, "HTTP 404: Not Found")
         assert calls == [
-            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
             f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
         ]
 
@@ -1983,7 +2040,7 @@ class TestProbeUnityGatewayCapabilities:
 
         assert model_service_probe == db_mod.GatewayProbe(False, "HTTP 403: Forbidden")
         assert calls == [
-            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
             f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
         ]
 
@@ -2042,7 +2099,111 @@ class TestProbeUnityGatewayCapabilities:
         with pytest.raises(RuntimeError, match="rejected"):
             db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
 
-        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"]
+        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50"]
+
+    def test_missing_scope_403_on_both_paths_routes_to_reauth_not_grants(self, monkeypatch):
+        calls: list[str] = []
+
+        def fake_get(url, token):
+            calls.append(url)
+            return None, (
+                "HTTP 403 Forbidden: Provided OAuth token does not have required "
+                "scopes: unity-catalog"
+            )
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        with pytest.raises(RuntimeError, match="missing an OAuth scope") as excinfo:
+            db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
+
+        message = str(excinfo.value)
+        assert "databricks auth login" in message
+        assert "USE CATALOG" not in message
+        assert "USE SCHEMA" not in message
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
+        ]
+
+    def test_model_service_scope_403_succeeds_when_legacy_reachable(self, monkeypatch):
+        calls: list[str] = []
+
+        def fake_get(url, token):
+            calls.append(url)
+            if "/api/ai-gateway/v2/endpoints" in url:
+                return {"endpoints": [{"name": "databricks-gpt-5"}]}, None
+            return None, (
+                "HTTP 403 Forbidden: Provided OAuth token does not have required "
+                "scopes: unity-catalog"
+            )
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        model_service_probe = db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
+
+        assert not model_service_probe.reachable
+        assert "required scopes" in model_service_probe.detail
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
+        ]
+
+    def test_probe_v3_later_page_error_is_reachable_not_empty(self, monkeypatch):
+        responses = iter(
+            [
+                ({"next_page_token": "cursor-1"}, None),
+                (None, "HTTP 500: Internal Server Error"),
+            ]
+        )
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: next(responses))
+
+        assert db_mod._probe_ai_gateway_v3(WS, "fake-token") == db_mod.GatewayProbe(
+            True, "reachable", conclusive=False
+        )
+
+    def test_probe_v3_page_cap_with_pending_cursor_is_reachable_not_empty(self, monkeypatch):
+        calls: list[str] = []
+
+        def fake_get(url, token):
+            calls.append(url)
+            return {"next_page_token": "more"}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        assert db_mod._probe_ai_gateway_v3(WS, "fake-token") == db_mod.GatewayProbe(
+            True, "reachable", conclusive=False
+        )
+        assert len(calls) == db_mod._MODEL_SERVICE_PROBE_MAX_PAGES
+
+    def test_inconclusive_model_service_probe_does_not_hard_fail_when_legacy_unavailable(
+        self, monkeypatch
+    ):
+        v3_responses = iter(
+            [
+                ({"next_page_token": "cursor-1"}, None),
+                (None, "HTTP 500: Internal Server Error"),
+            ]
+        )
+
+        def fake_get(url, token):
+            if "/api/ai-gateway/v2/endpoints" in url:
+                return None, "HTTP 404: AI Gateway V2 is not available for CSP-enabled workspaces"
+            return next(v3_responses)
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        assert db_mod.probe_unity_gateway_capabilities(WS, "fake-token") == db_mod.GatewayProbe(
+            True, "reachable", conclusive=False
+        )
+
+    def test_scope_failure_matches_oauth_token_but_not_pat(self):
+        assert db_mod._looks_like_scope_failure(
+            "HTTP 403 Forbidden: Provided OAuth token does not have required scopes: unity-catalog"
+        )
+        assert not db_mod._looks_like_scope_failure(
+            "HTTP 403 Forbidden: Provided access token does not have required scopes"
+        )
+        assert not db_mod._looks_like_scope_failure("HTTP 403: Missing Unity Catalog grants")
 
     def test_model_service_forbidden_and_legacy_unavailable_reports_permission_error(
         self, monkeypatch
