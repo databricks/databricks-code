@@ -81,6 +81,7 @@ from ucode.managed_resolve import (
     managed_launch_model,
     managed_provider_family_models,
     managed_provider_service,
+    managed_state_overrides,
     managed_supplies_models,
     managed_unclassifiable_models,
     managed_unservable_models,
@@ -149,7 +150,7 @@ _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
     "claude": ("claude", "opencode", "copilot", "pi"),
     "codex": ("codex", "copilot", "pi"),
     "gemini": ("gemini", "opencode", "pi"),
-    "oss": ("opencode",),
+    "oss": ("codex", "opencode", "pi"),
 }
 
 
@@ -652,7 +653,7 @@ def configure_shared_state(
     want_codex = fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools
     # Codex smart routing can select OSS models such as GLM, so a Codex-only
     # configure must persist that discovered family too.
-    want_oss = fetch_all or "opencode" in tools or "codex" in tools
+    want_oss = fetch_all or "opencode" in tools or "codex" in tools or "pi" in tools
 
     claude_reason: str | None = None
     gemini_reason: str | None = None
@@ -2023,9 +2024,23 @@ def _launch_tool(
             _warn_unclassifiable_managed_models(managed, tool)
             unservable = managed_unservable_models(managed, tool)
             if unservable:
+                # Only agents whose translation yields no state override actually
+                # fall back to discovery. Pi keeps its managed `pi_models` list
+                # even when nothing in it is servable (so unlisted models can
+                # never leak into a managed config), so claiming a fallback there
+                # would be false.
+                falls_back = f"{tool}_models" not in managed_state_overrides(managed, tool)
+                detail = (
+                    "using your discovered models instead."
+                    if falls_back
+                    else (
+                        "and its list is authoritative, so no model can be configured. "
+                        "Ask your workspace admin to publish a supported model."
+                    )
+                )
                 print_warning(
                     f"Your workspace's managed config lists no {TOOL_SPECS[tool]['display']}-servable "
-                    f"models ({', '.join(unservable)}); using your discovered models instead."
+                    f"models ({', '.join(unservable)}); {detail}"
                 )
         elif managed_agent_config_enabled():
             print_note("No managed coding agent config found; using your own settings")

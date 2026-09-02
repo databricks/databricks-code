@@ -994,7 +994,22 @@ class TestPiLaunch:
                 out.append(("codex", model))
         for model in e2e_state.get("gemini_models") or []:
             out.append(("gemini", model))
+        for model in e2e_state.get("oss_models") or []:
+            out.append(("oss", model))
         return out
+
+    def test_all_models_includes_oss_provider(self):
+        models = self._all_models(
+            {
+                "claude_models": {"sonnet": "claude-sonnet"},
+                "codex_models": ["gpt-5"],
+                "gemini_models": ["gemini-3"],
+                "oss_models": ["system.ai.glm-5-2"],
+            }
+        )
+
+        assert ("oss", "system.ai.glm-5-2") in models
+        assert len(models) == 4
 
     def test_launch_pi_per_model(self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token):
         import ucode.config_io as config_io_mod

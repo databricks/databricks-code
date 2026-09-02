@@ -30,6 +30,17 @@ runner = CliRunner()
 TOOLS = ["codex", "claude", "gemini", "opencode"]
 
 
+def test_oss_discovery_diagnostic_names_all_consumers(monkeypatch):
+    import ucode.cli as cli_mod
+
+    notes = []
+    monkeypatch.setattr(cli_mod, "print_note", notes.append)
+
+    cli_mod._print_discovery_diagnostics({"_discovery_reasons": {"oss": "not found"}})
+
+    assert notes[0] == "OSS models (needed for: codex, opencode, pi): not found"
+
+
 def _jwt(expires_at: float) -> str:
     payload = base64.urlsafe_b64encode(json.dumps({"exp": expires_at}).encode()).decode()
     return f"header.{payload.rstrip('=')}.signature"
@@ -3166,6 +3177,23 @@ class TestManagedModelWarnings:
         assert "system.ai.future-chat-1" in warnings[0]
         assert "will be ignored" in warnings[0]
         assert "claude-opus" not in warnings[0]
+
+    def test_unservable_message_only_claims_fallback_when_one_happens(self):
+        # Pi keeps its managed `pi_models` even when nothing in it is servable, so
+        # discovery does NOT stand in and the message must not claim it does.
+        # OpenCode withholds the override entirely, so for it the claim is true.
+        from ucode.managed_resolve import managed_state_overrides, managed_unservable_models
+
+        def managed_for(tool):
+            return {"enabled_agents": {tool: {"model_config": {"models": ["system.ai.mystery"]}}}}
+
+        pi_managed = managed_for("pi")
+        assert managed_unservable_models(pi_managed, "pi") == ["system.ai.mystery"]
+        assert "pi_models" in managed_state_overrides(pi_managed, "pi")
+
+        oc_managed = managed_for("opencode")
+        assert managed_unservable_models(oc_managed, "opencode") == ["system.ai.mystery"]
+        assert "opencode_models" not in managed_state_overrides(oc_managed, "opencode")
 
 
 class TestFetchManagedConfig:

@@ -289,14 +289,21 @@ class TestModelTokenLimits:
         ):
             assert db_mod.model_token_limits(model_id) is None
 
-    def test_embedding_model_returns_none_not_fallback(self):
-        assert db_mod.model_token_limits("system.ai.qwen3-embedding-0-6b") is None
+    @pytest.mark.parametrize(
+        "model_id",
+        ["system.ai.glm-embedding-0-6b", "system.ai.qwen3-embedding-0-6b"],
+    )
+    def test_embedding_model_returns_none_not_fallback(self, model_id):
+        assert db_mod.model_token_limits(model_id) is None
 
 
 class TestModelIsReasoning:
     def test_reasoning_families(self):
         assert db_mod.model_is_reasoning("system.ai.glm-5-2") is True
         assert db_mod.model_is_reasoning("system.ai.kimi-k2-7-code") is True
+
+    def test_matching_is_case_insensitive(self):
+        assert db_mod.model_is_reasoning("SYSTEM.AI.GLM-5-2") is True
 
     def test_unvalidated_families_are_not_marked_reasoning(self):
         assert db_mod.model_is_reasoning("system.ai.inkling") is False
