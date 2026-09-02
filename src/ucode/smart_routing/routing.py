@@ -33,7 +33,7 @@ SUBAGENT_ROUTING_DISCLAIMER = (
 def format_switch_message(model: str, reason: str | None) -> str:
     """Format the first-prompt routed-model notice."""
     lines = [
-        "Using Unity Gateway Smart Router.",
+        "Using ug Smart Router.",
         f"Selected Model : {model}",
         *([f"Reason : {reason}"] if reason else []),
         SUBAGENT_ROUTING_DISCLAIMER,
@@ -44,7 +44,7 @@ def format_switch_message(model: str, reason: str | None) -> str:
 def format_subagent_message(model: str, reason: str | None) -> str:
     """Format a routed-subagent notice without the first-prompt disclaimer."""
     lines = [
-        "Using Unity Gateway Smart Router - Subagent",
+        "Using ug Smart Router - Subagent",
         f"Selected Model : {model}",
         *([f"Reason : {reason}"] if reason else []),
     ]

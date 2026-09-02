@@ -189,7 +189,7 @@ def test_spawn_rewrite_preserves_original_input(monkeypatch):
         "gpt-5.5", "Review needs deeper reasoning."
     )
     assert output["systemMessage"] == expected_message
-    assert "Using Unity Gateway Smart Router - Subagent" in expected_message
+    assert "Using ug Smart Router - Subagent" in expected_message
     assert codex_routing.routing.SUBAGENT_ROUTING_DISCLAIMER not in expected_message
     assert hook["permissionDecision"] == "allow"
     assert hook["updatedInput"] == {
