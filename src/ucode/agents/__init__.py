@@ -251,6 +251,9 @@ def tool_binary_installed(tool: str) -> bool:
 def tool_update_available(tool: str) -> tuple[str, str] | None:
     """Return ``(current, latest)`` when a newer agent CLI is published, else None.
     Read-only wrapper over the npm update check — for ``ucode doctor``."""
+    checker = getattr(_MODULES[tool], "is_update_available", None)
+    if callable(checker):
+        return checker()
     return available_npm_package_update(TOOL_SPECS[tool]["package"])
 
 
