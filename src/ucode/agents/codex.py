@@ -526,11 +526,9 @@ def launch(state: dict, tool_args: list[str]) -> None:
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     if tool_args[:1] == ["app"]:
-        # Codex plugin commands reject --profile even though the app still
-        # needs the ucode profile's Databricks provider and auth settings.
-        # Reproduce profile layering at CLI precedence: Codex loads the normal
-        # base config, then these overrides apply every value from
-        # ucode.config.toml without mutating the user's config.toml.
+        # `codex app` rejects --profile. Pass the ucode profile as --config
+        # overrides instead, preserving its Databricks provider and auth
+        # settings without changing the user's base config.toml.
         profile_doc = read_toml_safe(CODEX_CONFIG_PATH)
         if not profile_doc:
             raise RuntimeError(
