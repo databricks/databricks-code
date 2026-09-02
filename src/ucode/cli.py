@@ -2531,10 +2531,18 @@ def copilot_cmd(
 @app.command("pi", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def pi_cmd(
     ctx: typer.Context,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            help="Route through a Unity Catalog Model Provider Service "
+            "(<catalog>.<schema>.<name>). Pass before any `--` separator.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
 ) -> None:
     """Launch Pi coding agent via Databricks."""
-    _launch_tool("pi", ctx, skip_preflight=skip_preflight)
+    _launch_tool("pi", ctx, provider=provider, skip_preflight=skip_preflight)
 
 
 @app.command("cursor", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
