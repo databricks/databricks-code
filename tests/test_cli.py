@@ -10,6 +10,7 @@ import re
 import subprocess
 import time
 import tomllib
+from importlib import metadata
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -127,39 +128,194 @@ class TestProjectScripts:
 
 
 class TestUpgrade:
-    def test_uninstalls_legacy_distribution_then_force_installs(self):
-        git_url = "git+https://github.com/databricks/ucode"
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                subprocess.CompletedProcess([], 1),
-                subprocess.CompletedProcess([], 0),
-            ]
+    @staticmethod
+    def _ok() -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    @staticmethod
+    def _which(command: str) -> str:
+        return f"/tools/{command}"
+
+    def test_before_cutover_upgrades_ucode_normally_and_verifies_commands(self):
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("ucode.cli.shutil.which", side_effect=self._which),
+            patch("subprocess.run", side_effect=[self._ok(), self._ok(), self._ok()]) as run,
+        ):
             result = runner.invoke(app, ["upgrade"])
 
         assert result.exit_code == 0, result.output
-        assert mock_run.call_args_list == [
-            call(["uv", "tool", "uninstall", "ucode"], check=False),
-            call(["uv", "tool", "install", "--force", git_url], check=True),
+        assert run.call_args_list == [
+            call(
+                ["uv", "tool", "upgrade", "ucode"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+            call(
+                ["/tools/ug", "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+            call(
+                ["/tools/ucode", "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
         ]
-        assert "ug upgraded" in result.output
+        assert "ucode upgraded" in result.output
 
-    def test_install_failure_is_actionable(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.side_effect = [
-                subprocess.CompletedProcess([], 0),
+    def test_cutover_migrates_legacy_distribution_and_verifies_commands(self):
+        git_url = "git+https://github.com/databricks/ucode"
+        rename_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr=("Package metadata name `unity-gateway` does not match given name `ucode`"),
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("ucode.cli.shutil.which", side_effect=self._which),
+            patch(
+                "subprocess.run",
+                side_effect=[
+                    rename_failure,
+                    self._ok(),
+                    self._ok(),
+                    self._ok(),
+                    self._ok(),
+                ],
+            ) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        assert run.call_args_list == [
+            call(
+                ["uv", "tool", "upgrade", "ucode"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+            call(["uv", "tool", "uninstall", "ucode"], check=True),
+            call(["uv", "tool", "install", "--force", git_url], check=True),
+            call(
+                ["/tools/ug", "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+            call(
+                ["/tools/ucode", "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+        ]
+        assert "Migrated to `unity-gateway`" in result.output
+
+    def test_after_cutover_upgrades_unity_gateway_normally_and_verifies_commands(self):
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="unity-gateway"),
+            patch("ucode.cli.shutil.which", side_effect=self._which),
+            patch("subprocess.run", side_effect=[self._ok(), self._ok(), self._ok()]) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        assert run.call_args_list[0] == call(
+            ["uv", "tool", "upgrade", "unity-gateway"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert all("uninstall" not in invocation.args[0] for invocation in run.call_args_list)
+        assert "unity-gateway upgraded" in result.output
+
+    def test_unrelated_legacy_upgrade_failure_does_not_uninstall_ucode(self):
+        failure = subprocess.CompletedProcess(
+            [], 7, stdout="", stderr="Could not resolve host: github.com"
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run", return_value=failure) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 1
+        run.assert_called_once_with(
+            ["uv", "tool", "upgrade", "ucode"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert "left unchanged" in result.output
+
+    def test_cutover_install_failure_has_recovery_command(self):
+        rename_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr=("Package metadata name `unity-gateway` does not match given name `ucode`"),
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run") as run,
+        ):
+            run.side_effect = [
+                rename_failure,
+                self._ok(),
                 subprocess.CalledProcessError(7, ["uv", "tool", "install"]),
             ]
             result = runner.invoke(app, ["upgrade"])
 
         assert result.exit_code == 1
-        assert "Upgrade failed (exit code 7)" in result.output
+        assert "legacy `ucode` tool was removed" in result.output
+        assert "uv tool install --force git+https://github.com/databricks/ucode" in re.sub(
+            r"\s+", " ", result.output
+        )
+
+    def test_verification_failure_is_actionable(self):
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("ucode.cli.shutil.which", return_value=None),
+            patch("subprocess.run", return_value=self._ok()),
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 1
+        assert "`ug` is not available on PATH" in result.output
 
     def test_missing_uv_is_actionable(self):
-        with patch("subprocess.run", side_effect=FileNotFoundError):
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run", side_effect=FileNotFoundError),
+        ):
             result = runner.invoke(app, ["upgrade"])
 
         assert result.exit_code == 1
         assert "uv" in result.output.lower()
+
+    def test_installed_distribution_prefers_unity_gateway(self):
+        with patch("ucode.cli.metadata.version", return_value="1.0.0") as package_version:
+            from ucode.cli import _installed_cli_distribution
+
+            assert _installed_cli_distribution() == "unity-gateway"
+
+        package_version.assert_called_once_with("unity-gateway")
+
+    def test_installed_distribution_falls_back_to_ucode(self):
+        def package_version(distribution_name: str) -> str:
+            if distribution_name == "unity-gateway":
+                raise metadata.PackageNotFoundError
+            return "1.0.0"
+
+        with patch("ucode.cli.metadata.version", side_effect=package_version):
+            from ucode.cli import _installed_cli_distribution
+
+            assert _installed_cli_distribution() == "ucode"
 
 
 class TestVersion:

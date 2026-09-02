@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
+from importlib import metadata
 from typing import Annotated
 
 import typer
@@ -3397,31 +3399,125 @@ def usage_cmd(
 @app.command("upgrade")
 def upgrade_cmd() -> None:
     """Upgrade ug to the latest version from GitHub."""
-    import subprocess
-
+    legacy_distribution = "ucode"
+    current_distribution = "unity-gateway"
     git_url = "git+https://github.com/databricks/ucode"
+    installed_distribution = _installed_cli_distribution()
+    migrated = False
+    legacy_removed = False
+
     print_section("Upgrade")
     print_kv("Source", git_url)
+    print_kv("Installed distribution", installed_distribution)
     try:
-        # uv tracks tools by distribution name, so it cannot upgrade the old
-        # `ucode` distribution across the future rename to `unity-gateway`.
-        # Removing the legacy registration is best-effort: users who are
-        # already migrated will not have a tool registered under that name.
-        subprocess.run(
-            ["uv", "tool", "uninstall", "ucode"],
+        result = subprocess.run(
+            ["uv", "tool", "upgrade", installed_distribution],
             check=False,
+            capture_output=True,
+            text=True,
         )
-        subprocess.run(
-            ["uv", "tool", "install", "--force", git_url],
-            check=True,
-        )
+        if result.returncode != 0:
+            if installed_distribution == legacy_distribution and _is_distribution_cutover(result):
+                print_note(
+                    "The package is now distributed as `unity-gateway`; migrating this installation."
+                )
+                subprocess.run(
+                    ["uv", "tool", "uninstall", legacy_distribution],
+                    check=True,
+                )
+                legacy_removed = True
+                subprocess.run(
+                    ["uv", "tool", "install", "--force", git_url],
+                    check=True,
+                )
+                migrated = True
+                installed_distribution = current_distribution
+            else:
+                detail = _upgrade_failure_detail(result)
+                print_err(
+                    f"Upgrade failed (exit code {result.returncode})"
+                    f"{f': {detail}' if detail else '.'}"
+                )
+                print_note("The existing installation was left unchanged.")
+                raise typer.Exit(1)
+
+        _verify_upgraded_commands()
     except FileNotFoundError:
         print_err("`uv` was not found on PATH. Install uv to upgrade ug.")
         raise typer.Exit(1) from None
     except subprocess.CalledProcessError as exc:
-        print_err(f"Upgrade failed (exit code {exc.returncode}).")
+        if legacy_removed:
+            print_err(
+                "The legacy `ucode` tool was removed, but installing `unity-gateway` failed "
+                f"(exit code {exc.returncode})."
+            )
+            print_note(f"Recover by running `uv tool install --force {git_url}`.")
+        else:
+            print_err(f"Upgrade failed (exit code {exc.returncode}); `ucode` was not removed.")
         raise typer.Exit(1) from None
-    print_success("ug upgraded; `ucode` remains available as an alias")
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+
+    if migrated:
+        print_success("Migrated to `unity-gateway`; both `ug` and `ucode` are working")
+    else:
+        print_success(f"{installed_distribution} upgraded; both `ug` and `ucode` are working")
+
+
+def _installed_cli_distribution() -> str:
+    """Return the uv tool identity, preferring the post-cutover distribution."""
+    for distribution_name in ("unity-gateway", "ucode"):
+        try:
+            metadata.version(distribution_name)
+        except metadata.PackageNotFoundError:
+            continue
+        return distribution_name
+    # Source checkouts and unusual installers may expose neither distribution.
+    # The repository is still named ucode when this bridge ships, so use the
+    # non-destructive legacy upgrade path and let uv report an actionable error.
+    return "ucode"
+
+
+def _is_distribution_cutover(result: subprocess.CompletedProcess[str]) -> bool:
+    """Recognize uv's specific error when source metadata changes distribution name."""
+    output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    return all(
+        marker in output
+        for marker in (
+            "metadata name",
+            "unity-gateway",
+            "does not match given name",
+            "ucode",
+        )
+    )
+
+
+def _upgrade_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
+    return (result.stderr or result.stdout or "").strip()
+
+
+def _verify_upgraded_commands() -> None:
+    """Ensure both compatibility entry points were installed and can start."""
+    for command in ("ug", "ucode"):
+        executable = shutil.which(command)
+        if executable is None:
+            raise RuntimeError(
+                f"Upgrade completed, but `{command}` is not available on PATH. "
+                "Reinstall Unity Gateway and ensure the uv tool bin directory is on PATH."
+            )
+        result = subprocess.run(
+            [executable, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = _upgrade_failure_detail(result)
+            raise RuntimeError(
+                f"Upgrade completed, but `{command} --version` failed"
+                f"{f': {detail}' if detail else '.'}"
+            )
 
 
 def main() -> None:
