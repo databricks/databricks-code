@@ -1887,6 +1887,7 @@ def _can_launch_from_cached_config(
         return (
             claude_agent.CLAUDE_SETTINGS_PATH.exists()
             and claude_agent.managed_settings_are_current(state)
+            and claude_agent.gateway_model_discovery_setting_is_absent()
         )
     return codex_agent.has_ucode_config() and codex_agent.managed_config_is_current(state)
 

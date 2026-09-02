@@ -198,6 +198,9 @@ CLAUDE_DEFAULT_MODEL_ENV_KEYS = {
     "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 }
+# Launch-scoped feature flags that ucode may write into Claude settings. These
+# must be removed again when the corresponding launch flag is absent.
+CLAUDE_CONDITIONAL_ENV_KEYS = ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",)
 # Env keys ucode used to write but no longer does; stripped from the managed
 # settings file on every launch so stale values never linger.
 CLAUDE_REMOVED_ENV_KEYS = ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",)
@@ -265,6 +268,15 @@ def managed_settings_are_current(state: dict) -> bool:
     else:
         required_scope = None
     return managed_file_is_verified(state, "claude", path, required_scope=required_scope)
+
+
+def gateway_model_discovery_setting_is_absent() -> bool:
+    """Return whether model discovery is absent from persistent Claude settings."""
+    env = read_json_safe(CLAUDE_SETTINGS_PATH).get("env")
+    actual = (
+        env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY") if isinstance(env, dict) else None
+    )
+    return actual is None
 
 
 def managed_settings_status(state: dict) -> tuple[Path | None, str, str]:
@@ -402,14 +414,6 @@ def render_overlay(
         "ENABLE_TOOL_SEARCH": "1",
         "CLAUDE_CODE_USE_GATEWAY": "1",
     }
-    # Native /model discovery: picker lists every gateway Messages-API endpoint,
-    # not just the family aliases. Skipped under a provider (its routing header
-    # would send a discovered gateway id to a provider that can't resolve it).
-    discovery_enabled = (
-        os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1" or smart_routing_v2.enabled()
-    )
-    if discovery_enabled and not provider:
-        env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     # Intentionally NOT setting ANTHROPIC_MODEL by default. Setting it produces a
     # duplicate catalog row in Claude Code's /model picker (e.g. "Opus 4.8 (1M
     # context) ✓") on top of the family-alias row from ANTHROPIC_DEFAULT_OPUS_MODEL.
@@ -658,6 +662,7 @@ def write_tool_config(
     managed_file_keys = list(managed_keys)
     for path in (
         [["env", key] for key in CLAUDE_MANAGED_MODEL_ENV_KEYS]
+        + [["env", key] for key in CLAUDE_CONDITIONAL_ENV_KEYS]
         + [["env", key] for key in CLAUDE_REMOVED_ENV_KEYS]
         + [["env", key] for key in CLAUDE_TRACING_ENV_KEYS]
         + [["hooks", "Stop"]]
@@ -726,6 +731,9 @@ def write_tool_config(
         merged_env = merged.get("env")
         if isinstance(merged_env, dict):
             for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
+                if key not in overlay_env:
+                    merged_env.pop(key, None)
+            for key in CLAUDE_CONDITIONAL_ENV_KEYS:
                 if key not in overlay_env:
                     merged_env.pop(key, None)
             # deep_merge_dict keeps keys already in the file, so drop the ones ucode no
@@ -1273,6 +1281,9 @@ def _build_claude_argv(
     merged = _merge_claude_settings(caller_settings, read_json_safe(CLAUDE_SETTINGS_PATH))
     if settings_override is not None:
         merged = _merge_claude_settings(merged, settings_override)
+    merged_env = merged.get("env")
+    if isinstance(merged_env, dict):
+        merged_env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
     return [
         binary,
         *source_args,
@@ -1435,7 +1446,14 @@ def launch(state: dict, tool_args: list[str]) -> None:
     if first_prompt_routing:
         _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=True)
         return
-    if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
+    if (
+        workspace
+        and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1"
+        and not _has_provider_launch(state)
+    ):
+        # Discovery is launch-scoped. Pass it in the process environment rather
+        # than persisting it in Claude's private or OS-managed settings.
+        os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
         _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=False)
         return
     if workspace:

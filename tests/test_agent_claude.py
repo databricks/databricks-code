@@ -202,16 +202,16 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
-    def test_enables_gateway_model_discovery(self, monkeypatch):
+    def test_does_not_persist_gateway_model_discovery(self, monkeypatch):
         monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", "1")
         overlay, _ = claude.render_overlay(WS, "s4")
-        assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
-    def test_enables_gateway_model_discovery_for_smart_routing_v2(self, monkeypatch):
+    def test_smart_routing_does_not_persist_gateway_model_discovery(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
         overlay, _ = claude.render_overlay(WS, "s4")
-        assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
     def test_gateway_model_discovery_skipped_under_provider(self, monkeypatch):
         # A Model Provider Service routes every request to the external provider,
@@ -220,6 +220,16 @@ class TestRenderOverlay:
         monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", "1")
         overlay, _ = claude.render_overlay(WS, "s4", provider="main.x.claude-svc")
         assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
+
+    def test_gateway_model_discovery_setting_detects_stale_opt_in(self, monkeypatch):
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
+        monkeypatch.setattr(
+            claude,
+            "read_json_safe",
+            lambda path: {"env": {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}},
+        )
+
+        assert claude.gateway_model_discovery_setting_is_absent() is False
 
     def test_sets_api_key_helper(self):
         overlay, _ = claude.render_overlay(WS, "s4")
@@ -614,6 +624,16 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
         assert written[0]["env"]["ENABLE_TOOL_SEARCH"] == "1"
         assert written[0]["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
+    def test_strips_stale_gateway_model_discovery(self, monkeypatch):
+        existing = {"env": {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}}
+        written: list = []
+        self._patch(monkeypatch, existing, written)
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in written[0]["env"]
+
 
 FAKE_MANAGED_PATH = Path("/tmp/ucode-test/managed-settings.json")
 
@@ -723,6 +743,26 @@ class TestWriteToolConfigManagedSettings:
         assert written["env"]["MY_OWN"] == "keep"
         assert written["env"]["ANTHROPIC_BASE_URL"]
         assert written["apiKeyHelper"]
+
+    def test_managed_file_strips_stale_gateway_model_discovery(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        stale = {"env": {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}}
+        existing = {
+            str(claude.CLAUDE_SETTINGS_PATH): stale,
+            str(FAKE_MANAGED_PATH): stale,
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in private_writes[0][1]["env"]
+        assert (
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
+            not in json.loads(managed_writes[0][1])["env"]
+        )
 
     def test_managed_file_merges_anthropic_custom_headers(self, monkeypatch):
         private_writes: list = []
@@ -1200,6 +1240,7 @@ class TestClaudeLaunch:
         assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
         assert os.environ["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
         assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
+        assert os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
         assert calls[:2] == [
             ("proxy", WS, 0),
             ("serve",),
@@ -1208,6 +1249,7 @@ class TestClaudeLaunch:
         argv = calls[2][1]
         assert argv[:2] == ["claude", "--settings"]
         assert json.loads(argv[2])["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in json.loads(argv[2])["env"]
         assert argv[3:] == ["--debug"]
         assert calls[3:] == [("shutdown",), ("close",)]
 
