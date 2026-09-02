@@ -2060,6 +2060,33 @@ def _launch_tool(
                         if _pi_entered:
                             bedrock_targets = [_pi_entered]
                             resolved_model = _pi_entered
+            elif tool == "codex":
+                # Codex's built-in model picker queries OpenAI, not the MPS, so it shows the
+                # wrong model list when routing through a Bedrock provider. Pin a target from
+                # the MPS so Codex never reaches its picker.
+                if model:
+                    resolved_model = model
+                else:
+                    _token = get_databricks_token(state["workspace"], state.get("profile"))
+                    with spinner("Fetching provider model targets..."):
+                        _svc, _ = get_model_provider_service(provider, state["workspace"], _token)
+                    if _svc:
+                        _targets: list[str] = _svc.get("targets") or []
+                        if len(_targets) == 1:
+                            resolved_model = _targets[0]
+                        elif len(_targets) > 1:
+                            _picked = prompt_for_selection(
+                                "Select a model from the provider service:",
+                                [(_t, _t) for _t in _targets],
+                            )
+                            if _picked is None:
+                                raise KeyboardInterrupt
+                            resolved_model = _picked
+                        elif _svc.get("allow_all_targets"):
+                            print_warning(
+                                f"'{provider}' allows all targets but has none declared. "
+                                "Pass --model with the Bedrock model ID you want to use."
+                            )
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
             # in as the explicit model rather than being applied afterwards: for codex the proto has

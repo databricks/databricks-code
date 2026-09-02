@@ -306,11 +306,12 @@ def revert_legacy_shared_config() -> bool:
 
 def write_tool_config(state: dict, model: str | None = None, provider: str | None = None) -> dict:
     workspace = state["workspace"]
-    # Leave model selection to Codex. The gateway still receives the configured
-    # provider and authentication settings, while Codex uses its own default.
-    # A managed default is the sole exception.
+    # Leave model selection to Codex — except when a provider is set and a target
+    # model was resolved from its MPS targets, or an admin managed default exists.
     managed_model = state.get("codex_default_model")
-    chosen_model = managed_model if isinstance(managed_model, str) else None
+    chosen_model = (model if provider else None) or (
+        managed_model if isinstance(managed_model, str) else None
+    )
     databricks_profile = state.get("profile")
 
     if _use_legacy_layout():
