@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 
+from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -153,6 +154,18 @@ def minimum_version_error() -> str | None:
     if message is None:
         return None
     return f"{message} Update it with `npm install -g {SPEC['package']}`."
+
+
+def is_update_available() -> tuple[str, str] | None:
+    """Offer only stable OpenCode v1 updates, never npm's beta `latest` tag."""
+    update = available_npm_package_update(OPENCODE_NPM_PACKAGE)
+    if update is None:
+        return None
+    _, target = update
+    parsed = _parse_version(target)
+    if "-" in target or parsed is None or parsed[0] != 1:
+        return None
+    return update
 
 
 def render_auth_plugin(state: dict) -> str:

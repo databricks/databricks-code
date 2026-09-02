@@ -81,6 +81,20 @@ class TestToolSpecs:
     def test_default_tool_is_codex(self):
         assert DEFAULT_TOOL == "codex"
 
+    def test_tool_update_available_uses_agent_override(self, monkeypatch):
+        monkeypatch.setattr(
+            agents_mod.opencode,
+            "is_update_available",
+            lambda: ("1.18.15", "1.18.16"),
+        )
+        monkeypatch.setattr(
+            agents_mod,
+            "available_npm_package_update",
+            lambda _package: (_ for _ in ()).throw(AssertionError("should use override")),
+        )
+
+        assert agents_mod.tool_update_available("opencode") == ("1.18.15", "1.18.16")
+
 
 class TestInstallAiToolsForAgents:
     def _capture(self, monkeypatch):
