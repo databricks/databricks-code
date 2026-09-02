@@ -192,6 +192,7 @@ def _request_claude_routing_decision(
         prompt,
         [(model, "claude") for model in available],
         lambda selected: available.get(routing.normalize_model(selected)),
+        router_name=routing.configured_router_name(),
         timeout=CLAUDE_ROUTE_SELECTION_TIMEOUT_S,
     )
 

@@ -80,7 +80,7 @@ def request_routing_decision(
     *,
     timeout: float = REQUEST_TIMEOUT_S,
 ) -> tuple[RoutingDecision | None, str | None]:
-    """Ask the configured workspace router for a servable Claude model.
+    """Ask the router for a servable Claude model.
 
     Offers the full ``cc`` menu; resolves the router's pick back to the
     workspace's routable id (e.g. ``system.ai.claude-opus-4-8``).
@@ -96,6 +96,7 @@ def request_routing_decision(
         task,
         [(arm, "claude") for arm in CLAUDE_ROUTE_ARMS],
         lambda raw_model: available.get(_normalize_model(raw_model)),
+        router_name=routing.configured_router_name(),
         timeout=timeout,
     )
 

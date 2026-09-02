@@ -43,7 +43,7 @@ def request_routing_decision(
     timeout: float = REQUEST_TIMEOUT_S,
     log: Callable[[str], None] | None = None,
 ) -> tuple[RoutingDecision | None, str | None]:
-    """Ask the configured workspace router for a servable Codex model."""
+    """Ask the router for a servable Codex model."""
     available = {_normalize_model(model): model for model in available_models}
     route_options = [(model, "codex") for model in available]
     if not route_options:
@@ -65,6 +65,7 @@ def request_routing_decision(
         task,
         route_options,
         lambda raw_model: available.get(_normalize_model(raw_model)),
+        router_name=router_name,
         timeout=timeout,
     )
 

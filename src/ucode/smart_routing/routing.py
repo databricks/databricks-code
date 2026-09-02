@@ -111,7 +111,7 @@ def select_route(
     route_options: Iterable[tuple[str, str | None]],
     resolve: Callable[[str], str | None],
     *,
-    router_name: str | None = None,
+    router_name: str,
     timeout: float = REQUEST_TIMEOUT_S,
 ) -> tuple[RoutingDecision | None, str | None]:
     """POST one ``routes:select`` request and resolve the router's pick.
@@ -125,7 +125,7 @@ def select_route(
     body = {
         "route_options": [{"model": model, "harness": harness} for model, harness in route_options],
         "task": {"prompt": task},
-        "route_selector": {"router_name": router_name or configured_router_name()},
+        "route_selector": {"router_name": router_name},
     }
     request = urllib.request.Request(
         workspace.rstrip("/") + ROUTING_PATH,
