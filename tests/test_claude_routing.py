@@ -25,6 +25,7 @@ class _Response:
 
 
 def test_routes_with_task_v1_claude_menu(monkeypatch):
+    monkeypatch.delenv("UCODE_SMART_ROUTER", raising=False)
     captured = {}
 
     def fake_urlopen(request, timeout):

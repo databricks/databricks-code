@@ -54,7 +54,9 @@ ucode claude --enable-smart-routing
 ```
 
 The flag applies only to that launch; later launches use normal model selection unless the flag is
-passed again.
+passed again. Smart routing uses the `task_v1` router by default. Power users can select another
+router for a launch by setting `UCODE_SMART_ROUTER`, for example
+`UCODE_SMART_ROUTER=task_v2 ucode codex --enable-smart-routing`.
 
 To configure all tools at once:
 

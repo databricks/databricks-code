@@ -1,7 +1,7 @@
 """Shared AI Gateway routing helpers for coding-agent sessions and subagents.
 
 Both the Codex and Claude Code integrations route through the workspace's
-``task_v1`` router at ``/ai-gateway/routing/v1/routes:select``. The
+configured router at ``/ai-gateway/routing/v1/routes:select``. The
 harness-agnostic mechanics live here — the gateway call, the decision shape,
 model-name normalization, and the canary/audit/decision bookkeeping. Each
 harness module (``codex_routing`` / ``claude_routing``) supplies its own route
@@ -11,6 +11,7 @@ arms, spawn-tool detector, model-id translation, and artifact paths.
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 ROUTER_NAME = "task_v1"
+ROUTER_NAME_ENV_VAR = "UCODE_SMART_ROUTER"
 ROUTING_PATH = "/ai-gateway/routing/v1/routes:select"
 REQUEST_TIMEOUT_S = 30.0
 SUBAGENT_ROUTING_DISCLAIMER = (
@@ -97,6 +99,11 @@ def normalize_model(model: str) -> str:
     return tail.lower()
 
 
+def configured_router_name() -> str:
+    """Return the environment-selected router, falling back to ``task_v1``."""
+    return os.environ.get(ROUTER_NAME_ENV_VAR, "").strip() or ROUTER_NAME
+
+
 def select_route(
     workspace: str,
     token: str,
@@ -104,7 +111,7 @@ def select_route(
     route_options: Iterable[tuple[str, str | None]],
     resolve: Callable[[str], str | None],
     *,
-    router_name: str = ROUTER_NAME,
+    router_name: str | None = None,
     timeout: float = REQUEST_TIMEOUT_S,
 ) -> tuple[RoutingDecision | None, str | None]:
     """POST one ``routes:select`` request and resolve the router's pick.
@@ -118,7 +125,7 @@ def select_route(
     body = {
         "route_options": [{"model": model, "harness": harness} for model, harness in route_options],
         "task": {"prompt": task},
-        "route_selector": {"router_name": router_name},
+        "route_selector": {"router_name": router_name or configured_router_name()},
     }
     request = urllib.request.Request(
         workspace.rstrip("/") + ROUTING_PATH,
