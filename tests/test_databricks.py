@@ -1931,7 +1931,67 @@ class TestProbeUnityGatewayCapabilities:
             True, "reachable, accessible model service returned", True
         )
         assert calls == [
-            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
+        ]
+
+    def test_empty_first_page_follows_cursor_to_accessible_model_service(self, monkeypatch):
+        # UC applies page_size before ACL filtering, so an early page can come
+        # back empty (only a next_page_token) while accessible rows remain behind
+        # the cursor (ES-2185388). The probe must page before reporting empty.
+        calls: list[str] = []
+        responses = iter(
+            [
+                ({"next_page_token": "cursor-1"}, None),
+                ({"model_services": [{"name": "model-services/system.ai.gpt-5"}]}, None),
+            ]
+        )
+
+        def fake_get(url, token):
+            calls.append(url)
+            return next(responses)
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        model_service_probe = db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
+
+        assert model_service_probe == db_mod.GatewayProbe(
+            True, "reachable, accessible model service returned", True
+        )
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50"
+            "&page_token=cursor-1",
+        ]
+
+    def test_empty_pages_exhaust_cursor_before_reporting_no_model_service(self, monkeypatch):
+        calls: list[str] = []
+        responses = iter(
+            [
+                ({"next_page_token": "cursor-1"}, None),
+                ({"model_services": []}, None),
+            ]
+        )
+
+        def fake_get(url, token):
+            calls.append(url)
+            if "/api/ai-gateway/v2/endpoints" in url:
+                return {"endpoints": []}, None
+            return next(responses)
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        model_service_probe = db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
+
+        assert model_service_probe == db_mod.GatewayProbe(
+            True,
+            "reachable, no accessible model services returned; check USE CATALOG on system, and "
+            "USE SCHEMA and EXECUTE on system.ai",
+        )
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50"
+            "&page_token=cursor-1",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
         ]
 
     def test_empty_model_service_response_includes_permission_hint(self, monkeypatch):
@@ -1964,7 +2024,7 @@ class TestProbeUnityGatewayCapabilities:
 
         assert model_service_probe == db_mod.GatewayProbe(False, "HTTP 404: Not Found")
         assert calls == [
-            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
             f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
         ]
 
@@ -1983,7 +2043,7 @@ class TestProbeUnityGatewayCapabilities:
 
         assert model_service_probe == db_mod.GatewayProbe(False, "HTTP 403: Forbidden")
         assert calls == [
-            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50",
             f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
         ]
 
@@ -2042,7 +2102,31 @@ class TestProbeUnityGatewayCapabilities:
         with pytest.raises(RuntimeError, match="rejected"):
             db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
 
-        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"]
+        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50"]
+
+    def test_missing_scope_403_routes_to_reauth_not_grants(self, monkeypatch):
+        # A token missing the OAuth scope 403s every workspace API, so the fix is
+        # re-login, not a UC grant. It must not reach the grant-hint message, nor
+        # probe the legacy endpoint.
+        calls: list[str] = []
+
+        def fake_get(url, token):
+            calls.append(url)
+            return None, (
+                "HTTP 403 Forbidden: Provided OAuth token does not have required "
+                "scopes: unity-catalog"
+            )
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        with pytest.raises(RuntimeError, match="rejected the access token") as excinfo:
+            db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
+
+        message = str(excinfo.value)
+        assert "databricks auth login" in message
+        assert "USE CATALOG" not in message
+        assert "USE SCHEMA" not in message
+        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=50"]
 
     def test_model_service_forbidden_and_legacy_unavailable_reports_permission_error(
         self, monkeypatch

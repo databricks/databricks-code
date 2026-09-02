@@ -3062,17 +3062,13 @@ def _gateway_probe_result(
     reason: str | None,
     collection_key: str,
     resource_name: str,
-    empty_hint: str | None = None,
 ) -> GatewayProbe:
     if payload is None:
         return GatewayProbe(False, _version_neutral_gateway_detail(reason or "unknown error"))
     resources = payload.get(collection_key) if isinstance(payload, dict) else None
     if resources:
         return GatewayProbe(True, f"reachable, accessible {resource_name} returned", True)
-    detail = f"reachable, no accessible {resource_name}s returned"
-    if empty_hint:
-        detail = f"{detail}; {empty_hint}"
-    return GatewayProbe(True, detail)
+    return GatewayProbe(True, f"reachable, no accessible {resource_name}s returned")
 
 
 def _probe_ai_gateway_v2(workspace: str, token: str) -> GatewayProbe:
@@ -3087,17 +3083,39 @@ def _probe_ai_gateway_v2(workspace: str, token: str) -> GatewayProbe:
     )
 
 
+# The model-services listing applies `page_size` before ACL filtering, so an
+# early page can come back empty (only a `next_page_token`) while accessible
+# rows remain further in. Follow the cursor before concluding nothing is
+# accessible, or a caller with many services still reads as empty.
+_MODEL_SERVICE_PROBE_PAGE_SIZE = 50
+_MODEL_SERVICE_PROBE_MAX_PAGES = 20
+_MODEL_SERVICE_EMPTY_DETAIL = (
+    "reachable, no accessible model services returned; "
+    "check USE CATALOG on system, and USE SCHEMA and EXECUTE on system.ai"
+)
+
+
 def _probe_ai_gateway_v3(workspace: str, token: str) -> GatewayProbe:
     hostname = workspace_hostname(workspace)
-    url = f"https://{hostname}/api/2.1/unity-catalog/model-services?page_size=1"
-    payload, reason = _http_get_json(url, token)
-    return _gateway_probe_result(
-        payload=payload,
-        reason=reason,
-        collection_key="model_services",
-        resource_name="model service",
-        empty_hint="check USE CATALOG on system, and USE SCHEMA and EXECUTE on system.ai",
-    )
+    base = f"https://{hostname}/api/2.1/unity-catalog/model-services"
+    page_token: str | None = None
+    for page in range(_MODEL_SERVICE_PROBE_MAX_PAGES):
+        params: dict[str, object] = {"page_size": _MODEL_SERVICE_PROBE_PAGE_SIZE}
+        if page_token:
+            params["page_token"] = page_token
+        payload, reason = _http_get_json(f"{base}?{urlencode(params)}", token)
+        if payload is None:
+            if page == 0:
+                return GatewayProbe(
+                    False, _version_neutral_gateway_detail(reason or "unknown error")
+                )
+            break  # Reachability already confirmed; stop paging on a later-page error.
+        if isinstance(payload, dict) and payload.get("model_services"):
+            return GatewayProbe(True, "reachable, accessible model service returned", True)
+        page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
+        if not page_token:
+            break
+    return GatewayProbe(True, _MODEL_SERVICE_EMPTY_DETAIL)
 
 
 def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
@@ -3167,11 +3185,16 @@ def _looks_like_definitive_auth_failure(reason: str) -> bool:
     """True when retrying another workspace API cannot rescue this token.
 
     A 403 can be endpoint-specific authorization, so the preflight must still
-    try the fallback before surfacing it as an auth failure.
+    try the fallback before surfacing it as an auth failure. A missing-OAuth-
+    scope 403 is the exception: it 403s every workspace API, so re-login (not a
+    UC grant) is the fix.
     """
     if "HTTP 401" in reason:
         return True
-    return "HTTP 400" in reason and "invalid token" in reason.lower()
+    lowered = reason.lower()
+    if "HTTP 403" in reason and "required scopes" in lowered:
+        return True
+    return "HTTP 400" in reason and "invalid token" in lowered
 
 
 def _looks_like_permission_failure(reason: str) -> bool:
