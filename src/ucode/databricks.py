@@ -3046,18 +3046,42 @@ def fetch_codex_models(workspace: str, token: str) -> list[str]:
     return models
 
 
-def _probe_ai_gateway_v2(workspace: str, token: str) -> tuple[bool, str | None]:
+class GatewayProbe(NamedTuple):
+    reachable: bool
+    detail: str
+
+
+class GatewayCapabilities(NamedTuple):
+    v3: GatewayProbe
+    v2: GatewayProbe
+
+
+def _gateway_probe_result(
+    payload: dict | list | None,
+    reason: str | None,
+    collection_key: str,
+    resource_name: str,
+) -> GatewayProbe:
+    if payload is None:
+        return GatewayProbe(False, reason or "unknown error")
+    resources = payload.get(collection_key) if isinstance(payload, dict) else None
+    if resources:
+        return GatewayProbe(True, f"reachable, accessible {resource_name} returned")
+    return GatewayProbe(True, f"reachable, no accessible {resource_name}s returned")
+
+
+def _probe_ai_gateway_v2(workspace: str, token: str) -> GatewayProbe:
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}/api/ai-gateway/v2/endpoints?page_size=1"
     payload, reason = _http_get_json(url, token)
-    return payload is not None, reason
+    return _gateway_probe_result(payload, reason, "endpoints", "endpoint")
 
 
-def _probe_ai_gateway_v3(workspace: str, token: str) -> tuple[bool, str | None]:
+def _probe_ai_gateway_v3(workspace: str, token: str) -> GatewayProbe:
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}/api/2.1/unity-catalog/model-services?page_size=1"
     payload, reason = _http_get_json(url, token)
-    return payload is not None, reason
+    return _gateway_probe_result(payload, reason, "model_services", "model service")
 
 
 def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
@@ -3090,27 +3114,26 @@ def _raise_ai_gateway_v2_permission_failure(
     )
 
 
-def ensure_ai_gateway(workspace: str, token: str) -> None:
-    """Pass if either AI Gateway V2 or V3 is available."""
-    v3_ok, v3_reason = _probe_ai_gateway_v3(workspace, token)
-    if v3_ok:
-        return
-    if v3_reason and _looks_like_definitive_auth_failure(v3_reason):
-        _raise_ai_gateway_auth_failure(workspace, v3_reason)
+def ensure_ai_gateway(workspace: str, token: str) -> GatewayCapabilities:
+    """Return both gateway probe results if either V2 or V3 is reachable."""
+    v3 = _probe_ai_gateway_v3(workspace, token)
+    if not v3.reachable and _looks_like_definitive_auth_failure(v3.detail):
+        _raise_ai_gateway_auth_failure(workspace, v3.detail)
 
-    v2_ok, v2_reason = _probe_ai_gateway_v2(workspace, token)
-    if v2_ok:
-        return
-    if v2_reason and _looks_like_definitive_auth_failure(v2_reason):
-        _raise_ai_gateway_auth_failure(workspace, v2_reason)
-    if v3_reason and _looks_like_permission_failure(v3_reason):
-        _raise_ai_gateway_v3_permission_failure(workspace, v3_reason, v2_reason)
-    if v2_reason and _looks_like_permission_failure(v2_reason):
-        _raise_ai_gateway_v2_permission_failure(workspace, v2_reason, v3_reason)
+    v2 = _probe_ai_gateway_v2(workspace, token)
+    capabilities = GatewayCapabilities(v3=v3, v2=v2)
+    if v3.reachable or v2.reachable:
+        return capabilities
+    if _looks_like_definitive_auth_failure(v2.detail):
+        _raise_ai_gateway_auth_failure(workspace, v2.detail)
+    if _looks_like_permission_failure(v3.detail):
+        _raise_ai_gateway_v3_permission_failure(workspace, v3.detail, v2.detail)
+    if _looks_like_permission_failure(v2.detail):
+        _raise_ai_gateway_v2_permission_failure(workspace, v2.detail, v3.detail)
 
     raise RuntimeError(
         "Databricks AI Gateway is not enabled on this workspace: neither V3 "
-        f"({v3_reason or 'unknown error'}) nor V2 ({v2_reason or 'unknown error'}) is available. "
+        f"({v3.detail}) nor V2 ({v2.detail}) is available. "
         f"See {AI_GATEWAY_V2_DOCS_URL}"
     )
 

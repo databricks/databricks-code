@@ -516,7 +516,7 @@ def configure_shared_state(
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
 ) -> dict:
-    """Log into Databricks, enforce AI Gateway v2, fetch model lists, persist state.
+    """Log into Databricks, verify AI Gateway, fetch model lists, persist state.
 
     If tools is provided, only fetch models for those tools. Otherwise fetch all.
     If force_login is True, always run databricks auth login (used by explicit configure).
@@ -635,8 +635,10 @@ def configure_shared_state(
             state["profile"] = profile
     with spinner("Verifying Unity AI Gateway..."):
         token = get_databricks_token(workspace, profile)
-        ensure_ai_gateway(workspace, token)
+        gateway_capabilities = ensure_ai_gateway(workspace, token)
     print_success("Unity AI Gateway detected")
+    print_kv("V3 model services", gateway_capabilities.v3.detail)
+    print_kv("V2 endpoints", gateway_capabilities.v2.detail)
 
     want_claude = (
         fetch_all or "claude" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools

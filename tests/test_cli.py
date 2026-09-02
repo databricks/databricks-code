@@ -14,6 +14,7 @@ import pytest
 from typer.testing import CliRunner
 
 from ucode.cli import app
+from ucode.databricks import GatewayCapabilities, GatewayProbe
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -28,6 +29,11 @@ def _strip_ansi(text: str) -> str:
 runner = CliRunner()
 
 TOOLS = ["codex", "claude", "gemini", "opencode"]
+
+GATEWAY_CAPABILITIES = GatewayCapabilities(
+    v3=GatewayProbe(True, "reachable, accessible model service returned"),
+    v2=GatewayProbe(False, "HTTP 404 Not Found"),
+)
 
 
 def _jwt(expires_at: float) -> str:
@@ -2466,7 +2472,7 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "resolve_pat_token", lambda p: pat_token)
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
         monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
-        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: None)
+        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: GATEWAY_CAPABILITIES)
         monkeypatch.setattr(cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], None))
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
@@ -2488,6 +2494,15 @@ class TestConfigureSharedStateUsePat:
         assert os_mod.environ["DATABRICKS_BEARER"] == "dapi-pat"
         assert state["use_pat"] is True
         assert saved and saved[-1]["use_pat"] is True
+
+    def test_prints_v3_and_v2_gateway_capabilities(self, monkeypatch, capsys):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+
+        cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        output = _strip_ansi(capsys.readouterr().out)
+        assert "V3 model services: reachable, accessible model service returned" in output
+        assert "V2 endpoints: HTTP 404 Not Found" in output
 
     def test_use_pat_without_pat_profile_raises(self, monkeypatch):
         cli_mod, logins, _, _ = self._stub_deps(monkeypatch, pat_token=None)
@@ -2787,7 +2802,7 @@ class TestConfigureSharedStateMcpCleanup:
         monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda w, p=None: None)
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
         monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
-        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: None)
+        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: GATEWAY_CAPABILITIES)
         monkeypatch.setattr(cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], None))
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
@@ -2847,7 +2862,7 @@ class TestConfigureSharedStateSkipDiscovery:
         monkeypatch.setattr(cli_mod, "run_databricks_login", lambda w, p: None)
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
         monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
-        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: None)
+        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: GATEWAY_CAPABILITIES)
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
         monkeypatch.setattr(cli_mod, "save_state", lambda s: None)
 

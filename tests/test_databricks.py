@@ -1916,18 +1916,42 @@ class TestListDatabricksApps:
 
 
 class TestEnsureAiGateway:
-    def test_v3_only_workspace_succeeds_without_v2_probe(self, monkeypatch):
+    def test_reports_v3_resource_and_empty_v2_listing(self, monkeypatch):
         calls: list[str] = []
 
         def fake_get(url, token):
             calls.append(url)
-            return {"model_services": []}, None
+            if "/api/2.1/unity-catalog/model-services" in url:
+                return {"model_services": [{"name": "model-services/system.ai.gpt-5"}]}, None
+            return {"endpoints": []}, None
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        db_mod.ensure_ai_gateway(WS, "fake-token")
+        capabilities = db_mod.ensure_ai_gateway(WS, "fake-token")
 
-        assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"]
+        assert capabilities.v3 == db_mod.GatewayProbe(
+            True, "reachable, accessible model service returned"
+        )
+        assert capabilities.v2 == db_mod.GatewayProbe(
+            True, "reachable, no accessible endpoints returned"
+        )
+        assert calls == [
+            f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
+            f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
+        ]
+
+    def test_empty_v3_response_is_reachable_but_not_reported_as_accessible(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: ({}, None),
+        )
+
+        capabilities = db_mod.ensure_ai_gateway(WS, "fake-token")
+
+        assert capabilities.v3 == db_mod.GatewayProbe(
+            True, "reachable, no accessible model services returned"
+        )
 
     def test_v2_only_workspace_succeeds_after_v3_probe(self, monkeypatch):
         calls: list[str] = []
@@ -1940,8 +1964,12 @@ class TestEnsureAiGateway:
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        db_mod.ensure_ai_gateway(WS, "fake-token")
+        capabilities = db_mod.ensure_ai_gateway(WS, "fake-token")
 
+        assert capabilities.v3 == db_mod.GatewayProbe(False, "HTTP 404: Not Found")
+        assert capabilities.v2 == db_mod.GatewayProbe(
+            True, "reachable, no accessible endpoints returned"
+        )
         assert calls == [
             f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
             f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
@@ -1958,8 +1986,12 @@ class TestEnsureAiGateway:
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        db_mod.ensure_ai_gateway(WS, "fake-token")
+        capabilities = db_mod.ensure_ai_gateway(WS, "fake-token")
 
+        assert capabilities.v3 == db_mod.GatewayProbe(False, "HTTP 403: Forbidden")
+        assert capabilities.v2 == db_mod.GatewayProbe(
+            True, "reachable, no accessible endpoints returned"
+        )
         assert calls == [
             f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
             f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
