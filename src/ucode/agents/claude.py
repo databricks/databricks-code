@@ -190,9 +190,20 @@ CLAUDE_MANAGED_MODEL_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
 )
+# Launch-scoped feature flags that ucode may write into Claude settings. These
+# must be removed again when the corresponding launch flag is absent.
+CLAUDE_CONDITIONAL_ENV_KEYS = ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",)
 # Env keys ucode used to write but no longer does; stripped from the managed
 # settings file on every launch so stale values never linger.
 CLAUDE_REMOVED_ENV_KEYS = ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",)
+ANTHROPIC_CUSTOM_HEADERS_ENV_KEY = "ANTHROPIC_CUSTOM_HEADERS"
+CLAUDE_MANAGED_CUSTOM_HEADER_NAMES = frozenset(
+    {
+        "x-databricks-use-coding-agent-mode",
+        "user-agent",
+        "databricks-model-provider-service",
+    }
+)
 CLAUDE_TRACING_STOP_HOOK_SUFFIX = " autolog claude stop-hook"
 # Tracing is driven by an `mlflow autolog claude stop-hook` Stop hook, run by
 # the `mlflow` CLI on each session end. Pin to 3.11.x: 3.12 dropped the Unity
@@ -249,6 +260,15 @@ def managed_settings_are_current(state: dict) -> bool:
     else:
         required_scope = None
     return managed_file_is_verified(state, "claude", path, required_scope=required_scope)
+
+
+def gateway_model_discovery_setting_is_absent() -> bool:
+    """Return whether model discovery is absent from persistent Claude settings."""
+    env = read_json_safe(CLAUDE_SETTINGS_PATH).get("env")
+    actual = (
+        env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY") if isinstance(env, dict) else None
+    )
+    return actual is None
 
 
 def managed_settings_status(state: dict) -> tuple[Path | None, str, str]:
@@ -386,14 +406,6 @@ def render_overlay(
         "ENABLE_TOOL_SEARCH": "1",
         "CLAUDE_CODE_USE_GATEWAY": "1",
     }
-    # Native /model discovery: picker lists every gateway Messages-API endpoint,
-    # not just the family aliases. Skipped under a provider (its routing header
-    # would send a discovered gateway id to a provider that can't resolve it).
-    discovery_enabled = (
-        os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1" or smart_routing_v2.enabled()
-    )
-    if discovery_enabled and not provider:
-        env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     # Intentionally NOT setting ANTHROPIC_MODEL by default. Setting it produces a
     # duplicate catalog row in Claude Code's /model picker (e.g. "Opus 4.8 (1M
     # context) ✓") on top of the family-alias row from ANTHROPIC_DEFAULT_OPUS_MODEL.
@@ -615,6 +627,7 @@ def write_tool_config(
     managed_file_keys = list(managed_keys)
     for path in (
         [["env", key] for key in CLAUDE_MANAGED_MODEL_ENV_KEYS]
+        + [["env", key] for key in CLAUDE_CONDITIONAL_ENV_KEYS]
         + [["env", key] for key in CLAUDE_REMOVED_ENV_KEYS]
         + [["env", key] for key in CLAUDE_TRACING_ENV_KEYS]
         + [["hooks", "Stop"]]
@@ -626,9 +639,17 @@ def write_tool_config(
     # V2 installs routing hooks in a transient per-launch settings file. Persistent settings must
     # contain no ucode routing hooks; surgically strip legacy ones while preserving user hooks.
     def _compose(base: dict) -> dict:
+        base_env = base.get("env")
+        existing_custom_headers = (
+            base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY) if isinstance(base_env, dict) else None
+        )
         # deepcopy the overlay per file so merging into one base can't alias nested dicts into
         # the other (deep_merge_dict grafts overlay's own dict objects onto a base missing the key).
         merged = deep_merge_dict(base, copy.deepcopy(overlay))
+        overlay_custom_headers = overlay["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
+        merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
+            existing_custom_headers, overlay_custom_headers
+        )
         # Drop any apiKeyHelper a prior non-relayed launch left in the file; relayed
         # must not carry one (it would outrank the subscription OAuth).
         if relayed:
@@ -648,6 +669,9 @@ def write_tool_config(
         merged_env = merged.get("env")
         if isinstance(merged_env, dict):
             for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
+                if key not in overlay_env:
+                    merged_env.pop(key, None)
+            for key in CLAUDE_CONDITIONAL_ENV_KEYS:
                 if key not in overlay_env:
                     merged_env.pop(key, None)
             # deep_merge_dict keeps keys already in the file, so drop the ones ucode no
@@ -685,6 +709,54 @@ def write_tool_config(
     state = mark_tool_managed(state, "claude", managed_keys)
     save_state(state)
     return state
+
+
+def _merge_anthropic_custom_headers(existing: object, ucode_headers: str) -> str:
+    """Preserve user headers while replacing the header names managed by ucode.
+
+    Claude's ``ANTHROPIC_CUSTOM_HEADERS`` value is a newline-delimited string. To merge it, we:
+
+    1. Split the existing custom headers by newline into individual header items.
+    2. Split each item on ``:`` to identify its header name.
+    3. Replace headers in ``CLAUDE_MANAGED_CUSTOM_HEADER_NAMES`` with ucode's values in their
+       existing positions, while preserving all other existing headers.
+    4. Append any ucode-managed headers that were not already present.
+
+    Header names are compared case-insensitively. Non-header lines are also preserved to avoid
+    silently discarding user configuration we do not understand.
+    """
+
+    if not isinstance(existing, str) or not existing:
+        return ucode_headers
+
+    ucode_lines_by_name: dict[str, str] = {}
+    ucode_header_names: list[str] = []
+    for line in ucode_headers.splitlines():
+        name, separator, _value = line.partition(":")
+        normalized_name = name.strip().casefold()
+        if separator and normalized_name not in ucode_lines_by_name:
+            ucode_header_names.append(normalized_name)
+        if separator:
+            ucode_lines_by_name[normalized_name] = line
+
+    merged: list[str] = []
+    replaced_names: set[str] = set()
+    for line in existing.splitlines():
+        name, separator, _value = line.partition(":")
+        normalized_name = name.strip().casefold()
+        if separator and normalized_name in CLAUDE_MANAGED_CUSTOM_HEADER_NAMES:
+            replacement = ucode_lines_by_name.get(normalized_name)
+            if replacement is not None and normalized_name not in replaced_names:
+                merged.append(replacement)
+                replaced_names.add(normalized_name)
+            continue
+        if line:
+            merged.append(line)
+
+    for name in ucode_header_names:
+        if name not in replaced_names:
+            merged.append(ucode_lines_by_name[name])
+    return "\n".join(merged)
 
 
 def _reconcile_managed_settings(
@@ -1139,6 +1211,9 @@ def _build_claude_argv(
     merged = _merge_claude_settings(caller_settings, read_json_safe(CLAUDE_SETTINGS_PATH))
     if settings_override is not None:
         merged = _merge_claude_settings(merged, settings_override)
+    merged_env = merged.get("env")
+    if isinstance(merged_env, dict):
+        merged_env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
     return [
         binary,
         *source_args,
@@ -1265,6 +1340,14 @@ def launch(state: dict, tool_args: list[str]) -> None:
             model_name=_maybe_add_1m_suffix,
         )
         return
+    if (
+        workspace
+        and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1"
+        and not _has_provider_launch(state)
+    ):
+        # Discovery is launch-scoped. Pass it in the process environment rather
+        # than persisting it in Claude's private or OS-managed settings.
+        os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     exec_or_spawn(_build_claude_argv(binary, tool_args))

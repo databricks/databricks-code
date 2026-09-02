@@ -1886,6 +1886,7 @@ def _can_launch_from_cached_config(
         return (
             claude_agent.CLAUDE_SETTINGS_PATH.exists()
             and claude_agent.managed_settings_are_current(state)
+            and claude_agent.gateway_model_discovery_setting_is_absent()
         )
     return codex_agent.has_ucode_config() and codex_agent.managed_config_is_current(state)
 
@@ -2047,13 +2048,8 @@ def _launch_tool(
             # provider). Skip model resolution, which would otherwise fail when
             # the workspace has no matching Databricks models.
             resolved_model = None
-            if tool == "claude" and relayed:
-                if model:
-                    print_warning(
-                        "This is a subscription-relay Model Provider Service; the gateway selects "
-                        "the model, so --model is ignored."
-                    )
-            elif tool == "claude" and (model or provider_models):
+            # Relayed services forward --model to Claude Code's own flag at launch (below), not env.
+            if tool == "claude" and not relayed and (model or provider_models):
                 route_root_model = resolve_provider_launch_model(model, provider_models or {})
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
@@ -2092,6 +2088,10 @@ def _launch_tool(
             # per-family target pins.
             custom_model=model if (tool == "claude" and not provider) else None,
         )
+        # Relayed = a Claude subscription: forward --model to Claude Code's own flag, like `-- --model X`.
+        if tool == "claude" and provider and relayed and model and not forwarded_model:
+            ctx.args = ["--model", model, *ctx.args]
+            forwarded_model = model
         print_section(_launch_title(tool))
         if managed is not None:
             print_kv("Config", "workspace-managed")

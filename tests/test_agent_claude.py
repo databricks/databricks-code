@@ -201,16 +201,16 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
-    def test_enables_gateway_model_discovery(self, monkeypatch):
+    def test_does_not_persist_gateway_model_discovery(self, monkeypatch):
         monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", "1")
         overlay, _ = claude.render_overlay(WS, "s4")
-        assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
-    def test_enables_gateway_model_discovery_for_smart_routing_v2(self, monkeypatch):
+    def test_smart_routing_does_not_persist_gateway_model_discovery(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
         overlay, _ = claude.render_overlay(WS, "s4")
-        assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
     def test_gateway_model_discovery_skipped_under_provider(self, monkeypatch):
         # A Model Provider Service routes every request to the external provider,
@@ -219,6 +219,16 @@ class TestRenderOverlay:
         monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", "1")
         overlay, _ = claude.render_overlay(WS, "s4", provider="main.x.claude-svc")
         assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
+
+    def test_gateway_model_discovery_setting_detects_stale_opt_in(self, monkeypatch):
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
+        monkeypatch.setattr(
+            claude,
+            "read_json_safe",
+            lambda path: {"env": {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}},
+        )
+
+        assert claude.gateway_model_discovery_setting_is_absent() is False
 
     def test_sets_api_key_helper(self):
         overlay, _ = claude.render_overlay(WS, "s4")
@@ -410,6 +420,57 @@ class TestRenderOverlayUserAgent:
         assert "\n" in self._ua(monkeypatch)
 
 
+class TestMergeAnthropicCustomHeaders:
+    def test_merges_existing_settings_with_ucode_managed_headers(self):
+        headers_from_existing_settings = "\n".join(
+            [
+                "X-User-Header: keep-me",
+                "user-agent: custom-agent",
+            ]
+        )
+        headers_managed_by_ucode = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/1.0 claude/2.0",
+            ]
+        )
+
+        merged_headers = claude._merge_anthropic_custom_headers(
+            headers_from_existing_settings, headers_managed_by_ucode
+        )
+
+        assert merged_headers.splitlines() == [
+            "X-User-Header: keep-me",  # Preserved from existing settings.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
+        ]
+
+    def test_preserves_existing_header_order(self):
+        headers_from_existing_settings = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/0.1.0+41.gd09c080 claude/2.1.258",
+                "meep: lala",
+            ]
+        )
+        headers_managed_by_ucode = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/1.0 claude/2.0",
+            ]
+        )
+
+        merged_headers = claude._merge_anthropic_custom_headers(
+            headers_from_existing_settings, headers_managed_by_ucode
+        )
+
+        assert merged_headers.splitlines() == [
+            "x-databricks-use-coding-agent-mode: true",  # From ucode; overwrites existing.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "meep: lala",  # Preserved from existing settings in its original position.
+        ]
+
+
 class TestRenderOverlayWebSearchDisable:
     def test_settings_overlay_never_includes_mcp_servers(self):
         # MCP servers belong in ~/.claude.json, not settings.json.
@@ -562,6 +623,16 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
         assert written[0]["env"]["ENABLE_TOOL_SEARCH"] == "1"
         assert written[0]["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
+    def test_strips_stale_gateway_model_discovery(self, monkeypatch):
+        existing = {"env": {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}}
+        written: list = []
+        self._patch(monkeypatch, existing, written)
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in written[0]["env"]
+
 
 FAKE_MANAGED_PATH = Path("/tmp/ucode-test/managed-settings.json")
 
@@ -626,6 +697,49 @@ class TestWriteToolConfigManagedSettings:
         assert written["env"]["MY_OWN"] == "keep"
         assert written["env"]["ANTHROPIC_BASE_URL"]
         assert written["apiKeyHelper"]
+
+    def test_managed_file_strips_stale_gateway_model_discovery(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        stale = {"env": {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}}
+        existing = {
+            str(claude.CLAUDE_SETTINGS_PATH): stale,
+            str(FAKE_MANAGED_PATH): stale,
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in private_writes[0][1]["env"]
+        assert (
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
+            not in json.loads(managed_writes[0][1])["env"]
+        )
+
+    def test_managed_file_merges_anthropic_custom_headers(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        existing_managed_settings = {
+            str(FAKE_MANAGED_PATH): {
+                "env": {"ANTHROPIC_CUSTOM_HEADERS": "X-Enterprise-Header: retain\nUser-Agent: old"}
+            }
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing_managed_settings)
+        monkeypatch.setattr(claude, "ucode_version", lambda: "1.0")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.0")
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        _, text = managed_writes[0]
+        merged_headers = json.loads(text)["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+        assert merged_headers.splitlines() == [
+            "X-Enterprise-Header: retain",  # Preserved from existing managed settings.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
+        ]
 
     def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []
@@ -1007,6 +1121,7 @@ class TestClaudeLaunch:
         claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
 
         assert os.environ["OAUTH_TOKEN"] == "token"
+        assert os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
 
 
