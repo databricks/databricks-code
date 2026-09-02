@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from typer.testing import CliRunner
 
+import ucode.databricks as db_mod
 from ucode.cli import app
 from ucode.databricks import GatewayCapabilities, GatewayProbe
 
@@ -2503,6 +2504,99 @@ class TestConfigureSharedStateUsePat:
         output = _strip_ansi(capsys.readouterr().out)
         assert "V3 model services: reachable, accessible model service returned" in output
         assert "V2 endpoints: HTTP 404 Not Found" in output
+
+    @pytest.mark.parametrize(
+        ("v3_response", "v2_response", "expected_v3", "expected_v2"),
+        [
+            (
+                ({"model_services": [{"name": "model-services/system.ai.gpt-5"}]}, None),
+                ({"endpoints": [{"name": "databricks-gpt-5"}]}, None),
+                "reachable, accessible model service returned",
+                "reachable, accessible endpoint returned",
+            ),
+            (
+                ({}, None),
+                ({"endpoints": []}, None),
+                "reachable, no accessible model services returned; check USE CATALOG on system, "
+                "and USE SCHEMA and EXECUTE on system.ai",
+                "reachable, no accessible endpoints returned",
+            ),
+            (
+                ({"model_services": [{"name": "model-services/system.ai.gpt-5"}]}, None),
+                (None, "HTTP 404 Not Found: FEATURE_DISABLED"),
+                "reachable, accessible model service returned",
+                "HTTP 404 Not Found: FEATURE_DISABLED",
+            ),
+            (
+                ({}, None),
+                (None, "HTTP 404 Not Found: FEATURE_DISABLED"),
+                "reachable, no accessible model services returned; check USE CATALOG on system, "
+                "and USE SCHEMA and EXECUTE on system.ai",
+                "HTTP 404 Not Found: FEATURE_DISABLED",
+            ),
+            (
+                (None, "HTTP 403 Forbidden"),
+                ({"endpoints": [{"name": "databricks-gpt-5"}]}, None),
+                "HTTP 403 Forbidden",
+                "reachable, accessible endpoint returned",
+            ),
+        ],
+        ids=[
+            "both-return-resources",
+            "both-return-empty-listings",
+            "v3-resource-v2-unavailable",
+            "v3-empty-v2-unavailable",
+            "v3-forbidden-v2-resource",
+        ],
+    )
+    def test_prints_local_gateway_probe_scenarios(
+        self,
+        monkeypatch,
+        capsys,
+        v3_response,
+        v2_response,
+        expected_v3,
+        expected_v2,
+    ):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        responses = iter([v3_response, v2_response])
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: next(responses))
+        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", db_mod.ensure_ai_gateway)
+
+        cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        output = " ".join(_strip_ansi(capsys.readouterr().out).split())
+        assert "Unity AI Gateway detected" in output
+        assert f"V3 model services: {expected_v3}" in output
+        assert f"V2 endpoints: {expected_v2}" in output
+
+    @pytest.mark.parametrize(
+        ("responses", "error_match"),
+        [
+            (
+                [
+                    (None, "HTTP 404 Not Found: V3 missing"),
+                    (None, "HTTP 404 Not Found: V2 missing"),
+                ],
+                "neither V3",
+            ),
+            ([(None, "HTTP 401 Unauthorized")], "rejected the access token"),
+        ],
+        ids=["neither-version-reachable", "invalid-token"],
+    )
+    def test_local_gateway_probe_failures_do_not_print_success(
+        self, monkeypatch, capsys, responses, error_match
+    ):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        response_iter = iter(responses)
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: next(response_iter))
+        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", db_mod.ensure_ai_gateway)
+
+        with pytest.raises(RuntimeError, match=error_match):
+            cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        output = _strip_ansi(capsys.readouterr().out)
+        assert "Unity AI Gateway detected" not in output
 
     def test_use_pat_without_pat_profile_raises(self, monkeypatch):
         cli_mod, logins, _, _ = self._stub_deps(monkeypatch, pat_token=None)
