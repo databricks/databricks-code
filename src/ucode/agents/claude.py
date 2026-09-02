@@ -16,9 +16,6 @@ from pathlib import Path
 from typing import cast
 
 from ucode import gateway_proxy
-from ucode.anthropic_model_discovery_proxy import (
-    start_proxy as start_anthropic_model_discovery_proxy,
-)
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -411,7 +408,7 @@ def render_overlay(
         # Claude Code only sends when experimental betas are enabled — so we must
         # not set CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS (see CLAUDE_REMOVED_ENV_KEYS).
         "ENABLE_PROMPT_CACHING_1H": "1",
-        "ENABLE_TOOL_SEARCH": "1",
+        "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_USE_GATEWAY": "1",
     }
     # Intentionally NOT setting ANTHROPIC_MODEL by default. Setting it produces a
@@ -1380,51 +1377,6 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
-def _launch_claude_with_gateway_proxy(
-    state: dict, binary: str, tool_args: list[str], *, smart_routing: bool
-) -> None:
-    """Launch Claude through the gateway model-alias proxy."""
-    workspace = state["workspace"]
-    server, client = start_anthropic_model_discovery_proxy(workspace, 0)
-    os.environ["ANTHROPIC_BASE_URL"] = f"http://{LOOPBACK_HOST}:{server.server_address[1]}"
-    os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
-
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-    settings_override = {"env": {"ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"]}}
-    try:
-        if smart_routing:
-
-            def compose_gateway_settings(args: list[str]) -> tuple[dict, list[str]]:
-                settings, remaining = _compose_v2_settings(args)
-                return _merge_claude_settings(settings, settings_override), remaining
-
-            smart_routing_v2.launch_claude(
-                state,
-                tool_args,
-                binary=binary,
-                user_settings_path=CLAUDE_USER_SETTINGS_PATH,
-                launch_model=_original_launch_model(state),
-                compose_settings=compose_gateway_settings,
-                launch_model_args=_launch_model_args,
-                model_name=_maybe_add_1m_suffix,
-            )
-            return
-
-        proc = subprocess.Popen(
-            _build_claude_argv(binary, tool_args, settings_override=settings_override)
-        )
-        try:
-            returncode = proc.wait()
-        except KeyboardInterrupt:
-            proc.send_signal(signal.SIGINT)
-            returncode = proc.wait()
-    finally:
-        server.shutdown()
-        client.close()
-    raise SystemExit(returncode)
-
-
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
@@ -1446,7 +1398,16 @@ def launch(state: dict, tool_args: list[str]) -> None:
             "Please use Codex or disable smart routing."
         )
     if first_prompt_routing:
-        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=True)
+        smart_routing_v2.launch_claude(
+            state,
+            tool_args,
+            binary=binary,
+            user_settings_path=CLAUDE_USER_SETTINGS_PATH,
+            launch_model=_original_launch_model(state),
+            compose_settings=_compose_v2_settings,
+            launch_model_args=_launch_model_args,
+            model_name=_maybe_add_1m_suffix,
+        )
         return
     if (
         workspace
@@ -1456,8 +1417,6 @@ def launch(state: dict, tool_args: list[str]) -> None:
         # Discovery is launch-scoped. Pass it in the process environment rather
         # than persisting it in Claude's private or OS-managed settings.
         os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
-        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=False)
-        return
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     exec_or_spawn(_build_claude_argv(binary, tool_args))
