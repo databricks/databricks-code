@@ -2106,6 +2106,7 @@ _TOOL_PROVIDER_TYPES: dict[str, tuple[str, ...]] = {
     "claude": ("anthropic", "amazon_bedrock"),
     "codex": ("openai", "amazon_bedrock"),
     "gemini": ("gemini_enterprise",),
+    "pi": ("anthropic", "amazon_bedrock"),
 }
 
 # Provider types that expose Bedrock-style model ids (e.g.
