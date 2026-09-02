@@ -46,7 +46,7 @@ from ucode.ui import normalize_workspace_url
 # The claude and codex provider-launch tests each route through one fixed,
 # non-relayed MPS that exposes only its cheapest model, so the inference is
 # deterministic and ~a cent per run rather than depending on whichever service
-# `_first_service` happens to list first. Hardcoded on purpose.
+# happened to list first. Hardcoded on purpose.
 CI_ANTHROPIC_MPS = "main.ucode.ci_e2e_anthropic_nonrelay_mps"  # api-key Anthropic (for claude)
 CI_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 CI_OPENAI_MPS = "main.ucode.ci_openai_mps"  # api-key OpenAI (for codex)
@@ -558,31 +558,11 @@ class TestClaudeLaunch:
 class TestModelProviderLaunch:
     """Launch claude/codex routed through a real Model Provider Service.
 
-    claude is pinned to a fixed CI Anthropic MPS (see CI_ANTHROPIC_MPS); codex
-    still picks the first usable non-relayed service on the workspace. Each writes
-    a provider config and runs the agent so a real request flows through the MPS
-    gateway. Skips when the feature is off, the service is absent, or the caller
-    lacks permission on the backing connection.
+    Both are pinned to fixed CI MPSes (CI_ANTHROPIC_MPS / CI_OPENAI_MPS), each
+    exposing only its cheapest model, so a real request flows through the MPS
+    gateway deterministically. Skips when the MPS is absent or the caller lacks
+    permission on the backing connection.
     """
-
-    @staticmethod
-    def _first_service(tool: str, workspace: str, token: str) -> str:
-        services, reason = list_model_provider_services(workspace, token)
-        if is_model_provider_feature_unavailable(reason):
-            pytest.skip("Model Provider Service feature not enabled on this workspace")
-        if reason is not None:
-            pytest.skip(f"could not list provider services: {reason}")
-        # Relayed (subscription-relay) services can only be invoked through the credential-swap
-        # launch path, so the plain provider launch these tests exercise gets a 400. Skip them and
-        # pick a normal service instead.
-        names = [
-            s["name"] for s in services if service_usable_for_tool(tool, s) and not s.get("relayed")
-        ]
-        if not names:
-            pytest.skip(
-                f"no non-relayed {tool} model provider services available on this workspace"
-            )
-        return names[0]
 
     @staticmethod
     def _skip_if_provider_unusable(combined: str, provider: str) -> None:
