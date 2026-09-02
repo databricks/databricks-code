@@ -45,7 +45,6 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
-    ensure_ai_gateway,
     ensure_databricks_auth,
     ensure_pat_bearer,
     find_profile_name_for_host,
@@ -57,6 +56,7 @@ from ucode.databricks import (
     list_profile_entries,
     list_tool_provider_services,
     normalize_workspace_url,
+    probe_unity_gateway_capabilities,
     resolve_pat_token,
     resolve_provider_launch_model,
     run_databricks_login,
@@ -635,11 +635,9 @@ def configure_shared_state(
             state["profile"] = profile
     with spinner("Verifying Unity AI Gateway..."):
         token = get_databricks_token(workspace, profile)
-        gateway_capabilities = ensure_ai_gateway(workspace, token)
+        model_service_probe = probe_unity_gateway_capabilities(workspace, token)
     print_success("Unity AI Gateway detected")
-    print_kv("Model service", gateway_capabilities.v3.detail)
-    if gateway_capabilities.v2 is not None:
-        print_kv("(Legacy) endpoints", gateway_capabilities.v2.detail)
+    print_kv("Model service", model_service_probe.detail)
 
     want_claude = (
         fetch_all or "claude" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools

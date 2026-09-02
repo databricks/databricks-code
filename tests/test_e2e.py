@@ -27,7 +27,6 @@ from ucode.databricks import (
     build_tool_base_url,
     discover_model_services,
     discover_sql_warehouses,
-    ensure_ai_gateway,
     fetch_ai_gateway_claude_models,
     fetch_codex_models,
     fetch_gemini_models,
@@ -35,6 +34,7 @@ from ucode.databricks import (
     is_model_provider_feature_unavailable,
     list_model_provider_services,
     list_tool_provider_services,
+    probe_unity_gateway_capabilities,
     service_usable_for_tool,
     workspace_hostname,
 )
@@ -137,8 +137,8 @@ class TestDatabricksAuth:
 
 
 class TestAiGateway:
-    def test_ensure_ai_gateway_does_not_raise(self, e2e_workspace, e2e_token):
-        ensure_ai_gateway(e2e_workspace, e2e_token)
+    def test_probe_unity_gateway_capabilities_does_not_raise(self, e2e_workspace, e2e_token):
+        probe_unity_gateway_capabilities(e2e_workspace, e2e_token)
 
     def test_workspace_hostname_resolves(self, e2e_workspace):
         hostname = workspace_hostname(e2e_workspace)

@@ -1915,8 +1915,8 @@ class TestListDatabricksApps:
             list_databricks_apps(WS)
 
 
-class TestEnsureAiGateway:
-    def test_v3_resource_skips_v2_probe(self, monkeypatch):
+class TestProbeUnityGatewayCapabilities:
+    def test_model_service_resource_skips_legacy_probe(self, monkeypatch):
         calls: list[str] = []
 
         def fake_get(url, token):
@@ -1925,32 +1925,31 @@ class TestEnsureAiGateway:
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        capabilities = db_mod.ensure_ai_gateway(WS, "fake-token")
+        model_service_probe = db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
 
-        assert capabilities.v3 == db_mod.GatewayProbe(
+        assert model_service_probe == db_mod.GatewayProbe(
             True, "reachable, accessible model service returned", True
         )
-        assert capabilities.v2 is None
         assert calls == [
             f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
         ]
 
-    def test_empty_v3_response_includes_permission_hint(self, monkeypatch):
+    def test_empty_model_service_response_includes_permission_hint(self, monkeypatch):
         monkeypatch.setattr(
             db_mod,
             "_http_get_json",
             lambda url, token: ({}, None),
         )
 
-        capabilities = db_mod.ensure_ai_gateway(WS, "fake-token")
+        model_service_probe = db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
 
-        assert capabilities.v3 == db_mod.GatewayProbe(
+        assert model_service_probe == db_mod.GatewayProbe(
             True,
             "reachable, no accessible model services returned; check USE CATALOG on system, and "
             "USE SCHEMA and EXECUTE on system.ai",
         )
 
-    def test_v2_only_workspace_succeeds_after_v3_probe(self, monkeypatch):
+    def test_legacy_only_workspace_returns_model_service_probe(self, monkeypatch):
         calls: list[str] = []
 
         def fake_get(url, token):
@@ -1961,18 +1960,15 @@ class TestEnsureAiGateway:
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        capabilities = db_mod.ensure_ai_gateway(WS, "fake-token")
+        model_service_probe = db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
 
-        assert capabilities.v3 == db_mod.GatewayProbe(False, "HTTP 404: Not Found")
-        assert capabilities.v2 == db_mod.GatewayProbe(
-            True, "reachable, no accessible endpoints returned"
-        )
+        assert model_service_probe == db_mod.GatewayProbe(False, "HTTP 404: Not Found")
         assert calls == [
             f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
             f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
         ]
 
-    def test_v3_forbidden_still_succeeds_when_v2_is_available(self, monkeypatch):
+    def test_model_service_forbidden_still_succeeds_when_legacy_is_available(self, monkeypatch):
         calls: list[str] = []
 
         def fake_get(url, token):
@@ -1983,33 +1979,58 @@ class TestEnsureAiGateway:
 
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
-        capabilities = db_mod.ensure_ai_gateway(WS, "fake-token")
+        model_service_probe = db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
 
-        assert capabilities.v3 == db_mod.GatewayProbe(False, "HTTP 403: Forbidden")
-        assert capabilities.v2 == db_mod.GatewayProbe(
-            True, "reachable, no accessible endpoints returned"
-        )
+        assert model_service_probe == db_mod.GatewayProbe(False, "HTTP 403: Forbidden")
         assert calls == [
             f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1",
             f"https://{WS_HOST}/api/ai-gateway/v2/endpoints?page_size=1",
         ]
 
+    def test_empty_model_service_requires_reachable_legacy_fallback(self, monkeypatch):
+        responses = iter(
+            [
+                ({}, None),
+                (None, "HTTP 404: AI Gateway V2 is not available for CSP-enabled workspaces"),
+            ]
+        )
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: next(responses),
+        )
+
+        with pytest.raises(RuntimeError, match="no accessible model services") as excinfo:
+            db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
+
+        message = str(excinfo.value)
+        assert "HTTP 404: AI Gateway legacy endpoint is not available" in message
+        assert "v2" not in message.lower()
+        assert "v3" not in message.lower()
+
     def test_neither_gateway_available_raises(self, monkeypatch):
-        reasons = iter(["HTTP 404: V3 missing", "HTTP 404: V2 missing"])
+        reasons = iter(
+            [
+                "HTTP 404: V3 unavailable",
+                "HTTP 404: V2 unavailable",
+            ]
+        )
         monkeypatch.setattr(
             db_mod,
             "_http_get_json",
             lambda url, token: (None, next(reasons)),
         )
 
-        with pytest.raises(RuntimeError, match="neither V3") as excinfo:
-            db_mod.ensure_ai_gateway(WS, "fake-token")
+        with pytest.raises(RuntimeError, match="neither model services") as excinfo:
+            db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
 
         message = str(excinfo.value)
-        assert "HTTP 404: V2 missing" in message
-        assert "HTTP 404: V3 missing" in message
+        assert "HTTP 404: model service unavailable" in message
+        assert "HTTP 404: legacy endpoint unavailable" in message
+        assert "v2" not in message.lower()
+        assert "v3" not in message.lower()
 
-    def test_v3_auth_failure_does_not_probe_v2(self, monkeypatch):
+    def test_model_service_auth_failure_does_not_probe_legacy(self, monkeypatch):
         calls: list[str] = []
 
         def fake_get(url, token):
@@ -2019,12 +2040,19 @@ class TestEnsureAiGateway:
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
         with pytest.raises(RuntimeError, match="rejected"):
-            db_mod.ensure_ai_gateway(WS, "fake-token")
+            db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
 
         assert calls == [f"https://{WS_HOST}/api/2.1/unity-catalog/model-services?page_size=1"]
 
-    def test_v3_forbidden_and_v2_unavailable_reports_permission_error(self, monkeypatch):
-        reasons = iter(["HTTP 403: Missing Unity Catalog grants", "HTTP 404: V2 missing"])
+    def test_model_service_forbidden_and_legacy_unavailable_reports_permission_error(
+        self, monkeypatch
+    ):
+        reasons = iter(
+            [
+                "HTTP 403: Missing Unity Catalog grants",
+                "HTTP 404: legacy endpoints unavailable",
+            ]
+        )
         monkeypatch.setattr(
             db_mod,
             "_http_get_json",
@@ -2032,15 +2060,25 @@ class TestEnsureAiGateway:
         )
 
         with pytest.raises(RuntimeError, match="permission") as excinfo:
-            db_mod.ensure_ai_gateway(WS, "fake-token")
+            db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
 
         message = str(excinfo.value)
         assert "USE SCHEMA" in message
+        assert "EXECUTE" in message
+        assert "v2" not in message.lower()
+        assert "v3" not in message.lower()
         assert "rejected the access token" not in message
         assert "not enabled" not in message
 
-    def test_v2_forbidden_and_v3_unavailable_reports_permission_error(self, monkeypatch):
-        reasons = iter(["HTTP 404: V3 missing", "HTTP 403: V2 forbidden"])
+    def test_legacy_forbidden_and_model_service_unavailable_reports_permission_error(
+        self, monkeypatch
+    ):
+        reasons = iter(
+            [
+                "HTTP 404: V3 unavailable",
+                "HTTP 403: V2 forbidden",
+            ]
+        )
         monkeypatch.setattr(
             db_mod,
             "_http_get_json",
@@ -2048,16 +2086,18 @@ class TestEnsureAiGateway:
         )
 
         with pytest.raises(RuntimeError, match="workspace permissions") as excinfo:
-            db_mod.ensure_ai_gateway(WS, "fake-token")
+            db_mod.probe_unity_gateway_capabilities(WS, "fake-token")
 
         message = str(excinfo.value)
-        assert "V2 access could not be verified" in message
+        assert "legacy endpoint access could not be verified" in message
+        assert "v2" not in message.lower()
+        assert "v3" not in message.lower()
         assert "USE SCHEMA" not in message
 
 
 class TestHttpGetJsonReason:
     """The `reason` string returned by `_http_get_json` must include the response body
-    so callers (e.g. ensure_ai_gateway) can route on it. Before issue #84's fix
+    so callers (e.g. the Unity Gateway capability probe) can route on it. Before issue #84's fix
     the body was logged only when UCODE_DEBUG=1 and dropped from the bubbled error."""
 
     @staticmethod
