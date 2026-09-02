@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 @pytest.mark.parametrize("command", ["ug", "ucode"])
@@ -29,4 +32,4 @@ def test_installed_console_script_runs_with_its_invoked_name(command: str) -> No
 
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
-    assert f"Usage: {command} " in output
+    assert f"Usage: {command} " in _ANSI_RE.sub("", output)
