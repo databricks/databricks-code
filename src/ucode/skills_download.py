@@ -21,6 +21,7 @@ from ucode.ui import (
     print_success,
     print_warning,
     progress_bar,
+    prompt_for_multi_selection,
     prompt_yes_no,
 )
 
@@ -50,6 +51,18 @@ class SkillRef:
 
     securable_name: str
     bundle_name: str
+
+
+@dataclass(frozen=True)
+class MetastoreSkill:
+    """A finalized skill discovered without a schema filter."""
+
+    full_name: str
+    ref: SkillRef
+
+    @property
+    def location(self) -> str:
+        return self.full_name.rsplit(".", 1)[0]
 
 
 def _non_empty_str(value: object) -> str | None:
@@ -116,6 +129,58 @@ def list_schema_skills(
         page_token = data.get("next_page_token")
         if not page_token:
             return refs, None
+
+
+def list_metastore_skills(workspace: str, token: str) -> tuple[list[MetastoreSkill], str | None]:
+    """List finalized, downloadable skills visible in the current metastore."""
+    hostname = workspace_hostname(workspace)
+    base_url = f"https://{hostname}/api/2.1/unity-catalog/skills"
+
+    skills: list[MetastoreSkill] = []
+    page_token: str | None = None
+    while True:
+        url = base_url
+        if page_token:
+            url = f"{url}?{urlencode({'page_token': page_token})}"
+        payload, reason = _http_get_json(url, token, timeout=30)
+        if payload is None:
+            return [], reason
+        data = payload if isinstance(payload, dict) else {}
+        for skill in data.get("skills") or []:
+            if not isinstance(skill, dict):
+                continue
+            resource_name = _non_empty_str(skill.get("name"))
+            ref = _skill_ref(skill)
+            if ref is None:
+                continue
+            full_name = resource_name.removeprefix("skills/") if resource_name else None
+            if full_name is None or full_name.count(".") != 2:
+                print_warning(
+                    f"Skipping `{resource_name or '<unnamed skill>'}`: expected a fully-qualified "
+                    "`<catalog>.<schema>.<name>` from the skills API."
+                )
+                continue
+            skills.append(MetastoreSkill(full_name=full_name, ref=ref))
+        page_token = data.get("next_page_token")
+        if not page_token:
+            return sorted(skills, key=lambda skill: skill.full_name.lower()), None
+
+
+def prompt_for_skill_download(
+    skills: list[MetastoreSkill],
+) -> list[MetastoreSkill] | None:
+    """Select metastore skills to download, or return None when cancelled."""
+    by_name = {skill.full_name: skill for skill in skills}
+    options = []
+    for skill in skills:
+        label = skill.full_name
+        if skill.ref.bundle_name != skill.ref.securable_name:
+            label = f"{label} (bundle: {skill.ref.bundle_name})"
+        options.append((skill.full_name, label))
+    selected = prompt_for_multi_selection("Skills:", options, searchable=True)
+    if selected is None:
+        return None
+    return [by_name[name] for name in selected if name in by_name]
 
 
 def list_skill_files(
@@ -447,6 +512,36 @@ def configure_skills_download_command(
     token = get_databricks_token(workspace, profile)
 
     download_skills(workspace, token, locations, path, skills)
+
+    register_schemaless_skills_connection(state, workspace, profile, clients)
+    return 0
+
+
+def configure_skills_download_interactive_command(*, path: str | None) -> int:
+    """Discover metastore skills, let the user select some, and download them."""
+    state = load_state()
+    workspace, profile, clients = setup_mcp_clients(state, "Add Skills")
+    token = get_databricks_token(workspace, profile)
+
+    available, reason = list_metastore_skills(workspace, token)
+    if reason:
+        raise RuntimeError(f"Could not list workspace skills: {reason}.")
+    if not available:
+        print_note("No finalized skills are available to download in this metastore.")
+        return 0
+
+    selected = prompt_for_skill_download(available)
+    if selected is None:
+        return 0
+    if not selected:
+        print_note("No skills selected. Press space to toggle an item, then enter to download.")
+        return 0
+
+    selected_by_location: dict[str, set[str]] = {}
+    for skill in selected:
+        selected_by_location.setdefault(skill.location, set()).add(skill.ref.securable_name)
+    for location, securable_names in selected_by_location.items():
+        download_skills(workspace, token, [location], path, securable_names)
 
     register_schemaless_skills_connection(state, workspace, profile, clients)
     return 0
