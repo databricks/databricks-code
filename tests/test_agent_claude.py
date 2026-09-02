@@ -189,7 +189,7 @@ class TestRenderOverlay:
 
     def test_enables_tool_search(self):
         overlay, _ = claude.render_overlay(WS, "s4")
-        assert overlay["env"]["ENABLE_TOOL_SEARCH"] == "1"
+        assert overlay["env"]["ENABLE_TOOL_SEARCH"] == "true"
 
     def test_enables_use_gateway(self):
         overlay, _ = claude.render_overlay(WS, "s4")
@@ -621,7 +621,7 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
         assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in written[0]["env"]
         assert written[0]["env"]["ENABLE_PROMPT_CACHING_1H"] == "1"
-        assert written[0]["env"]["ENABLE_TOOL_SEARCH"] == "1"
+        assert written[0]["env"]["ENABLE_TOOL_SEARCH"] == "true"
         assert written[0]["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
 
     def test_strips_stale_gateway_model_discovery(self, monkeypatch):
