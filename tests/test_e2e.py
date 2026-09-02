@@ -41,6 +41,18 @@ from ucode.databricks import (
 from ucode.ui import normalize_workspace_url
 
 # ---------------------------------------------------------------------------
+# CI provider-launch pinning
+# ---------------------------------------------------------------------------
+# The claude and codex provider-launch tests each route through one fixed,
+# non-relayed MPS that exposes only its cheapest model, so the inference is
+# deterministic and ~a cent per run rather than depending on whichever service
+# `_first_service` happens to list first. Hardcoded on purpose.
+CI_ANTHROPIC_MPS = "main.ucode.ci_e2e_anthropic_nonrelay_mps"  # api-key Anthropic (for claude)
+CI_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+CI_OPENAI_MPS = "main.ucode.ci_openai_mps"  # api-key OpenAI (for codex)
+CI_OPENAI_MODEL = "gpt-5-nano"
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -546,10 +558,11 @@ class TestClaudeLaunch:
 class TestModelProviderLaunch:
     """Launch claude/codex routed through a real Model Provider Service.
 
-    Picks the first matching service on the workspace, writes a provider config
-    (no Databricks model pinned), and runs the agent so a real request flows
-    through the MPS gateway. Skips when the feature is off, no service exists, or
-    the caller lacks permission on the backing connection.
+    claude is pinned to a fixed CI Anthropic MPS (see CI_ANTHROPIC_MPS); codex
+    still picks the first usable non-relayed service on the workspace. Each writes
+    a provider config and runs the agent so a real request flows through the MPS
+    gateway. Skips when the feature is off, the service is absent, or the caller
+    lacks permission on the backing connection.
     """
 
     @staticmethod
@@ -588,14 +601,16 @@ class TestModelProviderLaunch:
         from ucode.agents import claude, resolve_provider_models
 
         _require_binary("claude")
-        provider = self._first_service("claude", e2e_workspace, e2e_token)
+        # Pinned to a fixed CI MPS so the inference is deterministic and cheap. Skip (don't fail)
+        # when it's absent, so e2e runs against other workspaces still work.
+        provider = CI_ANTHROPIC_MPS
         state = {**e2e_state, "workspace": e2e_workspace}
-        # Resolve the provider's models exactly as the launch path does: an Anthropic service
-        # returns None (canonical names route via the header), while a Bedrock service returns the
-        # per-family provider-side ids to pin — without which the gateway 403s ("not in the allowed
-        # models list") because Claude Code's canonical name isn't a Bedrock-routable model.
+        # Resolve the provider's models as the launch path does. This Anthropic MPS declares a
+        # single Haiku target, so provider_models pins that family and route_root_model (below)
+        # makes Claude Code launch on exactly it — its built-in default tier isn't in the allowlist.
         provider_models, error, _relayed = resolve_provider_models("claude", state, provider)
-        assert error is None, f"provider={provider} could not resolve models: {error}"
+        if error is not None:
+            pytest.skip(f"CI Anthropic MPS {provider} unavailable on this workspace: {error}")
 
         config_dir = tmp_path / "claude_config"
         config_dir.mkdir()
@@ -606,7 +621,11 @@ class TestModelProviderLaunch:
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr("ucode.state.save_state", lambda s: None)
             claude.write_tool_config(
-                state, None, provider=provider, provider_models=provider_models
+                state,
+                None,
+                provider=provider,
+                provider_models=provider_models,
+                route_root_model=CI_ANTHROPIC_MODEL,
             )
 
         env = {
@@ -627,10 +646,16 @@ class TestModelProviderLaunch:
         self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
     ):
         import ucode.config_io as config_io_mod
-        from ucode.agents import codex
+        from ucode.agents import codex, resolve_provider_models
 
         _require_binary("codex")
-        provider = self._first_service("codex", e2e_workspace, e2e_token)
+        # Pinned to the fixed CI OpenAI MPS (Nano-only) — the codex counterpart to the claude pin
+        # (codex speaks the OpenAI API, so it can't use the Anthropic MPS). Skip when it's absent.
+        provider = CI_OPENAI_MPS
+        state = {**e2e_state, "workspace": e2e_workspace, "codex_default_model": CI_OPENAI_MODEL}
+        _, error, _ = resolve_provider_models("codex", state, provider)
+        if error is not None:
+            pytest.skip(f"CI OpenAI MPS {provider} unavailable on this workspace: {error}")
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
         config_dir = _codex_home_outside_tmp() / ".codex"
@@ -640,9 +665,9 @@ class TestModelProviderLaunch:
 
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr("ucode.state.save_state", lambda s: None)
-            codex.write_tool_config(
-                {**e2e_state, "workspace": e2e_workspace}, None, provider=provider
-            )
+            # codex.write_tool_config pins the model from state["codex_default_model"] (set above),
+            # so it lands as gpt-5-nano — the only model this MPS allows.
+            codex.write_tool_config(state, None, provider=provider)
 
         timeout_seconds = int(os.environ.get("UCODE_E2E_AGENT_TIMEOUT", "60"))
         try:
