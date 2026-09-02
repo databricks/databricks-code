@@ -2488,6 +2488,20 @@ class TestSkillMcpLocations:
         assert mcp._skill_mcp_locations(_skills_state([])) == []
         assert mcp._skill_mcp_locations(_skills_state()) == []
 
+    def test_client_override_takes_precedence_over_legacy_default(self):
+        entry = mcp._build_skills_entry(
+            WS,
+            ["common.schema"],
+            ["claude", "codex"],
+            {"claude": ["common.schema", "claude.only"]},
+        )
+
+        assert mcp.skill_locations_for_client(entry, "claude") == [
+            "common.schema",
+            "claude.only",
+        ]
+        assert mcp.skill_locations_for_client(entry, "codex") == ["common.schema"]
+
 
 class TestUnionLocations:
     def test_appends_new_after_existing(self):
@@ -2536,6 +2550,31 @@ class TestAddSkillsCommand:
         assert mcp.add_skills_command(["A.a"]) == 0
 
         assert _find_skills(state["mcp_servers"])[0]["skill_locations"] == ["A.a"]
+
+    def test_agents_updates_only_selected_client_scope(self, monkeypatch):
+        configured: list[tuple[str, str]] = []
+        prior = mcp._resolve_skills_mcp_servers(WS, ["claude", "codex"], ["A.a"], [])
+        state = {
+            "workspace": WS,
+            "available_tools": ["claude", "codex"],
+            "mcp_servers": prior,
+        }
+        _stub_location_base(monkeypatch, state)
+        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["claude", "codex"])
+        monkeypatch.setattr(
+            mcp,
+            "configure_client_mcp_server",
+            lambda client, name, url, *a, **kw: configured.append((client, url)) or [],
+        )
+        monkeypatch.setattr(mcp, "save_state", lambda s: None)
+
+        assert mcp.add_skills_command(["B.b"], agents={"claude"}) == 0
+
+        entry = _find_skills(state["mcp_servers"])[0]
+        assert entry["skill_locations"] == ["A.a"]
+        assert entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] == {"claude": ["A.a", "B.b"]}
+        assert mcp.skill_locations_for_client(entry, "codex") == ["A.a"]
+        assert configured == [("claude", f"{WS}/ai-gateway/skills/?schema=A.a&schema=B.b")]
 
 
 class TestRegisterSchemalessSkillsConnection:

@@ -101,6 +101,7 @@ MCP_CLIENTS = {
 }
 SKILLS_MCP_KIND = "skills"
 SKILLS_MCP_SERVER_NAME = "databricks-skill-registry"
+SKILL_LOCATION_OVERRIDES_KEY = "skill_location_overrides"
 # MCP-only clients ucode never launches for model routing, so they never land in
 # `available_tools`; they're eligible for MCP config purely on being installed.
 MCP_ONLY_CLIENTS = ("cursor",)
@@ -1210,22 +1211,36 @@ def apply_managed_skills(
     ]
     if not desired and not prev_managed:
         return []
-    # Preserve the developer's own locations, drop previously-managed ones no longer in the config,
-    # and add the current managed set. dict.fromkeys dedupes while keeping first-seen order.
-    current = _skill_mcp_locations(state)
+    # Preserve this agent's own locations, drop previously-managed ones no longer in the config,
+    # and add the current managed set. Other agents may intentionally have different scopes.
+    entry = _skills_entry(list(state.get("mcp_servers") or []))
+    current = skill_locations_for_client(entry, tool)
     developer_own = [loc for loc in current if loc not in prev_managed]
     new_locations = list(dict.fromkeys([*developer_own, *desired]))
-
-    original = list(state.get("mcp_servers") or [])
-    working = _resolve_skills_mcp_servers(workspace, [tool], new_locations, original)
-    changed = apply_mcp_server_changes(
-        original, working, [tool], workspace, profile, use_pat=use_pat
-    )
-    if not (changed or original != working or prev_managed != desired):
+    if current == new_locations and prev_managed == desired:
         return []
-    state["mcp_servers"] = working
+
+    default_locations = _skill_mcp_locations(state)
+    overrides = _skill_location_overrides(entry)
+    entry_clients = set((entry or {}).get("clients") or [])
+    if not overrides and entry_clients <= {tool}:
+        default_locations = new_locations
+    else:
+        _set_skill_location_override(overrides, tool, new_locations, default_locations)
     state["managed_skill_locations"] = desired
-    save_state(state)
+    if current != new_locations:
+        _update_skills_mcp(
+            state,
+            workspace,
+            profile,
+            [tool],
+            default_locations,
+            location_overrides=overrides,
+            print_summary=False,
+            use_pat=use_pat,
+        )
+    else:
+        save_state(state)
     return desired
 
 
@@ -2104,17 +2119,64 @@ def _merge_clients(prior: list[str] | None, new: list[str]) -> list[str]:
     return prior + [c for c in new if c not in prior]
 
 
-def _build_skills_entry(workspace: str, locations: list[str], clients: list[str]) -> dict:
-    """Canonical single skills-registry entry. ``skill_locations`` is the source
-    of truth; the URL is always derived from it, never parsed back."""
+def _dedupe_locations(locations: list[str]) -> list[str]:
+    return list(dict.fromkeys(loc for loc in locations if isinstance(loc, str) and loc))
+
+
+def _skill_location_overrides(entry: dict | None) -> dict[str, list[str]]:
+    raw = (entry or {}).get(SKILL_LOCATION_OVERRIDES_KEY)
+    if not isinstance(raw, dict):
+        return {}
     return {
+        client: _dedupe_locations(locations)
+        for client, locations in raw.items()
+        if client in MCP_CLIENTS and isinstance(locations, list)
+    }
+
+
+def skill_locations_for_client(entry: dict | None, client: str) -> list[str]:
+    """Return one client's effective skills scope from a persisted skills entry."""
+    default = _dedupe_locations(list((entry or {}).get("skill_locations") or []))
+    return _skill_location_overrides(entry).get(client, default)
+
+
+def _set_skill_location_override(
+    overrides: dict[str, list[str]], client: str, locations: list[str], default: list[str]
+) -> None:
+    normalized = _dedupe_locations(locations)
+    if normalized == default:
+        overrides.pop(client, None)
+    else:
+        overrides[client] = normalized
+
+
+def _build_skills_entry(
+    workspace: str,
+    locations: list[str],
+    clients: list[str],
+    location_overrides: dict[str, list[str]] | None = None,
+) -> dict:
+    """Build the single skills-registry entry with a common scope and sparse overrides."""
+    default = _dedupe_locations(locations)
+    normalized_overrides: dict[str, list[str]] = {}
+    for client, client_locations in (location_overrides or {}).items():
+        if client in MCP_CLIENTS:
+            _set_skill_location_override(normalized_overrides, client, client_locations, default)
+    entry: dict = {
         "name": SKILLS_MCP_SERVER_NAME,
         "kind": SKILLS_MCP_KIND,
-        "skill_locations": list(locations),
-        "url": build_skills_mcp_url(workspace, locations),
+        "skill_locations": default,
+        "url": build_skills_mcp_url(workspace, default),
         "auth": "proxy",
         "clients": clients,
     }
+    if normalized_overrides:
+        entry[SKILL_LOCATION_OVERRIDES_KEY] = normalized_overrides
+    return entry
+
+
+def _skills_entry(servers: list[dict]) -> dict | None:
+    return next((server for server in servers if server.get("kind") == SKILLS_MCP_KIND), None)
 
 
 def _resolve_skills_mcp_servers(
@@ -2122,6 +2184,7 @@ def _resolve_skills_mcp_servers(
     clients: list[str],
     locations: list[str],
     original_servers: list[dict],
+    location_overrides: dict[str, list[str]] | None = None,
 ) -> list[dict]:
     """Rebuild the MCP server list around exactly one skills entry.
 
@@ -2131,14 +2194,17 @@ def _resolve_skills_mcp_servers(
     else, and appends one rebuilt entry whose clients merge the prior skills
     entry's clients with ``clients``.
     """
-    prior = next((s for s in original_servers if s.get("kind") == SKILLS_MCP_KIND), None)
+    prior = _skills_entry(original_servers)
     merged = _merge_clients((prior or {}).get("clients"), clients)
+    overrides = (
+        _skill_location_overrides(prior) if location_overrides is None else location_overrides
+    )
     kept = [
         s
         for s in original_servers
         if s.get("kind") != SKILLS_MCP_KIND and _server_name(s) != SKILLS_MCP_SERVER_NAME
     ]
-    return [*kept, _build_skills_entry(workspace, locations, merged)]
+    return [*kept, _build_skills_entry(workspace, locations, merged, overrides)]
 
 
 def _join_with_and(items: list[str]) -> str:
@@ -2153,6 +2219,11 @@ def _skills_tools_description(locations: list[str]) -> str:
     return f"UC skill utility tools + skills tools in schema {_join_with_and(locations)}"
 
 
+def _skills_workspace(entry: dict) -> str:
+    url = str(entry.get("url") or "")
+    return url.split("/ai-gateway/skills/", 1)[0]
+
+
 def _print_skills_summary(entry: dict) -> None:
     """Report the registered skills connection and how to start using it."""
     clients = [
@@ -2163,9 +2234,24 @@ def _print_skills_summary(entry: dict) -> None:
     console.print()
     print_success("Skills MCP registered")
     print_kv("Server", str(entry.get("name") or SKILLS_MCP_SERVER_NAME))
-    print_kv("URL", str(entry.get("url") or ""))
-    print_kv("Configured", ", ".join(clients) if clients else "none")
-    print_kv("Tools", _skills_tools_description(entry.get("skill_locations") or []))
+    scopes = {
+        client: skill_locations_for_client(entry, client)
+        for client in (entry.get("clients") or [])
+        if client in MCP_CLIENTS
+    }
+    distinct_scopes = {tuple(locations) for locations in scopes.values()}
+    if len(distinct_scopes) <= 1:
+        locations = next(iter(scopes.values()), list(entry.get("skill_locations") or []))
+        print_kv("URL", build_skills_mcp_url(_skills_workspace(entry), locations))
+        print_kv("Configured", ", ".join(clients) if clients else "none")
+        print_kv("Tools", _skills_tools_description(locations))
+    else:
+        print_kv("Configured", ", ".join(clients) if clients else "none")
+        workspace = _skills_workspace(entry)
+        for client, locations in scopes.items():
+            display = str(MCP_CLIENTS[client]["display"])
+            print_kv(f"{display} URL", build_skills_mcp_url(workspace, locations))
+            print_kv(f"{display} tools", _skills_tools_description(locations))
     print_note(
         "Run `ucode <agent>` to use the skills MCP. For existing sessions, "
         "restart the agent for the skills to take effect."
@@ -2173,17 +2259,60 @@ def _print_skills_summary(entry: dict) -> None:
 
 
 def _update_skills_mcp(
-    state: dict, workspace: str, profile: str | None, clients: list[str], locations: list[str]
-) -> None:
-    """Rebuild the single skills connection for ``locations`` and persist it."""
+    state: dict,
+    workspace: str,
+    profile: str | None,
+    clients: list[str],
+    locations: list[str],
+    *,
+    location_overrides: dict[str, list[str]] | None = None,
+    print_summary: bool = True,
+    use_pat: bool | None = None,
+) -> bool:
+    """Persist one skills entry and update only clients whose effective URL changed."""
     original = list(state.get("mcp_servers") or [])
-    working = _resolve_skills_mcp_servers(workspace, clients, locations, original)
-    changed = apply_mcp_server_changes(original, working, clients, workspace, profile)
+    working = _resolve_skills_mcp_servers(
+        workspace, clients, locations, original, location_overrides
+    )
+    original_entry = _skills_entry(original)
+    working_entry = _skills_entry(working)
+    assert working_entry is not None
+
+    changed = False
+    for client in clients:
+        original_view = []
+        if original_entry is not None and client in (original_entry.get("clients") or []):
+            original_view = [
+                _build_skills_entry(
+                    workspace,
+                    skill_locations_for_client(original_entry, client),
+                    [client],
+                )
+            ]
+        working_view = [
+            _build_skills_entry(
+                workspace,
+                skill_locations_for_client(working_entry, client),
+                [client],
+            )
+        ]
+        changed = (
+            apply_mcp_server_changes(
+                original_view,
+                working_view,
+                [client],
+                workspace,
+                profile,
+                use_pat=bool(state.get("use_pat")) if use_pat is None else use_pat,
+            )
+            or changed
+        )
     if changed or original != working:
         state["mcp_servers"] = working
         save_state(state)
-    entry = next(s for s in working if s.get("kind") == SKILLS_MCP_KIND)
-    _print_skills_summary(entry)
+    if print_summary:
+        _print_skills_summary(working_entry)
+    return changed or original != working
 
 
 def configure_skills_mcp_command(locations: list[str]) -> int:
@@ -2191,13 +2320,13 @@ def configure_skills_mcp_command(locations: list[str]) -> int:
     replacing any previous set."""
     state = load_state()
     workspace, profile, clients = setup_mcp_clients(state, "Skills MCP")
-    _update_skills_mcp(state, workspace, profile, clients, locations)
+    _update_skills_mcp(state, workspace, profile, clients, locations, location_overrides={})
     return 0
 
 
 def _skill_mcp_locations(state: dict) -> list[str]:
     """The skills MCP connection's ``skill_locations``, or ``[]`` if none exists."""
-    entry = next(iter(_skills_entries(list(state.get("mcp_servers") or []))), None)
+    entry = _skills_entry(list(state.get("mcp_servers") or []))
     return list((entry or {}).get("skill_locations") or [])
 
 
@@ -2222,10 +2351,34 @@ def _union_locations(base: list[str], new: list[str]) -> list[str]:
     return merged
 
 
-def add_skills_command(locations: list[str]) -> int:
+def add_skills_command(locations: list[str], agents: set[str] | None = None) -> int:
     """Add ``locations`` to the skills MCP connection's scope, keeping any already configured."""
     state = load_state()
-    workspace, profile, clients = setup_mcp_clients(state, "Add Skills MCP")
-    merged = _union_locations(_skill_mcp_locations(state), locations)
-    _update_skills_mcp(state, workspace, profile, clients, merged)
+    workspace, profile, clients = setup_mcp_clients(state, "Add Skills MCP", agents=agents)
+    entry = _skills_entry(list(state.get("mcp_servers") or []))
+    default = _skill_mcp_locations(state)
+    overrides = _skill_location_overrides(entry)
+    if agents is None:
+        merged = _union_locations(default, locations)
+        overrides = {
+            client: _union_locations(client_locations, locations)
+            for client, client_locations in overrides.items()
+        }
+    else:
+        merged = default
+        for client in clients:
+            _set_skill_location_override(
+                overrides,
+                client,
+                _union_locations(skill_locations_for_client(entry, client), locations),
+                default,
+            )
+    _update_skills_mcp(
+        state,
+        workspace,
+        profile,
+        clients,
+        merged,
+        location_overrides=overrides,
+    )
     return 0

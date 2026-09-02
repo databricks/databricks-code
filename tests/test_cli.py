@@ -1171,6 +1171,28 @@ class TestSkillsAddCommand:
         assert "--location" in _strip_ansi(result.output)
         mock_add.assert_not_called()
 
+    def test_agents_scope_is_configured_and_forwarded_for_mcp(self):
+        with (
+            patch("ucode.cli._configure_agents_for_mcp", return_value={"claude"}) as configure,
+            patch("ucode.cli.add_skills_command") as mock_add,
+        ):
+            result = runner.invoke(
+                app,
+                ["skill", "add", "--location", "a.b", "--mcp", "--agents", "claude"],
+            )
+
+        assert result.exit_code == 0, result.output
+        configure.assert_called_once_with(["claude"])
+        mock_add.assert_called_once_with(["a.b"], agents={"claude"})
+
+    def test_agents_is_rejected_for_download_mode(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["skill", "add", "--location", "a.b", "--agents", "claude"])
+
+        assert result.exit_code == 1
+        assert "--agents is only supported when using --mcp" in _strip_ansi(result.output)
+        mock_download.assert_not_called()
+
 
 class TestApplyManagedSkills:
     """The launch path both registers the skills MCP connection and downloads bundles to disk."""
@@ -1322,6 +1344,29 @@ class TestStatusSkillsSection:
             if "MCP servers:" in line:
                 assert "databricks-skill-registry" not in line
         assert "Skill MCP Locations: main.default" in out
+
+    def test_renders_per_agent_locations_when_scopes_diverge(self):
+        state = {
+            **MINIMAL_STATE,
+            "mcp_servers": [
+                {
+                    "name": "databricks-skill-registry",
+                    "kind": "skills",
+                    "skill_locations": ["main.default"],
+                    "skill_location_overrides": {"claude": ["main.default", "claude.only"]},
+                    "url": "https://example.databricks.com/ai-gateway/skills/?schema=main.default",
+                    "auth": "proxy",
+                    "clients": ["claude", "codex"],
+                }
+            ],
+        }
+
+        result = self._run(state)
+
+        assert result.exit_code == 0, result.output
+        out = _strip_ansi(result.output)
+        assert "Claude Code skill MCP locations: main.default, claude.only" in out
+        assert "Codex skill MCP locations: main.default" in out
 
 
 class TestRevert:
