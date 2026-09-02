@@ -23,6 +23,7 @@ from ucode.databricks import (
     build_auth_token_argv,
     build_databricks_cli_env,
     build_opencode_base_urls,
+    build_pi_base_urls,
     build_shared_base_urls,
     build_skills_mcp_url,
     build_tool_base_url,
@@ -128,6 +129,12 @@ class TestBuildOpencodeBaseUrls:
         assert urls["anthropic"] == f"{WS}/ai-gateway/anthropic/v1"
         assert urls["gemini"] == f"{WS}/ai-gateway/gemini/v1beta"
         assert urls["oss"] == f"{WS}/ai-gateway/mlflow/v1"
+
+
+class TestBuildPiBaseUrls:
+    def test_returns_native_responses_gateway(self):
+        urls = build_pi_base_urls(WS)
+        assert urls["openai"] == f"{WS}/ai-gateway/openai/v1"
 
 
 class TestBuildSharedBaseUrls:
@@ -247,6 +254,83 @@ class TestModelTokenLimits:
         assert db_mod.model_token_limits("system.ai.kimi-k2-7-code") is None
 
 
+class TestGptModelTokenLimits:
+    def test_gpt_and_grok_limits_across_id_forms(self):
+        assert db_mod.gpt_model_token_limits("SYSTEM.AI.GPT-5-6-SOL") == {
+            "context": 1_050_000,
+            "output": 128_000,
+        }
+        assert db_mod.gpt_model_token_limits("databricks-gpt-4-1") == {
+            "context": 1_047_576,
+            "output": 32_768,
+        }
+        assert db_mod.gpt_model_token_limits("system.ai.grok-4-6") == {
+            "context": 500_000,
+            "output": 16_384,
+        }
+
+    def test_unknown_model_uses_conservative_fallback(self):
+        assert db_mod.gpt_model_token_limits("custom-responses") == {
+            "context": 128_000,
+            "output": 16_384,
+        }
+
+    def test_preferred_gpt_model_uses_semantic_version_and_excludes_gpt_oss(self):
+        assert (
+            db_mod.preferred_gpt_model(["gpt-5", "system.ai.gpt-5-6-sol", "databricks-gpt-5-5"])
+            == "system.ai.gpt-5-6-sol"
+        )
+        assert db_mod.preferred_gpt_model(["gpt-oss-120b", "system.ai.grok-4-6"]) == (
+            "system.ai.grok-4-6"
+        )
+        assert db_mod.preferred_gpt_model(["system.ai.gpt-oss-120b"]) is None
+
+
+class TestClaudeModelCapabilities:
+    @pytest.mark.parametrize(
+        ("model_id", "context", "output", "supports_1m", "adaptive", "xhigh"),
+        [
+            ("databricks-claude-opus-4-5", 200_000, 64_000, False, False, False),
+            ("databricks-claude-opus-4-6", 1_000_000, 128_000, True, True, False),
+            ("system.ai.claude-opus-4-8", 1_000_000, 128_000, True, True, True),
+            ("system.ai.claude-opus-5", 1_000_000, 128_000, True, True, False),
+            ("system.ai.claude-sonnet-4-5", 1_000_000, 64_000, True, False, False),
+            ("claude-sonnet-5", 1_000_000, 64_000, True, True, True),
+            ("claude-haiku-4-5", 200_000, 64_000, False, False, False),
+            ("system.ai.claude-fable-5", 1_000_000, 128_000, False, True, True),
+            ("claude-future", 200_000, 64_000, False, False, False),
+        ],
+    )
+    def test_shared_capability_policy(
+        self, model_id, context, output, supports_1m, adaptive, xhigh
+    ):
+        capabilities = db_mod.claude_model_capabilities(model_id)
+        assert capabilities.context == context
+        assert capabilities.output == output
+        assert capabilities.supports_1m is supports_1m
+        assert capabilities.force_adaptive_thinking is adaptive
+        assert capabilities.supports_xhigh_thinking is xhigh
+        assert db_mod.claude_model_supports_1m(model_id) is supports_1m
+        assert db_mod.claude_model_token_limits(model_id) == {
+            "context": context,
+            "output": output,
+        }
+
+    @pytest.mark.parametrize(
+        ("model_id", "expected"),
+        [
+            ("claude-opus-4-7", True),
+            ("claude-opus-5", False),
+            ("claude-sonnet-5", True),
+            ("claude-sonnet-6", False),
+            ("claude-fable-5", True),
+            ("claude-fable-6", False),
+        ],
+    )
+    def test_xhigh_thinking_is_explicitly_allowlisted(self, model_id, expected):
+        assert db_mod.claude_model_capabilities(model_id).supports_xhigh_thinking is expected
+
+
 class TestDiscoverModelServices:
     def test_buckets_families_by_name(self, monkeypatch):
         payload = {
@@ -256,6 +340,8 @@ class TestDiscoverModelServices:
                 _model_service("system.ai.claude-opus-4-8"),
                 _model_service("system.ai.claude-sonnet-4-6"),
                 _model_service("system.ai.gpt-5"),
+                _model_service("system.ai.gpt-oss-120b"),
+                _model_service("system.ai.grok-4-6"),
                 _model_service("system.ai.gemini-2-5-flash"),
                 _model_service("system.ai.gemini-3-5-flash"),
                 _model_service("system.ai.kimi-k2-7-code"),
@@ -277,7 +363,8 @@ class TestDiscoverModelServices:
             "opus": "system.ai.claude-opus-4-8",
             "sonnet": "system.ai.claude-sonnet-4-6",
         }
-        assert codex == ["system.ai.gpt-5"]
+        assert codex == ["system.ai.gpt-5", "system.ai.grok-4-6"]
+        assert "system.ai.gpt-oss-120b" not in codex
         # Gemini ordered newest-first via the shared sort key.
         assert gemini[0] == "system.ai.gemini-3-5-flash"
         # DeepSeek, GLM, and Kimi are allowlisted OSS families; Llama is not.
@@ -2728,6 +2815,9 @@ class TestClassifyModelFamily:
             ("databricks-claude-haiku-4-5", "haiku"),
             ("system.ai.claude-fable-5", "fable"),
             ("system.ai.gpt-5-3-codex", "codex"),
+            ("system.ai.grok-4-6", "codex"),
+            ("SYSTEM.AI.GROK-4-6", "codex"),
+            ("system.ai.gpt-oss-120b", None),
             ("system.ai.gemini-3-flash", "gemini"),
             ("system.ai.kimi-k2-7-code", "oss"),
             ("system.ai.glm-4-6", "oss"),
