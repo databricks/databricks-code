@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Annotated
 
 import typer
@@ -108,7 +110,6 @@ from ucode.skills_download import (
     configure_skills_download_command,
     download_managed_skills_on_launch,
 )
-from ucode.smart_routing import claude_routing, codex_routing
 from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, ROUTE_FIRST_PROMPT_EVENT
 from ucode.state import (
@@ -1057,6 +1058,11 @@ def status() -> int:
             print_kv("OS-managed settings", managed_status)
             print_kv("Managed settings file", str(managed_path) if managed_path else "unsupported")
             print_kv("Managed settings backup", backup_status)
+        elif tool == "codex":
+            managed_path, managed_status, backup_status = codex_agent.managed_config_status(state)
+            print_kv("OS-managed settings", managed_status)
+            print_kv("Managed settings file", str(managed_path) if managed_path else "unsupported")
+            print_kv("Managed settings backup", backup_status)
         console.print()
 
     print_heading("Skills")
@@ -1113,6 +1119,7 @@ def revert() -> int:
     managed_configs = state.get("managed_configs") or {}
     mcp_results = revert_mcp_configs(state)
     claude_managed_result = claude_agent.revert_managed_settings()
+    codex_managed_result = codex_agent.revert_managed_config()
 
     results: dict[str, bool] = {
         tool: restore_file(
@@ -1141,6 +1148,7 @@ def revert() -> int:
     if legacy_codex_stripped:
         print_kv("Codex shared config", "ucode entries removed")
     print_kv("Claude Code OS-managed settings", claude_managed_result)
+    print_kv("Codex OS-managed settings", codex_managed_result)
     print_kv("Pi settings", "restored" if pi_settings_restored else "unchanged")
     for client, spec in MCP_CLIENTS.items():
         print_kv(
@@ -1438,6 +1446,9 @@ def codex_router_hook_cmd(
     import json
     import sys
 
+    if not smart_routing_v2.enabled():
+        return
+
     from ucode.smart_routing.codex_routing import (
         record_session_start,
         record_subagent_start,
@@ -1514,13 +1525,12 @@ def claude_router_hook_cmd(
     import json
     import sys
 
-    if event == ROUTE_FIRST_PROMPT_EVENT and not smart_routing_v2.enabled():
+    if not smart_routing_v2.enabled():
         return
 
     from ucode.smart_routing.claude_routing import (
         record_session_start,
         record_subagent_start,
-        route_pre_tool_use,
     )
 
     try:
@@ -1583,22 +1593,13 @@ def claude_router_hook_cmd(
             token = get_databricks_token(host, profile)
         except RuntimeError:
             return
-    if smart_routing_v2.enabled():
-        output = smart_routing_v2.route_claude_pre_tool_use(
-            payload,
-            workspace=host,
-            token=token,
-            available_models=model or [],
-            audit_decision=True,
-        )
-    else:
-        output = route_pre_tool_use(
-            payload,
-            workspace=host,
-            token=token,
-            available_models=model or [],
-            audit_decision=True,
-        )
+    output = smart_routing_v2.route_claude_pre_tool_use(
+        payload,
+        workspace=host,
+        token=token,
+        available_models=model or [],
+        audit_decision=True,
+    )
     if output is not None:
         sys.stdout.write(json.dumps(output))
 
@@ -1640,12 +1641,35 @@ def _auto_configure_tool(tool: str) -> None:
         raise RuntimeError(f"{spec['display']} validation failed — config reverted.")
 
 
-# Agent modules exposing the smart-routing opt-in surface (enable/disable/
-# enabled + launch-model routing), keyed by tool. Both share the identical
-# function names via their agent module and their routing module.
-_ROUTING_AGENTS = {"codex": codex_agent, "claude": claude_agent}
-_ROUTING_MODULES = {"codex": codex_routing, "claude": claude_routing}
 CAN_USE_CACHED_CONFIG_AGENTS = frozenset({"claude", "codex"})
+
+
+@contextmanager
+def _smart_routing_v2_flag(enabled: bool) -> Iterator[None]:
+    """Enable V2 for this launch without leaking into an embedding process."""
+    if not enabled:
+        yield
+        return
+    previous = os.environ.get(smart_routing_v2.ENV_VAR)
+    os.environ[smart_routing_v2.ENV_VAR] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(smart_routing_v2.ENV_VAR, None)
+        else:
+            os.environ[smart_routing_v2.ENV_VAR] = previous
+
+
+def _migrate_legacy_smart_routing(state: dict) -> dict:
+    """Remove the former persisted opt-in and its permanent routing hooks."""
+    if smart_routing_v2.LEGACY_STATE_KEY not in state:
+        return state
+    # The legacy key was shared by both agents. Clean both sets of files and
+    # artifacts before the first helper removes the marker from state.
+    codex_agent.disable_smart_routing(state)
+    claude_agent.disable_smart_routing(state)
+    return state
 
 
 def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
@@ -1847,7 +1871,6 @@ def _can_launch_from_cached_config(
     refresh: bool,
     model: str | None,
     explicit_provider: str | None,
-    enable_smart_routing_flag: bool,
     workspace_url: str | None,
 ) -> bool:
     """Return whether a normal Claude/Codex launch can use its cached config."""
@@ -1860,14 +1883,6 @@ def _can_launch_from_cached_config(
     if tool == "codex" and smart_routing_v2.enabled():
         if not state.get("codex_models") or not state.get("oss_models"):
             return False
-
-    smart_routing_enabled = _ROUTING_AGENTS[tool].smart_routing_enabled(state)
-    legacy_smart_routing_enabled = enable_smart_routing_flag or smart_routing_enabled
-
-    # Legacy smart routing overwrites the model into ucode-settings.json and so cannot use the
-    # cached state. Smart routing v2 will use PTY so can use the fast path.
-    if legacy_smart_routing_enabled:
-        return False
 
     # If managed agent config is enabled, we cannot use the cached state in case the config changed.
     if managed_agent_config_enabled():
@@ -1885,8 +1900,9 @@ def _can_launch_from_cached_config(
         return (
             claude_agent.CLAUDE_SETTINGS_PATH.exists()
             and claude_agent.managed_settings_are_current(state)
+            and claude_agent.gateway_model_discovery_setting_is_absent()
         )
-    return codex_agent.has_ucode_config()
+    return codex_agent.has_ucode_config() and codex_agent.managed_config_is_current(state)
 
 
 def _launch_tool(
@@ -1896,7 +1912,6 @@ def _launch_tool(
     refresh: bool = False,
     skip_preflight: bool = False,
     workspace_url: str | None = None,
-    enable_smart_routing_flag: bool = False,
     managed: dict | None = None,
     recommendation: dict | None = None,
     model: str | None = None,
@@ -1935,14 +1950,13 @@ def _launch_tool(
         # An explicit --provider overrides the persisted choice; otherwise fall
         # back to whatever `ucode configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
-        routing_agent = _ROUTING_AGENTS.get(tool)
+        state = _migrate_legacy_smart_routing(state)
         if _can_launch_from_cached_config(
             tool,
             state,
             refresh=refresh,
             model=model,
             explicit_provider=explicit_provider,
-            enable_smart_routing_flag=enable_smart_routing_flag,
             workspace_url=workspace_url,
         ):
             print_section(_launch_title(tool))
@@ -2006,7 +2020,7 @@ def _launch_tool(
                 provider = managed_provider
         # Checked after the managed config settles `provider`: an admin-set provider must trip this
         # guard too, or routing would be persisted as on while a provider is active.
-        if routing_agent is not None and enable_smart_routing_flag and provider:
+        if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_v2.enabled() and provider:
             raise RuntimeError(
                 f"{TOOL_SPECS[tool]['display']} smart routing cannot be enabled with "
                 "--provider. Launch without a Model Provider Service and try again."
@@ -2039,8 +2053,6 @@ def _launch_tool(
                 authored = managed_provider_family_models(managed)
                 if authored:
                     provider_models = authored
-        if routing_agent is not None and enable_smart_routing_flag:
-            state = routing_agent.enable_smart_routing(state)
         # The router's per-launch pick for the root session. Codex pins it as the
         # resolved model; claude pins it via ANTHROPIC_MODEL (route_root_model).
         route_root_model = None
@@ -2050,13 +2062,8 @@ def _launch_tool(
             # provider). Skip model resolution, which would otherwise fail when
             # the workspace has no matching Databricks models.
             resolved_model = None
-            if tool == "claude" and relayed:
-                if model:
-                    print_warning(
-                        "This is a subscription-relay Model Provider Service; the gateway selects "
-                        "the model, so --model is ignored."
-                    )
-            elif tool == "claude" and (model or provider_models):
+            # Relayed services forward --model to Claude Code's own flag at launch (below), not env.
+            if tool == "claude" and not relayed and (model or provider_models):
                 route_root_model = resolve_provider_launch_model(model, provider_models or {})
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
@@ -2067,28 +2074,6 @@ def _launch_tool(
                 managed_launch_model(managed, recommendation, tool) if managed is not None else None
             )
             state, resolved_model = resolve_launch_model(tool, state, managed_model)
-            first_prompt_routes_claude = tool == "claude" and smart_routing_v2.enabled()
-            if (
-                routing_agent is not None
-                and routing_agent.smart_routing_enabled(state)
-                and not first_prompt_routes_claude
-                and not forwarded_model
-            ):
-                display = TOOL_SPECS[tool]["display"]
-                with spinner(f"Selecting a {display} model with smart routing..."):
-                    decision, routing_error = _ROUTING_MODULES[tool].route_launch_model(
-                        state, ctx.args
-                    )
-                if decision is not None:
-                    print_note(decision.display_message())
-                    if tool == "codex":
-                        resolved_model = decision.model
-                    else:
-                        route_root_model = decision.model
-                elif routing_error:
-                    print_warning(
-                        f"Smart routing was unavailable ({routing_error}); using {resolved_model}."
-                    )
             # The admin's model outranks a smart-routing pick too. Claude only launches on it when
             # pinned as ANTHROPIC_MODEL (route_root_model); other agents take `resolved_model`,
             # which already holds it from resolve_launch_model above.
@@ -2117,6 +2102,10 @@ def _launch_tool(
             # per-family target pins.
             custom_model=model if (tool == "claude" and not provider) else None,
         )
+        # Relayed = a Claude subscription: forward --model to Claude Code's own flag, like `-- --model X`.
+        if tool == "claude" and provider and relayed and model and not forwarded_model:
+            ctx.args = ["--model", model, *ctx.args]
+            forwarded_model = model
         print_section(_launch_title(tool))
         if managed is not None:
             print_kv("Config", "workspace-managed")
@@ -2136,17 +2125,12 @@ def _launch_tool(
             print_kv("Model", route_root_model)
         elif resolved_model:
             print_kv("Model", resolved_model)
-        if (
-            routing_agent is not None
-            and routing_agent.smart_routing_enabled(state)
-            and not provider
-        ):
+        if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_v2.enabled() and not provider:
             print_kv("Smart routing", "enabled")
-            if enable_smart_routing_flag:
-                print_note(
-                    f"{TOOL_SPECS[tool]['display']} requires one-time hook review. Open "
-                    "`/hooks` and trust the ucode routing hooks if prompted."
-                )
+            print_note(
+                f"{TOOL_SPECS[tool]['display']} may require one-time hook review. Open "
+                "`/hooks` and trust the ucode routing hooks if prompted."
+            )
         if tool in ("gemini", "opencode", "copilot", "pi"):
             print_note(
                 f"{TOOL_SPECS[tool]['display']} token refresh is managed automatically "
@@ -2387,6 +2371,7 @@ def codex_cmd(
         bool,
         typer.Option(
             "--disable-smart-routing",
+            hidden=True,
             help="Disable smart routing and remove ucode's Codex routing hooks.",
         ),
     ] = False,
@@ -2400,15 +2385,15 @@ def codex_cmd(
         codex_agent.disable_smart_routing(load_state())
         print_success("Codex smart routing disabled; ucode routing hooks removed")
         return
-    _launch_tool(
-        "codex",
-        ctx,
-        provider=provider,
-        refresh=refresh,
-        skip_preflight=skip_preflight,
-        workspace_url=workspace,
-        enable_smart_routing_flag=enable_smart_routing_flag,
-    )
+    with _smart_routing_v2_flag(enable_smart_routing_flag):
+        _launch_tool(
+            "codex",
+            ctx,
+            provider=provider,
+            refresh=refresh,
+            skip_preflight=skip_preflight,
+            workspace_url=workspace,
+        )
 
 
 @app.command("claude", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -2463,6 +2448,7 @@ def claude_cmd(
         bool,
         typer.Option(
             "--disable-smart-routing",
+            hidden=True,
             help="Disable smart routing and remove ucode's Claude Code routing hooks.",
         ),
     ] = False,
@@ -2478,16 +2464,16 @@ def claude_cmd(
         return
     if enable_model_discovery:
         os.environ[claude_agent.GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
-    _launch_tool(
-        "claude",
-        ctx,
-        provider=provider,
-        model=model,
-        refresh=refresh,
-        skip_preflight=skip_preflight,
-        workspace_url=workspace,
-        enable_smart_routing_flag=enable_smart_routing_flag,
-    )
+    with _smart_routing_v2_flag(enable_smart_routing_flag):
+        _launch_tool(
+            "claude",
+            ctx,
+            provider=provider,
+            model=model,
+            refresh=refresh,
+            skip_preflight=skip_preflight,
+            workspace_url=workspace,
+        )
 
 
 @app.command("gemini", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -3243,6 +3229,18 @@ def revert_cmd() -> None:
     """Clear ucode state and restore backed-up agent config files."""
     try:
         revert()
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+
+
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Diagnose the local ucode setup and offer to fix any problems found."""
+    from ucode.doctor import doctor
+
+    try:
+        doctor()
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

@@ -34,26 +34,54 @@ class TestClaudeSpec:
 class TestMinimumVersion:
     @pytest.mark.parametrize("version", ["2.1.248", "2.1.250", "3.0.0"])
     def test_supported_version(self, monkeypatch, version):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: version)
 
         assert claude.minimum_version_error() is None
         assert claude.required_update_message() is None
 
     def test_older_version_requires_update(self, monkeypatch):
-        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247 (Claude Code)")
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() == (
-            "Claude Code 2.1.247 (Claude Code) is too old for gateway model discovery. "
-            "Claude Code must be updated to 2.1.248 or newer; run "
-            "`npm install -g @anthropic-ai/claude-code` or `ucode configure`."
+            "Smart routing requires Claude Code 2.1.248 or newer. "
+            "Your current version is Claude Code 2.1.247."
         )
         assert claude.required_update_message() == (
-            "Claude Code 2.1.247 (Claude Code) is older than required 2.1.248; "
-            "updating Claude Code is required for gateway model discovery."
+            "Smart routing requires Claude Code 2.1.248 or newer. "
+            "Your current version is Claude Code 2.1.247."
         )
 
+    def test_older_version_requires_update_for_model_discovery(self, monkeypatch):
+        monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
+
+        expected = (
+            "Model discovery requires Claude Code 2.1.248 or newer. "
+            "Your current version is Claude Code 2.1.247."
+        )
+        assert claude.minimum_version_error() == expected
+        assert claude.required_update_message() == expected
+
+    def test_smart_routing_message_wins_when_both_features_are_enabled(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
+
+        assert claude.minimum_version_error().startswith("Smart routing requires")
+
     def test_unknown_version_does_not_block(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "unknown")
+
+        assert claude.minimum_version_error() is None
+        assert claude.required_update_message() is None
+
+    def test_older_version_is_not_validated_without_discovery_features(self, monkeypatch):
+        monkeypatch.delenv(v2.ENV_VAR, raising=False)
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() is None
         assert claude.required_update_message() is None
@@ -160,7 +188,7 @@ class TestRenderOverlay:
 
     def test_enables_tool_search(self):
         overlay, _ = claude.render_overlay(WS, "s4")
-        assert overlay["env"]["ENABLE_TOOL_SEARCH"] == "1"
+        assert overlay["env"]["ENABLE_TOOL_SEARCH"] == "true"
 
     def test_enables_use_gateway(self):
         overlay, _ = claude.render_overlay(WS, "s4")
@@ -173,16 +201,16 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
-    def test_enables_gateway_model_discovery(self, monkeypatch):
+    def test_does_not_persist_gateway_model_discovery(self, monkeypatch):
         monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", "1")
         overlay, _ = claude.render_overlay(WS, "s4")
-        assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
-    def test_enables_gateway_model_discovery_for_smart_routing_v2(self, monkeypatch):
+    def test_smart_routing_does_not_persist_gateway_model_discovery(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
         overlay, _ = claude.render_overlay(WS, "s4")
-        assert overlay["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
 
     def test_gateway_model_discovery_skipped_under_provider(self, monkeypatch):
         # A Model Provider Service routes every request to the external provider,
@@ -191,6 +219,16 @@ class TestRenderOverlay:
         monkeypatch.setenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", "1")
         overlay, _ = claude.render_overlay(WS, "s4", provider="main.x.claude-svc")
         assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in overlay["env"]
+
+    def test_gateway_model_discovery_setting_detects_stale_opt_in(self, monkeypatch):
+        monkeypatch.delenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, raising=False)
+        monkeypatch.setattr(
+            claude,
+            "read_json_safe",
+            lambda path: {"env": {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}},
+        )
+
+        assert claude.gateway_model_discovery_setting_is_absent() is False
 
     def test_sets_api_key_helper(self):
         overlay, _ = claude.render_overlay(WS, "s4")
@@ -382,6 +420,57 @@ class TestRenderOverlayUserAgent:
         assert "\n" in self._ua(monkeypatch)
 
 
+class TestMergeAnthropicCustomHeaders:
+    def test_merges_existing_settings_with_ucode_managed_headers(self):
+        headers_from_existing_settings = "\n".join(
+            [
+                "X-User-Header: keep-me",
+                "user-agent: custom-agent",
+            ]
+        )
+        headers_managed_by_ucode = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/1.0 claude/2.0",
+            ]
+        )
+
+        merged_headers = claude._merge_anthropic_custom_headers(
+            headers_from_existing_settings, headers_managed_by_ucode
+        )
+
+        assert merged_headers.splitlines() == [
+            "X-User-Header: keep-me",  # Preserved from existing settings.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
+        ]
+
+    def test_preserves_existing_header_order(self):
+        headers_from_existing_settings = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/0.1.0+41.gd09c080 claude/2.1.258",
+                "meep: lala",
+            ]
+        )
+        headers_managed_by_ucode = "\n".join(
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "User-Agent: ucode/1.0 claude/2.0",
+            ]
+        )
+
+        merged_headers = claude._merge_anthropic_custom_headers(
+            headers_from_existing_settings, headers_managed_by_ucode
+        )
+
+        assert merged_headers.splitlines() == [
+            "x-databricks-use-coding-agent-mode: true",  # From ucode; overwrites existing.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "meep: lala",  # Preserved from existing settings in its original position.
+        ]
+
+
 class TestRenderOverlayWebSearchDisable:
     def test_settings_overlay_never_includes_mcp_servers(self):
         # MCP servers belong in ~/.claude.json, not settings.json.
@@ -531,8 +620,18 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
         assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in written[0]["env"]
         assert written[0]["env"]["ENABLE_PROMPT_CACHING_1H"] == "1"
-        assert written[0]["env"]["ENABLE_TOOL_SEARCH"] == "1"
+        assert written[0]["env"]["ENABLE_TOOL_SEARCH"] == "true"
         assert written[0]["env"]["CLAUDE_CODE_USE_GATEWAY"] == "1"
+
+    def test_strips_stale_gateway_model_discovery(self, monkeypatch):
+        existing = {"env": {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}}
+        written: list = []
+        self._patch(monkeypatch, existing, written)
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in written[0]["env"]
 
 
 FAKE_MANAGED_PATH = Path("/tmp/ucode-test/managed-settings.json")
@@ -598,6 +697,49 @@ class TestWriteToolConfigManagedSettings:
         assert written["env"]["MY_OWN"] == "keep"
         assert written["env"]["ANTHROPIC_BASE_URL"]
         assert written["apiKeyHelper"]
+
+    def test_managed_file_strips_stale_gateway_model_discovery(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        stale = {"env": {"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}}
+        existing = {
+            str(claude.CLAUDE_SETTINGS_PATH): stale,
+            str(FAKE_MANAGED_PATH): stale,
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in private_writes[0][1]["env"]
+        assert (
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"
+            not in json.loads(managed_writes[0][1])["env"]
+        )
+
+    def test_managed_file_merges_anthropic_custom_headers(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        existing_managed_settings = {
+            str(FAKE_MANAGED_PATH): {
+                "env": {"ANTHROPIC_CUSTOM_HEADERS": "X-Enterprise-Header: retain\nUser-Agent: old"}
+            }
+        }
+        self._patch(monkeypatch, private_writes, managed_writes, existing_managed_settings)
+        monkeypatch.setattr(claude, "ucode_version", lambda: "1.0")
+        monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.0")
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        _, text = managed_writes[0]
+        merged_headers = json.loads(text)["env"]["ANTHROPIC_CUSTOM_HEADERS"]
+        assert merged_headers.splitlines() == [
+            "X-Enterprise-Header: retain",  # Preserved from existing managed settings.
+            "User-Agent: ucode/1.0 claude/2.0",  # From ucode; overwrites existing.
+            "x-databricks-use-coding-agent-mode: true",  # Newly added by ucode.
+        ]
 
     def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []
@@ -780,7 +922,7 @@ class TestRegisterWebSearchMcp:
 
 
 class TestClaudeLaunch:
-    def test_relayed_launch_uses_refresh_proxy_not_discovery_proxy(self, monkeypatch):
+    def test_relayed_launch_uses_refresh_proxy(self, monkeypatch):
         calls: list[tuple] = []
 
         class Server:
@@ -823,11 +965,6 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "_managed_relayed_conflicts", lambda: None)
         monkeypatch.setattr(claude, "_ensure_subscription_login", lambda: None)
         monkeypatch.setattr(claude.gateway_proxy, "start_proxy", start_proxy)
-        monkeypatch.setattr(
-            claude,
-            "start_anthropic_model_discovery_proxy",
-            lambda *_args: pytest.fail("relayed auth must not use the discovery proxy"),
-        )
         monkeypatch.setattr(claude.subprocess, "Popen", Process)
 
         with pytest.raises(SystemExit) as exc:
@@ -933,7 +1070,6 @@ class TestClaudeLaunch:
         [
             ["--print", "say hi"],
             ["doctor"],
-            ["--", "fix this bug"],
         ],
     )
     def test_v2_noninteractive_launch_bypasses_first_prompt_routing(self, monkeypatch, tool_args):
@@ -948,127 +1084,45 @@ class TestClaudeLaunch:
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]]
         v2.launch_claude.assert_not_called()
 
+    @pytest.mark.parametrize("tool_args", [["fix this bug"], ["--", "fix this bug"]])
+    def test_v2_positional_prompt_uses_first_prompt_routing(self, monkeypatch, tool_args):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        launch_v2 = Mock()
+        monkeypatch.setattr(claude, "_original_launch_model", lambda _state: None)
+        monkeypatch.setattr(v2, "launch_claude", launch_v2)
+
+        claude.launch({"workspace": WS}, tool_args)
+
+        launch_v2.assert_called_once_with(
+            {"workspace": WS},
+            tool_args,
+            binary="claude",
+            user_settings_path=claude.CLAUDE_USER_SETTINGS_PATH,
+            launch_model=None,
+            compose_settings=claude._compose_v2_settings,
+            launch_model_args=claude._launch_model_args,
+            model_name=claude._maybe_add_1m_suffix,
+        )
+
     def test_v2_does_not_treat_option_value_as_positional_argument(self):
         assert claude._uses_interactive_tui(["--name", "doctor"]) is True
 
     def test_v2_treats_optional_option_value_as_interactive(self):
         assert claude._uses_interactive_tui(["--resume", "session-id"]) is True
 
-    def test_gateway_discovery_uses_anthropic_proxy(self, monkeypatch):
-        calls: list[tuple] = []
-
+    def test_gateway_discovery_uses_direct_gateway(self, monkeypatch):
+        calls: list[list[str]] = []
         monkeypatch.delenv(v2.ENV_VAR, raising=False)
-
-        class Server:
-            server_address = ("127.0.0.1", 12345)
-
-            def serve_forever(self):
-                calls.append(("serve",))
-
-            def shutdown(self):
-                calls.append(("shutdown",))
-
-        class Client:
-            def close(self):
-                calls.append(("close",))
-
-        class Process:
-            def __init__(self, argv):
-                calls.append(("popen", argv))
-
-            def wait(self):
-                return 0
-
-        def start_proxy(workspace, port):
-            calls.append(("proxy", workspace, port))
-            return Server(), Client()
-
         monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
         monkeypatch.delenv("OAUTH_TOKEN", raising=False)
-        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-        monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
-        monkeypatch.setattr(
-            claude,
-            "get_databricks_token",
-            lambda *_args: pytest.fail("model discovery must rely on apiKeyHelper"),
-        )
-        monkeypatch.setattr(
-            claude,
-            "start_anthropic_model_discovery_proxy",
-            start_proxy,
-        )
-        monkeypatch.setattr(claude.subprocess, "Popen", Process)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        with pytest.raises(SystemExit) as exc:
-            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
 
-        assert exc.value.code == 0
-        assert "OAUTH_TOKEN" not in os.environ
-        assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
-        assert os.environ["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
-        assert os.environ["CLAUDE_CODE_USE_GATEWAY"] == "1"
-        assert calls[:2] == [
-            ("proxy", WS, 0),
-            ("serve",),
-        ]
-        assert calls[2][0] == "popen"
-        argv = calls[2][1]
-        assert argv[:2] == ["claude", "--settings"]
-        assert json.loads(argv[2])["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
-        assert argv[3:] == ["--debug"]
-        assert calls[3:] == [("shutdown",), ("close",)]
-
-    def test_smart_routing_uses_anthropic_proxy(self, monkeypatch):
-        calls: list[tuple] = []
-        captured: dict = {}
-
-        class Server:
-            server_address = ("127.0.0.1", 12345)
-
-            def serve_forever(self):
-                calls.append(("serve",))
-
-            def shutdown(self):
-                calls.append(("shutdown",))
-
-        class Client:
-            def close(self):
-                calls.append(("close",))
-
-        def start_proxy(workspace, port):
-            calls.append(("proxy", workspace, port))
-            return Server(), Client()
-
-        def launch_v2(state, tool_args, **kwargs):
-            captured["settings"] = kwargs["compose_settings"](["--debug"])
-            raise SystemExit(0)
-
-        monkeypatch.setenv(v2.ENV_VAR, "1")
-        monkeypatch.delenv("OAUTH_TOKEN", raising=False)
-        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-        monkeypatch.setattr(claude, "start_anthropic_model_discovery_proxy", start_proxy)
-        monkeypatch.setattr(
-            claude,
-            "_compose_v2_settings",
-            lambda args: ({"env": {"ANTHROPIC_BASE_URL": "https://direct"}}, args),
-        )
-        monkeypatch.setattr(v2, "launch_claude", launch_v2)
-
-        with pytest.raises(SystemExit) as exc:
-            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
-
-        assert exc.value.code == 0
-        assert "OAUTH_TOKEN" not in os.environ
-        assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
-        assert calls[:2] == [
-            ("proxy", WS, 0),
-            ("serve",),
-        ]
-        settings, remaining = captured["settings"]
-        assert settings["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
-        assert remaining == ["--debug"]
-        assert calls[2:] == [("shutdown",), ("close",)]
+        assert os.environ["OAUTH_TOKEN"] == "token"
+        assert os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
 
 
 class TestWriteToolConfigPrunesStaleModelEnv:
@@ -1288,27 +1342,29 @@ class TestClaudeSmartRouting:
         monkeypatch.setattr(claude, "save_state", lambda state: None)
         monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
 
-    def test_enable_sets_state_key(self):
-        state = claude.enable_smart_routing({})
-        assert state[claude.SMART_ROUTING_STATE_KEY] is True
-
-    def test_enabled_reads_state_key(self):
-        assert claude.smart_routing_enabled({claude.SMART_ROUTING_STATE_KEY: True})
-        assert not claude.smart_routing_enabled({})
-
-    def test_write_config_installs_routing_hooks(self, monkeypatch):
+    def test_write_config_removes_legacy_routing_hooks(self, monkeypatch):
         written: list = []
-        self._capture_write(monkeypatch, {}, written)
+        existing = {
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"command": "user-policy"}]},
+                    {
+                        "matcher": "Agent|Task",
+                        "hooks": [{"command": "ucode claude-router-hook route-subagent"}],
+                    },
+                ]
+            }
+        }
+        self._capture_write(monkeypatch, existing, written)
         state = {
             "workspace": WS,
             "claude_models": {"opus": "system.ai.claude-opus-4-8"},
             claude.SMART_ROUTING_STATE_KEY: True,
         }
         claude.write_tool_config(state, "system.ai.claude-opus-4-8", route_root_model=None)
-        hooks = written[0]["hooks"]
-        assert set(hooks) == {"PreToolUse", "SessionStart", "SubagentStart"}
-        commands = [hook["command"] for group in hooks["PreToolUse"] for hook in group["hooks"]]
-        assert any("claude-router-hook" in command for command in commands)
+        assert written[0]["hooks"]["PreToolUse"] == [
+            {"matcher": "Bash", "hooks": [{"command": "user-policy"}]}
+        ]
 
     def test_root_model_pins_anthropic_model(self, monkeypatch):
         written: list = []

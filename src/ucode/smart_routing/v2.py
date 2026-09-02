@@ -33,6 +33,7 @@ from ucode.smart_routing.codex_hooks import merge_pre_tool_use_hooks, routing_mo
 from ucode.ui import print_note
 
 ENV_VAR = "ENABLE_SMART_ROUTING_V2"
+LEGACY_STATE_KEY = "smart_routing_enabled"
 
 CODEX_INTERPOSER_LOG = APP_DIR / "codex-v2-interposer.log"
 
@@ -332,6 +333,7 @@ def launch_claude(
     token = get_databricks_token(workspace, state.get("profile"))
     os.environ[OAUTH_TOKEN_ENV_VAR] = token
     os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
+    os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     model_ids, discovery_error = list_anthropic_models(workspace, token)
     if not model_ids:
         raise RuntimeError(discovery_error or "Anthropic models endpoint returned no Claude models")
@@ -347,7 +349,7 @@ def launch_claude(
     env = settings.setdefault("env", {})
     if not isinstance(env, dict):
         raise RuntimeError("Claude settings 'env' must be an object for smart routing.")
-    env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
+    env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
     env[FIRST_PROMPT_SOCKET_ENV] = str(socket_path)
     model_overrides = settings.setdefault("modelOverrides", {})
     if not isinstance(model_overrides, dict):

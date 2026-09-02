@@ -16,9 +16,6 @@ from pathlib import Path
 from typing import cast
 
 from ucode import gateway_proxy
-from ucode.anthropic_model_discovery_proxy import (
-    start_proxy as start_anthropic_model_discovery_proxy,
-)
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -78,16 +75,13 @@ SPEC: ToolSpec = {
     "backup_path": CLAUDE_BACKUP_PATH,
 }
 
-# Per-workspace opt-in flag for Claude Code smart routing (state key).
-# Shared across agents: one opt-in enables smart routing for every routing-capable
-# tool (codex, claude), so a workspace turns it on once. Kept identical to
-# codex.SMART_ROUTING_STATE_KEY on purpose.
-SMART_ROUTING_STATE_KEY = "smart_routing_enabled"
-# Claude Code settings.json hook events ucode manages when routing is enabled;
-# marked managed so they're tracked/reverted with the rest of ucode's config.
-CLAUDE_ROUTING_HOOK_EVENTS = ("PreToolUse", "SessionStart", "SubagentStart")
+# Retained only to identify and remove state written by the legacy persisted opt-in.
+SMART_ROUTING_STATE_KEY = smart_routing_v2.LEGACY_STATE_KEY
 CLAUDE_NONINTERACTIVE_FLAGS = frozenset(
     {"-p", "--print", "--bg", "--background", "--cloud", "-h", "--help", "-v", "--version"}
+)
+CLAUDE_SUBCOMMANDS = frozenset(
+    {"agents", "auth", "config", "doctor", "install", "mcp", "plugin", "setup-token", "update"}
 )
 CLAUDE_OPTIONAL_VALUE_OPTIONS = frozenset(
     {
@@ -114,11 +108,21 @@ def _parse_version(value: str) -> tuple[int, int, int] | None:
 
 
 def _installed_version_status() -> tuple[str, bool] | None:
+    if os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) != "1" and not smart_routing_v2.enabled():
+        return None
     version = agent_version(SPEC["binary"])
     parsed = _parse_version(version)
     if parsed is None:
         return None
     return version, parsed < MINIMUM_CLAUDE_VERSION
+
+
+def _minimum_version_requirement_message(version: str) -> str:
+    feature = "Smart routing" if smart_routing_v2.enabled() else "Model discovery"
+    return (
+        f"{feature} requires Claude Code {MINIMUM_CLAUDE_VERSION_TEXT} or newer. "
+        f"Your current version is Claude Code {version}."
+    )
 
 
 def minimum_version_error() -> str | None:
@@ -128,11 +132,7 @@ def minimum_version_error() -> str | None:
     version, is_too_old = status
     if not is_too_old:
         return None
-    return (
-        f"Claude Code {version} is too old for gateway model discovery. "
-        f"Claude Code must be updated to {MINIMUM_CLAUDE_VERSION_TEXT} or newer; "
-        f"run `npm install -g {SPEC['package']}` or `ucode configure`."
-    )
+    return _minimum_version_requirement_message(version)
 
 
 def required_update_message() -> str | None:
@@ -142,10 +142,7 @@ def required_update_message() -> str | None:
     version, is_too_old = status
     if not is_too_old:
         return None
-    return (
-        f"Claude Code {version} is older than required {MINIMUM_CLAUDE_VERSION_TEXT}; "
-        "updating Claude Code is required for gateway model discovery."
-    )
+    return _minimum_version_requirement_message(version)
 
 
 def _resolve_web_search_model(state: dict) -> str | None:
@@ -193,9 +190,20 @@ CLAUDE_MANAGED_MODEL_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
 )
+# Launch-scoped feature flags that ucode may write into Claude settings. These
+# must be removed again when the corresponding launch flag is absent.
+CLAUDE_CONDITIONAL_ENV_KEYS = ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",)
 # Env keys ucode used to write but no longer does; stripped from the managed
 # settings file on every launch so stale values never linger.
 CLAUDE_REMOVED_ENV_KEYS = ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",)
+ANTHROPIC_CUSTOM_HEADERS_ENV_KEY = "ANTHROPIC_CUSTOM_HEADERS"
+CLAUDE_MANAGED_CUSTOM_HEADER_NAMES = frozenset(
+    {
+        "x-databricks-use-coding-agent-mode",
+        "user-agent",
+        "databricks-model-provider-service",
+    }
+)
 CLAUDE_TRACING_STOP_HOOK_SUFFIX = " autolog claude stop-hook"
 # Tracing is driven by an `mlflow autolog claude stop-hook` Stop hook, run by
 # the `mlflow` CLI on each session end. Pin to 3.11.x: 3.12 dropped the Unity
@@ -252,6 +260,15 @@ def managed_settings_are_current(state: dict) -> bool:
     else:
         required_scope = None
     return managed_file_is_verified(state, "claude", path, required_scope=required_scope)
+
+
+def gateway_model_discovery_setting_is_absent() -> bool:
+    """Return whether model discovery is absent from persistent Claude settings."""
+    env = read_json_safe(CLAUDE_SETTINGS_PATH).get("env")
+    actual = (
+        env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY") if isinstance(env, dict) else None
+    )
+    return actual is None
 
 
 def managed_settings_status(state: dict) -> tuple[Path | None, str, str]:
@@ -386,17 +403,9 @@ def render_overlay(
         # Claude Code only sends when experimental betas are enabled — so we must
         # not set CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS (see CLAUDE_REMOVED_ENV_KEYS).
         "ENABLE_PROMPT_CACHING_1H": "1",
-        "ENABLE_TOOL_SEARCH": "1",
+        "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_USE_GATEWAY": "1",
     }
-    # Native /model discovery: picker lists every gateway Messages-API endpoint,
-    # not just the family aliases. Skipped under a provider (its routing header
-    # would send a discovered gateway id to a provider that can't resolve it).
-    discovery_enabled = (
-        os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1" or smart_routing_v2.enabled()
-    )
-    if discovery_enabled and not provider:
-        env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     # Intentionally NOT setting ANTHROPIC_MODEL by default. Setting it produces a
     # duplicate catalog row in Claude Code's /model picker (e.g. "Opus 4.8 (1M
     # context) ✓") on top of the family-alias row from ANTHROPIC_DEFAULT_OPUS_MODEL.
@@ -555,17 +564,6 @@ def _unregister_web_search_mcp() -> None:
             pass
 
 
-def smart_routing_enabled(state: dict) -> bool:
-    """Return whether the current workspace opted into Claude Code routing."""
-    return state.get(SMART_ROUTING_STATE_KEY) is True
-
-
-def enable_smart_routing(state: dict) -> dict:
-    """Persist the current workspace's Claude Code smart-routing opt-in."""
-    state[SMART_ROUTING_STATE_KEY] = True
-    return state
-
-
 def disable_smart_routing(state: dict) -> bool:
     """Disable routing and remove only ucode's Claude Code routing hooks."""
     state.pop(SMART_ROUTING_STATE_KEY, None)
@@ -626,27 +624,32 @@ def write_tool_config(
                 "to install the Claude Stop hook — traces won't be emitted. Re-run "
                 "`ucode configure tracing`."
             )
-    # Smart-routing hooks: install ucode's PreToolUse/SessionStart/SubagentStart hooks when routing
-    # is enabled (and not under a provider, which pins no Databricks model), else surgically strip
-    # only ucode's own. Applied per file inside _compose_claude_settings.
-    routing_enabled = smart_routing_enabled(state) and provider is None
-    if routing_enabled:
-        managed_keys = managed_keys + [["hooks", event] for event in CLAUDE_ROUTING_HOOK_EVENTS]
     managed_file_keys = list(managed_keys)
     for path in (
         [["env", key] for key in CLAUDE_MANAGED_MODEL_ENV_KEYS]
+        + [["env", key] for key in CLAUDE_CONDITIONAL_ENV_KEYS]
         + [["env", key] for key in CLAUDE_REMOVED_ENV_KEYS]
         + [["env", key] for key in CLAUDE_TRACING_ENV_KEYS]
         + [["hooks", "Stop"]]
-        + [["hooks", event] for event in CLAUDE_ROUTING_HOOK_EVENTS]
+        + [["hooks", event] for event in ("PreToolUse", "SessionStart", "SubagentStart")]
     ):
         if path not in managed_file_keys:
             managed_file_keys.append(path)
 
+    # V2 installs routing hooks in a transient per-launch settings file. Persistent settings must
+    # contain no ucode routing hooks; surgically strip legacy ones while preserving user hooks.
     def _compose(base: dict) -> dict:
+        base_env = base.get("env")
+        existing_custom_headers = (
+            base_env.get(ANTHROPIC_CUSTOM_HEADERS_ENV_KEY) if isinstance(base_env, dict) else None
+        )
         # deepcopy the overlay per file so merging into one base can't alias nested dicts into
         # the other (deep_merge_dict grafts overlay's own dict objects onto a base missing the key).
         merged = deep_merge_dict(base, copy.deepcopy(overlay))
+        overlay_custom_headers = overlay["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
+        merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
+            existing_custom_headers, overlay_custom_headers
+        )
         # Drop any apiKeyHelper a prior non-relayed launch left in the file; relayed
         # must not carry one (it would outrank the subscription OAuth).
         if relayed:
@@ -668,11 +671,14 @@ def write_tool_config(
             for key in CLAUDE_MANAGED_MODEL_ENV_KEYS:
                 if key not in overlay_env:
                     merged_env.pop(key, None)
+            for key in CLAUDE_CONDITIONAL_ENV_KEYS:
+                if key not in overlay_env:
+                    merged_env.pop(key, None)
             # deep_merge_dict keeps keys already in the file, so drop the ones ucode no
             # longer writes.
             for key in CLAUDE_REMOVED_ENV_KEYS:
                 merged_env.pop(key, None)
-        sync_smart_routing_hooks(merged, state, enabled=routing_enabled)
+        sync_smart_routing_hooks(merged, state, enabled=False)
         return merged
 
     write_json_file(CLAUDE_SETTINGS_PATH, _compose(read_json_safe(CLAUDE_SETTINGS_PATH)))
@@ -703,6 +709,54 @@ def write_tool_config(
     state = mark_tool_managed(state, "claude", managed_keys)
     save_state(state)
     return state
+
+
+def _merge_anthropic_custom_headers(existing: object, ucode_headers: str) -> str:
+    """Preserve user headers while replacing the header names managed by ucode.
+
+    Claude's ``ANTHROPIC_CUSTOM_HEADERS`` value is a newline-delimited string. To merge it, we:
+
+    1. Split the existing custom headers by newline into individual header items.
+    2. Split each item on ``:`` to identify its header name.
+    3. Replace headers in ``CLAUDE_MANAGED_CUSTOM_HEADER_NAMES`` with ucode's values in their
+       existing positions, while preserving all other existing headers.
+    4. Append any ucode-managed headers that were not already present.
+
+    Header names are compared case-insensitively. Non-header lines are also preserved to avoid
+    silently discarding user configuration we do not understand.
+    """
+
+    if not isinstance(existing, str) or not existing:
+        return ucode_headers
+
+    ucode_lines_by_name: dict[str, str] = {}
+    ucode_header_names: list[str] = []
+    for line in ucode_headers.splitlines():
+        name, separator, _value = line.partition(":")
+        normalized_name = name.strip().casefold()
+        if separator and normalized_name not in ucode_lines_by_name:
+            ucode_header_names.append(normalized_name)
+        if separator:
+            ucode_lines_by_name[normalized_name] = line
+
+    merged: list[str] = []
+    replaced_names: set[str] = set()
+    for line in existing.splitlines():
+        name, separator, _value = line.partition(":")
+        normalized_name = name.strip().casefold()
+        if separator and normalized_name in CLAUDE_MANAGED_CUSTOM_HEADER_NAMES:
+            replacement = ucode_lines_by_name.get(normalized_name)
+            if replacement is not None and normalized_name not in replaced_names:
+                merged.append(replacement)
+                replaced_names.add(normalized_name)
+            continue
+        if line:
+            merged.append(line)
+
+    for name in ucode_header_names:
+        if name not in replaced_names:
+            merged.append(ucode_lines_by_name[name])
+    return "\n".join(merged)
 
 
 def _reconcile_managed_settings(
@@ -1092,7 +1146,7 @@ def _uses_interactive_tui(tool_args: list[str]) -> bool:
     while index < len(tool_args):
         arg = tool_args[index]
         if arg == "--":
-            return index == len(tool_args) - 1
+            return True
         if arg in CLAUDE_VALUE_OPTIONS:
             index += 2
             continue
@@ -1105,7 +1159,9 @@ def _uses_interactive_tui(tool_args: list[str]) -> bool:
         if arg.startswith("-"):
             index += 1
             continue
-        return False
+        # Claude accepts an initial prompt positionally and still opens the TUI.
+        # Keep prompts inside the V2 PTY while bypassing utility subcommands.
+        return arg not in CLAUDE_SUBCOMMANDS
     return True
 
 
@@ -1155,6 +1211,9 @@ def _build_claude_argv(
     merged = _merge_claude_settings(caller_settings, read_json_safe(CLAUDE_SETTINGS_PATH))
     if settings_override is not None:
         merged = _merge_claude_settings(merged, settings_override)
+    merged_env = merged.get("env")
+    if isinstance(merged_env, dict):
+        merged_env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
     return [
         binary,
         *source_args,
@@ -1249,51 +1308,6 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
-def _launch_claude_with_gateway_proxy(
-    state: dict, binary: str, tool_args: list[str], *, smart_routing: bool
-) -> None:
-    """Launch Claude through the gateway model-alias proxy."""
-    workspace = state["workspace"]
-    server, client = start_anthropic_model_discovery_proxy(workspace, 0)
-    os.environ["ANTHROPIC_BASE_URL"] = f"http://{LOOPBACK_HOST}:{server.server_address[1]}"
-    os.environ["CLAUDE_CODE_USE_GATEWAY"] = "1"
-
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-    settings_override = {"env": {"ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"]}}
-    try:
-        if smart_routing:
-
-            def compose_gateway_settings(args: list[str]) -> tuple[dict, list[str]]:
-                settings, remaining = _compose_v2_settings(args)
-                return _merge_claude_settings(settings, settings_override), remaining
-
-            smart_routing_v2.launch_claude(
-                state,
-                tool_args,
-                binary=binary,
-                user_settings_path=CLAUDE_USER_SETTINGS_PATH,
-                launch_model=_original_launch_model(state),
-                compose_settings=compose_gateway_settings,
-                launch_model_args=_launch_model_args,
-                model_name=_maybe_add_1m_suffix,
-            )
-            return
-
-        proc = subprocess.Popen(
-            _build_claude_argv(binary, tool_args, settings_override=settings_override)
-        )
-        try:
-            returncode = proc.wait()
-        except KeyboardInterrupt:
-            proc.send_signal(signal.SIGINT)
-            returncode = proc.wait()
-    finally:
-        server.shutdown()
-        client.close()
-    raise SystemExit(returncode)
-
-
 def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
@@ -1315,11 +1329,25 @@ def launch(state: dict, tool_args: list[str]) -> None:
             "Please use Codex or disable smart routing."
         )
     if first_prompt_routing:
-        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=True)
+        smart_routing_v2.launch_claude(
+            state,
+            tool_args,
+            binary=binary,
+            user_settings_path=CLAUDE_USER_SETTINGS_PATH,
+            launch_model=_original_launch_model(state),
+            compose_settings=_compose_v2_settings,
+            launch_model_args=_launch_model_args,
+            model_name=_maybe_add_1m_suffix,
+        )
         return
-    if workspace and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1":
-        _launch_claude_with_gateway_proxy(state, binary, tool_args, smart_routing=False)
-        return
+    if (
+        workspace
+        and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1"
+        and not _has_provider_launch(state)
+    ):
+        # Discovery is launch-scoped. Pass it in the process environment rather
+        # than persisting it in Claude's private or OS-managed settings.
+        os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     exec_or_spawn(_build_claude_argv(binary, tool_args))

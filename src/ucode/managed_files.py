@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -22,7 +21,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from ucode.config_io import APP_DIR, is_dry_run
-from ucode.ui import console, print_err, print_note, print_success, print_warning
+from ucode.ui import console, print_note, print_success, print_warning
 
 # Absolute path so a stripped PATH (desktop/GUI launchers) still finds it.
 _SUDO = "/usr/bin/sudo"
@@ -65,14 +64,6 @@ def managed_files_supported() -> bool:
     any other platform are unsupported.
     """
     return current_os() in (OS.LINUX, OS.MACOS)
-
-
-def _read_existing(path: Path) -> str:
-    """Current file contents, or "" when absent. No sudo — the managed file is world-readable."""
-    try:
-        return path.read_text(encoding="utf-8") if path.exists() else ""
-    except OSError:
-        return ""
 
 
 def read_managed_file(path: Path) -> str | None:
@@ -622,45 +613,6 @@ def _sudo_remove(path: Path) -> None:
             _restore_immutable(path, original_flags)
 
 
-def write_managed_file(path: Path, desired_text: str, *, display: str) -> str:
-    """Write ``desired_text`` to a root-owned managed file, only when it differs (drift check).
-
-    Returns ``"written"``, ``"unchanged"``, or ``"skipped"``. Never raises: a permission or immutable
-    failure is surfaced as an actionable message and reported as ``"skipped"`` so the launch still
-    proceeds (the private ucode config already lets ``ucode <agent>`` work).
-    """
-    if not managed_files_supported():
-        print_warning(
-            f"{display}: machine-wide managed settings aren't supported on this platform; "
-            f"skipped {path}."
-        )
-        return "skipped"
-    # Drift check first — reading is unprivileged, so an unchanged file never triggers a sudo prompt.
-    if _read_existing(path) == desired_text:
-        return "unchanged"
-    if is_dry_run():
-        console.print(f"\n[bold]\\[dry run] {path} (via sudo)[/bold]\n{desired_text}")
-        return "written"
-    if not managed_writes_allowed():
-        print_warning(
-            f"{display}: skipped the OS-managed settings update at {path} because the command "
-            "is non-interactive."
-        )
-        return "skipped"
-    try:
-        _sudo_replace(path, desired_text)
-    except PermissionError as exc:
-        print_err(
-            f"{display}: cannot write {path} without root ({exc}). Re-run with `sudo ucode ...` to "
-            "apply the config machine-wide."
-        )
-        return "skipped"
-    except subprocess.CalledProcessError as exc:
-        _report_sudo_failure(path, display, exc)
-        return "skipped"
-    return "written"
-
-
 def _sudo_replace(path: Path, desired_text: str) -> None:
     """Atomically replace ``path`` via sudo while preserving metadata and file flags."""
     if not managed_writes_allowed():
@@ -787,23 +739,6 @@ def _restore_immutable(path: Path, flags: tuple[str, ...]) -> None:
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         print_warning(f"Could not restore the immutable flag on {path}.")
-
-
-def _report_sudo_failure(path: Path, display: str, exc: subprocess.CalledProcessError) -> None:
-    """Surface a sudo helper failure with a concrete fix. An immutable destination is the common
-    cause — cp fails with EPERM even under root — so point at the OS-specific clear command."""
-    stderr = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else ""
-    cmd = exc.cmd or []
-    cp_failed = "cp" in cmd[1:3]
-    if cp_failed and "Operation not permitted" in stderr:
-        quoted = shlex.quote(str(path))
-        clear_cmd = f"sudo {'chflags noschg' if current_os() is OS.MACOS else 'chattr -i'} {quoted}"
-        print_err(
-            f"{display}: {path} appears to be immutable. Clear the immutable attribute and re-run:\n"
-            f"  {clear_cmd}\n  ucode ..."
-        )
-    else:
-        print_err(f"{display}: failed to write managed settings at {path}: {stderr or exc}")
 
 
 def _sudo_failure_message(path: Path, display: str, exc: subprocess.CalledProcessError) -> str:

@@ -97,60 +97,6 @@ def normalize_model(model: str) -> str:
     return tail.lower()
 
 
-def extract_seed_prompt(tool_args: list[str], value_options: frozenset[str]) -> str | None:
-    """Recover a launch-time seed prompt from the passthrough CLI args.
-
-    A coding agent launched as ``<tool> [OPTIONS] [PROMPT]`` (or with an explicit
-    ``exec <PROMPT>`` subcommand) may carry the user's first prompt on the command
-    line. When it does, routing the root-session model on that real prompt beats
-    the generic placeholder. Everything after a ``--`` separator is treated as
-    positional (the agent's own convention for "stop parsing flags").
-
-    ``value_options`` is the set of the tool's flags that consume a following
-    value (e.g. ``-m``/``--model``); their values are skipped so a flag argument
-    is never mistaken for the prompt. Returns the joined positional tokens, or
-    None when the args carry no unambiguous prompt (bare launch, or only flags) —
-    the caller then falls back to its placeholder task.
-
-    Conservative by design: an unrecognized ``--flag`` (not in ``value_options``)
-    is treated as a boolean and skipped, and ``--flag=value`` forms are skipped
-    whole. We only return text we are confident is the user's prompt.
-    """
-    if "exec" in tool_args:
-        after = tool_args[tool_args.index("exec") + 1 :]
-        positionals = _positional_args(after, value_options)
-        return " ".join(positionals) if positionals else None
-    positionals = _positional_args(tool_args, value_options)
-    return " ".join(positionals) if positionals else None
-
-
-def _positional_args(args: list[str], value_options: frozenset[str]) -> list[str]:
-    positionals: list[str] = []
-    i = 0
-    seen_double_dash = False
-    while i < len(args):
-        arg = args[i]
-        if seen_double_dash:
-            positionals.append(arg)
-            i += 1
-            continue
-        if arg == "--":
-            seen_double_dash = True
-            i += 1
-            continue
-        if arg.startswith("-") and arg != "-":
-            # `--opt=value` carries its own value; a bare option in value_options
-            # consumes the next token. Anything else is a boolean flag we skip.
-            if "=" not in arg and arg in value_options:
-                i += 2
-            else:
-                i += 1
-            continue
-        positionals.append(arg)
-        i += 1
-    return positionals
-
-
 def select_route(
     workspace: str,
     token: str,

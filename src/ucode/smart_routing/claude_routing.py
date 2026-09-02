@@ -16,7 +16,6 @@ import urllib.request  # noqa: F401
 from typing import Any
 
 from ucode.config_io import APP_DIR
-from ucode.databricks import get_databricks_token
 from ucode.smart_routing import routing
 from ucode.smart_routing.routing import RoutingDecision
 
@@ -32,31 +31,6 @@ AUDIT_PATH = APP_DIR / "claude-smart-routing-audit.jsonl"
 DECISIONS_PATH = APP_DIR / "claude-smart-routing-decisions.jsonl"
 
 _normalize_model = routing.normalize_model
-
-
-def route_launch_model(state: dict, tool_args: list[str]):
-    """Route a root Claude Code launch on the launch-time prompt, if there is one.
-
-    Returns (None, None) when the launch carries no prompt (a bare interactive
-    session): with no task signal the router can only return its floor arm, so
-    routing would just add a round-trip and silently override the user's default
-    model. In that case we don't route and keep the configured default. Routing
-    on a typed-in first prompt is out of scope — no hook/MCP can retarget the
-    root model once the session is running.
-    """
-    task = _launch_routing_task(tool_args)
-    if task is None:
-        return None, None
-    workspace = state.get("workspace")
-    models = state.get("claude_models")
-    if not isinstance(workspace, str) or not isinstance(models, dict):
-        return None, "workspace model metadata is unavailable"
-    try:
-        token = get_databricks_token(workspace, state.get("profile"))
-    except RuntimeError as exc:
-        return None, f"could not authenticate the routing request: {exc}"
-    available = [m for m in models.values() if isinstance(m, str) and m]
-    return request_routing_decision(workspace, token, task, available)
 
 
 # Claude Code CLI options that consume a following value (from `claude --help`);
@@ -96,14 +70,6 @@ CLAUDE_VALUE_OPTIONS = frozenset(
         "--settings",
     }
 )
-
-
-def _launch_routing_task(tool_args: list[str]) -> str | None:
-    # The routing task is the user's real first prompt when it's on the command
-    # line (`claude "<prompt>"` or `claude -p "<prompt>"`, or after `--`). A bare
-    # interactive launch has no prompt yet → None, and the caller skips routing
-    # (the root model can't be re-routed once the session is running).
-    return routing.extract_seed_prompt(tool_args, CLAUDE_VALUE_OPTIONS)
 
 
 def request_routing_decision(
