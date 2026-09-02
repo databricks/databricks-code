@@ -33,7 +33,7 @@ FAKE_URLS = {
     "copilot": f"{FAKE_WS}/ai-gateway/mlflow/v1",
     "pi": {
         "claude": f"{FAKE_WS}/ai-gateway/anthropic",
-        "openai": f"{FAKE_WS}/ai-gateway/codex/v1",
+        "openai": f"{FAKE_WS}/ai-gateway/openai/v1",
         "gemini": f"{FAKE_WS}/ai-gateway/gemini/v1beta",
     },
 }
@@ -109,7 +109,7 @@ class TestSaveLoadRoundTrip:
         assert loaded["workspace"] == FAKE_WS
         assert loaded["claude_models"]["sonnet"] == "databricks-claude-sonnet-4"
 
-    def test_persists_codex_launcher_default_in_agent_state(self):
+    def test_persists_latest_gpt_pi_default_in_agent_state(self):
         save_state(
             {
                 "workspace": FAKE_WS,
@@ -124,7 +124,7 @@ class TestSaveLoadRoundTrip:
         persisted = load_full_state()["workspaces"][FAKE_WS]
         assert persisted["codex_models"][0] == "system.ai.gpt-5"
         assert "model" not in persisted["agents"]["codex"]
-        assert persisted["agents"]["pi"]["model"] == "system.ai.gpt-5"
+        assert persisted["agents"]["pi"]["model"] == "system.ai.gpt-5-6-luna"
 
     def test_save_respects_dry_run(self):
         import ucode.config_io as config_io_mod

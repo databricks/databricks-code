@@ -215,6 +215,14 @@ class TestCheckGatewayEndpoint:
     def test_pi_available_with_gemini(self):
         assert check_gateway_endpoint({"gemini_models": ["gemini-2"]}, "pi") is True
 
+    def test_pi_available_with_oss(self):
+        assert check_gateway_endpoint({"oss_models": ["system.ai.glm-5-2"]}, "pi") is True
+
+    def test_pi_oss_discovery_reason_is_reported(self):
+        state = {"_discovery_reasons": {"oss": "no validated OSS models"}}
+        detail = agents_mod._availability_failure_detail("pi", state)
+        assert detail == " (oss discovery: no validated OSS models)"
+
     def test_pi_unavailable_when_no_models(self):
         assert check_gateway_endpoint({}, "pi") is False
 
@@ -268,6 +276,15 @@ class TestDefaultModelForTool:
     def test_pi_falls_back_to_gemini(self):
         state = {"claude_models": {}, "codex_models": [], "gemini_models": ["gemini-2"]}
         assert default_model_for_tool("pi", state) == "gemini-2"
+
+    def test_pi_falls_back_to_oss(self):
+        state = {
+            "claude_models": {},
+            "codex_models": [],
+            "gemini_models": [],
+            "oss_models": ["system.ai.glm-5-2"],
+        }
+        assert default_model_for_tool("pi", state) == "system.ai.glm-5-2"
 
     def test_pi_returns_none_when_no_models(self):
         assert default_model_for_tool("pi", {}) is None

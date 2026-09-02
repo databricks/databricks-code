@@ -994,7 +994,22 @@ class TestPiLaunch:
                 out.append(("codex", model))
         for model in e2e_state.get("gemini_models") or []:
             out.append(("gemini", model))
+        for model in e2e_state.get("oss_models") or []:
+            out.append(("oss", model))
         return out
+
+    def test_all_models_includes_oss_provider(self):
+        models = self._all_models(
+            {
+                "claude_models": {"sonnet": "claude-sonnet"},
+                "codex_models": ["gpt-5"],
+                "gemini_models": ["gemini-3"],
+                "oss_models": ["system.ai.glm-5-2"],
+            }
+        )
+
+        assert ("oss", "system.ai.glm-5-2") in models
+        assert len(models) == 4
 
     def test_launch_pi_per_model(self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token):
         import ucode.config_io as config_io_mod
@@ -1008,11 +1023,9 @@ class TestPiLaunch:
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
         # Point PI_CODING_AGENT_DIR and ucode's config writer at the same
         # isolated directory without changing the process HOME.
-        pi_home = tmp_path / "pi-home"
-        pi_dir = pi_home / ".pi" / "agent"
+        pi_dir = tmp_path / ".pi" / "agent"
         config_path = pi_dir / "models.json"
         backup_path = tmp_path / "pi-models.backup.json"
-        monkeypatch.setattr(pi, "PI_UCODE_HOME", pi_home)
         monkeypatch.setattr(pi, "PI_CONFIG_DIR", pi_dir)
         monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
         monkeypatch.setattr(pi, "PI_SETTINGS_PATH", pi_dir / "settings.json")

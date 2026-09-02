@@ -23,6 +23,7 @@ from ucode.databricks import (
     build_auth_token_argv,
     build_databricks_cli_env,
     build_opencode_base_urls,
+    build_pi_base_urls,
     build_shared_base_urls,
     build_skills_mcp_url,
     build_tool_base_url,
@@ -130,6 +131,12 @@ class TestBuildOpencodeBaseUrls:
         assert urls["oss"] == f"{WS}/ai-gateway/mlflow/v1"
 
 
+class TestBuildPiBaseUrls:
+    def test_returns_native_responses_gateway(self):
+        urls = build_pi_base_urls(WS)
+        assert urls["openai"] == f"{WS}/ai-gateway/openai/v1"
+
+
 class TestBuildSharedBaseUrls:
     def test_contains_all_tools(self):
         urls = build_shared_base_urls(WS)
@@ -224,6 +231,18 @@ class TestDiscoverClaudeModels:
         assert reason is None
         assert models["fable"] == "databricks-claude-fable-5"
 
+    def test_discovery_preserves_gateway_failure_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, **kwargs: (None, "HTTP 503 unavailable"),
+        )
+
+        models, reason = db_mod.discover_claude_models(WS, "token")
+
+        assert models == {}
+        assert reason == "HTTP 503 unavailable"
+
 
 def _model_service(model_id: str) -> dict:
     """A model-services entry whose `name` strips to `model_id`."""
@@ -232,19 +251,141 @@ def _model_service(model_id: str) -> dict:
 
 class TestModelTokenLimits:
     def test_glm_is_capped(self):
+        # Probed 2026-07-16: glm-5-2 accepts 1M context / 65536 output.
         assert db_mod.model_token_limits("system.ai.glm-5-2") == {
+            "context": 1_000_000,
+            "output": 65_536,
+        }
+
+    @pytest.mark.parametrize(
+        "model_id",
+        ["system.ai.glm-4-6-flash", "system.ai.glm-future"],
+    )
+    def test_other_glm_versions_keep_conservative_limits(self, model_id):
+        assert db_mod.model_token_limits(model_id) == {
             "context": 200_000,
             "output": 25_000,
         }
 
-    def test_glm_matches_any_version(self):
-        assert db_mod.model_token_limits("system.ai.glm-4-6-flash") == {
-            "context": 200_000,
-            "output": 25_000,
+    def test_kimi_is_capped(self):
+        assert db_mod.model_token_limits("system.ai.kimi-k2-7-code") == {
+            "context": 128_000,
+            "output": 65_536,
         }
 
-    def test_uncapped_model_returns_none(self):
-        assert db_mod.model_token_limits("system.ai.kimi-k2-7-code") is None
+    def test_deepseek_uses_conservative_fallback(self):
+        assert db_mod.model_token_limits("system.ai.deepseek-v4-pro") == {
+            "context": 128_000,
+            "output": 8_192,
+        }
+
+    def test_unvalidated_families_return_none(self):
+        for model_id in (
+            "system.ai.inkling",
+            "system.ai.gpt-oss-120b",
+            "system.ai.llama-4-maverick",
+            "system.ai.qwen35-122b-a10b",
+            "system.ai.gemma-3-12b",
+        ):
+            assert db_mod.model_token_limits(model_id) is None
+
+    @pytest.mark.parametrize(
+        "model_id",
+        ["system.ai.glm-embedding-0-6b", "system.ai.qwen3-embedding-0-6b"],
+    )
+    def test_embedding_model_returns_none_not_fallback(self, model_id):
+        assert db_mod.model_token_limits(model_id) is None
+
+
+class TestModelIsReasoning:
+    def test_reasoning_families(self):
+        assert db_mod.model_is_reasoning("system.ai.glm-5-2") is True
+        assert db_mod.model_is_reasoning("system.ai.kimi-k2-7-code") is True
+
+    def test_matching_is_case_insensitive(self):
+        assert db_mod.model_is_reasoning("SYSTEM.AI.GLM-5-2") is True
+
+    def test_unvalidated_families_are_not_marked_reasoning(self):
+        assert db_mod.model_is_reasoning("system.ai.inkling") is False
+        assert db_mod.model_is_reasoning("system.ai.qwen35-122b-a10b") is False
+        assert db_mod.model_is_reasoning("system.ai.gpt-oss-120b") is False
+
+
+class TestGptModelTokenLimits:
+    def test_gpt_and_grok_limits_across_id_forms(self):
+        assert db_mod.gpt_model_token_limits("SYSTEM.AI.GPT-5-6-SOL") == {
+            "context": 1_050_000,
+            "output": 128_000,
+        }
+        assert db_mod.gpt_model_token_limits("databricks-gpt-4-1") == {
+            "context": 1_047_576,
+            "output": 32_768,
+        }
+        assert db_mod.gpt_model_token_limits("system.ai.grok-4-6") == {
+            "context": 500_000,
+            "output": 16_384,
+        }
+
+    def test_unknown_model_uses_conservative_fallback(self):
+        assert db_mod.gpt_model_token_limits("custom-responses") == {
+            "context": 128_000,
+            "output": 16_384,
+        }
+
+    def test_preferred_gpt_model_uses_semantic_version_and_excludes_gpt_oss(self):
+        assert (
+            db_mod.preferred_gpt_model(["gpt-5", "system.ai.gpt-5-6-sol", "databricks-gpt-5-5"])
+            == "system.ai.gpt-5-6-sol"
+        )
+        assert db_mod.preferred_gpt_model(["gpt-oss-120b", "system.ai.grok-4-6"]) == (
+            "system.ai.grok-4-6"
+        )
+        assert db_mod.preferred_gpt_model(["system.ai.gpt-oss-120b"]) is None
+
+
+class TestClaudeModelCapabilities:
+    @pytest.mark.parametrize(
+        ("model_id", "context", "output", "supports_1m", "adaptive", "xhigh"),
+        [
+            ("databricks-claude-opus-4-5", 200_000, 64_000, False, False, False),
+            ("databricks-claude-opus-4-6", 1_000_000, 128_000, True, True, False),
+            ("system.ai.claude-opus-4-8", 1_000_000, 128_000, True, True, True),
+            ("system.ai.claude-opus-5", 1_000_000, 128_000, True, True, False),
+            ("system.ai.claude-sonnet-4-5", 1_000_000, 64_000, True, False, False),
+            ("claude-sonnet-5", 1_000_000, 64_000, True, True, True),
+            ("claude-haiku-4-5", 200_000, 64_000, False, False, False),
+            ("system.ai.claude-fable-5", 1_000_000, 128_000, False, True, True),
+            ("claude-future", 200_000, 64_000, False, False, False),
+        ],
+    )
+    def test_shared_capability_policy(
+        self, model_id, context, output, supports_1m, adaptive, xhigh
+    ):
+        capabilities = db_mod.claude_model_capabilities(model_id)
+        assert capabilities.context == context
+        assert capabilities.output == output
+        assert capabilities.supports_1m is supports_1m
+        assert capabilities.force_adaptive_thinking is adaptive
+        assert capabilities.supports_xhigh_thinking is xhigh
+        assert db_mod.claude_model_supports_1m(model_id) is supports_1m
+        assert db_mod.claude_model_token_limits(model_id) == {
+            "context": context,
+            "output": output,
+        }
+
+    @pytest.mark.parametrize(
+        ("model_id", "expected"),
+        [
+            ("claude-opus-4-7", True),
+            ("claude-opus-5", False),
+            ("claude-sonnet-5", True),
+            ("claude-sonnet-6", False),
+            ("claude-fable-5", True),
+            ("claude-fable-6", False),
+        ],
+    )
+    def test_xhigh_thinking_is_explicitly_allowlisted(self, model_id, expected):
+        assert db_mod.claude_model_capabilities(model_id).supports_xhigh_thinking is expected
 
 
 class TestDiscoverModelServices:
@@ -256,6 +397,8 @@ class TestDiscoverModelServices:
                 _model_service("system.ai.claude-opus-4-8"),
                 _model_service("system.ai.claude-sonnet-4-6"),
                 _model_service("system.ai.gpt-5"),
+                _model_service("system.ai.gpt-oss-120b"),
+                _model_service("system.ai.grok-4-6"),
                 _model_service("system.ai.gemini-2-5-flash"),
                 _model_service("system.ai.gemini-3-5-flash"),
                 _model_service("system.ai.kimi-k2-7-code"),
@@ -277,7 +420,8 @@ class TestDiscoverModelServices:
             "opus": "system.ai.claude-opus-4-8",
             "sonnet": "system.ai.claude-sonnet-4-6",
         }
-        assert codex == ["system.ai.gpt-5"]
+        assert codex == ["system.ai.gpt-5", "system.ai.grok-4-6"]
+        assert "system.ai.gpt-oss-120b" not in codex
         # Gemini ordered newest-first via the shared sort key.
         assert gemini[0] == "system.ai.gemini-3-5-flash"
         # DeepSeek, GLM, and Kimi are allowlisted OSS families; Llama is not.
@@ -337,6 +481,33 @@ class TestDiscoverModelServices:
         assert reason is None
         assert codex == ["system.ai.gpt-5"]
         assert claude == {"opus": "system.ai.claude-opus-4-8"}
+
+    def test_partial_uc_listing_supplements_missing_claude_families(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "list_model_services",
+            lambda w, t: (["system.ai.claude-opus-4-8"], "UC page failed"),
+        )
+        monkeypatch.setattr(
+            db_mod,
+            "discover_claude_models",
+            lambda w, t: (
+                {
+                    "opus": "databricks-claude-opus-4-8",
+                    "sonnet": "databricks-claude-sonnet-5",
+                },
+                None,
+            ),
+        )
+
+        claude, codex, gemini, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        assert claude == {
+            "opus": "system.ai.claude-opus-4-8",
+            "sonnet": "databricks-claude-sonnet-5",
+        }
+        assert (codex, gemini, oss) == ([], [], [])
 
     def test_http_failure_returns_reason(self, monkeypatch):
         monkeypatch.setattr(
@@ -1202,6 +1373,65 @@ class TestModelVersionSortKey:
         assert ordered[1:] == ["another-endpoint", "custom-endpoint"]
 
 
+class TestDiscoverEndpointsWithApiType:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"endpoints": None},
+            {"endpoints": "not-a-list"},
+            {"endpoints": [None, "not-an-endpoint"]},
+            {"endpoints": [{"name": 123, "config": {}}]},
+            {"endpoints": [{"name": "model", "config": None}]},
+            {"endpoints": [{"name": "model", "config": {"served_entities": None}}]},
+            {"endpoints": [{"name": "model", "config": {"served_entities": [None, "bad"]}}]},
+            {
+                "endpoints": [
+                    {
+                        "name": "model",
+                        "config": {"served_entities": [{"foundation_model": None}]},
+                    }
+                ]
+            },
+            {
+                "endpoints": [
+                    {
+                        "name": "model",
+                        "config": {
+                            "served_entities": [
+                                {
+                                    "foundation_model": {
+                                        "ai_gateway_v2_supported": True,
+                                        "api_types": "openai/v1/responses",
+                                    }
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+        ],
+    )
+    def test_malformed_payload_records_are_skipped(self, monkeypatch, payload):
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_endpoints_with_api_type(WS, "token", "openai/v1/responses")
+
+        assert models == []
+        assert reason and ("malformed" in reason or "no valid" in reason)
+
+    def test_malformed_records_do_not_hide_valid_endpoint(self, monkeypatch):
+        payload = _foundation_models_payload(["databricks-gemini-3-5-flash"])
+        payload["endpoints"].insert(0, None)
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_endpoints_with_api_type(
+            WS, "token", "gemini/v1/generateContent"
+        )
+
+        assert models == ["databricks-gemini-3-5-flash"]
+        assert reason is None
+
+
 class TestDiscoverGeminiModels:
     def test_returns_newest_flash_first(self, monkeypatch):
         payload = _foundation_models_payload(
@@ -1245,6 +1475,632 @@ class TestDiscoverGeminiModels:
 
         assert reason is None
         assert models == ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
+
+    @pytest.mark.parametrize(
+        ("name", "api_type", "discover"),
+        [
+            ("databricks-gpt-5-9", "openai/v1/responses", db_mod.discover_codex_models),
+            (
+                "databricks-gemini-3-5-flash",
+                "gemini/v1/generateContent",
+                db_mod.discover_gemini_models,
+            ),
+        ],
+    )
+    def test_explicitly_not_ready_endpoints_are_excluded(
+        self, monkeypatch, name, api_type, discover
+    ):
+        payload = {
+            "endpoints": [
+                {
+                    "name": name,
+                    "state": {"ready": "NOT_READY"},
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": [api_type],
+                                }
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = discover(WS, "token")
+
+        assert models == []
+        assert reason and "no ready endpoint" in reason
+
+    def test_unready_endpoint_for_another_api_does_not_blame_readiness(self, monkeypatch):
+        # An unready Gemini-only endpoint must not make a Responses lookup claim
+        # "no READY endpoint exposes Responses" — nothing exposed Responses at all.
+        payload = {
+            "endpoints": [
+                {
+                    "name": "databricks-gemini-3-5-flash",
+                    "state": {"ready": "NOT_READY"},
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": ["gemini/v1/generateContent"],
+                                }
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_codex_models(WS, "token")
+
+        assert models == []
+        assert reason == "no endpoint exposes api_type `openai/v1/responses`"
+        assert "no ready endpoint" not in reason
+
+    def test_duplicate_endpoint_names_are_deduplicated(self, monkeypatch):
+        endpoint = _foundation_models_payload(["databricks-gpt-5"])["endpoints"][0]
+        endpoint["config"]["served_entities"][0]["foundation_model"]["api_types"] = [
+            "openai/v1/responses"
+        ]
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: ({"endpoints": [endpoint, endpoint]}, None),
+        )
+
+        models, reason = db_mod.discover_codex_models(WS, "token")
+
+        assert reason is None
+        assert models == ["databricks-gpt-5"]
+
+
+def _foundation_endpoint(name, api_types, *, v2=True, description=None):
+    foundation_model = {
+        "ai_gateway_v2_supported": v2,
+        "api_types": api_types,
+    }
+    if description is not None:
+        foundation_model["description"] = description
+    return {
+        "name": name,
+        "config": {"served_entities": [{"foundation_model": foundation_model}]},
+    }
+
+
+def _mlflow_chat_payload(names, *, api_type="mlflow/v1/chat/completions", v2=True):
+    return {"endpoints": [_foundation_endpoint(name, [api_type], v2=v2) for name in names]}
+
+
+class TestDiscoverOssModels:
+    def test_finds_oss_endpoints_via_foundation_models(self, monkeypatch):
+        # Mirrors a workspace with no system.ai UC model-services: OSS models are
+        # plain databricks-* serving endpoints under the mlflow chat dialect.
+        payload = _mlflow_chat_payload(
+            [
+                "databricks-glm-5-2",
+                "databricks-kimi-k2-7-code",
+                "databricks-inkling",
+                "databricks-qwen35-122b-a10b",
+                "databricks-gemma-3-12b",
+            ]
+        )
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert reason is None
+        assert models == [
+            "databricks-gemma-3-12b",
+            "databricks-glm-5-2",
+            "databricks-inkling",
+            "databricks-kimi-k2-7-code",
+            "databricks-qwen35-122b-a10b",
+        ]
+
+    def test_excludes_claude_and_gemini_sharing_the_mlflow_dialect(self, monkeypatch):
+        # On some workspaces every foundation model advertises the mlflow chat
+        # dialect, so the api_type filter alone is too broad — the OSS family
+        # filter must drop Claude/Gemini and keep only the OSS cohort.
+        payload = _mlflow_chat_payload(
+            [
+                "databricks-claude-opus-4-8",
+                "databricks-gemini-2-5-pro",
+                "databricks-glm-5-2",
+                "databricks-qwen3-embedding-0-6b",
+            ]
+        )
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert reason is None
+        assert models == ["databricks-glm-5-2"]
+
+    def test_reports_reason_when_no_oss_family_matches(self, monkeypatch):
+        payload = _mlflow_chat_payload(["databricks-claude-opus-4-8"])
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_oss_models(WS, "token")
+
+        assert models == []
+        assert reason is not None
+        assert "OSS" in reason
+
+
+class TestDiscoverOssModelSpecs:
+    def test_explicitly_unready_endpoint_is_excluded(self, monkeypatch):
+        not_ready = _foundation_endpoint("databricks-inkling", ["mlflow/v1/chat/completions"])
+        not_ready["state"] = {"ready": "NOT_READY"}
+        payload = {
+            "endpoints": [
+                not_ready,
+                # Missing state remains compatible with older listings.
+                _foundation_endpoint("databricks-future-chat-1", ["mlflow/v1/chat/completions"]),
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert reason is None
+        assert [spec["id"] for spec in specs] == ["databricks-future-chat-1"]
+
+    def test_explicitly_unready_endpoint_suppresses_static_fallback(self, monkeypatch):
+        not_ready = _foundation_endpoint("databricks-glm-5-2", ["mlflow/v1/chat/completions"])
+        not_ready["state"] = {"ready": "NOT_READY"}
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token: ({"endpoints": [not_ready]}, None),
+        )
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token", ["system.ai.glm-5-2"])
+
+        assert specs == []
+        assert reason is not None
+
+    def test_parses_reasoning_context_and_known_output_cap(self, monkeypatch):
+        payload = {
+            "endpoints": [
+                {
+                    "name": "databricks-inkling",
+                    "capabilities": {"openai_reasoning": True},
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": ["mlflow/v1/chat/completions"],
+                                    "description": "Supports a context window of 1.5M tokens.",
+                                }
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert reason is None
+        assert specs == [
+            {
+                "id": "databricks-inkling",
+                "reasoning": True,
+                "context_window": 1_500_000,
+                "max_tokens": 65_536,
+            }
+        ]
+
+    def test_uses_largest_mlflow_entity_context(self, monkeypatch):
+        payload = {
+            "endpoints": [
+                {
+                    "name": "databricks-future-chat-1",
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": ["mlflow/v1/chat/completions"],
+                                    "description": "context window of 128K tokens",
+                                }
+                            },
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": ["mlflow/v1/chat/completions"],
+                                    "description": "supports a 500,000-token context window",
+                                }
+                            },
+                        ]
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert reason is None
+        assert specs[0]["context_window"] == 500_000
+
+    def test_excludes_endpoint_with_native_api_and_malformed_entries(self, monkeypatch):
+        payload = {
+            "endpoints": [
+                None,
+                {"name": "broken", "config": {"served_entities": "bad"}},
+                {
+                    "name": "databricks-qwen35-122b-a10b",
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": [
+                                        "mlflow/v1/chat/completions",
+                                        "openai/v1/responses",
+                                    ],
+                                }
+                            }
+                        ]
+                    },
+                },
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert specs == []
+        assert reason is not None
+
+    def test_v2_and_mlflow_type_must_belong_to_same_entity(self, monkeypatch):
+        payload = {
+            "endpoints": [
+                {
+                    "name": "databricks-inkling",
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": [],
+                                }
+                            },
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": False,
+                                    "api_types": ["mlflow/v1/chat/completions"],
+                                }
+                            },
+                        ]
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert specs == []
+        assert reason is not None
+
+    def test_duplicate_endpoint_ids_are_deduplicated(self, monkeypatch):
+        payload = _mlflow_chat_payload(["databricks-inkling", "databricks-inkling"])
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert reason is None
+        assert [spec["id"] for spec in specs] == ["databricks-inkling"]
+
+    def test_uc_ids_receive_matching_endpoint_capabilities(self, monkeypatch):
+        payload = {
+            "endpoints": [
+                {
+                    "name": "databricks-qwen35-122b-a10b",
+                    "capabilities": {"openai_reasoning": True},
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": ["mlflow/v1/chat/completions"],
+                                    "description": "context length of 128K tokens",
+                                }
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token", ["system.ai.qwen35-122b-a10b"])
+
+        assert reason is None
+        assert specs == [
+            {
+                "id": "system.ai.qwen35-122b-a10b",
+                "reasoning": True,
+                "context_window": 128_000,
+                "max_tokens": 25_000,
+            }
+        ]
+
+    def test_explicit_native_metadata_suppresses_static_oss_fallback(self, monkeypatch):
+        payload = {
+            "endpoints": [_foundation_endpoint("databricks-glm-5-2", ["openai/v1/responses"])]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, reason = db_mod.discover_oss_model_specs(WS, "token", ["system.ai.glm-5-2"])
+
+        assert specs == []
+        assert reason is not None
+
+    def test_unavailable_metadata_keeps_static_glm_kimi_fallback(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token: (None, "HTTP 503 unavailable")
+        )
+
+        specs, reason = db_mod.discover_oss_model_specs(
+            WS,
+            "token",
+            ["system.ai.glm-5-2", "system.ai.kimi-k2-7-code", "system.ai.inkling"],
+        )
+
+        assert reason is None
+        assert [spec["id"] for spec in specs] == [
+            "system.ai.glm-5-2",
+            "system.ai.kimi-k2-7-code",
+        ]
+
+    @pytest.mark.parametrize(
+        ("description", "expected"),
+        [
+            ("supports a context window of 1.5M tokens", 1_500_000),
+            ("supports a 500,000-token context window", 500_000),
+            ("context length is 1 million tokens", 1_000_000),
+        ],
+    )
+    def test_context_description_formats(self, description, expected):
+        assert db_mod._parse_context_window(description) == expected
+
+    @pytest.mark.parametrize("description", ["", "context length of nope", "context window of 0K"])
+    def test_malformed_context_description_degrades_to_none(self, monkeypatch, description):
+        payload = _mlflow_chat_payload(["databricks-inkling"])
+        payload["endpoints"][0]["config"]["served_entities"][0]["foundation_model"][
+            "description"
+        ] = description
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        specs, _ = db_mod.discover_oss_model_specs(WS, "token")
+
+        assert specs[0]["context_window"] is None
+
+
+class TestDiscoverModelServicesDynamicOss:
+    def test_uc_first_broad_model_requires_matching_endpoint_validation(self, monkeypatch):
+        model_services = {
+            "model_services": [
+                _model_service("system.ai.qwen35-122b-a10b"),
+                _model_service("system.ai.inkling"),
+            ]
+        }
+        foundation_models = _mlflow_chat_payload(["databricks-qwen35-122b-a10b"])
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        _, _, _, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        assert oss == ["system.ai.qwen35-122b-a10b"]
+
+    def test_unknown_system_models_are_bucketed_by_live_api(self, monkeypatch):
+        model_services = {
+            "model_services": [
+                _model_service("system.ai.future-coder-1"),
+                _model_service("system.ai.orion-1"),
+                _model_service("system.ai.future-chat-1"),
+                _model_service("system.ai.future-embed-1"),
+            ]
+        }
+        foundation_models = {
+            "endpoints": [
+                _foundation_endpoint(
+                    "databricks-future-coder-1",
+                    ["openai/v1/responses", "mlflow/v1/chat/completions"],
+                    description="supports a context window of 750K tokens",
+                ),
+                _foundation_endpoint(
+                    "databricks-orion-1",
+                    ["gemini/v1/generateContent", "mlflow/v1/chat/completions"],
+                ),
+                _foundation_endpoint("databricks-future-chat-1", ["mlflow/v1/chat/completions"]),
+                # Even misleading chat metadata cannot admit a non-chat service.
+                _foundation_endpoint("databricks-future-embed-1", ["openai/v1/responses"]),
+            ]
+        }
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        _, codex, gemini, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        assert codex == ["system.ai.future-coder-1"]
+        assert gemini == ["system.ai.orion-1"]
+        assert oss == ["system.ai.future-chat-1"]
+        specs, spec_reason = db_mod.discover_responses_model_specs(WS, "token", codex)
+        assert spec_reason is None
+        assert specs == [{"id": "system.ai.future-coder-1", "context_window": 750_000}]
+
+    def test_explicit_capabilities_override_known_name_fallback(self, monkeypatch):
+        model_services = {
+            "model_services": [
+                _model_service("system.ai.grok-4-6"),
+                _model_service("system.ai.gemini-future"),
+            ]
+        }
+        foundation_models = {
+            "endpoints": [
+                _foundation_endpoint("databricks-grok-4-6", []),
+                _foundation_endpoint("databricks-gemini-future", []),
+            ]
+        }
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        claude, codex, gemini, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert (claude, codex, gemini, oss) == ({}, [], [], [])
+        assert reason is not None
+
+    def test_claude_honours_explicit_endpoint_unavailability(self, monkeypatch):
+        # Claude must not be offered when the catalog explicitly says its endpoint
+        # is not ready — the same policy Codex/Gemini/OSS already apply.
+        model_services = {"model_services": [_model_service("system.ai.claude-sonnet-5")]}
+        endpoint = _foundation_endpoint("databricks-claude-sonnet-5", ["anthropic/v1/messages"])
+        endpoint["state"] = {"ready": "NOT_READY"}
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return {"endpoints": [endpoint]}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        claude, _, _, _, _ = db_mod.discover_model_services(WS, "token")
+
+        assert claude == {}
+
+    def test_claude_survives_a_catalog_that_never_lists_it(self, monkeypatch):
+        # An ABSENT catalog entry is not explicit unavailability: a workspace whose
+        # foundation catalog omits Claude (or is unreadable) must keep working.
+        model_services = {"model_services": [_model_service("system.ai.claude-sonnet-5")]}
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return {"endpoints": []}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        claude, _, _, _, _ = db_mod.discover_model_services(WS, "token")
+
+        assert claude == {"sonnet": "system.ai.claude-sonnet-5"}
+
+    def test_gateway_models_missing_from_uc_are_offered(self, monkeypatch):
+        # The gateway catalog leads UC registration: these models are routable as
+        # `databricks-*` today, so they must not wait for a `system.ai.*` entry.
+        model_services = {
+            "model_services": [
+                _model_service("system.ai.gemini-3-6-flash"),
+                _model_service("system.ai.kimi-k3"),
+            ]
+        }
+        foundation_models = {
+            "endpoints": [
+                _foundation_endpoint("databricks-gemini-3-6-flash", ["gemini/v1/generateContent"]),
+                _foundation_endpoint("databricks-gemini-3-7-flash", ["gemini/v1/generateContent"]),
+                _foundation_endpoint("databricks-kimi-k3", ["mlflow/v1/chat/completions"]),
+                _foundation_endpoint("databricks-kimi-k3-neo", ["mlflow/v1/chat/completions"]),
+                _foundation_endpoint("databricks-grok-4-7", ["openai/v1/responses"]),
+            ]
+        }
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        _, codex, gemini, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        # UC-registered models keep their system.ai id (no databricks-* twin);
+        # gemini/codex stay ordered newest-version-first.
+        assert gemini == ["databricks-gemini-3-7-flash", "system.ai.gemini-3-6-flash"]
+        assert oss == ["databricks-kimi-k3-neo", "system.ai.kimi-k3"]
+        assert codex == ["databricks-grok-4-7"]
+
+    def test_unready_or_v1_only_gateway_endpoints_are_ignored(self, monkeypatch):
+        model_services = {"model_services": [_model_service("system.ai.gpt-5")]}
+        not_ready = _foundation_endpoint("databricks-gpt-5-9", ["openai/v1/responses"])
+        not_ready["state"] = {"ready": "NOT_READY"}
+        ready = _foundation_endpoint("databricks-gpt-5-8", ["openai/v1/responses"])
+        ready["state"] = {"ready": "READY"}
+        foundation_models = {
+            "endpoints": [
+                _foundation_endpoint("databricks-gpt-5", ["openai/v1/responses"]),
+                not_ready,
+                ready,
+                # v1-only endpoints can't serve ucode's V2 routes.
+                _foundation_endpoint("databricks-gpt-5-7", ["openai/v1/responses"], v2=False),
+                # Non-chat services are never candidates.
+                _foundation_endpoint("databricks-bge-large-embed", ["openai/v1/responses"]),
+            ]
+        }
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        _, codex, _, _, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        assert codex == ["databricks-gpt-5-8", "system.ai.gpt-5"]
+
+    def test_newest_claude_wins_across_mixed_id_spellings(self, monkeypatch):
+        # A gateway-only newer opus must beat the alphabetically-later system.ai id.
+        model_services = {"model_services": [_model_service("system.ai.claude-sonnet-4-6")]}
+        foundation_models = {
+            "endpoints": [
+                _foundation_endpoint("databricks-claude-sonnet-4-6", ["anthropic/v1/messages"]),
+                _foundation_endpoint("databricks-claude-sonnet-5", ["anthropic/v1/messages"]),
+            ]
+        }
+
+        def fake_get(url, token, timeout=10):
+            if "model-services" in url:
+                return model_services, None
+            return foundation_models, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        claude, _, _, oss, reason = db_mod.discover_model_services(WS, "token")
+
+        assert reason is None
+        assert claude == {"sonnet": "databricks-claude-sonnet-5"}
+        assert oss == []
 
 
 class TestResolvePatToken:
@@ -2498,6 +3354,9 @@ class TestClassifyModelFamily:
             ("databricks-claude-haiku-4-5", "haiku"),
             ("system.ai.claude-fable-5", "fable"),
             ("system.ai.gpt-5-3-codex", "codex"),
+            ("system.ai.grok-4-6", "codex"),
+            ("SYSTEM.AI.GROK-4-6", "codex"),
+            ("system.ai.gpt-oss-120b", None),
             ("system.ai.gemini-3-flash", "gemini"),
             ("system.ai.kimi-k2-7-code", "oss"),
             ("system.ai.glm-4-6", "oss"),
@@ -2507,6 +3366,57 @@ class TestClassifyModelFamily:
     )
     def test_buckets_by_family(self, model_id, expected):
         assert classify_model_family(model_id) == expected
+
+
+class TestFoundationModelsCache:
+    def test_discovery_consumers_share_one_successful_snapshot(self, monkeypatch):
+        calls = {"foundation": 0}
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_get_model_services_page",
+            lambda url, token: (
+                {"model_services": [_model_service("system.ai.future-chat-1")]},
+                None,
+            ),
+        )
+        payload = _mlflow_chat_payload(["databricks-future-chat-1"])
+
+        def fake_get(url, token, timeout=10):
+            calls["foundation"] += 1
+            return payload, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        _, _, _, oss, _ = db_mod.discover_model_services(WS, "tok")
+        specs, _ = db_mod.discover_oss_model_specs(WS, "tok", oss)
+        endpoints, _ = db_mod.discover_endpoints_with_api_type(
+            WS, "tok", "mlflow/v1/chat/completions"
+        )
+
+        assert oss == ["system.ai.future-chat-1"]
+        assert [spec["id"] for spec in specs] == oss
+        assert endpoints == ["databricks-future-chat-1"]
+        assert calls["foundation"] == 1
+
+    def test_failed_catalog_fetch_is_retried(self, monkeypatch):
+        calls = {"foundation": 0}
+        payload = _mlflow_chat_payload(["databricks-future-chat-1"])
+
+        def fake_get(url, token):
+            calls["foundation"] += 1
+            if calls["foundation"] == 1:
+                return None, "HTTP 503 unavailable"
+            return payload, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        first, first_reason = db_mod._get_foundation_models_payload(WS, "tok")
+        second, second_reason = db_mod._get_foundation_models_payload(WS, "tok")
+
+        assert first is None and first_reason == "HTTP 503 unavailable"
+        assert second == payload and second_reason is None
+        assert calls["foundation"] == 2
 
 
 class TestModelServicesCache:
@@ -2549,6 +3459,231 @@ class TestModelServicesCache:
         # for smart-routing compatibility by _prefer_opus_4_8), and the full list.
         assert claude["opus"] == "system.ai.claude-opus-4-8"
         assert unbucketed == ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]
+
+    def test_unbucketed_falls_back_to_legacy_gateway_inventory(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "list_model_services", lambda w, t: ([], "UC unavailable"))
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, **kwargs: (
+                {
+                    "data": [
+                        {"id": "databricks-claude-opus-4-8"},
+                        {"id": "databricks-claude-opus-5"},
+                        {"id": "databricks-claude-opus-5-anthropic"},
+                    ]
+                },
+                None,
+            ),
+        )
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert reason is None
+        assert models == ["databricks-claude-opus-4-8", "databricks-claude-opus-5"]
+
+    def test_unbucketed_paginates_legacy_gateway_inventory(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "list_model_services", lambda w, t: ([], "UC unavailable"))
+        calls = []
+        pages = [
+            {
+                "data": [{"id": "databricks-claude-opus-4-8"}],
+                "has_more": True,
+                "last_id": "databricks-claude-opus-4-8",
+            },
+            {"data": [{"id": "databricks-claude-sonnet-5"}], "has_more": False},
+        ]
+
+        def get_page(url, token, **kwargs):
+            calls.append(url)
+            return pages[len(calls) - 1], None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", get_page)
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert reason is None
+        assert models == ["databricks-claude-opus-4-8", "databricks-claude-sonnet-5"]
+        assert len(calls) == 2
+        assert calls[1].endswith("?after_id=databricks-claude-opus-4-8")
+
+    def test_legacy_gateway_page_budget_keeps_what_it_read(self, monkeypatch):
+        # Exhausting the page budget leaves every id read trustworthy, just not
+        # provably complete: return the partial walk WITH a reason rather than
+        # discarding a large valid inventory (matches `list_model_services`).
+        monkeypatch.setattr(db_mod, "list_model_services", lambda w, t: ([], "UC unavailable"))
+        calls = 0
+
+        def get_page(url, token, **kwargs):
+            nonlocal calls
+            calls += 1
+            return {
+                "data": [{"id": f"databricks-claude-opus-4-8-{calls}"}],
+                "has_more": True,
+                "last_id": f"cursor-{calls}",
+            }, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", get_page)
+
+        ids, reason = db_mod._discover_claude_gateway_ids(WS, "tok")
+
+        assert len(ids) == db_mod._ANTHROPIC_MODELS_MAX_PAGES
+        assert reason == (
+            f"AI Gateway Claude model listing exceeded {db_mod._ANTHROPIC_MODELS_MAX_PAGES} pages"
+        )
+
+    def test_legacy_gateway_cursor_cycle_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "list_model_services", lambda w, t: ([], "UC unavailable"))
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, **kwargs: (
+                {"data": [], "has_more": True, "last_id": "same-cursor"},
+                None,
+            ),
+        )
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert models == []
+        assert reason == "AI Gateway returned an invalid or repeated Claude model cursor"
+
+    def test_legacy_gateway_mid_pagination_error_discards_partial_inventory(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "list_model_services", lambda w, t: ([], "UC unavailable"))
+        calls = 0
+
+        def get_page(url, token, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {
+                    "data": [{"id": "databricks-claude-opus-4-8"}],
+                    "has_more": True,
+                    "last_id": "databricks-claude-opus-4-8",
+                }, None
+            return None, "HTTP 403: permission denied"
+
+        monkeypatch.setattr(db_mod, "_http_get_json", get_page)
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert models == []
+        assert reason == "HTTP 403: permission denied"
+
+    def test_legacy_gateway_malformed_later_page_is_not_a_complete_inventory(self, monkeypatch):
+        # A later page that omits the required `data` member must not end the
+        # walk and report the ids gathered so far as a complete inventory.
+        monkeypatch.setattr(db_mod, "list_model_services", lambda w, t: ([], "UC unavailable"))
+        calls = 0
+
+        def get_page(url, token, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {
+                    "data": [{"id": "databricks-claude-opus-4-8"}],
+                    "has_more": True,
+                    "last_id": "databricks-claude-opus-4-8",
+                }, None
+            return {}, None
+
+        monkeypatch.setattr(db_mod, "_http_get_json", get_page)
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert models == []
+        assert reason == "AI Gateway returned invalid Claude model data"
+
+    def test_unbucketed_unions_legacy_inventory_after_partial_uc_walk(self, monkeypatch):
+        monkeypatch.setattr(
+            db_mod,
+            "list_model_services",
+            lambda w, t: (["system.ai.claude-opus-4-8"], "UC page failed"),
+        )
+        monkeypatch.setattr(
+            db_mod,
+            "_discover_claude_gateway_ids",
+            lambda w, t: (["databricks-claude-opus-5"], None),
+        )
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert reason is None
+        assert models == ["databricks-claude-opus-5", "system.ai.claude-opus-4-8"]
+
+    def test_malformed_legacy_model_data_is_safe(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "list_model_services", lambda w, t: ([], "UC unavailable"))
+        monkeypatch.setattr(
+            db_mod,
+            "_http_get_json",
+            lambda url, token, **kwargs: ({"data": None}, None),
+        )
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert models == []
+        assert reason == "AI Gateway returned invalid Claude model data"
+
+    def test_repeated_uc_page_token_is_incomplete_and_uses_gateway_fallback(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+
+        def page(url, token):
+            return {
+                "model_services": [
+                    {"name": "model-services/system.ai.claude-opus-4-8"},
+                ],
+                "next_page_token": "repeat",
+            }, None
+
+        monkeypatch.setattr(db_mod, "_get_model_services_page", page)
+        monkeypatch.setattr(
+            db_mod,
+            "_discover_claude_gateway_ids",
+            lambda w, t: (["databricks-claude-opus-5"], None),
+        )
+
+        models, reason = db_mod.discover_claude_models_unbucketed(WS, "tok")
+
+        assert reason is None
+        assert models == ["databricks-claude-opus-5", "system.ai.claude-opus-4-8"]
+        assert WS not in db_mod._MODEL_SERVICES_CACHE
+
+    def test_malformed_uc_model_services_degrades_to_empty_result(self, monkeypatch):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_get_model_services_page",
+            lambda url, token: ({"model_services": None}, None),
+        )
+
+        models, reason = db_mod.list_model_services(WS, "tok")
+
+        assert models == []
+        assert reason == "model-services listing returned invalid model_services"
+        assert WS not in db_mod._MODEL_SERVICES_CACHE
+
+    @pytest.mark.parametrize("invalid_token", [[], {}, 0, False])
+    def test_falsey_non_string_page_token_is_incomplete(self, monkeypatch, invalid_token):
+        db_mod.clear_model_services_cache()
+        monkeypatch.setattr(
+            db_mod,
+            "_get_model_services_page",
+            lambda url, token: (
+                {
+                    "model_services": [
+                        {"name": "model-services/system.ai.claude-opus-4-8"},
+                    ],
+                    "next_page_token": invalid_token,
+                },
+                None,
+            ),
+        )
+
+        models, reason = db_mod.list_model_services(WS, "tok")
+
+        assert models == ["system.ai.claude-opus-4-8"]
+        assert reason == "model-services listing returned an invalid page token"
+        assert WS not in db_mod._MODEL_SERVICES_CACHE
 
     def test_use_cache_false_forces_a_fresh_walk(self, monkeypatch):
         calls: dict = {}

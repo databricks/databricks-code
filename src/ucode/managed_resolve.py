@@ -87,13 +87,33 @@ def managed_state_overrides(managed: dict, tool: str) -> dict[str, object]:
     return overrides
 
 
+def managed_unclassifiable_models(managed: dict, tool: str) -> list[str]:
+    """Models ignored because a name-based provider family cannot be identified.
+
+    De-duplicated in first-seen order: a manifest may legitimately repeat an id,
+    and the caller warns once per returned entry.
+    """
+    if tool not in ("opencode", "pi"):
+        return []
+    models = _manifest_models(managed, tool)
+    if not isinstance(models, list):
+        return []
+    seen: set[str] = set()
+    unclassifiable: list[str] = []
+    for model in models:
+        if classify_model_family(model) is None and model not in seen:
+            seen.add(model)
+            unclassifiable.append(model)
+    return unclassifiable
+
+
 def managed_unservable_models(managed: dict, tool: str) -> list[str]:
     """The models the manifest names for ``tool`` when it has no provider to serve any of them.
 
     Only non-empty when *every* named model is unservable, which is when the translation yields
     nothing and the developer's own models stand — so the caller can say why the admin's list had no
-    effect. opencode has no OpenAI provider and pi has no OSS provider, so each can be handed a
-    valid model FQN it cannot route.
+    effect. An agent can be handed a valid model FQN that none of its own
+    providers route, so the manifest names models it cannot serve.
     """
     if tool not in ("opencode", "pi"):
         return []
@@ -106,7 +126,7 @@ def managed_unservable_models(managed: dict, tool: str) -> list[str]:
         else [
             m
             for m in models
-            if classify_model_family(m) in (*ANTHROPIC_FAMILIES, "codex", "gemini")
+            if classify_model_family(m) in (*ANTHROPIC_FAMILIES, "codex", "gemini", "oss")
         ]
     )
     return [] if servable else models
