@@ -39,7 +39,7 @@ class _Response:
 
 
 def test_routes_with_models_from_stored_state(monkeypatch):
-    monkeypatch.delenv("UCODE_SMART_ROUTER", raising=False)
+    monkeypatch.delenv("SMART_ROUTER_NAME", raising=False)
     captured = {}
     task = "Refactor the parser" + "x" * 5000
 
@@ -84,7 +84,7 @@ def test_routes_with_models_from_stored_state(monkeypatch):
 
 def test_router_name_can_be_selected_with_environment_variable(monkeypatch):
     captured = {}
-    monkeypatch.setenv("UCODE_SMART_ROUTER", "  task_v2  ")
+    monkeypatch.setenv("SMART_ROUTER_NAME", "  task_v2  ")
 
     def fake_urlopen(request, timeout):
         captured["body"] = json.loads(request.data)
@@ -104,7 +104,7 @@ def test_router_name_can_be_selected_with_environment_variable(monkeypatch):
 
 
 def test_blank_router_name_environment_variable_uses_default(monkeypatch):
-    monkeypatch.setenv("UCODE_SMART_ROUTER", "  ")
+    monkeypatch.setenv("SMART_ROUTER_NAME", "  ")
 
     assert codex_routing.routing.configured_router_name() == "task_v1"
 

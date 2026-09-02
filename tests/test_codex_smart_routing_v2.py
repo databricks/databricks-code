@@ -487,7 +487,7 @@ class TestInterposerSession:
 
 
 def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
-    monkeypatch.delenv("UCODE_SMART_ROUTER", raising=False)
+    monkeypatch.delenv("SMART_ROUTER_NAME", raising=False)
     captured = {}
     logged = []
 

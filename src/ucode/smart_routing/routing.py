@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 ROUTER_NAME = "task_v1"
-ROUTER_NAME_ENV_VAR = "UCODE_SMART_ROUTER"
+ROUTER_NAME_ENV_VAR = "SMART_ROUTER_NAME"
 ROUTING_PATH = "/ai-gateway/routing/v1/routes:select"
 REQUEST_TIMEOUT_S = 30.0
 SUBAGENT_ROUTING_DISCLAIMER = (
