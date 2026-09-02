@@ -764,9 +764,9 @@ class TestWriteToolConfigManagedSettings:
         )
 
         assert managed_defaults == {
-            "opus": "system.ai.claude-opus-4-8[1m]",
-            "sonnet": "system.ai.claude-sonnet-4-6",
-            "haiku": "system.ai.claude-haiku-5",
+            "opus": "system.ai.claude-opus-4-8[1m]",  # Coding Agent Config took priority.
+            "sonnet": "system.ai.claude-sonnet-4-6",  # Existing managed setting took priority.
+            "haiku": "system.ai.claude-haiku-5",  # Ucode default took priority.
         }
 
     def test_managed_file_removes_fable_default_when_fable_is_disabled(self, monkeypatch):

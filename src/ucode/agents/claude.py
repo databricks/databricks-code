@@ -685,9 +685,7 @@ def write_tool_config(
                 if isinstance((model := settings_file_env.get(key)), str)
             }
             managed_overlay = state.get(MANAGED_OVERLAY_KEY, {})
-            ucode_defaults = managed_overlay.get(
-                "claude_models", state.get("claude_models", {})
-            )
+            ucode_defaults = managed_overlay.get("claude_models", state.get("claude_models", {}))
 
             for family, key in CLAUDE_DEFAULT_MODEL_ENV_KEYS.items():
                 if family == "fable" and not state.get("fable_enabled"):
