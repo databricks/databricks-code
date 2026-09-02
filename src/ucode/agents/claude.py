@@ -403,7 +403,7 @@ def render_overlay(
         # Claude Code only sends when experimental betas are enabled — so we must
         # not set CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS (see CLAUDE_REMOVED_ENV_KEYS).
         "ENABLE_PROMPT_CACHING_1H": "1",
-        "ENABLE_TOOL_SEARCH": "1",
+        "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_USE_GATEWAY": "1",
     }
     # Intentionally NOT setting ANTHROPIC_MODEL by default. Setting it produces a
