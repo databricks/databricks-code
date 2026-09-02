@@ -524,6 +524,21 @@ def launch(state: dict, tool_args: list[str]) -> None:
         )
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
+    if tool_args[:1] == ["app"]:
+        # Codex plugin commands reject --profile even though the app still
+        # needs the ucode profile's Databricks provider and auth settings.
+        # Reproduce profile layering at CLI precedence: Codex loads the normal
+        # base config, then these overrides apply every value from
+        # ucode.config.toml without mutating the user's config.toml.
+        profile_doc = read_toml_safe(CODEX_CONFIG_PATH)
+        if not profile_doc:
+            raise RuntimeError(
+                f"Cannot launch Codex app with the ucode profile because {CODEX_CONFIG_PATH} "
+                "is missing or empty. Run `ucode configure --agents codex` first."
+            )
+        config_args = smart_routing_v2.codex_config_args(profile_doc)
+        exec_or_spawn([binary, "app", *config_args, *tool_args[1:]])
+        return  # unreachable in production (exec replaces the process)
     # Run codex with --profile first — the TUI and runtime subcommands
     # (exec/resume/mcp/...) keep ucode's Databricks routing, including any added
     # by future codex versions. codex rejects the global --profile on

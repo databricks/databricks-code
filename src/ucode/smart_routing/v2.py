@@ -406,7 +406,7 @@ def _toml_value(value: str | int | float | bool | list[object] | dict[str, objec
     return tomlkit.item(value).as_string()
 
 
-def _codex_config_args(overlay: dict) -> list[str]:
+def codex_config_args(overlay: dict) -> list[str]:
     args: list[str] = []
     for key, value in overlay.items():
         # This is Codex's AI Gateway transport definition, not Unity Catalog
@@ -483,7 +483,7 @@ def launch_codex(
     overlay["hooks"] = {
         "PreToolUse": _v2_pre_tool_use_hooks(state, available_models),
     }
-    config_args = _codex_config_args(overlay)
+    config_args = codex_config_args(overlay)
     app_port = _free_port()
     app_server_url = _loopback_websocket_url(app_port)
 

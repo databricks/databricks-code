@@ -20,7 +20,7 @@ class TestCodexConfigArgs:
             "gpt-5.6-luna",
             "myprof",
         )
-        args = v2._codex_config_args(overlay)
+        args = v2.codex_config_args(overlay)
 
         assert args[:4] == [
             "--config",
