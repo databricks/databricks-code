@@ -892,6 +892,53 @@ class TestOpencodeLaunch:
             f"stdout={result.stdout[:300]!r} stderr={result.stderr[:500]!r}"
         )
 
+    def test_recovers_from_rejected_initial_token(
+        self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
+    ):
+        """Exercise the real OpenCode plugin's 401 refresh-and-retry path."""
+        import ucode.config_io as config_io_mod
+        from ucode.agents import opencode
+
+        _require_binary("opencode")
+        models = self._all_models(e2e_state)
+        if not models:
+            pytest.skip("No OpenCode models available on this workspace")
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        xdg = tmp_path / "opencode-xdg"
+        monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
+        monkeypatch.setattr(
+            opencode, "OPENCODE_CONFIG_PATH", xdg / "opencode" / "opencode.json"
+        )
+        monkeypatch.setattr(
+            opencode, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-config.backup.json"
+        )
+        monkeypatch.setattr("ucode.state.save_state", lambda s: None)
+
+        _, model = models[0]
+        rejected_token = "ucode-intentionally-rejected-token"
+        opencode.write_tool_config(
+            {**e2e_state, "workspace": e2e_workspace},
+            model,
+            token=rejected_token,
+        )
+
+        env = opencode.build_runtime_env(rejected_token)
+        # CI authenticates this way; the helper subprocess inherits it and
+        # returns the known-good token after OpenCode's first request gets 401.
+        env["DATABRICKS_BEARER"] = e2e_token
+        result = _run_agent(
+            opencode.validate_cmd("opencode"),
+            env=env,
+            timeout=180,
+        )
+        combined = (result.stdout + result.stderr).strip()
+        assert result.returncode == 0 and combined, (
+            "OpenCode did not recover after its initial token was rejected: "
+            f"rc={result.returncode} stdout={result.stdout[:300]!r} "
+            f"stderr={result.stderr[:500]!r}"
+        )
+
 
 class TestCopilotLaunch:
     """Run copilot against every Claude/codex model via the MLflow chat-completions gateway.
