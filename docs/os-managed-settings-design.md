@@ -12,9 +12,10 @@ The two stacked PRs make precedence handling deterministic:
 2. The Codex PR reuses that lifecycle for TOML, applies it to Codex, and removes the old optional
    managed-settings path.
 
-After both PRs merge, interactive configuration reconciles the agent's OS-managed file by default.
-Non-interactive and CI execution never elevates privileges and instead uses local settings when the
-managed file is compatible.
+Claude and Codex configuration is local-only by default. OS-managed synchronization requires the
+explicit `--sync-managed-settings` flag and applies to the supported agents selected by the normal
+configure flow. Launches never write managed files or elevate privileges; they only verify that
+existing higher-precedence values are compatible.
 
 ## Configuration Files
 
@@ -23,37 +24,38 @@ managed file is compatible.
 | Claude Code | `~/.claude/ucode-settings.json` | Linux: `/etc/claude-code/managed-settings.json`; macOS: `/Library/Application Support/ClaudeCode/managed-settings.json` |
 | Codex | `~/.codex/ucode.config.toml` | `/etc/codex/managed_config.toml` |
 
-The local file is always written. The OS-managed file is additionally reconciled during interactive
-configuration, except for Claude subscription relay.
+The local file is always written. OS-managed files are changed only by explicit synchronization or
+restoration, except for Claude subscription relay, which is always local-only.
 
-## Interactive Detection
+## Explicit Synchronization
 
-An invocation may modify OS-managed settings only when standard input is a TTY. Standard output does
-not affect the decision, so piping logs does not disable an otherwise interactive configuration.
-CI, pipes, cron jobs, and headless subprocesses normally have non-TTY standard input and therefore
-remain local-only.
+`ucode configure` uses local settings. `--sync-managed-settings` is the user's explicit consent to
+configure selected Claude Code and Codex agents machine-wide. The normal picker still runs when no
+agents are named, and the command fails before agent installation or configuration when none of the
+final selections support synchronization. Because a write may require administrator approval, an
+actual change still requires standard input to be a TTY. An already-identical or compatible external
+file needs no elevation.
 
-This is a new shared ucode distinction. The previous implementation inferred interactivity from
-command shape in some flows and did not guard managed-file writes consistently.
+TTY state is only a privilege boundary; it does not select configuration scope and never changes
+whether a cached launch is valid.
 
 ## Behavior Matrix
 
 | Invocation | Managed file | Behavior |
 | --- | --- | --- |
-| Interactive | Absent | Create it from the ucode configuration after recording an absent baseline. |
-| Interactive | Unrelated or partially populated | Preserve unrelated values and add or update all ucode-owned values. |
-| Interactive | Conflicting | Back up the baseline, replace the conflicting ucode-owned values, and verify. |
-| Interactive | Already identical | Continue without a backup, write, or `sudo` invocation. |
-| Non-interactive | Absent | Use the local ucode file. Do not create the managed file. |
-| Non-interactive | Ucode-owned values absent or equal | Use the local ucode file. Do not modify the managed file. |
-| Non-interactive | Ucode-owned value conflicts | Stop before launching because the higher-precedence value would override ucode. |
+| Plain configure or launch | Absent | Use the local ucode file. Do not create the managed file. |
+| Plain configure or launch | Compatible | Use the local ucode file. Do not modify the managed file. |
+| Plain configure or launch | Conflicting | Stop because the higher-precedence value would override ucode. |
+| Explicit sync | Absent | Create it after recording an absent baseline. |
+| Explicit sync | Last version written by ucode | Update and verify it. |
+| Explicit sync | Compatible external file | Leave it untouched. |
+| Explicit sync | Conflicting or externally modified file | Refuse to overwrite it. |
 | Any | Invalid, unreadable, or symlinked | Stop without modifying the file because precedence cannot be established safely. |
 
-`ucode configure`, first-time `ucode claude` or `ucode codex`, and later launches all use the same
-agent-specific reconciliation path. A first-time launch from an interactive terminal can therefore
-request administrator permission. A first-time non-interactive launch remains local-only.
+First-time and later `ucode claude` and `ucode codex` launches use only the read-only compatibility
+path. They never request administrator permission.
 
-## Interactive Reconciliation
+## Explicit Reconciliation
 
 For each agent, ucode:
 
@@ -66,9 +68,9 @@ For each agent, ucode:
 7. Reads the installed file back and verifies its exact contents.
 8. Records the last-applied snapshot, owned paths, and a launch fingerprint.
 
-An existing managed file is reconciled even when it does not currently conflict. This ensures every
-ucode-required value exists at the highest-precedence scope and avoids separate behavior for absent,
-partial, and conflicting files.
+An existing file is updated only when it exactly matches ucode's last-applied snapshot. A compatible
+external file remains untouched, and a conflicting or externally modified file is preserved and
+reported.
 
 ## Privileged Write Transaction
 
@@ -124,9 +126,11 @@ If ucode cannot complete a write or revert, the backup remains available for a l
 - Preserve externally changed values rather than replacing them with stale baseline values.
 - Refuse an unsafe or unparsable merge and retain the backup.
 
-A revert that needs to change an OS-managed file must run interactively. A successful revert removes
-that agent's backup record. The existing local configuration and ucode state cleanup still occur as
-part of the command.
+A plain `ucode configure --agent claude` performs the same restoration before writing new local
+settings, making it the opt-out path after explicit synchronization. A restoration that needs to
+change an OS-managed file must run interactively. If restoration fails, local configuration can
+continue, the backup remains available, and launches do not retry elevation. A successful
+restoration removes that agent's backup record.
 
 ## Cached Launches
 
@@ -138,10 +142,10 @@ After a successful managed reconciliation or compatibility check, ucode stores:
 - size;
 - nanosecond modification and change times.
 
-A cached launch performs one `stat()` call and compares this fingerprint. When it matches, ucode
-does not read, parse, back up, write, or invoke `sudo`. When it changes, the normal reconciliation or
-compatibility path runs again. This catches later MDM replacement without adding meaningful latency
-to unchanged launches.
+A missing managed file is valid without a fingerprint. For an existing file, a cached launch
+compares its fingerprint. When it matches, ucode does not parse the file. When it changes, ucode
+runs the read-only compatibility path again. Launches never back up, write, restore, or invoke
+`sudo`.
 
 The verification scopes distinguish:
 
@@ -149,8 +153,8 @@ The verification scopes distinguish:
 - a managed file verified as compatible with local settings;
 - a managed file verified as compatible with Claude relay.
 
-A compatibility fingerprint created non-interactively cannot suppress the next interactive
-reconciliation.
+Compatibility fingerprints are valid independently of TTY state. Only the explicit synchronization
+flag selects the write path.
 
 ## Claude Subscription Relay
 
@@ -178,15 +182,14 @@ standard Databricks authentication.
   invalid, unreadable, missing, or unsupported;
 - whether a managed baseline backup is available.
 
-Interactive updates announce the backup location, administrator-permission request, and verified
-result. An identical file produces no elevation message.
+Explicit updates announce the backup location, administrator-permission request, and verified
+result. An identical or compatible external file produces no elevation message.
 
 Representative blockers are:
 
 ```text
-Claude Code configuration cannot be applied non-interactively because OS-managed settings at
-<path> override ucode values: env.ANTHROPIC_BASE_URL. Run `ucode configure --agent claude` from an
-interactive terminal or contact your administrator.
+Claude Code OS-managed settings at <path> override ucode values: env.ANTHROPIC_BASE_URL. ucode did
+not modify the file during this launch. Contact your administrator.
 ```
 
 ```text
@@ -199,9 +202,9 @@ Cannot safely update Codex managed settings at <path>: <parse error>. ucode did 
 Repair it or contact your administrator.
 ```
 
-Write, verification, parse, symlink, and managed-conflict failures block the agent launch. Recovery
-information always identifies the file and recommends either an interactive configure/revert or
-administrator help.
+Parse, symlink, unreadable-file, and managed-conflict failures block launch. Write and restoration
+failures occur only during explicit configure or revert operations. Recovery information identifies
+the file and recommends configure, revert, or administrator help.
 
 ## PR Boundaries
 
@@ -209,8 +212,9 @@ administrator help.
 
 - Add shared strict reads, fingerprints, compatibility checks, secure backups, atomic privileged
   writes, immutable-flag handling, verification, status, and three-way revert helpers.
-- Make interactive Claude configuration reconcile OS-managed JSON by default.
-- Add non-interactive local fallback with conflict detection.
+- Make Claude configuration local-only by default and add explicit managed synchronization.
+- Make every launch read-only with conflict detection.
+- Restore prior ucode-managed changes during plain configure and revert.
 - Add Claude relay-specific safety checks.
 - Add Claude managed status and revert output.
 - Remove Claude's old managed-settings scope choice.
@@ -218,8 +222,9 @@ administrator help.
 ### PR 2: Codex
 
 - Stack on the Claude PR and reuse the shared lifecycle with strict TOML parsing and serialization.
-- Make interactive Codex configuration reconcile OS-managed TOML by default.
-- Add non-interactive local fallback with conflict detection.
+- Make Codex configuration local-only by default and add explicit managed synchronization.
+- Make every launch read-only with conflict detection.
+- Restore prior ucode-managed changes during plain configure and revert.
 - Add Codex fingerprinted cached launches, status, and revert behavior.
 - Keep opt-in smart-routing hooks in the local Codex config rather than adding them by default to
   machine-managed policy.

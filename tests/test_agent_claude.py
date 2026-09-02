@@ -549,7 +549,6 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
         )
         monkeypatch.setattr(claude, "save_state", lambda state: None)
         monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
-        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: True)
 
     def test_strips_stale_disable_experimental_betas(self, monkeypatch):
         existing = {"env": {"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"}}
@@ -566,10 +565,37 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
 FAKE_MANAGED_PATH = Path("/tmp/ucode-test/managed-settings.json")
 
 
-class TestWriteToolConfigManagedSettings:
-    """Every normal configuration also writes Claude Code's OS-managed settings."""
+class TestManagedSettingsAreCurrent:
+    def test_absent_file_is_valid_without_fingerprint(self, tmp_path, monkeypatch):
+        path = tmp_path / "managed.json"
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: path)
 
-    def _patch(self, monkeypatch, private_writes, managed_writes, existing_by_path=None):
+        assert claude.managed_settings_are_current({}) is True
+
+    def test_existing_file_requires_matching_fingerprint(self, tmp_path, monkeypatch):
+        path = tmp_path / "managed.json"
+        path.write_text("{}\n", encoding="utf-8")
+        monkeypatch.setattr(claude, "_managed_settings_path", lambda: path)
+        state: dict = {}
+
+        assert claude.managed_settings_are_current(state) is False
+        claude.mark_managed_file_verified(state, "claude", path, scope="local-compatible")
+        assert claude.managed_settings_are_current(state) is True
+
+
+class TestWriteToolConfigManagedSettings:
+    """Managed settings are read-only unless configure explicitly requests synchronization."""
+
+    def _patch(
+        self,
+        monkeypatch,
+        private_writes,
+        managed_writes,
+        existing_by_path=None,
+        *,
+        ucode_owned=False,
+        backup_available=False,
+    ):
         existing_by_path = existing_by_path or {}
         monkeypatch.setattr(claude, "backup_existing_file", lambda *a, **kw: True)
         # Deep-copy the seeded existing content so the compose step can't mutate the fixture.
@@ -585,7 +611,6 @@ class TestWriteToolConfigManagedSettings:
         )
         monkeypatch.setattr(claude, "save_state", lambda state: None)
         monkeypatch.setattr(claude, "_register_web_search_mcp", lambda *a, **kw: True)
-        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: True)
         # Deterministic managed path, and a mocked sudo writer so NO real sudo/`/etc` write happens.
         monkeypatch.setattr(claude, "_managed_settings_path", lambda: FAKE_MANAGED_PATH)
         monkeypatch.setattr(
@@ -596,6 +621,16 @@ class TestWriteToolConfigManagedSettings:
             ),
         )
         monkeypatch.setattr(claude, "mark_managed_file_verified", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            claude,
+            "managed_file_matches_last_applied",
+            lambda *args: ucode_owned,
+        )
+        monkeypatch.setattr(
+            claude,
+            "managed_file_backup_available",
+            lambda tool: backup_available or ucode_owned,
+        )
 
         def fake_write_managed(path, text, **kwargs):
             managed_writes.append((str(path), text))
@@ -603,37 +638,58 @@ class TestWriteToolConfigManagedSettings:
 
         monkeypatch.setattr(claude, "reconcile_managed_file", fake_write_managed)
 
-    def test_writes_managed_file_by_default(self, monkeypatch):
+    def test_default_only_writes_local_settings(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
         self._patch(monkeypatch, private_writes, managed_writes)
         state = {"workspace": WS, "codex_models": []}
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
-        # Private file still written; managed file written too.
         assert str(claude.CLAUDE_SETTINGS_PATH) in [p for p, _ in private_writes]
-        assert [p for p, _ in managed_writes] == [str(FAKE_MANAGED_PATH)]
+        assert managed_writes == []
 
-    def test_managed_file_preserves_other_keys(self, monkeypatch):
+    def test_explicit_sync_writes_absent_managed_file(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
-        # An IT-authored key already in the managed file must survive the merge.
-        existing = {str(FAKE_MANAGED_PATH): {"env": {"MY_OWN": "keep"}}}
-        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        notes: list[str] = []
+        self._patch(monkeypatch, private_writes, managed_writes)
+        monkeypatch.setattr(claude, "print_note", notes.append)
         state = {"workspace": WS, "codex_models": []}
-        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        claude.write_tool_config(state, "databricks-claude-sonnet-4", sync_managed_settings=True)
+        assert [p for p, _ in managed_writes] == [str(FAKE_MANAGED_PATH)]
+        assert notes == [f"Synchronizing Claude Code OS-managed settings at {FAKE_MANAGED_PATH}."]
+
+    def test_sync_updates_ucode_owned_file_and_preserves_other_keys(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {str(FAKE_MANAGED_PATH): {"env": {"MY_OWN": "keep"}}}
+        self._patch(
+            monkeypatch,
+            private_writes,
+            managed_writes,
+            existing,
+            ucode_owned=True,
+        )
+        state = {"workspace": WS, "codex_models": []}
+        claude.write_tool_config(state, "databricks-claude-sonnet-4", sync_managed_settings=True)
         _, text = managed_writes[0]
         written = json.loads(text)
         assert written["env"]["MY_OWN"] == "keep"
         assert written["env"]["ANTHROPIC_BASE_URL"]
         assert written["apiKeyHelper"]
 
-    def test_managed_file_preserves_enterprise_permission_denies(self, monkeypatch):
+    def test_sync_preserves_enterprise_permission_denies(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
         existing = {str(FAKE_MANAGED_PATH): {"permissions": {"deny": ["Bash(rm:*)"]}}}
-        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        self._patch(
+            monkeypatch,
+            private_writes,
+            managed_writes,
+            existing,
+            ucode_owned=True,
+        )
         state = {"workspace": WS, "codex_models": ["databricks-gpt-5"]}
-        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        claude.write_tool_config(state, "databricks-claude-sonnet-4", sync_managed_settings=True)
         _, text = managed_writes[0]
         assert json.loads(text)["permissions"]["deny"] == ["Bash(rm:*)", "WebSearch"]
 
@@ -676,29 +732,80 @@ class TestWriteToolConfigManagedSettings:
 
         assert managed_writes == []
 
-    def test_noninteractive_uses_local_settings_when_managed_file_is_compatible(self, monkeypatch):
+    def test_compatible_managed_file_is_read_only(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
         self._patch(monkeypatch, private_writes, managed_writes)
-        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: False)
         state = {"workspace": WS, "codex_models": []}
 
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
 
         assert managed_writes == []
 
-    def test_noninteractive_fails_when_managed_file_conflicts(self, monkeypatch):
+    def test_conflicting_managed_file_fails_read_only(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
         existing = {
             str(FAKE_MANAGED_PATH): {"env": {"ANTHROPIC_BASE_URL": "https://other.example.com"}}
         }
         self._patch(monkeypatch, private_writes, managed_writes, existing)
-        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: False)
         state = {"workspace": WS, "codex_models": []}
 
-        with pytest.raises(RuntimeError, match="cannot be applied non-interactively"):
+        with pytest.raises(RuntimeError, match="override ucode values"):
             claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        assert managed_writes == []
+
+    def test_explicit_sync_leaves_compatible_external_file_untouched(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {str(FAKE_MANAGED_PATH): {"env": {"MY_OWN": "keep"}}}
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        notes: list[str] = []
+        monkeypatch.setattr(claude, "print_note", notes.append)
+
+        claude.write_tool_config(
+            {"workspace": WS, "codex_models": []},
+            "databricks-claude-sonnet-4",
+            sync_managed_settings=True,
+        )
+
+        assert managed_writes == []
+        assert any("externally managed and compatible" in note for note in notes)
+
+    def test_explicit_sync_refuses_conflicting_external_file(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {str(FAKE_MANAGED_PATH): {"env": {"ANTHROPIC_BASE_URL": "https://other"}}}
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+
+        with pytest.raises(RuntimeError, match="externally managed and conflict"):
+            claude.write_tool_config(
+                {"workspace": WS, "codex_models": []},
+                "databricks-claude-sonnet-4",
+                sync_managed_settings=True,
+            )
+
+        assert managed_writes == []
+
+    def test_explicit_sync_refuses_file_modified_after_ucode(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        existing = {str(FAKE_MANAGED_PATH): {"enterprise": "new-policy"}}
+        self._patch(
+            monkeypatch,
+            private_writes,
+            managed_writes,
+            existing,
+            backup_available=True,
+        )
+
+        with pytest.raises(RuntimeError, match="changed after ucode last synchronized"):
+            claude.write_tool_config(
+                {"workspace": WS, "codex_models": []},
+                "databricks-claude-sonnet-4",
+                sync_managed_settings=True,
+            )
 
         assert managed_writes == []
 

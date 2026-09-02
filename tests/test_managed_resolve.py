@@ -193,20 +193,13 @@ class TestStateFileIsNotRewritten:
 
     @pytest.fixture
     def real_state_file(self, tmp_path, monkeypatch):
-        """Redirect state.json and both Claude settings files into tmp_path, unstubbed."""
+        """Redirect state.json and Claude's local settings file into tmp_path, unstubbed."""
         monkeypatch.setattr(config_io, "APP_DIR", tmp_path)
         monkeypatch.setattr(state_mod, "STATE_PATH", tmp_path / "state.json")
         monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", tmp_path / "ucode-settings.json")
         monkeypatch.setattr(claude, "CLAUDE_BACKUP_PATH", tmp_path / "backup.json")
         managed_settings_path = tmp_path / "managed-settings.json"
         monkeypatch.setattr(claude, "_managed_settings_path", lambda: managed_settings_path)
-        monkeypatch.setattr(claude, "managed_writes_allowed", lambda: True)
-
-        def reconcile_managed_file(path, desired_text, **kwargs):
-            path.write_text(desired_text, encoding="utf-8")
-            return "written"
-
-        monkeypatch.setattr(claude, "reconcile_managed_file", reconcile_managed_file)
         # Seed a developer whose own opus choice differs from the manifest's.
         state_mod.save_state(
             {
@@ -240,8 +233,7 @@ class TestStateFileIsNotRewritten:
 
         env = json.loads((real_state_file / "ucode-settings.json").read_text())["env"]
         assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"].startswith("system.ai.claude-opus-5")
-        managed_env = json.loads((real_state_file / "managed-settings.json").read_text())["env"]
-        assert managed_env["ANTHROPIC_DEFAULT_OPUS_MODEL"].startswith("system.ai.claude-opus-5")
+        assert not (real_state_file / "managed-settings.json").exists()
 
     def test_overlay_bookkeeping_never_lands_on_disk(self, real_state_file):
         resolved_state = resolve_state(MANAGED, state_mod.load_state(), "claude")

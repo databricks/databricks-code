@@ -242,8 +242,9 @@ def reconcile_managed_file(
         return "unsupported"
     if not managed_writes_allowed() and not is_dry_run():
         raise RuntimeError(
-            f"Refusing to update {display} managed settings at {path} non-interactively. "
-            "Run the command from an interactive terminal."
+            f"Cannot synchronize {display} OS-managed settings at {path} non-interactively "
+            "because administrator approval may be required. Run the configure command from an "
+            "interactive terminal."
         )
     if path.is_symlink():
         raise RuntimeError(
@@ -270,8 +271,8 @@ def reconcile_managed_file(
             _sudo_replace(path, desired_text)
         except PermissionError as exc:
             raise RuntimeError(
-                f"{display} cannot start because ucode could not update {path}: {exc}. "
-                "Run the ucode command from an interactive terminal and approve the administrator "
+                f"Could not synchronize {display} OS-managed settings at {path}: {exc}. Run "
+                "the configure command from an interactive terminal and approve the administrator "
                 "prompt, or contact your administrator."
             ) from exc
         except subprocess.CalledProcessError as exc:
@@ -501,6 +502,19 @@ def _snapshot_text(entry: dict, key: str) -> str | None:
     return text
 
 
+def managed_file_matches_last_applied(tool: str, path: Path, current_text: str | None) -> bool:
+    """Whether ``current_text`` is the exact managed file last written by ucode."""
+    entry = _manifest_files(_load_manifest()).get(tool)
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("path") != str(path):
+        raise RuntimeError(
+            f"The saved {tool} managed-settings backup targets {entry.get('path')}, not {path}."
+        )
+    last_text = _snapshot_text(entry, "last_applied_file")
+    return last_text is not None and current_text == last_text
+
+
 def _original_text(entry: dict) -> str | None:
     if not entry.get("original_existed"):
         return None
@@ -513,6 +527,11 @@ def _backup_label(tool: str) -> str:
     except RuntimeError:
         return "invalid"
     return "available" if isinstance(entry, dict) else "none"
+
+
+def managed_file_backup_available(tool: str) -> bool:
+    """Whether ucode has restoration metadata for ``tool``."""
+    return _backup_label(tool) != "none"
 
 
 def _delete_backup(tool: str, manifest: dict, entry: dict) -> None:
@@ -751,8 +770,8 @@ def _sudo_failure_message(path: Path, display: str, exc: subprocess.CalledProces
             "Contact your administrator."
         )
     return (
-        f"{display} cannot start because ucode could not update {path}: {stderr or exc}. "
-        "Run the ucode command from an interactive terminal and approve the administrator prompt, "
+        f"Could not synchronize {display} OS-managed settings at {path}: {stderr or exc}. Run "
+        "the configure command from an interactive terminal and approve the administrator prompt, "
         "or contact your administrator."
     )
 

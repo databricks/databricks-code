@@ -37,10 +37,12 @@ from ucode.launcher import exec_or_spawn
 from ucode.managed_files import (
     OS,
     current_os,
+    managed_file_backup_available,
     managed_file_conflicts,
+    managed_file_fingerprint,
     managed_file_is_verified,
+    managed_file_matches_last_applied,
     managed_file_status,
-    managed_writes_allowed,
     mark_managed_file_verified,
     read_managed_file,
     reconcile_managed_file,
@@ -245,12 +247,14 @@ def managed_settings_are_current(state: dict) -> bool:
     path = _managed_settings_path()
     if path is None:
         return True
-    if state.get("claude_relayed"):
-        required_scope = "relay-compatible"
-    elif managed_writes_allowed():
-        required_scope = "managed"
-    else:
-        required_scope = None
+    if path.is_symlink():
+        return False
+    try:
+        if not managed_file_fingerprint(path).get("exists"):
+            return True
+    except RuntimeError:
+        return False
+    required_scope = "relay-compatible" if state.get("claude_relayed") else None
     return managed_file_is_verified(state, "claude", path, required_scope=required_scope)
 
 
@@ -267,6 +271,10 @@ def revert_managed_settings() -> str:
         parser=_parse_managed_settings,
         dumper=_dump_managed_settings,
     )
+
+
+def managed_settings_backup_available() -> bool:
+    return managed_file_backup_available("claude")
 
 
 def _managed_relayed_conflicts(path: Path) -> list[str]:
@@ -580,6 +588,7 @@ def write_tool_config(
     relayed: bool = False,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    sync_managed_settings: bool = False,
 ) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
     web_search_model = _resolve_web_search_model(state)
@@ -662,7 +671,10 @@ def write_tool_config(
 
     write_json_file(CLAUDE_SETTINGS_PATH, _compose(read_json_safe(CLAUDE_SETTINGS_PATH)))
 
-    _reconcile_managed_settings(state, _compose, managed_file_keys, relayed)
+    if sync_managed_settings:
+        _sync_managed_settings(state, _compose, managed_file_keys, relayed)
+    else:
+        _validate_managed_settings(state, _compose, managed_file_keys, relayed)
 
     if web_search_model:
         web_search_entry = _web_search_mcp_entry(
@@ -690,27 +702,32 @@ def write_tool_config(
     return state
 
 
-def _reconcile_managed_settings(
+def _managed_settings_documents(
+    path: Path, compose: Callable[[dict], dict]
+) -> tuple[str | None, dict, dict]:
+    current_text = read_managed_file(path)
+    try:
+        existing = _parse_managed_settings(current_text) if current_text is not None else {}
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Cannot safely inspect Claude Code managed settings at {path}: {exc}. "
+            "ucode did not modify the file. Repair it or contact your administrator."
+        ) from exc
+    managed_before = copy.deepcopy(existing)
+    desired_settings = compose(existing)
+    _preserve_permission_denies(managed_before, desired_settings)
+    return current_text, managed_before, desired_settings
+
+
+def _validate_managed_settings(
     state: dict,
     compose: Callable[[dict], dict],
     owned_paths: list[list[str]],
     relayed: bool,
 ) -> None:
-    """Reconcile Claude Code's OS-managed settings so a bare ``claude`` uses the gateway.
-
-    The managed file is root-owned and the highest-precedence scope, so every normal Claude
-    configuration mirrors ucode's settings there. The same compose operation that produced the
-    private file is applied to the existing managed file, preserving unrelated IT-authored keys.
-
-    Relayed launches are skipped: they depend on a per-session loopback refresh proxy that only runs
-    during `ucode claude`, so a bare `claude` could not reach the gateway anyway.
-    """
+    """Read-only check that managed settings do not override ucode's local settings."""
     path = _managed_settings_path()
     if path is None:
-        print_warning(
-            "Machine-wide Claude settings aren't supported on this platform; skipped the managed "
-            "settings."
-        )
         return
     if path.is_symlink():
         raise RuntimeError(
@@ -729,31 +746,74 @@ def _reconcile_managed_settings(
         mark_managed_file_verified(state, "claude", path, scope="relay-compatible")
         return
 
-    current_text = read_managed_file(path)
-    try:
-        existing = _parse_managed_settings(current_text) if current_text is not None else {}
-    except RuntimeError as exc:
+    _, managed_before, desired_settings = _managed_settings_documents(path, compose)
+    conflicts = managed_file_conflicts(managed_before, desired_settings, owned_paths)
+    if conflicts:
         raise RuntimeError(
-            f"Cannot safely update Claude Code managed settings at {path}: {exc}. "
-            "ucode did not modify the file. Repair it or contact your administrator."
-        ) from exc
-    managed_before = copy.deepcopy(existing)
-    desired_settings = compose(existing)
-    _preserve_permission_denies(managed_before, desired_settings)
-    if not managed_writes_allowed():
+            f"Claude Code OS-managed settings at {path} override ucode values: "
+            f"{', '.join(conflicts)}. ucode did not modify the file during this launch. If ucode "
+            "previously synchronized it, run `ucode configure --agent claude` or `ucode revert` "
+            "from an interactive terminal. Otherwise, contact your administrator."
+        )
+    mark_managed_file_verified(state, "claude", path, scope="local-compatible")
+
+
+def _sync_managed_settings(
+    state: dict,
+    compose: Callable[[dict], dict],
+    owned_paths: list[list[str]],
+    relayed: bool,
+) -> None:
+    """Explicitly synchronize Claude's OS-managed settings when safe."""
+    path = _managed_settings_path()
+    if path is None:
+        print_warning(
+            "Machine-wide Claude settings aren't supported on this platform; skipped the managed "
+            "settings."
+        )
+        return
+    if path.is_symlink():
+        raise RuntimeError(
+            f"Refusing to use Claude Code managed settings through symlink {path}. Replace it "
+            "with a regular file or contact your administrator."
+        )
+    if relayed:
+        _validate_managed_settings(state, compose, owned_paths, relayed=True)
+        return
+
+    print_note(f"Synchronizing Claude Code OS-managed settings at {path}.")
+    current_text, managed_before, desired_settings = _managed_settings_documents(path, compose)
+    desired_text = _dump_managed_settings(desired_settings)
+    backup_available = managed_file_backup_available("claude")
+    ucode_owned = managed_file_matches_last_applied("claude", path, current_text)
+    if current_text == desired_text:
+        mark_managed_file_verified(
+            state, "claude", path, scope="managed" if ucode_owned else "local-compatible"
+        )
+        return
+    if current_text is not None and backup_available and not ucode_owned:
+        raise RuntimeError(
+            f"Claude Code OS-managed settings at {path} changed after ucode last synchronized "
+            "them. ucode preserved the newer file. Run `ucode revert` to remove only ucode-owned "
+            "entries, or contact your administrator."
+        )
+    if current_text is not None and not ucode_owned:
         conflicts = managed_file_conflicts(managed_before, desired_settings, owned_paths)
         if conflicts:
             raise RuntimeError(
-                "Claude Code configuration cannot be applied non-interactively because "
-                f"OS-managed settings at {path} override ucode values: {', '.join(conflicts)}. "
-                "Run `ucode configure --agent claude` from an interactive terminal or contact "
-                "your administrator."
+                f"Claude Code OS-managed settings at {path} are externally managed and conflict "
+                f"with ucode values: {', '.join(conflicts)}. ucode did not modify the file; "
+                "contact your administrator."
             )
+        print_note(
+            f"Claude Code OS-managed settings at {path} are externally managed and compatible; "
+            "left unchanged."
+        )
         mark_managed_file_verified(state, "claude", path, scope="local-compatible")
         return
     reconcile_managed_file(
         path,
-        _dump_managed_settings(desired_settings),
+        desired_text,
         tool="claude",
         display="Claude Code",
         owned_paths=owned_paths,

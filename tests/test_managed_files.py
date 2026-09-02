@@ -133,7 +133,7 @@ class TestManagedFileLifecycle:
 
         monkeypatch.setattr(managed_files, "_sudo_replace", deny_write)
 
-        with pytest.raises(RuntimeError, match="could not update"):
+        with pytest.raises(RuntimeError, match="Could not synchronize"):
             managed_files.reconcile_managed_file(
                 path,
                 '{"ucode": true}\n',
@@ -238,6 +238,25 @@ class TestManagedFileLifecycle:
         path.write_text("changed-content", encoding="utf-8")
         assert managed_files.managed_file_is_verified(state, "claude", path) is False
 
+    def test_matches_last_applied_snapshot(self, tmp_path, backup_dir, monkeypatch):
+        path = tmp_path / "managed.json"
+        monkeypatch.setattr(
+            managed_files,
+            "_sudo_replace",
+            lambda target, text: target.write_text(text, encoding="utf-8"),
+        )
+        managed_files.reconcile_managed_file(
+            path,
+            '{"ucode": true}\n',
+            tool="claude",
+            display="Claude Code",
+            owned_paths=[["ucode"]],
+        )
+
+        assert managed_files.managed_file_matches_last_applied("claude", path, path.read_text())
+        path.write_text('{"ucode": false}\n', encoding="utf-8")
+        assert not managed_files.managed_file_matches_last_applied("claude", path, path.read_text())
+
     def test_revert_restores_exact_original(self, tmp_path, backup_dir, monkeypatch):
         path = tmp_path / "managed.json"
         path.write_text('{"enterprise": true}\n', encoding="utf-8")
@@ -290,6 +309,37 @@ class TestManagedFileLifecycle:
 
         assert result == "removed"
         assert not path.exists()
+
+    def test_revert_permission_failure_retains_backup(self, tmp_path, backup_dir, monkeypatch):
+        path = tmp_path / "managed.json"
+        monkeypatch.setattr(
+            managed_files,
+            "_sudo_replace",
+            lambda target, text: target.write_text(text, encoding="utf-8"),
+        )
+        managed_files.reconcile_managed_file(
+            path,
+            '{"ucode": true}\n',
+            tool="claude",
+            display="Claude Code",
+            owned_paths=[["ucode"]],
+        )
+        monkeypatch.setattr(
+            managed_files,
+            "_sudo_remove",
+            lambda target: (_ for _ in ()).throw(PermissionError("denied")),
+        )
+
+        with pytest.raises(RuntimeError, match="backup was retained"):
+            managed_files.revert_managed_file(
+                "claude",
+                display="Claude Code",
+                parser=json.loads,
+                dumper=lambda doc: json.dumps(doc) + "\n",
+            )
+
+        assert managed_files.managed_file_backup_available("claude") is True
+        assert path.exists()
 
     def test_revert_preserves_external_changes(self, tmp_path, backup_dir, monkeypatch):
         path = tmp_path / "managed.json"

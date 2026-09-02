@@ -31,10 +31,12 @@ from ucode.launcher import exec_or_spawn
 from ucode.managed_files import (
     OS,
     current_os,
+    managed_file_backup_available,
     managed_file_conflicts,
+    managed_file_fingerprint,
     managed_file_is_verified,
+    managed_file_matches_last_applied,
     managed_file_status,
-    managed_writes_allowed,
     mark_managed_file_verified,
     read_managed_file,
     reconcile_managed_file,
@@ -49,7 +51,7 @@ from ucode.smart_routing.codex_hooks import (
 from ucode.smart_routing.codex_routing import codex_model_id
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
-from ucode.ui import print_warning_err
+from ucode.ui import print_note, print_warning_err
 
 CODEX_CONFIG_DIR = Path.home() / ".codex"
 CODEX_PROFILE_NAME = "ucode"
@@ -298,7 +300,12 @@ def revert_legacy_shared_config() -> bool:
     return _strip_legacy_ucode_entries(_legacy_config_path())
 
 
-def write_tool_config(state: dict, model: str | None = None, provider: str | None = None) -> dict:
+def write_tool_config(
+    state: dict,
+    model: str | None = None,
+    provider: str | None = None,
+    sync_managed_settings: bool = False,
+) -> dict:
     workspace = state["workspace"]
     # Leave model selection to Codex. The gateway still receives the configured
     # provider and authentication settings, while Codex uses its own default.
@@ -362,7 +369,10 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         enabled=False,
     )
     write_toml_file(CODEX_CONFIG_PATH, doc)
-    _reconcile_managed_config(state, compose)
+    if sync_managed_settings:
+        _sync_managed_config(state, compose)
+    else:
+        _validate_managed_config(state, compose)
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
     return state
@@ -394,8 +404,14 @@ def managed_config_is_current(state: dict) -> bool:
     path = _managed_config_path()
     if path is None:
         return True
-    required_scope = "managed" if managed_writes_allowed() else None
-    return managed_file_is_verified(state, "codex", path, required_scope=required_scope)
+    if path.is_symlink():
+        return False
+    try:
+        if not managed_file_fingerprint(path).get("exists"):
+            return True
+    except RuntimeError:
+        return False
+    return managed_file_is_verified(state, "codex", path)
 
 
 def managed_config_status(state: dict) -> tuple[Path | None, str, str]:
@@ -413,8 +429,50 @@ def revert_managed_config() -> str:
     )
 
 
-def _reconcile_managed_config(state: dict, compose: Callable[[dict], dict]) -> None:
-    """Reconcile Codex's highest-precedence config while preserving unrelated policy."""
+def managed_config_backup_available() -> bool:
+    return managed_file_backup_available("codex")
+
+
+def _managed_config_documents(
+    path: Path, compose: Callable[[dict], dict]
+) -> tuple[str | None, dict, dict]:
+    current_text = read_managed_file(path)
+    try:
+        existing = _parse_managed_config(current_text) if current_text is not None else {}
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Cannot safely inspect Codex managed settings at {path}: {exc}. ucode did not "
+            "modify the file. Repair it or contact your administrator."
+        ) from exc
+    managed_before = copy.deepcopy(existing)
+    desired_doc = compose(existing)
+    return current_text, managed_before, desired_doc
+
+
+def _validate_managed_config(state: dict, compose: Callable[[dict], dict]) -> None:
+    """Read-only check that managed settings do not override ucode's local profile."""
+    path = _managed_config_path()
+    if path is None:
+        return
+    if path.is_symlink():
+        raise RuntimeError(
+            f"Refusing to use Codex managed settings through symlink {path}. Replace it with a "
+            "regular file or contact your administrator."
+        )
+    _, managed_before, desired_doc = _managed_config_documents(path, compose)
+    conflicts = managed_file_conflicts(managed_before, desired_doc, MANAGED_KEYS)
+    if conflicts:
+        raise RuntimeError(
+            f"Codex OS-managed settings at {path} override ucode values: "
+            f"{', '.join(conflicts)}. ucode did not modify the file during this launch. If ucode "
+            "previously synchronized it, run `ucode configure --agent codex` or `ucode revert` "
+            "from an interactive terminal. Otherwise, contact your administrator."
+        )
+    mark_managed_file_verified(state, "codex", path, scope="local-compatible")
+
+
+def _sync_managed_config(state: dict, compose: Callable[[dict], dict]) -> None:
+    """Explicitly synchronize Codex's OS-managed config when safe."""
     path = _managed_config_path()
     if path is None:
         print_warning_err(
@@ -427,35 +485,45 @@ def _reconcile_managed_config(state: dict, compose: Callable[[dict], dict]) -> N
             f"Refusing to use Codex managed settings through symlink {path}. Replace it with a "
             "regular file or contact your administrator."
         )
-    current_text = read_managed_file(path)
-    try:
-        existing = _parse_managed_config(current_text) if current_text is not None else {}
-    except RuntimeError as exc:
+
+    print_note(f"Synchronizing Codex OS-managed settings at {path}.")
+    current_text, managed_before, desired_doc = _managed_config_documents(path, compose)
+    desired_text = tomlkit.dumps(desired_doc)
+    backup_available = managed_file_backup_available("codex")
+    ucode_owned = managed_file_matches_last_applied("codex", path, current_text)
+    if current_text == desired_text:
+        mark_managed_file_verified(
+            state, "codex", path, scope="managed" if ucode_owned else "local-compatible"
+        )
+        return
+    if current_text is not None and backup_available and not ucode_owned:
         raise RuntimeError(
-            f"Cannot safely update Codex managed settings at {path}: {exc}. ucode did not modify "
-            "the file. Repair it or contact your administrator."
-        ) from exc
-    managed_before = copy.deepcopy(existing)
-    desired_doc = compose(existing)
-    if not managed_writes_allowed():
+            f"Codex OS-managed settings at {path} changed after ucode last synchronized them. "
+            "ucode preserved the newer file. Run `ucode revert` to remove only ucode-owned "
+            "entries, or contact your administrator."
+        )
+    if current_text is not None and not ucode_owned:
         conflicts = managed_file_conflicts(managed_before, desired_doc, MANAGED_KEYS)
         if conflicts:
             raise RuntimeError(
-                "Codex configuration cannot be applied non-interactively because OS-managed "
-                f"settings at {path} override ucode values: {', '.join(conflicts)}. Run `ucode "
-                "configure --agent codex` from an interactive terminal or contact your "
-                "administrator."
+                f"Codex OS-managed settings at {path} are externally managed and conflict with "
+                f"ucode values: {', '.join(conflicts)}. ucode did not modify the file; contact "
+                "your administrator."
             )
+        print_note(
+            f"Codex OS-managed settings at {path} are externally managed and compatible; left "
+            "unchanged."
+        )
         mark_managed_file_verified(state, "codex", path, scope="local-compatible")
         return
     reconcile_managed_file(
         path,
-        tomlkit.dumps(desired_doc),
+        desired_text,
         tool="codex",
         display="Codex",
         owned_paths=MANAGED_KEYS,
     )
-    mark_managed_file_verified(state, "codex", path)
+    mark_managed_file_verified(state, "codex", path, scope="managed")
 
 
 def default_model(state: dict) -> str | None:

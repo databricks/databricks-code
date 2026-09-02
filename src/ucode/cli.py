@@ -421,6 +421,21 @@ def _parse_agents_option(agents: str) -> list[str]:
     return tools
 
 
+_MANAGED_SETTINGS_SYNC_TOOLS = {"claude", "codex"}
+
+
+def _validate_managed_settings_sync_selection(tools: list[str]) -> None:
+    if _MANAGED_SETTINGS_SYNC_TOOLS.intersection(tools):
+        return
+    supported = ", ".join(
+        spec["display"] for tool, spec in TOOL_SPECS.items() if tool in _MANAGED_SETTINGS_SYNC_TOOLS
+    )
+    raise RuntimeError(
+        "Managed settings synchronization was requested, but none of the selected agents "
+        f"support it. Supported agents: {supported}."
+    )
+
+
 def _parse_skill_locations(location: str | None) -> list[str]:
     """Parse a comma-separated `--location` into `<catalog>.<schema>` refs,
     dropping duplicates while preserving order. `None`/empty yields `[]` (the
@@ -830,6 +845,40 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
     return state
 
 
+def _restore_managed_settings_for_local_config(tool: str) -> None:
+    if is_dry_run():
+        return
+    if tool == "claude":
+        display = "Claude Code"
+        revert = claude_agent.revert_managed_settings
+    elif tool == "codex":
+        display = "Codex"
+        revert = codex_agent.revert_managed_config
+    else:
+        return
+    try:
+        result = revert()
+    except RuntimeError as exc:
+        print_warning(
+            f"{display} OS-managed settings cleanup is incomplete. Local settings will still be "
+            f"configured. {exc}"
+        )
+        return
+    if result != "unchanged":
+        print_note(f"{display} OS-managed settings: {result}")
+
+
+def _print_local_managed_settings_notes(tools: list[str]) -> None:
+    for tool in tools:
+        if tool not in _MANAGED_SETTINGS_SYNC_TOOLS:
+            continue
+        display = TOOL_SPECS[tool]["display"]
+        print_note(
+            f"{display} was configured locally. To also synchronize OS-managed settings, run "
+            f"`ucode configure --agent {tool} --sync-managed-settings`."
+        )
+
+
 def configure_workspace_command(
     tool: str | None = None,
     selected_tools: list[str] | None = None,
@@ -842,9 +891,14 @@ def configure_workspace_command(
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
     offer_optional_setup: bool = False,
+    sync_managed_settings: bool = False,
+    restore_managed_settings: bool = False,
 ) -> int:
     if tool is not None and selected_tools is not None:
         raise RuntimeError("Use either --agent or --agents, not both.")
+    explicitly_selected = [tool] if tool is not None else selected_tools
+    if sync_managed_settings and explicitly_selected is not None:
+        _validate_managed_settings_sync_selection(explicitly_selected)
 
     # The Databricks-vs-Model-Provider-Service picker is shown only on the fully
     # interactive path (`ucode configure` with no --agent/--agents). Naming agents
@@ -863,7 +917,13 @@ def configure_workspace_command(
             databricks_ai_tools_enabled=databricks_ai_tools_enabled,
         )
         state = states[0]
-        state = configure_single_tool(tool, state)
+        if (
+            tool in _MANAGED_SETTINGS_SYNC_TOOLS
+            and restore_managed_settings
+            and not sync_managed_settings
+        ):
+            _restore_managed_settings_for_local_config(tool)
+        state = configure_single_tool(tool, state, sync_managed_settings=sync_managed_settings)
         install_databricks_ai_tools_for_agents([tool], state)
         spec = TOOL_SPECS[tool]
         console.print(
@@ -876,6 +936,8 @@ def configure_workspace_command(
                 expand=False,
             )
         )
+        if not sync_managed_settings:
+            _print_local_managed_settings_notes([tool])
         if skip_validate:
             print_note(f"Skipping {spec['display']} validation (--skip-validate).")
             return 0
@@ -935,6 +997,8 @@ def configure_workspace_command(
             print_warning(f"Skipping agent(s) not available on this workspace: {displays}.")
         picked = [tool_name for tool_name in selected_tools if tool_name in available_on_workspace]
 
+    if sync_managed_settings:
+        _validate_managed_settings_sync_selection(picked)
     if not picked:
         print_note("No coding agents selected — nothing to configure.")
         return 0
@@ -953,10 +1017,18 @@ def configure_workspace_command(
         for tool_name in picked:
             state = _maybe_select_provider_service(tool_name, state)
 
+    if restore_managed_settings and not sync_managed_settings:
+        for tool_name in picked:
+            _restore_managed_settings_for_local_config(tool_name)
     if offer_optional_setup:
-        state = configure_selected_tools(state, picked, install_ai_tools=False)
+        state = configure_selected_tools(
+            state,
+            picked,
+            install_ai_tools=False,
+            sync_managed_settings=sync_managed_settings,
+        )
     else:
-        state = configure_selected_tools(state, picked)
+        state = configure_selected_tools(state, picked, sync_managed_settings=sync_managed_settings)
 
     summary_lines = [f"[bold]Workspace:[/bold] [cyan]{state['workspace']}[/cyan]"]
     for tool_name in picked:
@@ -973,6 +1045,8 @@ def configure_workspace_command(
             expand=False,
         )
     )
+    if not sync_managed_settings:
+        _print_local_managed_settings_notes(picked)
 
     if skip_validate:
         print_note("Skipping agent validation (--skip-validate).")
@@ -2596,6 +2670,14 @@ def configure(
             "freshly discovered models.",
         ),
     ] = False,
+    sync_managed_settings: Annotated[
+        bool,
+        typer.Option(
+            "--sync-managed-settings",
+            help="Also synchronize selected supported agents' OS-managed settings. This may "
+            "require administrator access and can affect agents launched outside ucode.",
+        ),
+    ] = False,
     skip_unavailable: Annotated[
         bool,
         typer.Option(
@@ -2679,6 +2761,8 @@ def configure(
         install_databricks_cli()
         if agent is not None and agents is not None:
             raise RuntimeError("Use either --agent or --agents, not both.")
+        if sync_managed_settings and agent is not None:
+            _validate_managed_settings_sync_selection([normalize_tool(agent)])
         if workspaces is not None and profiles is not None:
             raise RuntimeError("Use either --workspaces or --profiles, not both.")
         if use_pat and profiles is None:
@@ -2709,6 +2793,13 @@ def configure(
         # Only forward the opt-in flags when set so existing call expectations
         # (and defaults) stay unchanged for the common interactive path.
         skip_kwargs: dict = {}
+        if sync_managed_settings:
+            skip_kwargs["sync_managed_settings"] = True
+        elif (
+            claude_agent.managed_settings_backup_available()
+            or codex_agent.managed_config_backup_available()
+        ):
+            skip_kwargs["restore_managed_settings"] = True
         if use_pat:
             skip_kwargs["use_pat"] = True
         if skip_validate:
@@ -2754,6 +2845,10 @@ def configure(
             # only agent, do a workspace-only configure so that later `configure
             # mcp` run has a current workspace to target.
             requested = [a.strip().lower() for a in agents.split(",") if a.strip()]
+            if sync_managed_settings:
+                _validate_managed_settings_sync_selection(
+                    [normalize_tool(name) for name in requested if name != "cursor"]
+                )
             wants_cursor = "cursor" in requested
             model_agent_names = ",".join(a for a in requested if a != "cursor")
             if model_agent_names:

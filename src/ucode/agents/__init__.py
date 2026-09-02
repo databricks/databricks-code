@@ -350,10 +350,16 @@ def configure_tool(
     relayed: bool = False,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    sync_managed_settings: bool = False,
 ) -> dict:
     result: dict | tuple[dict, str]
     if tool == "codex":
-        result = codex.write_tool_config(state, model, provider=provider)
+        result = codex.write_tool_config(
+            state,
+            model,
+            provider=provider,
+            sync_managed_settings=sync_managed_settings,
+        )
     elif tool == "claude":
         # A Model Provider Service routes by header and pins no Databricks
         # model, so the usual "model required" guard doesn't apply to claude.
@@ -368,6 +374,7 @@ def configure_tool(
             relayed=relayed,
             route_root_model=route_root_model,
             custom_model=custom_model,
+            sync_managed_settings=sync_managed_settings,
         )
     else:
         # provider routing is claude/codex-only; every other tool needs a model.
@@ -433,7 +440,7 @@ def _availability_failure_detail(tool: str, state: dict) -> str:
     return " (" + "; ".join(parts) + ")"
 
 
-def configure_single_tool(tool: str, state: dict) -> dict:
+def configure_single_tool(tool: str, state: dict, *, sync_managed_settings: bool = False) -> dict:
     """Check availability, configure, and persist state for one tool only."""
     provider = get_provider_service(state, tool)
     # A Model Provider Service routes through the same gateway and pins no
@@ -446,31 +453,49 @@ def configure_single_tool(tool: str, state: dict) -> dict:
             raise RuntimeError(
                 f"{TOOL_SPECS[tool]['display']} is not available on this workspace.{detail}"
             )
-    with managed_write_batch(_managed_settings_displays([tool])):
-        state = _configure_one(tool, state, provider)
+    with managed_write_batch(
+        _managed_settings_displays([tool], sync_managed_settings=sync_managed_settings)
+    ):
+        state = _configure_one(tool, state, provider, sync_managed_settings=sync_managed_settings)
     available_tools = list(set((state.get("available_tools") or []) + [tool]))
     state["available_tools"] = available_tools
     save_state(state)
     return state
 
 
-def _configure_one(tool: str, state: dict, provider: str | None) -> dict:
+def _configure_one(
+    tool: str,
+    state: dict,
+    provider: str | None,
+    *,
+    sync_managed_settings: bool = False,
+) -> dict:
     """Write one tool's config, routing through ``provider`` when set."""
     if provider:
         provider_models, error, relayed = resolve_provider_models(tool, state, provider)
         if error:
             raise RuntimeError(error)
         return configure_tool(
-            tool, state, None, provider=provider, provider_models=provider_models, relayed=relayed
+            tool,
+            state,
+            None,
+            provider=provider,
+            provider_models=provider_models,
+            relayed=relayed,
+            sync_managed_settings=sync_managed_settings,
         )
     if tool == "codex":
-        return configure_tool("codex", state)
+        return configure_tool("codex", state, sync_managed_settings=sync_managed_settings)
     state, model = resolve_launch_model(tool, state, None)
-    return configure_tool(tool, state, model)
+    return configure_tool(tool, state, model, sync_managed_settings=sync_managed_settings)
 
 
 def configure_selected_tools(
-    state: dict, tools: list[str], *, install_ai_tools: bool = True
+    state: dict,
+    tools: list[str],
+    *,
+    install_ai_tools: bool = True,
+    sync_managed_settings: bool = False,
 ) -> dict:
     """Configure the given tools. Caller is responsible for ensuring each tool
     is available on the workspace.
@@ -479,9 +504,16 @@ def configure_selected_tools(
     replacing it, so a previously-configured tool the user didn't pick this
     run is preserved.
     """
-    with managed_write_batch(_managed_settings_displays(tools)):
+    with managed_write_batch(
+        _managed_settings_displays(tools, sync_managed_settings=sync_managed_settings)
+    ):
         for tool in tools:
-            state = _configure_one(tool, state, get_provider_service(state, tool))
+            state = _configure_one(
+                tool,
+                state,
+                get_provider_service(state, tool),
+                sync_managed_settings=sync_managed_settings,
+            )
 
     existing = state.get("available_tools") or []
     state["available_tools"] = sorted(set(existing) | set(tools))
@@ -491,7 +523,11 @@ def configure_selected_tools(
     return state
 
 
-def _managed_settings_displays(tools: list[str]) -> list[str]:
+def _managed_settings_displays(
+    tools: list[str], *, sync_managed_settings: bool = False
+) -> list[str]:
+    if not sync_managed_settings:
+        return []
     return [TOOL_SPECS[tool]["display"] for tool in tools if tool in _MANAGED_SETTINGS_TOOLS]
 
 

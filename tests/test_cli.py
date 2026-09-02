@@ -45,6 +45,8 @@ def no_state_writes():
         patch("ucode.agents.codex.save_state"),
         patch("ucode.agents.claude.save_state"),
         patch("ucode.agents.claude._managed_settings_path", return_value=None),
+        patch("ucode.agents.claude.managed_settings_backup_available", return_value=False),
+        patch("ucode.agents.codex.managed_config_backup_available", return_value=False),
         patch("ucode.agents.gemini.save_state"),
         patch("ucode.agents.opencode.save_state"),
     ):
@@ -1577,6 +1579,74 @@ class TestConfigureAgentFlag:
         assert result.exit_code == 0, result.output
         mock_cfg.assert_called_once_with(prompt_optional_updates=True, offer_optional_setup=True)
 
+    def test_sync_managed_settings_preserves_interactive_picker(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.install_tool_binary") as mock_install,
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            result = runner.invoke(app, ["configure", "--sync-managed-settings"])
+
+        assert result.exit_code == 0, result.output
+        mock_install.assert_not_called()
+        mock_cfg.assert_called_once_with(
+            prompt_optional_updates=True,
+            offer_optional_setup=True,
+            sync_managed_settings=True,
+        )
+
+    def test_sync_managed_settings_requires_supported_agent(self):
+        with patch("ucode.cli.install_databricks_cli"):
+            result = runner.invoke(
+                app, ["configure", "--agent", "gemini", "--sync-managed-settings"]
+            )
+
+        assert result.exit_code == 1
+        assert "Managed settings synchronization was requested" in result.output
+        assert "agents support it" in result.output
+        assert "Claude Code" in result.output
+        assert "Codex" in result.output
+
+    def test_sync_managed_settings_supports_codex(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.install_tool_binary") as mock_install,
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            result = runner.invoke(
+                app, ["configure", "--agent", "codex", "--sync-managed-settings"]
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_install.assert_called_once_with(
+            "codex", strict=True, update_existing=True, prompt_optional_updates=True
+        )
+        mock_cfg.assert_called_once_with("codex", sync_managed_settings=True)
+
+    def test_plain_configure_restores_previous_managed_sync(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.install_tool_binary"),
+            patch("ucode.cli.claude_agent.managed_settings_backup_available", return_value=True),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            result = runner.invoke(app, ["configure", "--agent", "claude"])
+
+        assert result.exit_code == 0, result.output
+        mock_cfg.assert_called_once_with("claude", restore_managed_settings=True)
+
+    def test_plain_codex_configure_restores_previous_managed_sync(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.install_tool_binary"),
+            patch("ucode.cli.codex_agent.managed_config_backup_available", return_value=True),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            result = runner.invoke(app, ["configure", "--agent", "codex"])
+
+        assert result.exit_code == 0, result.output
+        mock_cfg.assert_called_once_with("codex", restore_managed_settings=True)
+
     def test_optional_setup_installs_ai_tools_and_configures_mcp(self):
         import ucode.cli as cli_mod
 
@@ -1974,6 +2044,96 @@ class TestConfigureMcpFlag:
 
 
 class TestConfigureAgentsSelection:
+    def test_plain_claude_configure_continues_when_restore_fails(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        state = {**MINIMAL_STATE, "available_tools": []}
+        monkeypatch.setattr(cli_mod, "_configure_shared_workspace_states", lambda *a, **k: [state])
+        monkeypatch.setattr(
+            cli_mod,
+            "configure_single_tool",
+            lambda tool, current, **kwargs: {**current, "available_tools": [tool]},
+        )
+        monkeypatch.setattr(cli_mod, "install_databricks_ai_tools_for_agents", lambda *a: None)
+        monkeypatch.setattr(
+            cli_mod.claude_agent,
+            "revert_managed_settings",
+            lambda: (_ for _ in ()).throw(RuntimeError("administrator access denied")),
+        )
+        monkeypatch.setattr(cli_mod, "is_dry_run", lambda: False)
+        warnings: list[str] = []
+        monkeypatch.setattr(cli_mod, "print_warning", warnings.append)
+
+        result = cli_mod.configure_workspace_command(
+            "claude",
+            workspaces=[("https://example.com", None)],
+            skip_validate=True,
+            restore_managed_settings=True,
+        )
+
+        assert result == 0
+        assert any("cleanup is incomplete" in warning for warning in warnings)
+
+    def test_plain_codex_configure_restores_managed_sync(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        state = {**MINIMAL_STATE, "available_tools": []}
+        monkeypatch.setattr(cli_mod, "_configure_shared_workspace_states", lambda *a, **k: [state])
+        monkeypatch.setattr(
+            cli_mod,
+            "configure_single_tool",
+            lambda tool, current, **kwargs: {**current, "available_tools": [tool]},
+        )
+        monkeypatch.setattr(cli_mod, "install_databricks_ai_tools_for_agents", lambda *a: None)
+        restored: list[str] = []
+        monkeypatch.setattr(
+            cli_mod.codex_agent,
+            "revert_managed_config",
+            lambda: restored.append("codex") or "restored",
+        )
+        monkeypatch.setattr(cli_mod, "is_dry_run", lambda: False)
+
+        result = cli_mod.configure_workspace_command(
+            "codex",
+            workspaces=[("https://example.com", None)],
+            skip_validate=True,
+            restore_managed_settings=True,
+        )
+
+        assert result == 0
+        assert restored == ["codex"]
+
+    def test_explicit_sync_skips_restore_and_forwards_intent(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        state = {**MINIMAL_STATE, "available_tools": []}
+        monkeypatch.setattr(cli_mod, "_configure_shared_workspace_states", lambda *a, **k: [state])
+        configured: list[tuple[str, bool]] = []
+        monkeypatch.setattr(
+            cli_mod,
+            "configure_single_tool",
+            lambda tool, current, *, sync_managed_settings=False: (
+                configured.append((tool, sync_managed_settings)) or current
+            ),
+        )
+        monkeypatch.setattr(cli_mod, "install_databricks_ai_tools_for_agents", lambda *a: None)
+        monkeypatch.setattr(
+            cli_mod.claude_agent,
+            "revert_managed_settings",
+            lambda: pytest.fail("explicit sync must not restore"),
+        )
+
+        result = cli_mod.configure_workspace_command(
+            "claude",
+            workspaces=[("https://example.com", None)],
+            skip_validate=True,
+            sync_managed_settings=True,
+            restore_managed_settings=True,
+        )
+
+        assert result == 0
+        assert configured == [("claude", True)]
+
     def test_selected_tools_skip_picker(self, monkeypatch):
         import ucode.cli as cli_mod
 
@@ -2004,13 +2164,40 @@ class TestConfigureAgentsSelection:
         monkeypatch.setattr(
             cli_mod,
             "configure_selected_tools",
-            lambda state, tools: configured.append(tools) or {**state, "available_tools": tools},
+            lambda state, tools, **kwargs: (
+                configured.append(tools) or {**state, "available_tools": tools}
+            ),
         )
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
 
         assert cli_mod.configure_workspace_command(selected_tools=["claude", "codex"]) == 0
         assert install_calls == ["claude", "codex"]
         assert configured == [["claude", "codex"]]
+
+    def test_interactive_sync_rejects_unsupported_selection_before_writes(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        state = {**MINIMAL_STATE, "available_tools": []}
+        monkeypatch.setattr(cli_mod, "_configure_shared_workspace_states", lambda *a, **k: [state])
+        monkeypatch.setattr(cli_mod, "save_state", lambda state: None)
+        monkeypatch.setattr(cli_mod, "check_gateway_endpoint", lambda state, tool: tool == "gemini")
+        monkeypatch.setattr(cli_mod, "prompt_for_tools", lambda available: ["gemini"])
+        monkeypatch.setattr(
+            cli_mod,
+            "install_tool_binary",
+            lambda *args, **kwargs: pytest.fail("must reject before installing agents"),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "configure_selected_tools",
+            lambda *args, **kwargs: pytest.fail("must reject before writing agent configuration"),
+        )
+
+        with pytest.raises(RuntimeError, match="none of the selected agents support it"):
+            cli_mod.configure_workspace_command(
+                workspaces=[("https://example.com", None)],
+                sync_managed_settings=True,
+            )
 
     def test_provider_picker_gated_by_interactive_path(self, monkeypatch):
         import ucode.cli as cli_mod
@@ -2020,7 +2207,9 @@ class TestConfigureAgentsSelection:
         monkeypatch.setattr(cli_mod, "check_gateway_endpoint", lambda s, t: t == "claude")
         monkeypatch.setattr(cli_mod, "install_tool_binary", lambda *a, **k: True)
         monkeypatch.setattr(
-            cli_mod, "configure_selected_tools", lambda s, tools: {**s, "available_tools": tools}
+            cli_mod,
+            "configure_selected_tools",
+            lambda s, tools, **kwargs: {**s, "available_tools": tools},
         )
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda s: None)
         picked_for: list[str] = []
@@ -2059,7 +2248,9 @@ class TestConfigureAgentsSelection:
         monkeypatch.setattr(
             cli_mod,
             "configure_selected_tools",
-            lambda state, tools: pytest.fail("configure_selected_tools should not be called"),
+            lambda state, tools, **kwargs: pytest.fail(
+                "configure_selected_tools should not be called"
+            ),
         )
 
         with pytest.raises(RuntimeError, match="Codex"):
@@ -2098,7 +2289,9 @@ class TestConfigureAgentsSelection:
         monkeypatch.setattr(
             cli_mod,
             "configure_selected_tools",
-            lambda state, tools: configured.append(tools) or {**state, "available_tools": tools},
+            lambda state, tools, **kwargs: (
+                configured.append(tools) or {**state, "available_tools": tools}
+            ),
         )
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
         warnings: list[str] = []
@@ -2126,7 +2319,9 @@ class TestConfigureAgentsSelection:
         monkeypatch.setattr(
             cli_mod,
             "configure_selected_tools",
-            lambda state, tools: pytest.fail("configure_selected_tools should not be called"),
+            lambda state, tools, **kwargs: pytest.fail(
+                "configure_selected_tools should not be called"
+            ),
         )
 
         assert (
@@ -2173,7 +2368,7 @@ class TestConfigureAgentsSelection:
         monkeypatch.setattr(
             cli_mod,
             "configure_selected_tools",
-            lambda state, tools: {**state, "available_tools": tools},
+            lambda state, tools, **kwargs: {**state, "available_tools": tools},
         )
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
 
@@ -2214,7 +2409,7 @@ class TestConfigureAgentsSelection:
         monkeypatch.setattr(
             cli_mod,
             "configure_selected_tools",
-            lambda state, tools: (
+            lambda state, tools, **kwargs: (
                 configured_tools.append((state["workspace"], tools))
                 or {**state, "available_tools": tools}
             ),
@@ -2732,7 +2927,7 @@ class TestConfigureSkipValidate:
         monkeypatch.setattr(
             cli_mod,
             "configure_selected_tools",
-            lambda s, tools: {**s, "available_tools": tools},
+            lambda s, tools, **kwargs: {**s, "available_tools": tools},
         )
         validated: list = []
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda s: validated.append(s))
@@ -2751,7 +2946,7 @@ class TestConfigureSkipValidate:
 
         state = {**MINIMAL_STATE, "workspace": "https://first.com"}
         monkeypatch.setattr(cli_mod, "configure_shared_state", lambda *a, **k: state)
-        monkeypatch.setattr(cli_mod, "configure_single_tool", lambda t, s: s)
+        monkeypatch.setattr(cli_mod, "configure_single_tool", lambda t, s, **kwargs: s)
         installed: list = []
         monkeypatch.setattr(
             cli_mod,
