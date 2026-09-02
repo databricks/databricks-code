@@ -156,6 +156,59 @@ class TestListSchemaSkills:
         assert reason == "HTTP 500 Server Error"
 
 
+class TestListMetastoreSkills:
+    def test_lists_finalized_skills_across_schemas_and_follows_pagination(self, monkeypatch):
+        pages = [
+            {
+                "skills": [
+                    {
+                        "name": "skills/ml.prod.triage",
+                        "bundle_name": "triage",
+                        "finalize_time": "t",
+                    },
+                    {"name": "skills/ml.prod.draft", "bundle_name": "draft"},
+                ],
+                "next_page_token": "next",
+            },
+            {
+                "skills": [
+                    {
+                        "name": "skills/main.default.pii",
+                        "bundle_name": "pii-handling",
+                        "finalize_time": "t",
+                    }
+                ]
+            },
+        ]
+        urls = []
+
+        def fake_get(url, token, timeout=30):
+            urls.append(url)
+            return pages.pop(0), None
+
+        monkeypatch.setattr(sd, "_http_get_json", fake_get)
+
+        skills, reason = sd.list_metastore_skills(WS, "token")
+
+        assert reason is None
+        assert skills == [
+            sd.MetastoreSkill("main.default.pii", ref("pii", "pii-handling")),
+            sd.MetastoreSkill("ml.prod.triage", ref("triage")),
+        ]
+        assert urls == [
+            f"{WS}/api/2.1/unity-catalog/skills",
+            f"{WS}/api/2.1/unity-catalog/skills?page_token=next",
+        ]
+
+    def test_http_failure_propagates_reason(self, monkeypatch):
+        monkeypatch.setattr(sd, "_http_get_json", lambda *a, **k: (None, "HTTP 500 Server Error"))
+
+        skills, reason = sd.list_metastore_skills(WS, "token")
+
+        assert skills == []
+        assert reason == "HTTP 500 Server Error"
+
+
 class TestListSkillFiles:
     def test_lists_under_the_skills_place(self, monkeypatch):
         captured = {}
@@ -744,3 +797,79 @@ class TestConfigureSkillsDownloadCommand:
 
         assert calls["download"] == (WS, "token", ["a.b"], None, {"triage"})
         assert calls["register"] == (WS, "profile", ["claude"])
+
+
+class TestConfigureSkillsDownloadInteractiveCommand:
+    def _stub(self, monkeypatch):
+        calls: dict[str, object] = {"downloads": []}
+        state = {"state": True}
+        monkeypatch.setattr(sd, "load_state", lambda: state)
+        monkeypatch.setattr(
+            sd, "setup_mcp_clients", lambda actual, section: (WS, "profile", ["claude"])
+        )
+        monkeypatch.setattr(sd, "get_databricks_token", lambda ws, profile: "token")
+        monkeypatch.setattr(
+            sd,
+            "download_skills",
+            lambda ws, token, locations, path, skills: calls["downloads"].append(
+                (ws, token, locations, path, skills)
+            ),
+        )
+        monkeypatch.setattr(
+            sd,
+            "register_schemaless_skills_connection",
+            lambda actual, ws, profile, clients: calls.update(
+                register=(actual, ws, profile, clients)
+            ),
+        )
+        return state, calls
+
+    def test_downloads_picker_selection_grouped_by_schema(self, monkeypatch):
+        state, calls = self._stub(monkeypatch)
+        available = [
+            sd.MetastoreSkill("main.default.pii", ref("pii")),
+            sd.MetastoreSkill("main.default.triage", ref("triage")),
+            sd.MetastoreSkill("ml.prod.eval", ref("eval")),
+        ]
+        monkeypatch.setattr(sd, "list_metastore_skills", lambda *a: (available, None))
+        monkeypatch.setattr(
+            sd, "prompt_for_skill_download", lambda actual: [available[0], available[2]]
+        )
+
+        assert sd.configure_skills_download_interactive_command(path="/tmp/project") == 0
+
+        assert calls["downloads"] == [
+            (WS, "token", ["main.default"], "/tmp/project", {"pii"}),
+            (WS, "token", ["ml.prod"], "/tmp/project", {"eval"}),
+        ]
+        assert calls["register"] == (state, WS, "profile", ["claude"])
+
+    def test_cancel_is_a_noop(self, monkeypatch):
+        _, calls = self._stub(monkeypatch)
+        available = [sd.MetastoreSkill("main.default.pii", ref("pii"))]
+        monkeypatch.setattr(sd, "list_metastore_skills", lambda *a: (available, None))
+        monkeypatch.setattr(sd, "prompt_for_skill_download", lambda actual: None)
+
+        assert sd.configure_skills_download_interactive_command(path=None) == 0
+
+        assert calls["downloads"] == []
+        assert "register" not in calls
+
+    def test_picker_is_searchable_and_shows_bundle_name_when_different(self, monkeypatch):
+        captured = {}
+        skill = sd.MetastoreSkill("main.default.task", ref("task", "task-triage"))
+        monkeypatch.setattr(
+            sd,
+            "prompt_for_multi_selection",
+            lambda prompt, options, searchable: (
+                captured.update(prompt=prompt, options=options, searchable=searchable)
+                or ["main.default.task"]
+            ),
+        )
+
+        assert sd.prompt_for_skill_download([skill]) == [skill]
+        assert captured == {
+            "prompt": "Skills:",
+            "options": [("main.default.task", "main.default.task (bundle: task-triage)")],
+            "searchable": True,
+        }
