@@ -375,6 +375,24 @@ class TestRenderOverlay:
             in env["ANTHROPIC_CUSTOM_HEADERS"]
         )
 
+    def test_non_relayed_provider_pins_tier_via_anthropic_model(self):
+        # A non-relayed api-key Anthropic MPS launched on a specific tier: the tier
+        # rides ANTHROPIC_MODEL (route_root_model), the routing header selects the
+        # service, and the gateway apiKeyHelper is still written (unlike relayed).
+        overlay, _ = claude.render_overlay(
+            WS,
+            None,
+            provider="main.mcao.anthropic-mps",
+            route_root_model="claude-haiku-4-5",
+        )
+        env = overlay["env"]
+        assert env["ANTHROPIC_MODEL"] == "claude-haiku-4-5"
+        assert (
+            "Databricks-Model-Provider-Service: main.mcao.anthropic-mps"
+            in (env["ANTHROPIC_CUSTOM_HEADERS"])
+        )
+        assert "apiKeyHelper" in overlay
+
     def test_picker_labels_show_raw_routable_id(self):
         # We deliberately don't set the `_NAME` companion env vars. Showing the
         # raw `system.ai.…` / `databricks-…` id in the picker label tells users
