@@ -3050,6 +3050,10 @@ class GatewayProbe(NamedTuple):
     reachable: bool
     detail: str
     resource_available: bool = False
+    # False when the probe reached the API but couldn't reach a verdict on
+    # accessibility (e.g. a later-page error or the page cap). Distinguishes
+    # "reachable, confirmed no accessible resource" from "reachable, unknown".
+    conclusive: bool = True
 
 
 def _version_neutral_gateway_detail(detail: str) -> str:
@@ -3111,7 +3115,7 @@ def _probe_ai_gateway_v3(workspace: str, token: str) -> GatewayProbe:
                 )
             # A later page failed: reachable, but the listing was not walked to
             # the end, so we can't claim nothing is accessible.
-            return GatewayProbe(True, "reachable")
+            return GatewayProbe(True, "reachable", conclusive=False)
         if isinstance(payload, dict) and payload.get("model_services"):
             return GatewayProbe(True, "reachable, accessible model service returned", True)
         page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
@@ -3120,7 +3124,7 @@ def _probe_ai_gateway_v3(workspace: str, token: str) -> GatewayProbe:
             return GatewayProbe(True, _MODEL_SERVICE_EMPTY_DETAIL)
     # Hit the page cap with a cursor still pending: reachable but inconclusive,
     # so don't assert the listing is empty.
-    return GatewayProbe(True, "reachable")
+    return GatewayProbe(True, "reachable", conclusive=False)
 
 
 def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
@@ -3177,6 +3181,11 @@ def probe_unity_gateway_capabilities(workspace: str, token: str) -> GatewayProbe
     legacy_endpoint_probe = _probe_ai_gateway_v2(workspace, token)
     if legacy_endpoint_probe.reachable:
         return model_service_probe
+    # The model-services API answered but the listing couldn't be walked to a
+    # verdict (later-page error or page cap): it is reachable, hence enabled, so
+    # don't let the unavailable fallback report the gateway as missing.
+    if model_service_probe.reachable and not model_service_probe.conclusive:
+        return model_service_probe
     if _looks_like_definitive_auth_failure(legacy_endpoint_probe.detail):
         _raise_ai_gateway_auth_failure(workspace, legacy_endpoint_probe.detail)
     # A missing-scope 403 that survived the fallback is a token problem, not a
@@ -3213,13 +3222,16 @@ def _looks_like_definitive_auth_failure(reason: str) -> bool:
 
 
 def _looks_like_scope_failure(reason: str) -> bool:
-    """True for a 403 that reports the OAuth token is missing a required scope.
+    """True for a 403 that reports the OAuth *token* is missing a required scope.
 
-    The scopes the model-service and legacy-endpoint APIs require differ, so
-    this is only conclusive once both probes have failed on it -- re-login (not
-    a UC grant) is the fix.
+    Matched to the OAuth-token wording so a PAT's permission 403 -- which
+    re-login cannot fix -- is not misrouted to the re-login hint and instead
+    falls through to the grant guidance. The scopes the model-service and
+    legacy-endpoint APIs require differ, so this is only conclusive once both
+    probes have failed on it.
     """
-    return "HTTP 403" in reason and "required scopes" in reason.lower()
+    lowered = reason.lower()
+    return "http 403" in lowered and "oauth token" in lowered and "required scopes" in lowered
 
 
 def _looks_like_permission_failure(reason: str) -> bool:

@@ -2168,7 +2168,7 @@ class TestProbeUnityGatewayCapabilities:
         monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: next(responses))
 
         assert db_mod._probe_ai_gateway_v3(WS, "fake-token") == db_mod.GatewayProbe(
-            True, "reachable"
+            True, "reachable", conclusive=False
         )
 
     def test_probe_v3_page_cap_with_pending_cursor_is_reachable_not_empty(self, monkeypatch):
@@ -2183,9 +2183,43 @@ class TestProbeUnityGatewayCapabilities:
         monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
 
         assert db_mod._probe_ai_gateway_v3(WS, "fake-token") == db_mod.GatewayProbe(
-            True, "reachable"
+            True, "reachable", conclusive=False
         )
         assert len(calls) == db_mod._MODEL_SERVICE_PROBE_MAX_PAGES
+
+    def test_inconclusive_model_service_probe_does_not_hard_fail_when_legacy_unavailable(
+        self, monkeypatch
+    ):
+        # A reachable-but-inconclusive v3 result means the API is enabled, so an
+        # unavailable legacy fallback must not report the gateway as missing.
+        v3_responses = iter(
+            [
+                ({"next_page_token": "cursor-1"}, None),
+                (None, "HTTP 500: Internal Server Error"),
+            ]
+        )
+
+        def fake_get(url, token):
+            if "/api/ai-gateway/v2/endpoints" in url:
+                return None, "HTTP 404: AI Gateway V2 is not available for CSP-enabled workspaces"
+            return next(v3_responses)
+
+        monkeypatch.setattr(db_mod, "_http_get_json", fake_get)
+
+        assert db_mod.probe_unity_gateway_capabilities(WS, "fake-token") == db_mod.GatewayProbe(
+            True, "reachable", conclusive=False
+        )
+
+    def test_scope_failure_matches_oauth_token_but_not_pat(self):
+        # OAuth-token scope 403 -> re-login; a PAT permission 403 (no "OAuth
+        # token") must not match, so it falls through to the grant guidance.
+        assert db_mod._looks_like_scope_failure(
+            "HTTP 403 Forbidden: Provided OAuth token does not have required scopes: unity-catalog"
+        )
+        assert not db_mod._looks_like_scope_failure(
+            "HTTP 403 Forbidden: Provided access token does not have required scopes"
+        )
+        assert not db_mod._looks_like_scope_failure("HTTP 403: Missing Unity Catalog grants")
 
     def test_model_service_forbidden_and_legacy_unavailable_reports_permission_error(
         self, monkeypatch
