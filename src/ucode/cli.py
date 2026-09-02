@@ -637,8 +637,9 @@ def configure_shared_state(
         token = get_databricks_token(workspace, profile)
         gateway_capabilities = ensure_ai_gateway(workspace, token)
     print_success("Unity AI Gateway detected")
-    print_kv("V3 model services", gateway_capabilities.v3.detail)
-    print_kv("V2 endpoints", gateway_capabilities.v2.detail)
+    print_kv("Model service", gateway_capabilities.v3.detail)
+    if gateway_capabilities.v2 is not None:
+        print_kv("(Legacy) endpoints", gateway_capabilities.v2.detail)
 
     want_claude = (
         fetch_all or "claude" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools

@@ -3049,11 +3049,12 @@ def fetch_codex_models(workspace: str, token: str) -> list[str]:
 class GatewayProbe(NamedTuple):
     reachable: bool
     detail: str
+    resource_available: bool = False
 
 
 class GatewayCapabilities(NamedTuple):
     v3: GatewayProbe
-    v2: GatewayProbe
+    v2: GatewayProbe | None
 
 
 def _gateway_probe_result(
@@ -3067,7 +3068,7 @@ def _gateway_probe_result(
         return GatewayProbe(False, reason or "unknown error")
     resources = payload.get(collection_key) if isinstance(payload, dict) else None
     if resources:
-        return GatewayProbe(True, f"reachable, accessible {resource_name} returned")
+        return GatewayProbe(True, f"reachable, accessible {resource_name} returned", True)
     detail = f"reachable, no accessible {resource_name}s returned"
     if empty_hint:
         detail = f"{detail}; {empty_hint}"
@@ -3125,10 +3126,12 @@ def _raise_ai_gateway_v2_permission_failure(
 
 
 def ensure_ai_gateway(workspace: str, token: str) -> GatewayCapabilities:
-    """Return both gateway probe results if either V2 or V3 is reachable."""
+    """Return gateway probe results, checking V2 only when V3 has no accessible resource."""
     v3 = _probe_ai_gateway_v3(workspace, token)
     if not v3.reachable and _looks_like_definitive_auth_failure(v3.detail):
         _raise_ai_gateway_auth_failure(workspace, v3.detail)
+    if v3.resource_available:
+        return GatewayCapabilities(v3=v3, v2=None)
 
     v2 = _probe_ai_gateway_v2(workspace, token)
     capabilities = GatewayCapabilities(v3=v3, v2=v2)
