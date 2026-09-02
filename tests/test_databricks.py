@@ -124,10 +124,11 @@ class TestBuildToolBaseUrl:
 
 
 class TestBuildOpencodeBaseUrls:
-    def test_returns_anthropic_gemini_and_oss(self):
+    def test_returns_anthropic_gemini_openai_and_oss(self):
         urls = build_opencode_base_urls(WS)
         assert urls["anthropic"] == f"{WS}/ai-gateway/anthropic/v1"
         assert urls["gemini"] == f"{WS}/ai-gateway/gemini/v1beta"
+        assert urls["openai"] == f"{WS}/ai-gateway/openai/v1"
         assert urls["oss"] == f"{WS}/ai-gateway/mlflow/v1"
 
 

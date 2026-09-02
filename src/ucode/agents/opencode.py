@@ -20,7 +20,9 @@ from ucode.databricks import (
     TOKEN_REFRESH_INTERVAL_SECONDS,
     build_opencode_base_urls,
     get_databricks_token,
+    gpt_model_token_limits,
     model_token_limits,
+    preferred_gpt_model,
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
@@ -41,13 +43,21 @@ SPEC: ToolSpec = {
 PROVIDER_KEYS: list[list[str]] = [
     ["provider", "databricks-anthropic"],
     ["provider", "databricks-google"],
+    ["provider", "databricks-openai"],
     ["provider", "databricks-oss"],
 ]
 
 
 def _resolve_model_selector(model: str, opencode_models: dict[str, list[str]]) -> str:
     """Return an OpenCode model selector in provider/model form when possible."""
-    if model.startswith(("databricks-anthropic/", "databricks-google/", "databricks-oss/")):
+    if model.startswith(
+        (
+            "databricks-anthropic/",
+            "databricks-google/",
+            "databricks-openai/",
+            "databricks-oss/",
+        )
+    ):
         return model
 
     anthropic_models = opencode_models.get("anthropic") or []
@@ -57,6 +67,10 @@ def _resolve_model_selector(model: str, opencode_models: dict[str, list[str]]) -
     gemini_models = opencode_models.get("gemini") or []
     if model in gemini_models:
         return f"databricks-google/{model}"
+
+    openai_models = opencode_models.get("openai") or []
+    if model in openai_models:
+        return f"databricks-openai/{model}"
 
     oss_models = opencode_models.get("oss") or []
     if model in oss_models:
@@ -129,12 +143,45 @@ def _oss_model_overlay(
     return overlay
 
 
+def _responses_specs_by_id(raw_specs: object) -> dict[str, dict[str, object]]:
+    if not isinstance(raw_specs, list):
+        return {}
+    specs: dict[str, dict[str, object]] = {}
+    for raw_spec in raw_specs:
+        if not isinstance(raw_spec, dict):
+            continue
+        typed_spec = cast(dict[str, object], raw_spec)
+        model_id = typed_spec.get("id")
+        context = _positive_int(typed_spec.get("context_window"))
+        if isinstance(model_id, str) and model_id and context is not None:
+            specs.setdefault(model_id, typed_spec)
+    return specs
+
+
+def _openai_model_overlay(
+    model: str, ua_header: dict[str, str], spec: dict[str, object] | None = None
+) -> dict:
+    """Per-model Responses API options and explicit token limits."""
+    limits = gpt_model_token_limits(model)
+    discovered_context = (
+        _positive_int(spec.get("context_window")) if isinstance(spec, dict) else None
+    )
+    if discovered_context is not None:
+        limits["context"] = discovered_context
+    return {
+        "headers": ua_header,
+        "limit": limits,
+        "options": {"useResponsesApi": True},
+    }
+
+
 def render_overlay(
     model: str,
     token: str,
     opencode_base_urls: dict[str, str],
     opencode_models: dict[str, list[str]],
     oss_specs: list[dict] | None = None,
+    codex_specs: list[dict] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for opencode.json."""
     auth_headers = {"Authorization": f"Bearer {token}"}
@@ -148,6 +195,7 @@ def render_overlay(
 
     anthropic_models = opencode_models.get("anthropic") or []
     gemini_models = opencode_models.get("gemini") or []
+    openai_models = opencode_models.get("openai") or []
     oss_models = opencode_models.get("oss") or []
 
     providers: dict = {}
@@ -183,6 +231,27 @@ def render_overlay(
             "models": {m: {"headers": ua_header} for m in gemini_models},
         }
         keys.append(["provider", "databricks-google"])
+    if openai_models:
+        codex_specs_by_id = _responses_specs_by_id(codex_specs)
+        # @ai-sdk/openai supports both Responses and legacy chat completions.
+        # These models use the native `/ai-gateway/openai/v1/responses` route,
+        # so `useResponsesApi: true` lives in models.<m>.options where OpenCode
+        # reads it (provider-level options is read by the SDK only).
+        providers["databricks-openai"] = {
+            "npm": "@ai-sdk/openai",
+            "options": {
+                "baseURL": opencode_base_urls["openai"],
+                "apiKey": token,
+                "headers": auth_headers,
+            },
+            "models": {
+                model_id: _openai_model_overlay(
+                    model_id, ua_header, codex_specs_by_id.get(model_id)
+                )
+                for model_id in openai_models
+            },
+        }
+        keys.append(["provider", "databricks-openai"])
     if oss_models:
         specs_by_id = _oss_specs_by_id(oss_specs)
         providers["databricks-oss"] = {
@@ -226,6 +295,7 @@ def write_tool_config(
         opencode_base_urls,
         state.get("opencode_models") or {},
         state.get("oss_model_specs") or [],
+        state.get("codex_model_specs") or [],
     )
     existing = read_json_safe(OPENCODE_CONFIG_PATH)
     providers = existing.get("provider")
@@ -286,6 +356,9 @@ def default_model(state: dict) -> str | None:
     anthropic = opencode_models.get("anthropic") or []
     if anthropic:
         return anthropic[0]
+    openai = preferred_gpt_model(opencode_models.get("openai") or [])
+    if openai:
+        return openai
     gemini = opencode_models.get("gemini") or []
     if gemini:
         return gemini[0]

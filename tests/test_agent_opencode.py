@@ -14,6 +14,7 @@ def _base_urls() -> dict[str, str]:
     return {
         "anthropic": f"{WS}/ai-gateway/anthropic/v1",
         "gemini": f"{WS}/ai-gateway/gemini/v1beta",
+        "openai": f"{WS}/ai-gateway/openai/v1",
         "oss": f"{WS}/ai-gateway/mlflow/v1",
     }
 
@@ -312,6 +313,81 @@ class TestRenderOverlay:
         assert overlay["model"] == "databricks-oss/system.ai.kimi-k2-7-code"
 
 
+class TestOpenAIProvider:
+    """OpenCode uses the native Responses route for GPT and Grok models."""
+
+    def test_openai_provider_added_when_codex_models_present(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        assert "databricks-openai" in overlay["provider"]
+
+    def test_openai_provider_uses_native_sdk_and_gateway(self):
+        models = {"openai": ["databricks-gpt-5-6-sol"]}
+        overlay, _ = opencode.render_overlay("databricks-gpt-5-6-sol", "tok", _base_urls(), models)
+        provider = overlay["provider"]["databricks-openai"]
+        assert provider["npm"] == "@ai-sdk/openai"
+        assert provider["options"]["baseURL"] == f"{WS}/ai-gateway/openai/v1"
+        assert provider["options"]["headers"]["Authorization"] == "Bearer tok"
+
+    def test_use_responses_api_set_on_every_codex_model(self):
+        model_ids = ["databricks-gpt-5-6-sol", "system.ai.grok-4-6"]
+        overlay, _ = opencode.render_overlay(
+            model_ids[0], "tok", _base_urls(), {"openai": model_ids}
+        )
+        entries = overlay["provider"]["databricks-openai"]["models"]
+        assert all(entry["options"]["useResponsesApi"] is True for entry in entries.values())
+        assert entries["databricks-gpt-5-6-sol"]["limit"] == {
+            "context": 1_050_000,
+            "output": 128_000,
+        }
+        assert entries["system.ai.grok-4-6"]["limit"]["context"] == 500_000
+
+    def test_live_responses_context_overrides_static_fallback(self):
+        model = "system.ai.future-coder-1"
+        specs = [{"id": model, "context_window": 750_000}]
+        overlay, _ = opencode.render_overlay(
+            model, "tok", _base_urls(), {"openai": [model]}, [], specs
+        )
+        entry = overlay["provider"]["databricks-openai"]["models"][model]
+        assert entry["limit"] == {"context": 750_000, "output": 16_384}
+
+    def test_openai_user_agent_header(self, monkeypatch):
+        monkeypatch.setattr(opencode, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(opencode, "agent_version", lambda binary: "0.74.0")
+        model = "databricks-gpt-5-6-sol"
+        overlay, _ = opencode.render_overlay(model, "tok", _base_urls(), {"openai": [model]})
+        entry = overlay["provider"]["databricks-openai"]["models"][model]
+        assert entry["headers"]["User-Agent"] == "ucode/0.1.0 opencode/0.74.0"
+
+    def test_selector_and_managed_keys_use_openai_provider(self):
+        model = "databricks-gpt-5-6-sol"
+        overlay, keys = opencode.render_overlay(model, "tok", _base_urls(), {"openai": [model]})
+        assert overlay["model"] == f"databricks-openai/{model}"
+        assert ["provider", "databricks-openai"] in keys
+        assert ["provider", "databricks-openai"] in opencode.PROVIDER_KEYS
+
+    def test_already_prefixed_openai_model_is_preserved(self):
+        model = "databricks-gpt-5-6-sol"
+        selector = f"databricks-openai/{model}"
+        overlay, _ = opencode.render_overlay(selector, "tok", _base_urls(), {"openai": [model]})
+        assert overlay["model"] == selector
+
+    def test_all_four_providers_can_coexist(self):
+        models = {
+            "anthropic": ["claude-sonnet"],
+            "gemini": ["gemini-2"],
+            "openai": ["databricks-gpt-5-6-sol"],
+            "oss": ["system.ai.kimi-k2-7-code"],
+        }
+        overlay, _ = opencode.render_overlay("claude-sonnet", "tok", _base_urls(), models)
+        assert set(overlay["provider"]) == {
+            "databricks-anthropic",
+            "databricks-google",
+            "databricks-openai",
+            "databricks-oss",
+        }
+
+
 class TestMcpServerConfig:
     # ucode registers the `ucode mcp-proxy ...` bridge as a `local` (stdio) MCP
     # server; the proxy handles token refresh, so no URL/bearer header here.
@@ -419,6 +495,28 @@ class TestOpencodeDefaultModel:
     def test_prefers_anthropic(self):
         state = {"opencode_models": {"anthropic": ["claude-sonnet"], "gemini": ["gemini-2"]}}
         assert opencode.default_model(state) == "claude-sonnet"
+
+    def test_falls_back_to_openai_before_gemini(self):
+        state = {
+            "opencode_models": {
+                "anthropic": [],
+                "openai": ["databricks-gpt-5-6-sol"],
+                "gemini": ["gemini-2"],
+            }
+        }
+        assert opencode.default_model(state) == "databricks-gpt-5-6-sol"
+
+    def test_openai_fallback_chooses_newest_gpt(self):
+        state = {
+            "opencode_models": {
+                "openai": ["databricks-gpt-4-1", "databricks-gpt-5-5", "databricks-gpt-5-4"]
+            }
+        }
+        assert opencode.default_model(state) == "databricks-gpt-5-5"
+
+    def test_gpt_oss_is_not_selected_for_responses(self):
+        state = {"opencode_models": {"openai": ["gpt-oss-120b"], "gemini": ["gemini-2"]}}
+        assert opencode.default_model(state) == "gemini-2"
 
     def test_falls_back_to_gemini(self):
         state = {"opencode_models": {"anthropic": [], "gemini": ["gemini-2"]}}

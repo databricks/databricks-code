@@ -2592,10 +2592,15 @@ class TestConfigureSharedStateUsePat:
             lambda w, t, ids: ([{"id": model, "context_window": 750_000}], None),
         )
 
-        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+        state = cli_mod.configure_shared_state(
+            self.WS,
+            profile="DEFAULT",
+            tools=["opencode"],
+        )
 
         assert state["codex_models"] == [model]
         assert state["codex_model_specs"] == [{"id": model, "context_window": 750_000}]
+        assert state["opencode_models"]["openai"] == [model]
         assert saved[-1]["codex_models"] == [model]
 
     def test_uc_oss_ids_persist_matching_capability_specs(self, monkeypatch):
@@ -2849,6 +2854,7 @@ class TestConfigureSharedStateUsePat:
                 "databricks-claude-opus-4-8",
                 "databricks-claude-sonnet-4-6",
             ],
+            "openai": ["databricks-gpt-5-6-sol"],
             "oss": ["databricks-glm-5-2"],
         }
 

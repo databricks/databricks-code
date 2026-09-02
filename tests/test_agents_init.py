@@ -193,6 +193,13 @@ class TestCheckGatewayEndpoint:
         state = {"opencode_models": {"anthropic": ["claude-sonnet"]}}
         assert check_gateway_endpoint(state, "opencode") is True
 
+    def test_opencode_failure_detail_includes_codex_discovery(self):
+        detail = agents_mod._availability_failure_detail(
+            "opencode", {"_discovery_reasons": {"codex": "HTTP 503 unavailable"}}
+        )
+
+        assert "codex discovery: HTTP 503 unavailable" in detail
+
     def test_copilot_available_with_claude(self):
         assert check_gateway_endpoint({"claude_models": {"sonnet": "s4"}}, "copilot") is True
 

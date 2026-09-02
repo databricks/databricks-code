@@ -768,6 +768,18 @@ class TestOpencodeLaunch:
                 out.append((provider, model))
         return out
 
+    def test_all_models_includes_native_openai_provider(self):
+        models = self._all_models(
+            {
+                "opencode_models": {
+                    "anthropic": ["claude-sonnet"],
+                    "openai": ["system.ai.gpt-5-6-sol"],
+                }
+            }
+        )
+
+        assert ("openai", "system.ai.gpt-5-6-sol") in models
+
     def test_launch_opencode_per_model(
         self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
     ):
