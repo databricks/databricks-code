@@ -1,6 +1,6 @@
 # Unity AI Gateway Coding CLI (ucode)
 
-`ucode` is a lightweight launcher for running Codex, Claude Code, Gemini CLI, OpenCode, GitHub Copilot CLI, and Pi through Databricks.
+`ucode` is a lightweight launcher for running Codex, Claude Code, Gemini CLI, OpenCode, GitHub Copilot CLI, Pi, and Continue through Databricks.
 
 ## Requirements
 
@@ -30,6 +30,7 @@ ucode gemini     # Gemini CLI
 ucode opencode   # OpenCode
 ucode copilot    # GitHub Copilot CLI
 ucode pi         # Pi
+ucode continue   # Continue (cn CLI + VS Code/JetBrains extensions)
 ucode cursor     # Cursor Agent (MCP only — see below)
 ```
 
@@ -68,7 +69,9 @@ To configure specific tools without the picker, pass a comma-separated list:
 ucode configure --agents claude,codex
 ```
 
-Available agent names are `codex`, `claude`, `gemini`, `opencode`, `copilot`, and `pi`. `cursor` is also accepted (MCP-only — it registers Databricks MCP servers but configures no models).
+Available agent names are `codex`, `claude`, `gemini`, `opencode`, `copilot`, `pi`, and `continue`. `cursor` is also accepted (MCP-only — it registers Databricks MCP servers but configures no models).
+
+`continue` writes `~/.continue/config.yaml`, which is shared by the `cn` CLI and the Continue VS Code/JetBrains extensions — so configuring it once wires up both. Its chat/edit/apply roles route to your Databricks Claude/GPT models through the Unity AI Gateway.
 
 Naming agents explicitly is treated as a request for all of them: if any one isn't available on the workspace, the run fails without configuring the others. Add `--skip-unavailable` to configure the available subset instead and skip the rest with a warning:
 
@@ -106,7 +109,7 @@ ucode configure --profiles DEFAULT --agents claude,codex --use-pat --skip-valida
 ucode configure mcp
 ```
 
-Add Databricks MCP servers to installed MCP-capable tools: Codex, Claude Code, Gemini CLI, OpenCode, GitHub Copilot CLI, and Cursor Agent.
+Add Databricks MCP servers to installed MCP-capable tools: Codex, Claude Code, Gemini CLI, OpenCode, GitHub Copilot CLI, Continue, and Cursor Agent.
 Options are shown in this order:
 
 - Discovered external MCP connections
@@ -385,6 +388,7 @@ control the installation.
 | `~/.config/opencode/opencode.json` | OpenCode |
 | `~/.copilot/.env` | GitHub Copilot CLI |
 | `~/.pi/agent/models.json` | Pi |
+| `~/.continue/config.yaml` | Continue (`cn` CLI + IDE extensions) |
 | `~/.cursor/mcp.json` | Cursor Agent (MCP servers only) |
 | `~/.ucode/managed-state.json` | The managed config — authored by `ucode setup` (admins) and refreshed from the workspace on launch |
 | `~/.ucode/managed-backups/` | Baseline backups for OS-managed files changed by ucode |

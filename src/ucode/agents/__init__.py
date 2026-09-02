@@ -40,7 +40,7 @@ from ucode.ui import (
     spinner,
 )
 
-from . import claude, codex, copilot, gemini, opencode, pi
+from . import claude, codex, continue_dev, copilot, gemini, opencode, pi
 from .args import explicit_model_arg_value as explicit_model_arg_value
 
 _MODULES = {
@@ -50,6 +50,7 @@ _MODULES = {
     "opencode": opencode,
     "copilot": copilot,
     "pi": pi,
+    "continue": continue_dev,
 }
 
 TOOL_SPECS: dict[str, ToolSpec] = {name: module.SPEC for name, module in _MODULES.items()}
@@ -68,6 +69,9 @@ TOOL_ALIASES = {
     "opencode": "opencode",
     "copilot": "copilot",
     "pi": "pi",
+    "continue": "continue",
+    "continue-dev": "continue",
+    "cn": "continue",
 }
 
 DEFAULT_TOOL = "codex"
@@ -100,7 +104,8 @@ def normalize_tool(tool: str) -> str:
     normalized = TOOL_ALIASES.get(tool.strip().lower())
     if not normalized:
         raise RuntimeError(
-            f"Unsupported tool '{tool}'. Use one of: codex, claude, gemini, opencode, copilot, pi."
+            f"Unsupported tool '{tool}'. Use one of: codex, claude, gemini, opencode, copilot, "
+            "pi, continue."
         )
     return normalized
 
@@ -379,6 +384,8 @@ def configure_tool(
             result = copilot.write_tool_config(state, model)
         elif tool == "pi":
             result = pi.write_tool_config(state, model)
+        elif tool == "continue":
+            result = continue_dev.write_tool_config(state, model)
         else:
             result = opencode.write_tool_config(state, model)
     # gemini/opencode/copilot/pi return (state, token); codex/claude return state
@@ -409,6 +416,8 @@ def check_gateway_endpoint(state: dict, tool: str) -> bool:
             or bool(state.get("codex_models"))
             or bool(state.get("gemini_models"))
         )
+    if tool == "continue":
+        return bool(state.get("claude_models")) or bool(state.get("codex_models"))
     return False
 
 
@@ -419,6 +428,7 @@ _TOOL_DISCOVERY_SOURCES: dict[str, tuple[str, ...]] = {
     "gemini": ("gemini",),
     "copilot": ("claude", "codex"),
     "pi": ("claude", "codex", "gemini"),
+    "continue": ("claude", "codex"),
 }
 
 

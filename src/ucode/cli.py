@@ -18,6 +18,7 @@ from ucode.agents import (
     configure_selected_tools,
     configure_single_tool,
     configure_tool,
+    continue_dev,
     ensure_bootstrap_dependencies,
     ensure_provider_state,
     explicit_model_arg_value,
@@ -143,8 +144,8 @@ from ucode.ui import (
 from ucode.usage import usage as usage_report
 
 _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
-    "claude": ("claude", "opencode", "copilot", "pi"),
-    "codex": ("codex", "copilot", "pi"),
+    "claude": ("claude", "opencode", "copilot", "pi", "continue"),
+    "codex": ("codex", "copilot", "pi", "continue"),
     "gemini": ("gemini", "opencode", "pi"),
     "oss": ("opencode",),
 }
@@ -639,10 +640,17 @@ def configure_shared_state(
     print_success("Unity AI Gateway detected")
 
     want_claude = (
-        fetch_all or "claude" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools
+        fetch_all
+        or "claude" in tools
+        or "opencode" in tools
+        or "copilot" in tools
+        or "pi" in tools
+        or "continue" in tools
     )
     want_gemini = fetch_all or "gemini" in tools or "opencode" in tools or "pi" in tools
-    want_codex = fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools
+    want_codex = (
+        fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools or "continue" in tools
+    )
     # Codex smart routing can select OSS models such as GLM, so a Codex-only
     # configure must persist that discovered family too.
     want_oss = fetch_all or "opencode" in tools or "codex" in tools
@@ -1118,7 +1126,13 @@ def revert() -> int:
             spec["config_path"], spec["backup_path"], bool(managed_configs.get(tool))
         )
         for tool, spec in TOOL_SPECS.items()
+        if tool != "continue"
     }
+    # Continue writes the user's shared ~/.continue/config.yaml (read by the IDE
+    # extensions), so a whole-file restore would clobber models the user added
+    # since ucode first ran — strip only ucode's own entries instead. Its MCP
+    # servers are removed above by revert_mcp_configs.
+    results["continue"] = continue_dev.revert_config()
     pi_settings_restored = restore_file(
         PI_SETTINGS_PATH, PI_SETTINGS_BACKUP_PATH, bool(managed_configs.get("pi"))
     )
@@ -2508,6 +2522,19 @@ def pi_cmd(
     _launch_tool("pi", ctx, skip_preflight=skip_preflight)
 
 
+@app.command(
+    "continue", context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
+)
+def continue_cmd(
+    ctx: typer.Context,
+    skip_preflight: SkipPreflightOption = False,
+    skip_managed_config: SkipManagedConfigOption = False,
+) -> None:
+    """Launch Continue via Databricks."""
+    _disable_managed_config_if_requested(skip_managed_config)
+    _launch_tool("continue", ctx, skip_preflight=skip_preflight)
+
+
 @app.command("cursor", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def cursor_cmd(ctx: typer.Context) -> None:
     """Launch Cursor Agent.
@@ -2551,7 +2578,8 @@ def configure(
         str | None,
         typer.Option(
             "--agent",
-            help="Configure only the named agent (e.g. claude, codex, gemini, opencode, copilot, pi).",
+            help="Configure only the named agent (e.g. claude, codex, gemini, opencode, copilot, "
+            "pi, continue).",
         ),
     ] = None,
     agents: Annotated[
