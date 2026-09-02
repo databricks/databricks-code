@@ -409,12 +409,11 @@ def configure_tool(
             coding_agent_config_defaults=coding_agent_config_defaults,
         )
     else:
-        # provider routing is claude/codex-only; every other tool needs a model.
+        # Every tool in this branch needs a model — including gemini under a provider,
+        # which still pins the service's target model in the URL.
         if not model:
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         if tool == "gemini":
-            # Gemini routes through a provider by header (like codex), but must also
-            # pin the service's target model in the URL — `model` already holds it.
             result = gemini.write_tool_config(state, model, provider=provider)
         elif tool == "copilot":
             result = copilot.write_tool_config(state, model)
