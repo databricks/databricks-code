@@ -2023,6 +2023,8 @@ def _launch_tool(
         # Validate the provider service before launching — it must exist, be a
         # provider type this tool can route to (e.g. claude can't use an OpenAI
         # or Foundry service), and, for Bedrock, expose Claude models to pin.
+        # Gemini is exempt: it validates the service and resolves its target in a single
+        # lookup via resolve_gemini_provider_model (below), and uses no family model map.
         provider_models = None
         relayed = False
         coding_agent_config_defaults = (
@@ -2030,7 +2032,7 @@ def _launch_tool(
             if tool == "claude" and managed is not None
             else {}
         )
-        if provider:
+        if provider and tool != "gemini":
             provider_models, error, relayed = resolve_provider_models(tool, state, provider)
             if error:
                 if managed is not None and provider == managed_provider_service(managed, tool):
@@ -2124,6 +2126,9 @@ def _launch_tool(
                 print_kv("Model", forwarded_model)
             elif route_root_model:
                 print_kv("Model", route_root_model)
+            # Gemini pins a concrete target under a provider (held in resolved_model).
+            elif resolved_model:
+                print_kv("Model", resolved_model)
         elif forwarded_model:
             print_kv("Model", forwarded_model)
         elif model and tool == "claude":

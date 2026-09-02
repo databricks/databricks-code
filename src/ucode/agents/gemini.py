@@ -188,6 +188,15 @@ def default_model(state: dict) -> str | None:
     return gemini_models[0] if gemini_models else None
 
 
+def persisted_provider_model() -> str | None:
+    """The Gemini model currently pinned in the env file, if any.
+
+    A provider launch writes the service's target here; reusing it lets a bare
+    ``ucode gemini`` relaunch (or reconfigure) run without re-passing ``--model``.
+    """
+    return parse_dotenv(GEMINI_ENV_PATH).get("GEMINI_MODEL")
+
+
 def _launch_model(state: dict, provider: str | None) -> str | None:
     """The model this session runs on.
 
@@ -196,7 +205,7 @@ def _launch_model(state: dict, provider: str | None) -> str | None:
     gateway can't resolve behind the provider header). Otherwise the usual default.
     """
     if provider:
-        written = parse_dotenv(GEMINI_ENV_PATH).get("GEMINI_MODEL")
+        written = persisted_provider_model()
         if written:
             return written
     return default_model(state)

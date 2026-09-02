@@ -683,6 +683,39 @@ class TestClaudeModelFlag:
         assert mock_launch.call_args.args[1]["_claude_launch_provider"] == "main.default.anthropic"
 
 
+class TestGeminiProviderLaunch:
+    @staticmethod
+    def _launch(monkeypatch, resolve_provider_models):
+        state = dict(MINIMAL_STATE)
+        monkeypatch.setattr("ucode.cli.ensure_bootstrap_dependencies", lambda *a, **k: None)
+        monkeypatch.setattr("ucode.cli.load_state", lambda: state)
+        monkeypatch.setattr("ucode.cli.ensure_provider_state", lambda t: state)
+        monkeypatch.setattr("ucode.cli.configure_shared_state", lambda *a, **k: state)
+        monkeypatch.setattr("ucode.cli._fetch_managed_config", lambda s: (None, False))
+        monkeypatch.setattr("ucode.cli.resolve_provider_models", resolve_provider_models)
+        monkeypatch.setattr("ucode.cli.configure_tool", lambda *a, **k: state)
+        monkeypatch.setattr(
+            "ucode.cli.resolve_gemini_provider_model",
+            lambda s, p, m: ("gemini-3.5-flash", None),
+        )
+        mock_launch = MagicMock()
+        monkeypatch.setattr("ucode.cli.launch_agent", mock_launch)
+        return runner.invoke(app, ["gemini", "--provider", "cat.schema.svc"])
+
+    def test_prints_resolved_target_model(self, monkeypatch):
+        # The concrete target gemini pins must show in the launch summary (not just the provider).
+        result = self._launch(monkeypatch, lambda t, s, p: (None, None, False))
+        assert result.exit_code == 0, result.output
+        assert "Model: gemini-3.5-flash" in _strip_ansi(result.output)
+
+    def test_skips_resolve_provider_models(self, monkeypatch):
+        # Gemini resolves its own target, so the claude-family lookup must not run (no double fetch).
+        mock_rpm = MagicMock(return_value=(None, None, False))
+        result = self._launch(monkeypatch, mock_rpm)
+        assert result.exit_code == 0, result.output
+        mock_rpm.assert_not_called()
+
+
 class TestMcpSubcommands:
     def test_web_search_subcommand_help(self):
         result = runner.invoke(app, ["mcp", "web-search", "--help"])
