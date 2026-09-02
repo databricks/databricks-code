@@ -3109,13 +3109,18 @@ def _probe_ai_gateway_v3(workspace: str, token: str) -> GatewayProbe:
                 return GatewayProbe(
                     False, _version_neutral_gateway_detail(reason or "unknown error")
                 )
-            break  # Reachability already confirmed; stop paging on a later-page error.
+            # A later page failed: reachable, but the listing was not walked to
+            # the end, so we can't claim nothing is accessible.
+            return GatewayProbe(True, "reachable")
         if isinstance(payload, dict) and payload.get("model_services"):
             return GatewayProbe(True, "reachable, accessible model service returned", True)
         page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
         if not page_token:
-            break
-    return GatewayProbe(True, _MODEL_SERVICE_EMPTY_DETAIL)
+            # Walked the whole listing without an accessible model service.
+            return GatewayProbe(True, _MODEL_SERVICE_EMPTY_DETAIL)
+    # Hit the page cap with a cursor still pending: reachable but inconclusive,
+    # so don't assert the listing is empty.
+    return GatewayProbe(True, "reachable")
 
 
 def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
@@ -3123,6 +3128,15 @@ def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
         f"Databricks rejected the access token for {workspace} ({reason}). "
         f"Try:\n"
         f"  databricks auth logout --host {workspace}\n"
+        f"  databricks auth login --host {workspace}"
+    )
+
+
+def _raise_ai_gateway_scope_failure(workspace: str, reason: str) -> NoReturn:
+    raise RuntimeError(
+        f"The access token for {workspace} is missing an OAuth scope required by the "
+        f"AI Gateway APIs ({reason}). Re-authenticate to mint a token with the needed "
+        f"scopes:\n"
         f"  databricks auth login --host {workspace}"
     )
 
@@ -3165,6 +3179,12 @@ def probe_unity_gateway_capabilities(workspace: str, token: str) -> GatewayProbe
         return model_service_probe
     if _looks_like_definitive_auth_failure(legacy_endpoint_probe.detail):
         _raise_ai_gateway_auth_failure(workspace, legacy_endpoint_probe.detail)
+    # A missing-scope 403 that survived the fallback is a token problem, not a
+    # UC grant, so surface re-login guidance before the permission hints.
+    if _looks_like_scope_failure(model_service_probe.detail):
+        _raise_ai_gateway_scope_failure(workspace, model_service_probe.detail)
+    if _looks_like_scope_failure(legacy_endpoint_probe.detail):
+        _raise_ai_gateway_scope_failure(workspace, legacy_endpoint_probe.detail)
     if _looks_like_permission_failure(model_service_probe.detail):
         _raise_model_service_permission_failure(
             workspace, model_service_probe.detail, legacy_endpoint_probe.detail
@@ -3185,16 +3205,21 @@ def _looks_like_definitive_auth_failure(reason: str) -> bool:
     """True when retrying another workspace API cannot rescue this token.
 
     A 403 can be endpoint-specific authorization, so the preflight must still
-    try the fallback before surfacing it as an auth failure. A missing-OAuth-
-    scope 403 is the exception: it 403s every workspace API, so re-login (not a
-    UC grant) is the fix.
+    try the fallback before surfacing it as an auth failure.
     """
     if "HTTP 401" in reason:
         return True
-    lowered = reason.lower()
-    if "HTTP 403" in reason and "required scopes" in lowered:
-        return True
-    return "HTTP 400" in reason and "invalid token" in lowered
+    return "HTTP 400" in reason and "invalid token" in reason.lower()
+
+
+def _looks_like_scope_failure(reason: str) -> bool:
+    """True for a 403 that reports the OAuth token is missing a required scope.
+
+    The scopes the model-service and legacy-endpoint APIs require differ, so
+    this is only conclusive once both probes have failed on it -- re-login (not
+    a UC grant) is the fix.
+    """
+    return "HTTP 403" in reason and "required scopes" in reason.lower()
 
 
 def _looks_like_permission_failure(reason: str) -> bool:
