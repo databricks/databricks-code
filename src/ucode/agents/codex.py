@@ -14,6 +14,7 @@ from pathlib import Path
 import tomlkit
 from tomlkit.exceptions import ParseError
 
+from ucode.codex_config import codex_config_args
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -536,7 +537,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
                 f"Cannot launch Codex app with the ucode profile because {CODEX_CONFIG_PATH} "
                 "is missing or empty. Run `ucode configure --agents codex` first."
             )
-        config_args = smart_routing_v2.codex_config_args(profile_doc)
+        config_args = codex_config_args(profile_doc)
         exec_or_spawn([binary, "app", *config_args, *tool_args[1:]])
         return  # unreachable in production (exec replaces the process)
     # Run codex with --profile first — the TUI and runtime subcommands

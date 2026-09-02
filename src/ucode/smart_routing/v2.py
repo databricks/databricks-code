@@ -14,8 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn, TextIO
 
-import tomlkit
-
+from ucode.codex_config import codex_config_args
 from ucode.config_io import APP_DIR, read_json_safe, read_toml_safe, write_json_file
 from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import (
@@ -391,37 +390,6 @@ def launch_claude(
         settings_path.unlink(missing_ok=True)
         socket_path.unlink(missing_ok=True)
     sys.exit(returncode)
-
-
-def _toml_value(value: str | int | float | bool | list[object] | dict[str, object]) -> str:
-    if isinstance(value, dict):
-        item = tomlkit.inline_table()
-        item.update(value)
-        return item.as_string()
-    if isinstance(value, list) and any(isinstance(entry, dict) for entry in value):
-        wrapper = tomlkit.inline_table()
-        wrapper["value"] = value
-        rendered = wrapper.as_string()
-        return rendered.removeprefix("{value = ").removesuffix("}")
-    return tomlkit.item(value).as_string()
-
-
-def codex_config_args(overlay: dict) -> list[str]:
-    args: list[str] = []
-    for key, value in overlay.items():
-        # This is Codex's AI Gateway transport definition, not Unity Catalog
-        # Model Provider Service support; smart routing still cannot use --provider.
-        if key in {"hooks", "model_providers"} and isinstance(value, dict):
-            for provider_name, provider_config in value.items():
-                args.extend(
-                    [
-                        "--config",
-                        f"{key}.{provider_name}={_toml_value(provider_config)}",
-                    ]
-                )
-        else:
-            args.extend(["--config", f"{key}={_toml_value(value)}"])
-    return args
 
 
 # TODO: Replace with /codex/v1/models once /codex/v1/models can send GPT models as well.
