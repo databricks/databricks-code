@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 from contextlib import nullcontext
+from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+import ucode.config_io as config_io
 from ucode.agents import pi
 
 WS = "https://example.databricks.com"
@@ -15,7 +19,7 @@ def _base_urls() -> dict[str, str]:
     # Native API per family — see agents/pi.py docstring for path conventions.
     return {
         "claude": f"{WS}/ai-gateway/anthropic",
-        "openai": f"{WS}/ai-gateway/codex/v1",
+        "openai": f"{WS}/ai-gateway/openai/v1",
         "gemini": f"{WS}/ai-gateway/gemini/v1beta",
     }
 
@@ -26,6 +30,7 @@ def _empty() -> dict:
         "claude_models": {},
         "codex_models": [],
         "gemini_models": [],
+        "claude_model_ids": None,
     }
 
 
@@ -39,6 +44,7 @@ def _overlay(model: str, token: str = "tok", **kwargs):
         bundle["claude_models"],
         bundle["codex_models"],
         bundle["gemini_models"],
+        bundle["claude_model_ids"],
     )
 
 
@@ -55,7 +61,31 @@ class TestPiSpec:
     def test_config_path_under_pi_agent_dir(self):
         assert pi.SPEC["config_path"].name == "models.json"
         assert pi.SPEC["config_path"].parent.name == "agent"
-        assert pi.PI_UCODE_HOME in pi.SPEC["config_path"].parents
+        assert pi.PI_CONFIG_DIR == Path.home() / ".pi" / "agent"
+
+    @pytest.mark.parametrize(
+        ("new_name", "legacy_name"),
+        [
+            (pi.PI_BACKUP_PATH.name, "pi-models.backup.json"),
+            (pi.PI_SETTINGS_BACKUP_PATH.name, "pi-settings.backup.json"),
+        ],
+    )
+    def test_standard_config_backup_does_not_reuse_legacy_private_backup(
+        self, tmp_path, monkeypatch, new_name, legacy_name
+    ):
+        monkeypatch.setattr(config_io, "APP_DIR", tmp_path)
+        config = tmp_path / "standard.json"
+        current_backup = tmp_path / new_name
+        legacy_backup = tmp_path / legacy_name
+        config.write_text("user-standard-config")
+        legacy_backup.write_text("old-private-config-backup")
+
+        assert config_io.backup_existing_file(config, current_backup) is True
+        config.write_text("ucode-overwrite")
+        assert config_io.restore_file(config, current_backup, managed=True) is True
+
+        assert config.read_text() == "user-standard-config"
+        assert legacy_backup.read_text() == "old-private-config-backup"
 
 
 class TestRenderOverlayProviders:
@@ -73,7 +103,28 @@ class TestRenderOverlayProviders:
         overlay, _ = _overlay("gpt-5", codex_models=["gpt-5"])
         provider = overlay["providers"]["databricks-openai"]
         assert provider["api"] == "openai-responses"
-        assert provider["baseUrl"] == f"{WS}/ai-gateway/codex/v1"
+        assert provider["baseUrl"] == f"{WS}/ai-gateway/openai/v1"
+
+    def test_claude_entries_pin_limits_and_extended_thinking_levels(self):
+        overlay, _ = _overlay(
+            "system.ai.claude-opus-4-8",
+            claude_models={
+                "opus": "system.ai.claude-opus-4-8",
+                "sonnet": "system.ai.claude-sonnet-5",
+                "haiku": "system.ai.claude-haiku-4-5",
+            },
+        )
+        entries = {m["id"]: m for m in overlay["providers"]["databricks-claude"]["models"]}
+        opus = entries["system.ai.claude-opus-4-8"]
+        assert opus["contextWindow"] == 1_000_000
+        assert opus["maxTokens"] == 128_000
+        assert opus["compat"] == {"forceAdaptiveThinking": True}
+        assert opus["thinkingLevelMap"] == {"max": "max", "xhigh": "xhigh"}
+        assert entries["system.ai.claude-sonnet-5"]["thinkingLevelMap"] == {
+            "max": "max",
+            "xhigh": "xhigh",
+        }
+        assert "thinkingLevelMap" not in entries["system.ai.claude-haiku-4-5"]
 
     def test_gemini_provider_uses_google_generative_ai(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
@@ -153,10 +204,62 @@ class TestRenderOverlayAuthAndModels:
         ids = {m["id"] for m in overlay["providers"]["databricks-claude"]["models"]}
         assert ids == {"claude-opus", "claude-sonnet"}
 
+    def test_pi_can_list_supplemental_claude_versions(self):
+        overlay, _ = _overlay(
+            "system.ai.claude-opus-5",
+            claude_models={"opus": "system.ai.claude-opus-4-8"},
+            claude_model_ids=[
+                "system.ai.claude-opus-4-8",
+                "system.ai.claude-opus-5",
+            ],
+        )
+        provider = overlay["providers"]["databricks-claude"]
+        assert {model["id"] for model in provider["models"]} == {
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-opus-5",
+        }
+        assert overlay["model"] == "databricks-claude/system.ai.claude-opus-5"
+
     def test_openai_models_listed(self):
         overlay, _ = _overlay("gpt-5", codex_models=["gpt-5", "gpt-5-mini"])
         ids = {m["id"] for m in overlay["providers"]["databricks-openai"]["models"]}
         assert ids == {"gpt-5", "gpt-5-mini"}
+
+    def test_gpt_entries_pin_limits_and_omit_unsupported_off_effort(self):
+        overlay, _ = _overlay(
+            "system.ai.gpt-5-6-sol",
+            codex_models=["system.ai.gpt-5-6-sol", "system.ai.gpt-5"],
+        )
+        entries = {
+            model["id"]: model for model in overlay["providers"]["databricks-openai"]["models"]
+        }
+        assert entries["system.ai.gpt-5-6-sol"]["contextWindow"] == 1_050_000
+        assert entries["system.ai.gpt-5"]["contextWindow"] == 400_000
+        assert entries["system.ai.gpt-5"]["thinkingLevelMap"] == {"off": None}
+
+    def test_grok_appears_with_supported_thinking_levels(self):
+        grok = "system.ai.grok-4-6"
+        overlay, _ = _overlay(grok, codex_models=[grok])
+
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+        assert entry["contextWindow"] == 500_000
+        assert entry["maxTokens"] == 16_384
+        assert entry["reasoning"] is True
+        assert entry["thinkingLevelMap"] == {
+            "off": None,
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": None,
+        }
+        assert overlay["model"] == f"databricks-openai/{grok}"
+
+    def test_grok_preview_does_not_inherit_unverified_thinking_levels(self):
+        model = "system.ai.grok-4-6-preview"
+        overlay, _ = _overlay(model, codex_models=[model])
+
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+        assert "reasoning" not in entry
+        assert "thinkingLevelMap" not in entry
 
     def test_gemini_models_listed(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2", "gemini-2-pro"])
@@ -220,9 +323,24 @@ class TestPiDefaultModel:
         state = {"claude_models": {"haiku": "h4"}}
         assert pi.default_model(state) == "h4"
 
-    def test_falls_back_to_codex(self):
-        state = {"claude_models": {}, "codex_models": ["gpt-5"]}
-        assert pi.default_model(state) == "gpt-5"
+    def test_falls_back_to_newest_gpt_model(self):
+        state = {
+            "claude_models": {},
+            "codex_models": ["gpt-5", "system.ai.gpt-5-6-sol", "gpt-5-5"],
+        }
+        assert pi.default_model(state) == "system.ai.gpt-5-6-sol"
+
+    def test_falls_back_to_grok_responses_endpoint(self):
+        grok = "system.ai.grok-4-6"
+        assert pi.default_model({"claude_models": {}, "codex_models": [grok]}) == grok
+
+    def test_does_not_route_gpt_oss_to_responses(self):
+        state = {
+            "claude_models": {},
+            "codex_models": ["system.ai.gpt-oss-120b"],
+            "gemini_models": ["gemini-2"],
+        }
+        assert pi.default_model(state) == "gemini-2"
 
     def test_falls_back_to_gemini(self):
         state = {"claude_models": {}, "codex_models": [], "gemini_models": ["gemini-2"]}
@@ -240,7 +358,7 @@ class TestBuildRuntimeEnv:
         env = pi.build_runtime_env("tok")
         assert env["OAUTH_TOKEN"] == "tok"
 
-    def test_sets_private_agent_dir_without_replacing_home(self, monkeypatch):
+    def test_sets_standard_agent_dir_without_replacing_home(self, monkeypatch):
         monkeypatch.setenv("HOME", "/real-user-home")
 
         env = pi.build_runtime_env("tok")
@@ -360,6 +478,57 @@ class TestWriteToolConfig:
         assert written["model"] == "databricks-claude/claude-sonnet"
         assert written["providers"]["databricks-claude"]["apiKey"] == "tok"
 
+    def test_config_discovers_and_caches_supplemental_claude_versions(self, tmp_path, monkeypatch):
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(claude_models={"opus": "system.ai.claude-opus-4-8"})
+        discovered = ["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"]
+        with (
+            patch.object(
+                pi_mod, "discover_claude_models_unbucketed", return_value=(discovered, None)
+            ) as discover,
+            patch("ucode.agents.pi.save_state"),
+        ):
+            pi_mod.write_tool_config(state, "system.ai.claude-opus-4-8", token="tok")
+
+        discover.assert_called_once_with(WS, "tok")
+        assert state["pi_claude_models"] == discovered
+        entries = json.loads(config_file.read_text())["providers"]["databricks-claude"]["models"]
+        assert {entry["id"] for entry in entries} == set(discovered)
+
+    def test_failed_supplemental_discovery_keeps_shared_family_pins(self, tmp_path, monkeypatch):
+        pi_mod, config_file, _, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(claude_models={"sonnet": "system.ai.claude-sonnet-4-6"})
+        with (
+            patch.object(
+                pi_mod, "discover_claude_models_unbucketed", side_effect=OSError("offline")
+            ),
+            patch("ucode.agents.pi.save_state"),
+        ):
+            pi_mod.write_tool_config(state, "system.ai.claude-sonnet-4-6", token="tok")
+
+        entries = json.loads(config_file.read_text())["providers"]["databricks-claude"]["models"]
+        assert [entry["id"] for entry in entries] == ["system.ai.claude-sonnet-4-6"]
+
+    def test_managed_pi_allowlist_keeps_same_family_claude_versions(self, tmp_path, monkeypatch):
+        pi_mod, config_file, settings_file, _ = self._setup(tmp_path, monkeypatch)
+        state = self._state(
+            pi_models=["system.ai.claude-opus-4-8", "system.ai.claude-opus-5"],
+            pi_default_model="system.ai.claude-opus-5",
+        )
+
+        with patch("ucode.agents.pi.save_state"):
+            pi_mod.write_tool_config(state, pi.default_model(state), token="tok")
+
+        written = json.loads(config_file.read_text())
+        assert {model["id"] for model in written["providers"]["databricks-claude"]["models"]} == {
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-opus-5",
+        }
+        assert written["model"] == "databricks-claude/system.ai.claude-opus-5"
+        settings = json.loads(settings_file.read_text())
+        assert settings["defaultProvider"] == "databricks-claude"
+        assert settings["defaultModel"] == "system.ai.claude-opus-5"
+
     def test_settings_pins_default_provider_and_model(self, tmp_path, monkeypatch):
         # Without this, Pi's `findInitialModel` can fall through to a built-in
         # provider when an unrelated env var (e.g. HF_TOKEN) makes one look
@@ -438,12 +607,13 @@ class TestManagedModels:
             "pi_models": [
                 "system.ai.claude-opus-4-8",
                 "system.ai.gpt-5",
+                "system.ai.grok-4-6",
                 "system.ai.gemini-3-flash",
             ]
         }
         assert pi._managed_model_families(state) == (
             {"opus": "system.ai.claude-opus-4-8"},
-            ["system.ai.gpt-5"],
+            ["system.ai.gpt-5", "system.ai.grok-4-6"],
             ["system.ai.gemini-3-flash"],
         )
 

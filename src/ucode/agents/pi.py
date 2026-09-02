@@ -1,11 +1,11 @@
-"""Pi coding agent: writes a ucode-private models.json with Databricks-backed providers.
+"""Pi coding agent: writes the user's models.json with Databricks-backed providers.
 
 Pi (https://pi.dev) is a multi-provider coding agent. We register three
 providers in its `models.json`, each speaking the API dialect best suited to
 that family's gateway path:
 
 - `databricks-claude`  (api: anthropic-messages)       → /ai-gateway/anthropic
-- `databricks-openai`  (api: openai-responses)         → /ai-gateway/codex/v1
+- `databricks-openai`  (api: openai-responses)         → /ai-gateway/openai/v1
 - `databricks-gemini`  (api: google-generative-ai)     → /ai-gateway/gemini/v1beta
 
 Per-provider `compat` flags work around fields the gateway translators reject:
@@ -31,6 +31,7 @@ import os
 import signal
 import subprocess
 import threading
+from pathlib import Path
 
 from ucode.config_io import (
     APP_DIR,
@@ -45,17 +46,26 @@ from ucode.databricks import (
     TOKEN_REFRESH_INTERVAL_SECONDS,
     build_pi_base_urls,
     classify_model_family,
+    claude_model_capabilities,
+    discover_claude_models_unbucketed,
     get_databricks_token,
+    gpt_model_token_limits,
+    preferred_gpt_model,
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 
-PI_UCODE_HOME = APP_DIR / "pi-home"
-PI_CONFIG_DIR = PI_UCODE_HOME / ".pi" / "agent"
+# Point Pi at its standard user configuration directory without replacing HOME.
+# This lets `ucode pi` retain the user's installed extensions, packages and
+# skills while ucode manages only its own provider keys and default selection.
+PI_CONFIG_DIR = Path.home() / ".pi" / "agent"
 PI_CONFIG_PATH = PI_CONFIG_DIR / "models.json"
 PI_SETTINGS_PATH = PI_CONFIG_DIR / "settings.json"
-PI_BACKUP_PATH = APP_DIR / "pi-models.backup.json"
-PI_SETTINGS_BACKUP_PATH = APP_DIR / "pi-settings.backup.json"
+# Do not reuse the legacy backup names from ucode's private Pi home. On upgrade,
+# those files can contain an unrelated old private config and must never be
+# restored over the user's standard ~/.pi/agent files.
+PI_BACKUP_PATH = APP_DIR / "pi-agent-models.backup.json"
+PI_SETTINGS_BACKUP_PATH = APP_DIR / "pi-agent-settings.backup.json"
 
 SPEC: ToolSpec = {
     "binary": "pi",
@@ -83,18 +93,72 @@ def _resolve_model_selector(
     claude_models: dict[str, str],
     codex_models: list[str],
     gemini_models: list[str],
+    claude_model_ids: list[str] | None = None,
 ) -> str:
     """Return a Pi model selector in `<provider>/<model>` form when possible."""
     for name in PROVIDER_NAMES:
         if model.startswith(f"{name}/"):
             return model
-    if model in claude_models.values():
+    all_claude_models = set(claude_models.values())
+    all_claude_models.update(claude_model_ids or [])
+    if model in all_claude_models:
         return f"databricks-claude/{model}"
     if model in codex_models:
         return f"databricks-openai/{model}"
     if model in gemini_models:
         return f"databricks-gemini/{model}"
     return model
+
+
+def _pi_claude_model_entry(model_id: str) -> dict:
+    """Build a Claude entry with explicit context and thinking metadata."""
+    capabilities = claude_model_capabilities(model_id)
+    entry: dict = {
+        "id": model_id,
+        "reasoning": True,
+        "input": ["text", "image"],
+        "contextWindow": capabilities.context,
+        "maxTokens": capabilities.output,
+    }
+    if capabilities.force_adaptive_thinking:
+        entry["compat"] = {"forceAdaptiveThinking": True}
+        entry["thinkingLevelMap"] = {"max": "max"}
+        if capabilities.supports_xhigh_thinking:
+            entry["thinkingLevelMap"]["xhigh"] = "xhigh"
+    return entry
+
+
+def _pi_gpt_model_entry(model_id: str) -> dict:
+    """Build a Pi Responses model entry with explicit limits and reasoning."""
+    limits = gpt_model_token_limits(model_id)
+    entry: dict = {
+        "id": model_id,
+        "contextWindow": limits["context"],
+        "maxTokens": limits["output"],
+    }
+    normalized_id = model_id.rsplit("/", 1)[-1].lower()
+    for prefix in ("system.ai.", "databricks-"):
+        if normalized_id.startswith(prefix):
+            normalized_id = normalized_id[len(prefix) :]
+            break
+    normalized_id = normalized_id.replace(".", "-")
+    if normalized_id == "grok-4-6":
+        # Grok 4.6 accepts exactly these reasoning levels. Hide Pi's unsupported
+        # off/minimal/max choices rather than translating them to invalid values.
+        entry["reasoning"] = True
+        entry["thinkingLevelMap"] = {
+            "off": None,
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": None,
+        }
+    elif "gpt-5" in normalized_id:
+        entry["reasoning"] = True
+        entry["input"] = ["text", "image"]
+        # Older GPT-5 routes reject `reasoning.effort: none`; None makes Pi omit
+        # the reasoning object entirely when thinking is off.
+        entry["thinkingLevelMap"] = {"off": None}
+    return entry
 
 
 def render_overlay(
@@ -104,15 +168,16 @@ def render_overlay(
     claude_models: dict[str, str],
     codex_models: list[str],
     gemini_models: list[str],
+    claude_model_ids: list[str] | None = None,
 ) -> tuple[dict, list[list[str]]]:
-    """Return (overlay, managed_key_paths) for Pi's private agent config."""
+    """Return (overlay, managed_key_paths) for Pi's user agent config."""
     providers: dict = {}
     keys: list[list[str]] = [["model"]]
     # Pi expands header values that match an env var name. Our UA contains
     # `/` and a space so it can never collide — safe to pass as a literal.
     ua_headers = {"User-Agent": f"ucode/{ucode_version()} pi/{agent_version('pi')}"}
 
-    claude_ids = sorted(set(claude_models.values()))
+    claude_ids = sorted(set(claude_models.values()) | set(claude_model_ids or []))
     if claude_ids:
         providers["databricks-claude"] = {
             "baseUrl": pi_base_urls["claude"],
@@ -124,7 +189,7 @@ def render_overlay(
             # the legacy beta header instead when this is false.
             "compat": {"supportsEagerToolInputStreaming": False},
             "headers": ua_headers,
-            "models": [{"id": m} for m in claude_ids],
+            "models": [_pi_claude_model_entry(m) for m in claude_ids],
         }
         keys.append(["providers", "databricks-claude"])
     if codex_models:
@@ -134,7 +199,7 @@ def render_overlay(
             "apiKey": token,
             "authHeader": True,
             "headers": ua_headers,
-            "models": [{"id": m} for m in codex_models],
+            "models": [_pi_gpt_model_entry(m) for m in codex_models],
         }
         keys.append(["providers", "databricks-openai"])
     if gemini_models:
@@ -148,7 +213,9 @@ def render_overlay(
         }
         keys.append(["providers", "databricks-gemini"])
     overlay: dict = {
-        "model": _resolve_model_selector(model, claude_models, codex_models, gemini_models),
+        "model": _resolve_model_selector(
+            model, claude_models, codex_models, gemini_models, claude_model_ids
+        ),
     }
     if providers:
         overlay["providers"] = providers
@@ -169,11 +236,16 @@ def write_tool_config(
         )
     pi_base_urls = state.get("base_urls", {}).get("pi") or build_pi_base_urls(state["workspace"])
     managed_families = _managed_model_families(state)
-    claude_models, codex_models, gemini_models = managed_families or (
-        state.get("claude_models") or {},
-        state.get("codex_models") or [],
-        state.get("gemini_models") or [],
-    )
+    if managed_families is None:
+        claude_models = state.get("claude_models") or {}
+        codex_models = state.get("codex_models") or []
+        gemini_models = state.get("gemini_models") or []
+        claude_model_ids = (
+            _discover_pi_claude_models(state, token, claude_models) if claude_models else None
+        )
+    else:
+        claude_models, codex_models, gemini_models = managed_families
+        claude_model_ids = _managed_pi_claude_models(state)
     overlay, managed_keys = render_overlay(
         model,
         token,
@@ -181,6 +253,7 @@ def write_tool_config(
         claude_models,
         codex_models,
         gemini_models,
+        claude_model_ids,
     )
     existing = read_json_safe(PI_CONFIG_PATH)
     providers = existing.get("providers")
@@ -193,6 +266,39 @@ def write_tool_config(
     state = mark_tool_managed(state, "pi", managed_keys)
     save_state(state)
     return state, token
+
+
+def _managed_pi_claude_models(state: dict) -> list[str]:
+    """Return every Claude id explicitly allowed by a managed Pi config."""
+    managed = state.get("pi_models")
+    if not isinstance(managed, list):
+        return []
+    return [
+        model
+        for model in managed
+        if isinstance(model, str) and classify_model_family(model) in ANTHROPIC_FAMILIES
+    ]
+
+
+def _discover_pi_claude_models(state: dict, token: str, claude_models: dict[str, str]) -> list[str]:
+    """Supplement Pi's family pins with all enabled Claude model versions."""
+    allowed_families = set(claude_models)
+    cached = state.get("pi_claude_models")
+    if isinstance(cached, list):
+        return [
+            model
+            for model in cached
+            if isinstance(model, str) and classify_model_family(model) in allowed_families
+        ]
+
+    try:
+        discovered, _ = discover_claude_models_unbucketed(state["workspace"], token)
+    except (RuntimeError, OSError):
+        discovered = []
+    if discovered:
+        state["pi_claude_models"] = discovered
+        return [model for model in discovered if classify_model_family(model) in allowed_families]
+    return list(claude_models.values())
 
 
 def _write_settings(model_selector: str) -> None:
@@ -251,9 +357,9 @@ def default_model(state: dict) -> str | None:
     for family in ("opus", "sonnet", "haiku"):
         if claude_models.get(family):
             return claude_models[family]
-    codex_models = state.get("codex_models") or []
-    if codex_models:
-        return codex_models[0]
+    codex_model = preferred_gpt_model(state.get("codex_models") or [])
+    if codex_model:
+        return codex_model
     gemini_models = state.get("gemini_models") or []
     return gemini_models[0] if gemini_models else None
 

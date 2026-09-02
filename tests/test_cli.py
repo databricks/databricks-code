@@ -2471,6 +2471,23 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
         monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        monkeypatch.setattr(cli_mod, "discover_responses_model_specs", lambda w, t, ids: ([], None))
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: (
+                [
+                    {
+                        "id": model_id,
+                        "reasoning": True,
+                        "context_window": 128_000,
+                        "max_tokens": 8_192,
+                    }
+                    for model_id in (model_ids or [])
+                ],
+                None,
+            ),
+        )
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
         return cli_mod, logins, ensures, saved
 
@@ -2560,6 +2577,82 @@ class TestConfigureSharedStateUsePat:
         assert state["codex_models"] == ["system.ai.gpt-5"]
         assert legacy_called == []
         assert "uc_enabled" not in state
+
+    def test_future_responses_model_persists_capability_spec(self, monkeypatch):
+        cli_mod, _, _, saved = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        model = "system.ai.future-coder-1"
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [model], [], [], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_responses_model_specs",
+            lambda w, t, ids: ([{"id": model, "context_window": 750_000}], None),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert state["codex_models"] == [model]
+        assert state["codex_model_specs"] == [{"id": model, "context_window": 750_000}]
+        assert saved[-1]["codex_models"] == [model]
+
+    def test_uc_oss_ids_persist_matching_capability_specs(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [], [], ["system.ai.qwen35-122b-a10b"], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: (
+                [
+                    {
+                        "id": "system.ai.qwen35-122b-a10b",
+                        "reasoning": True,
+                        "context_window": 128_000,
+                        "max_tokens": 25_000,
+                    }
+                ],
+                None,
+            ),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert state["oss_models"] == ["system.ai.qwen35-122b-a10b"]
+        assert state["oss_model_specs"] == [
+            {
+                "id": "system.ai.qwen35-122b-a10b",
+                "reasoning": True,
+                "context_window": 128_000,
+                "max_tokens": 25_000,
+            }
+        ]
+        assert state["opencode_models"]["oss"] == ["system.ai.qwen35-122b-a10b"]
+
+    def test_uc_dynamic_oss_ids_are_dropped_when_spec_refresh_fails(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: ({}, [], [], ["system.ai.inkling"], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: ([], "HTTP 503 unavailable"),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        assert state["oss_models"] == []
+        assert state["oss_model_specs"] == []
+        assert "oss" not in state["opencode_models"]
+        assert state["_discovery_reasons"]["oss"] == "HTTP 503 unavailable"
 
     def test_codex_only_configure_persists_discovered_oss_models(self, monkeypatch):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
@@ -2700,6 +2793,7 @@ class TestConfigureSharedStateUsePat:
     def test_falls_back_to_legacy_when_uc_empty(self, monkeypatch):
         # No UC model-services: each family falls back to the legacy listing.
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        calls: list[str] = []
         monkeypatch.setattr(
             cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], "no model services")
         )
@@ -2711,12 +2805,51 @@ class TestConfigureSharedStateUsePat:
                 None,
             ),
         )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_codex_models",
+            lambda w, t: (calls.append("codex") or ["databricks-gpt-5-6-sol"], None),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_oss_model_specs",
+            lambda w, t, model_ids=None: (
+                calls.append("oss")
+                or [
+                    {
+                        "id": "databricks-glm-5-2",
+                        "reasoning": True,
+                        "context_window": 128_000,
+                        "max_tokens": 8_192,
+                    }
+                ],
+                None,
+            ),
+        )
 
         state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
 
+        assert calls == ["codex", "oss"]
         assert state["claude_models"] == {
             "opus": "databricks-claude-opus-4-8",
             "sonnet": "databricks-claude-sonnet-4-6",
+        }
+        assert state["codex_models"] == ["databricks-gpt-5-6-sol"]
+        assert state["oss_models"] == ["databricks-glm-5-2"]
+        assert state["oss_model_specs"] == [
+            {
+                "id": "databricks-glm-5-2",
+                "reasoning": True,
+                "context_window": 128_000,
+                "max_tokens": 8_192,
+            }
+        ]
+        assert state["opencode_models"] == {
+            "anthropic": [
+                "databricks-claude-opus-4-8",
+                "databricks-claude-sonnet-4-6",
+            ],
+            "oss": ["databricks-glm-5-2"],
         }
 
 
@@ -3009,6 +3142,30 @@ class TestRejectDisabledAgent:
     def test_a_config_naming_no_agents_blocks_nothing(self, managed):
         # No managed config, or one that only sets a budget policy, expresses no opinion on agents.
         self._reject(managed, "gemini")
+
+
+class TestManagedModelWarnings:
+    def test_warns_only_for_unclassifiable_models(self, monkeypatch):
+        from ucode import cli
+
+        warnings = []
+        monkeypatch.setattr(cli, "print_warning", warnings.append)
+        managed = {
+            "enabled_agents": {
+                "opencode": {
+                    "model_config": {
+                        "models": ["system.ai.future-chat-1", "system.ai.claude-opus-4-8"]
+                    }
+                }
+            }
+        }
+
+        cli._warn_unclassifiable_managed_models(managed, "opencode")
+
+        assert len(warnings) == 1
+        assert "system.ai.future-chat-1" in warnings[0]
+        assert "will be ignored" in warnings[0]
+        assert "claude-opus" not in warnings[0]
 
 
 class TestFetchManagedConfig:

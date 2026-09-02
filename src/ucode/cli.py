@@ -45,6 +45,8 @@ from ucode.databricks import (
     discover_codex_models,
     discover_gemini_models,
     discover_model_services,
+    discover_oss_model_specs,
+    discover_responses_model_specs,
     ensure_ai_gateway,
     ensure_databricks_auth,
     ensure_pat_bearer,
@@ -80,6 +82,7 @@ from ucode.managed_resolve import (
     managed_provider_family_models,
     managed_provider_service,
     managed_supplies_models,
+    managed_unclassifiable_models,
     managed_unservable_models,
     recommended_agent,
     resolve_state,
@@ -585,6 +588,10 @@ def configure_shared_state(
         state.pop("fable_enabled", None)
     state["databricks_ai_tools_enabled"] = databricks_ai_tools_enabled
     state["base_urls"] = build_shared_base_urls(workspace)
+    # Refresh Pi's supplemental Claude inventory after discovery or a workspace
+    # change rather than carrying stale model ids into the next config write.
+    if not skip_preflight or previous_workspace != workspace:
+        state.pop("pi_claude_models", None)
 
     if skip_preflight:
         # A prior `ucode configure` created the profile; resolve it locally (no
@@ -654,7 +661,9 @@ def configure_shared_state(
     claude_models = {}
     gemini_models = []
     codex_models = []
+    codex_specs: list[dict] = []
     oss_models = []
+    oss_specs: list[dict] = []
     opencode_models: dict[str, list[str]] = {}
     web_search_model: str | None = None
     if skip_model_discovery:
@@ -695,8 +704,26 @@ def configure_shared_state(
                 codex_models, codex_reason = ms_codex, ms_reason
                 if not codex_models:
                     codex_models, codex_reason = discover_codex_models(workspace, token)
+                if codex_models:
+                    codex_specs, _ = discover_responses_model_specs(workspace, token, codex_models)
             if want_oss:
                 oss_models, oss_reason = ms_oss, ms_reason
+                if oss_models:
+                    oss_specs, specs_reason = discover_oss_model_specs(workspace, token, oss_models)
+                    # Keep IDs and specs aligned. Broad OSS families are admitted
+                    # only by live capability validation; if that refresh fails,
+                    # offering the stale IDs without safe metadata would regress
+                    # them to uncapped client defaults. Static GLM/Kimi/DeepSeek
+                    # fallback specs are still returned by discover_oss_model_specs.
+                    oss_models = [spec["id"] for spec in oss_specs]
+                    if not oss_specs and specs_reason:
+                        oss_reason = specs_reason
+                else:
+                    # The endpoint fallback returns ids and capabilities from
+                    # the same validated listing, avoiding a second request
+                    # whose transient failure could leave broad models uncapped.
+                    oss_specs, oss_reason = discover_oss_model_specs(workspace, token)
+                    oss_models = [spec["id"] for spec in oss_specs]
         if claude_models:
             opencode_models["anthropic"] = list(claude_models.values())
         if gemini_models:
@@ -717,8 +744,10 @@ def configure_shared_state(
             state["gemini_models"] = gemini_models
         if want_codex:
             state["codex_models"] = codex_models
+            state["codex_model_specs"] = codex_specs
         if want_oss:
             state["oss_models"] = oss_models
+            state["oss_model_specs"] = oss_specs
         if fetch_all or "opencode" in tools:
             state["opencode_models"] = opencode_models
     save_state(state)
@@ -1658,6 +1687,15 @@ def _migrate_legacy_smart_routing(state: dict) -> dict:
     return state
 
 
+def _warn_unclassifiable_managed_models(managed: dict, tool: str) -> None:
+    """Explain when a managed model cannot be routed from its name alone."""
+    for model in managed_unclassifiable_models(managed, tool):
+        print_warning(
+            f"Your workspace's managed config model {model} has an unrecognized model family "
+            "and will be ignored."
+        )
+
+
 def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
     """Refuse to launch ``tool`` when the managed config enables other agents but not this one.
 
@@ -1982,6 +2020,7 @@ def _launch_tool(
         if managed is not None:
             state = resolve_state(managed, state, tool)
             print_success("Applied your workspace's managed coding agent config")
+            _warn_unclassifiable_managed_models(managed, tool)
             unservable = managed_unservable_models(managed, tool)
             if unservable:
                 print_warning(
