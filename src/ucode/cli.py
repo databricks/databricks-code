@@ -44,7 +44,7 @@ from ucode.agents import (
 from ucode.agents.args import has_explicit_model_arg
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
-from ucode.config_io import is_dry_run, restore_file, set_dry_run
+from ucode.config_io import is_dry_run, read_toml_safe, restore_file, set_dry_run
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
@@ -62,6 +62,7 @@ from ucode.databricks import (
     is_model_provider_feature_unavailable,
     is_workspace_admin,
     list_model_provider_services,
+    list_mps_codex_models,
     list_profile_entries,
     list_tool_provider_services,
     normalize_workspace_url,
@@ -144,6 +145,7 @@ from ucode.ui import (
     print_success,
     print_warning,
     prompt_for_selection,
+    prompt_for_text,
     prompt_for_tools,
     prompt_for_workspace,
     prompt_yes_no,
@@ -2023,6 +2025,7 @@ def _launch_tool(
         # The router's per-launch pick for the root session. Codex pins it as the
         # resolved model; claude pins it via ANTHROPIC_MODEL (route_root_model).
         route_root_model = None
+        bedrock_targets: list[str] | None = None
         if provider:
             # Routing through a Model Provider Service pins no Databricks model;
             # the agent uses its own canonical model names (header selects the
@@ -2038,6 +2041,24 @@ def _launch_tool(
                 resolved_model, gemini_error = resolve_gemini_provider_model(state, provider, model)
                 if gemini_error:
                     raise RuntimeError(gemini_error)
+            elif tool == "pi":
+                # Pi receives the MPS targets as its databricks-bedrock model list;
+                # a single model is also set as the default for the session.
+                _pi_token = get_databricks_token(state["workspace"], state.get("profile"))
+                with spinner("Fetching provider model targets..."):
+                    _pi_svc, _ = get_model_provider_service(provider, state["workspace"], _pi_token)
+                if _pi_svc:
+                    bedrock_targets = _pi_svc.get("targets") or []
+                    if bedrock_targets:
+                        resolved_model = bedrock_targets[0]
+                    elif _pi_svc.get("allow_all_targets"):
+                        _pi_entered = prompt_for_text(
+                            f"Enter a Bedrock model ID to use with '{provider}'",
+                            required=True,
+                        )
+                        if _pi_entered:
+                            bedrock_targets = [_pi_entered]
+                            resolved_model = _pi_entered
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
             # in as the explicit model rather than being applied afterwards: for codex the proto has
@@ -2071,6 +2092,7 @@ def _launch_tool(
             # Claude's explicit model is launch-scoped and is passed through LaunchOptions below.
             custom_model=None,
             coding_agent_config_defaults=coding_agent_config_defaults,
+            bedrock_targets=bedrock_targets,
         )
         # Relayed = a Claude subscription: forward --model to Claude Code's own flag, like `-- --model X`.
         if tool == "claude" and provider and relayed and model and not forwarded_model:

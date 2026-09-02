@@ -71,6 +71,7 @@ PROVIDER_NAMES = (
     "databricks-claude",
     "databricks-openai",
     "databricks-gemini",
+    "databricks-bedrock",
 )
 
 PROVIDER_KEYS: list[list[str]] = [["providers", name] for name in PROVIDER_NAMES]
@@ -100,12 +101,15 @@ def _resolve_model_selector(
 
 
 def render_overlay(
-    model: str,
+    model: str | None,
     token: str,
     pi_base_urls: dict[str, str],
     claude_models: dict[str, str],
     codex_models: list[str],
     gemini_models: list[str],
+    *,
+    provider: str | None = None,
+    bedrock_targets: list[str] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Pi's private agent config."""
     providers: dict = {}
@@ -149,9 +153,23 @@ def render_overlay(
             "models": [{"id": m} for m in gemini_models],
         }
         keys.append(["providers", "databricks-gemini"])
-    overlay: dict = {
-        "model": _resolve_model_selector(model, claude_models, codex_models, gemini_models),
-    }
+    if provider and bedrock_targets:
+        providers["databricks-bedrock"] = {
+            "baseUrl": pi_base_urls.get(
+                "bedrock", f"{pi_base_urls['claude'].rsplit('/ai-gateway', 1)[0]}/ai-gateway"
+            ),
+            "api": "bedrock-converse-stream",
+            "apiKey": token,
+            "authHeader": True,
+            "headers": {**ua_headers, "Databricks-Model-Provider-Service": provider},
+            "models": [{"id": t} for t in bedrock_targets],
+        }
+        keys.append(["providers", "databricks-bedrock"])
+    resolved = _resolve_model_selector(model or "", claude_models, codex_models, gemini_models)
+    # When launching with a Bedrock provider, default to the first target.
+    if not resolved and "databricks-bedrock" in providers and bedrock_targets:
+        resolved = f"databricks-bedrock/{bedrock_targets[0]}"
+    overlay: dict = {"model": resolved}
     if providers:
         overlay["providers"] = providers
     return overlay, keys
@@ -159,10 +177,12 @@ def render_overlay(
 
 def write_tool_config(
     state: dict,
-    model: str,
+    model: str | None,
     token: str | None = None,
     *,
     force_refresh: bool = False,
+    provider: str | None = None,
+    bedrock_targets: list[str] | None = None,
 ) -> tuple[dict, str]:
     backup_existing_file(PI_CONFIG_PATH, PI_BACKUP_PATH)
     if token is None:
@@ -183,6 +203,8 @@ def write_tool_config(
         claude_models,
         codex_models,
         gemini_models,
+        provider=provider,
+        bedrock_targets=bedrock_targets,
     )
     existing = read_json_safe(PI_CONFIG_PATH)
     providers = existing.get("providers")

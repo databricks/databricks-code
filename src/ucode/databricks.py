@@ -3079,6 +3079,44 @@ class GatewayProbe(NamedTuple):
     conclusive: bool = True
 
 
+def list_mps_codex_models(
+    service_name: str, workspace: str, token: str
+) -> tuple[list[str], str | None]:
+    """List models available through a Bedrock MPS's OpenAI-compatible endpoint.
+
+    Queries ``{workspace}/ai-gateway/codex/v1/models`` with the
+    ``Databricks-Model-Provider-Service`` header so the gateway asks the MPS
+    what models it exposes.  Used when a service has ``allow_all_targets`` set
+    and no explicit targets are declared.
+
+    Returns ``(model_ids, reason)`` where ``reason`` is non-None on failure.
+    """
+    url = f"{build_tool_base_url('codex', workspace)}/models"
+    req = urllib_request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Databricks-Model-Provider-Service": service_name,
+        },
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+        payload = json.loads(body)
+    except urllib_error.HTTPError as exc:
+        return [], f"HTTP {exc.code}"
+    except Exception as exc:
+        return [], str(exc)
+    if not isinstance(payload, dict):
+        return [], "unexpected response shape"
+    data = payload.get("data") or []
+    models = sorted(
+        str(m["id"]) for m in data if isinstance(m, dict) and isinstance(m.get("id"), str)
+    )
+    return models, None
+
+
 _MODEL_SERVICE_PROBE_PAGE_SIZE = 50
 _MODEL_SERVICE_PROBE_MAX_PAGES = 20
 _MODEL_SERVICE_EMPTY_DETAIL = (
@@ -3416,6 +3454,10 @@ def build_pi_base_urls(workspace: str) -> dict[str, str]:
         "claude": build_tool_base_url("claude", workspace),
         "openai": build_tool_base_url("codex", workspace),
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
+        # Bedrock routes through the standard gateway; MPS header selects the provider.
+        # Do NOT include the MPS name in the path — /ai-gateway/amazonbedrock/ maps to
+        # the control plane (bedrock.amazonaws.com), not the runtime.
+        "bedrock": f"{workspace}/ai-gateway",
     }
 
 
