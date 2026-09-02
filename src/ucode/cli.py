@@ -57,9 +57,11 @@ from ucode.databricks import (
     find_profile_name_for_host,
     get_databricks_profiles,
     get_databricks_token,
+    get_model_provider_service,
     install_databricks_cli,
     is_model_provider_feature_unavailable,
     is_workspace_admin,
+    list_model_provider_services,
     list_profile_entries,
     list_tool_provider_services,
     normalize_workspace_url,
@@ -67,6 +69,7 @@ from ucode.databricks import (
     resolve_pat_token,
     resolve_provider_launch_model,
     run_databricks_login,
+    service_usable_for_tool,
 )
 from ucode.managed_budget import (
     budget_usage_percent,
@@ -132,6 +135,7 @@ from ucode.tracing import configure_tracing_command
 from ucode.ui import (
     console,
     heading,
+    muted,
     print_err,
     print_heading,
     print_kv,
@@ -143,6 +147,7 @@ from ucode.ui import (
     prompt_for_tools,
     prompt_for_workspace,
     prompt_yes_no,
+    render_box_table,
     set_verbosity,
     spinner,
     status_badge,
@@ -1051,6 +1056,8 @@ mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ug.")
 skill_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(skill_app, name="skill", help="Databricks Skills for your coding tools.")
+providers_app = typer.Typer(add_completion=False, no_args_is_help=True)
+app.add_typer(providers_app, name="providers", help="Inspect Model Provider Services on the workspace.")
 setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(
     setup_app,
@@ -3351,6 +3358,82 @@ def _verify_upgraded_commands() -> None:
                 f"Upgrade completed, but `{command} --version` failed"
                 f"{f': {detail}' if detail else '.'}"
             )
+
+
+@providers_app.command("list")
+def providers_list_cmd(
+    tool: Annotated[
+        str | None,
+        typer.Option("--tool", help="Filter to services usable by a specific tool (claude, codex)."),
+    ] = None,
+) -> None:
+    """List Model Provider Services on the workspace."""
+    state = load_state()
+    workspace = state.get("workspace")
+    if not workspace:
+        print_err("No workspace configured. Run `ucode configure` first.")
+        raise typer.Exit(1) from None
+    token = get_databricks_token(workspace, state.get("profile"))
+    with spinner("Fetching model provider services..."):
+        services, reason = list_model_provider_services(workspace, token)
+    if reason is not None:
+        print_err(f"Could not list model provider services: {reason}")
+        raise typer.Exit(1) from None
+    if tool:
+        services = [s for s in services if service_usable_for_tool(tool, s)]
+    if not services:
+        msg = "No model provider services found" + (f" for {tool}" if tool else "") + "."
+        print_note(msg)
+        return
+    rows = [
+        [
+            s["name"],
+            s["provider_type"],
+            ", ".join(s["targets"]) if s["targets"] else ("(all)" if s["allow_all_targets"] else "—"),
+        ]
+        for s in services
+    ]
+    print_section("Model Provider Services")
+    console.print(render_box_table(["Service", "Provider", "Targets"], rows, max_widths=[60, 20, 60]))
+    if tool:
+        console.print(muted(f"  Filtered to services usable by {tool}."))
+
+
+@providers_app.command("show")
+def providers_show_cmd(
+    service_name: Annotated[
+        str,
+        typer.Argument(help="Fully qualified service name (catalog.schema.service)."),
+    ],
+) -> None:
+    """Show targets and configuration for a Model Provider Service."""
+    state = load_state()
+    workspace = state.get("workspace")
+    if not workspace:
+        print_err("No workspace configured. Run `ucode configure` first.")
+        raise typer.Exit(1) from None
+    token = get_databricks_token(workspace, state.get("profile"))
+    with spinner(f"Fetching {service_name}..."):
+        service, reason = get_model_provider_service(service_name, workspace, token)
+    if reason is not None:
+        print_err(f"Could not fetch '{service_name}': {reason}")
+        raise typer.Exit(1) from None
+    if service is None:
+        print_err(f"Model provider service '{service_name}' not found.")
+        raise typer.Exit(1) from None
+    print_section(service["name"])
+    print_kv("Provider type", service["provider_type"])
+    if service["relayed"]:
+        print_kv("Relay", "yes (subscription-backed, no credential stored)")
+    if service["allow_all_targets"]:
+        print_kv("Allow all targets", "yes")
+    targets = service["targets"]
+    if targets:
+        print_kv("Targets", targets[0])
+        for t in targets[1:]:
+            print_kv("", t)
+    else:
+        print_kv("Targets", "none declared")
 
 
 def main() -> None:
