@@ -6,14 +6,14 @@ at ``~/.ucode/managed-state.json`` (the one local managed-config file, owned by
 :mod:`ucode.managed_config`).
 
 Authoring is split across commands so an admin can change one part without walking the whole flow:
-``ucode setup`` picks the agents and models, and ``ucode setup mcps`` / ``skills`` / ``spend-tiers``
-each edit their own section of the same manifest. ``ucode setup`` carries the other sections forward
-untouched (:func:`_carry_forward_sections`), and ``ucode setup help`` prints the whole sequence.
+``ucode setup`` picks the agents and models, and ``ucode setup spend-tiers`` edits the tiered spend
+policy of the same manifest. ``ucode setup`` carries the other sections forward untouched
+(:func:`_carry_forward_sections`), and ``ucode setup help`` prints the whole sequence. The managed
+config carries agents/models/global policy/spend tiers only — MCP servers and skills are personal
+configuration (`ucode mcp` / `ucode skills`), not part of it.
 
 Serialization, validation, and the per-agent model catalogs live in :mod:`ucode.managed_setup`; this
-module is the interaction layer on top of them. Sub-flows an admin already knows — MCP, skills — are
-delegated to the existing ``ucode configure <thing>`` commands and their results read back out of
-``state.json``, so there is exactly one picker per concern in the codebase.
+module is the interaction layer on top of them.
 """
 
 from __future__ import annotations
@@ -112,89 +112,6 @@ def _tracing_table_from_state(state: dict) -> str | None:
         return None
     destination = tracing.get("uc_destination")
     return destination if isinstance(destination, str) and destination else None
-
-
-def _mcp_server_from_url(url: str) -> tuple[str, str] | None:
-    """Derive a managed-config ``(name, type)`` entry from a registered server's resolved URL.
-
-    ``state.json`` stores each MCP server's resolved URL but not its type, while the managed config
-    stores ``{name, type}`` and lets the developer's ucode rebuild the URL. So map the URL back to the
-    type *and* the identifier the ai-gateway ``McpServer.name`` field is meant to hold for that type
-    (a UC name for a UC service, a Genie space id for a genie space, a `<catalog>.<schema>` for
-    vector-search / uc-functions, a connection name for external). Deriving ``name`` from the URL —
-    rather than reusing the local display slug — is what lets the developer's ucode reconstruct the
-    URL on launch. Returns None for a URL that matches nothing reconstructable (e.g. an app's
-    off-workspace host), so those are skipped rather than published unusably.
-    """
-    stripped = url.rstrip("/")
-    marker = "/ai-gateway/mcp-services/"
-    if marker in url:
-        # `.../mcp-services/<catalog>.<schema>.<svc>` — store the dash form the launch path expects.
-        service = url.split(marker, 1)[1].split("/", 1)[0]
-        return service.replace(".", "-"), "mcp-service"
-    for fragment, tag in (
-        ("/api/2.0/mcp/external/", "external"),
-        ("/api/2.0/mcp/genie/", "genie-space"),
-    ):
-        if fragment in url:
-            # external -> connection name; genie -> space id. Both are the single trailing segment.
-            return url.split(fragment, 1)[1].split("/", 1)[0], tag
-    for fragment, tag in (
-        ("/api/2.0/mcp/vector-search/", "vector-search"),
-        ("/api/2.0/mcp/functions/", "uc-functions"),
-    ):
-        if fragment in url:
-            # `.../<catalog>/<schema>` — store the `<catalog>.<schema>` the launch path splits back.
-            rest = url.split(fragment, 1)[1].split("/")
-            if len(rest) >= 2 and rest[0] and rest[1]:
-                return f"{rest[0]}.{rest[1]}", tag
-            return None
-    if stripped.endswith("/api/2.0/mcp/sql"):
-        return "databricks-sql", "sql"
-    # Databricks apps are the residual case: an arbitrary app host with a /mcp suffix. Its host isn't
-    # reconstructable from the workspace + an id, so it can't be published to the managed config yet.
-    if stripped.endswith("/mcp"):
-        return None
-    return None
-
-
-def _mcp_servers_from_state(state: dict) -> list[dict]:
-    """The registered MCP servers, as managed-config ``{name, type}`` entries.
-
-    Skips the skills registry connection: skills are published under the manifest's own ``skills``
-    field, so including its MCP entry would configure it twice.
-    """
-    from ucode.mcp import SKILLS_MCP_KIND
-
-    servers: list[dict] = []
-    seen: set[str] = set()
-    for entry in state.get("mcp_servers") or []:
-        if not isinstance(entry, dict) or entry.get("kind") == SKILLS_MCP_KIND:
-            continue
-        name = entry.get("name")
-        url = entry.get("url")
-        if not isinstance(name, str) or not name or not isinstance(url, str):
-            continue
-        resolved = _mcp_server_from_url(url)
-        if resolved is None:
-            print_warning(
-                f"Skipping MCP server '{name}': ucode can't publish it to a managed config "
-                f"(unrecognized or app-hosted URL: {url})."
-            )
-            continue
-        config_name, tag = resolved
-        if config_name in seen:
-            continue
-        seen.add(config_name)
-        servers.append({"name": config_name, "type": tag})
-    return servers
-
-
-def _skill_names_from_state(state: dict) -> list[str]:
-    """Skill schemas registered on the skills MCP connection (``catalog.schema`` entries)."""
-    from ucode.mcp import _skill_mcp_locations
-
-    return [name for name in _skill_mcp_locations(state) if isinstance(name, str) and name]
 
 
 def provider_service_model_options(service: dict) -> list[str]:
@@ -1085,15 +1002,6 @@ def _render_summary(workspace: str, manifest: dict) -> None:
         elif isinstance(models, list) and len(models) > 1:
             lines.append(kv_line("  models", ", ".join(str(m) for m in models)))
 
-    mcp_servers = manifest.get("mcp_servers") or []
-    lines.append(
-        kv_line(
-            "MCP servers",
-            ", ".join(str(server.get("name")) for server in mcp_servers) if mcp_servers else "none",
-        )
-    )
-    skills = (manifest.get("skills") or {}).get("names") or []
-    lines.append(kv_line("Skills", ", ".join(skills) if skills else "none"))
     # Managed tracing isn't offered by the flow yet, so a "disabled" line is just noise. Only surface
     # it when a `--from-file` config actually set a table.
     if manifest.get("tracing_table"):
@@ -1121,7 +1029,7 @@ def _config_facts(manifest: dict) -> list[tuple[str, str, str]]:
     """Flatten a normalized config into ordered ``(key, label, value)`` facts, for diffing.
 
     Each fact is one thing an admin would think of as a single setting — the default agent, an agent's
-    model, its settings scope, an MCP server, a skill, the tracing table, a budget tier. The ``key`` is
+    model, its settings scope, the tracing table, a budget tier. The ``key`` is
     a stable identity so the same setting lines up across two configs even when values differ; the
     ``label`` is what the admin reads. Deliberately mirrors what :func:`_render_summary` chooses to
     show, so the diff and the summary never disagree about what's in a config.
@@ -1152,13 +1060,6 @@ def _config_facts(manifest: dict) -> list[tuple[str, str, str]]:
                 facts.append((f"agent:{tool}:model:{family}", f"{display} ({family})", str(model)))
         elif isinstance(models, list) and len(models) > 1:
             facts.append((f"agent:{tool}:models", f"{display} models", ", ".join(map(str, models))))
-    for server in manifest.get("mcp_servers") or []:
-        name = str(server.get("name"))
-        facts.append((f"mcp:{name}", f"MCP server {name}", str(server.get("type") or "")))
-
-    for skill in (manifest.get("skills") or {}).get("names") or []:
-        facts.append((f"skill:{skill}", f"Skill {skill}", "published"))
-
     tracing = manifest.get("tracing_table")
     if tracing:
         facts.append(("tracing_table", "Tracing table", str(tracing)))
@@ -1255,8 +1156,8 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
 
     Returns ``(keep_going, existing)``: ``keep_going`` is True to continue authoring (publishing later
     replaces the existing config) and False to stop (the admin chose to delete it instead). ``existing``
-    is the published config when one was read, so the caller can carry its MCP servers / skills /
-    tracing / budget policy forward — the local draft may be missing on a fresh machine or after
+    is the published config when one was read, so the caller can carry its tracing table and budget
+    policy forward — the local draft may be missing on a fresh machine or after
     ``ucode revert``, and without this those sections would be silently dropped on the next publish.
 
     Deliberately doesn't itemize what the existing config holds. The admin doesn't need an inventory
@@ -1275,8 +1176,8 @@ def _handle_existing_config(workspace: str, token: str) -> tuple[bool, dict | No
         return True, None
 
     print_warning(
-        "This workspace already has a managed configuration — one config covers every agent, MCP "
-        "server, skill, tracing table, and budget policy for the whole workspace."
+        "This workspace already has a managed configuration — one config covers every agent, "
+        "tracing table, and budget policy for the whole workspace."
     )
     choice = prompt_for_selection(
         "What would you like to do?",
@@ -1376,8 +1277,6 @@ def setup_from_file(path: str) -> int:
 # The sections that have their own `ucode setup <thing>` command, in the order the checklist lists
 # them: the command, the label the summary uses, and how to tell whether the manifest has one.
 SETUP_SECTIONS: list[tuple[str, str, Callable[[dict], bool]]] = [
-    ("ucode setup mcps", "MCP servers", lambda m: bool(m.get("mcp_servers"))),
-    ("ucode setup skills", "Skills", lambda m: bool((m.get("skills") or {}).get("names"))),
     (
         "ucode setup spend-tiers",
         "Tiered Spend Policy",
@@ -1481,8 +1380,6 @@ def _offer_publish() -> None:
 
 # The sections `ucode setup` carries forward instead of prompting for, and how to rebuild each one.
 CARRIED_SECTIONS: list[tuple[str, str, str]] = [
-    ("mcp_servers", "MCP servers", "ucode setup mcps"),
-    ("skills", "Skills", "ucode setup skills"),
     ("tracing_table", "Tracing table", "ucode setup --from-file"),
     ("budget_policy", "Tiered Spend Policy", "ucode setup spend-tiers"),
 ]
@@ -1491,9 +1388,9 @@ CARRIED_SECTIONS: list[tuple[str, str, str]] = [
 def _carry_forward_sections(previous: dict, manifest: dict) -> None:
     """Copy the sections `ucode setup` no longer prompts for out of a previously authored config.
 
-    `setup` writes the whole manifest, so without this a re-run would silently clear the MCP servers,
-    skills, tracing table, and budget policy an admin authored with the other commands — they'd have
-    to redo every one of them just to change a model.
+    `setup` writes the whole manifest, so without this a re-run would silently clear the tracing
+    table and budget policy an admin authored with the other commands — they'd have to redo both
+    just to change a model.
 
     Each section is probe-validated before it's carried, and dropped with a warning if it no longer
     fits. Otherwise a carried section could make the manifest invalid and block the save outright,
@@ -1535,9 +1432,8 @@ def setup_command(
 ) -> int:
     """Author the agents and models half of the workspace's managed coding config interactively.
 
-    Agents and per-agent models only. MCP servers, skills, and the tiered spend policy each have their
-    own command (`ucode setup mcps` / `skills` / `spend-tiers`), so an admin changing one of them doesn't
-    have to walk the whole flow again — and this command carries whatever they already authored
+    Agents and per-agent models only. The tiered spend policy has its own command (`ucode setup
+    spend-tiers`), so an admin changing it doesn't have to walk the whole flow again — and this command carries whatever they already authored
     forward untouched rather than clearing it (:func:`_carry_forward_sections`).
 
     ``workspace``/``profile`` let a caller that has already resolved (and authenticated against) a
@@ -1547,7 +1443,7 @@ def setup_command(
     ``command_label`` brands the section headers to the invoking command: `ucode configure` passes
     "Configure Unity Gateway" so a user who never typed `ucode setup` isn't jarred by it (the
     standalone `ucode setup` command keeps the default). References to specific sub-commands (`ucode
-    setup mcps`, `ucode apply`, …) stay verbatim — those are real command names, not branding.
+    setup spend-tiers`, `ucode apply`, …) stay verbatim — those are real command names, not branding.
 
     ``token`` lets a caller that already authenticated and admin-checked the workspace (e.g.
     `ucode configure`) hand its token in, so setup's admin gate uses the *same* token as the routing
@@ -1602,7 +1498,7 @@ def setup_command(
 
     # The local draft is the carry-forward source, falling back to what's published on the workspace:
     # a fresh machine (or one after `ucode revert`) has no draft, and without the fallback the next
-    # publish would silently wipe the workspace's MCP servers, skills, tracing, and budget policy.
+    # publish would silently wipe the workspace's tracing table and budget policy.
     previous = load_managed_state(workspace) or published or {}
     previously_enabled = [
         tool for tool in (previous.get("enabled_agents") or {}) if tool in available
@@ -1675,9 +1571,8 @@ def _resolve_admin_workspace() -> tuple[str, str | None, str]:
     """Resolve the workspace a section command edits, authenticate, and gate on admin.
 
     Returns ``(workspace, profile, token)``. Unlike `ucode setup`, this doesn't prompt for a workspace
-    and takes it strictly from local state rather than falling back to the draft file's workspace: the
-    MCP and skills pickers re-read ``current_workspace`` themselves (via ``setup_mcp_clients``), so a
-    mismatch would have them operate against one workspace while the manifest is saved for another.
+    and takes it strictly from local state rather than falling back to the draft file's workspace, so a
+    mismatch can't have the section saved for one workspace while local state points at another.
     Requiring ``ucode configure`` to have set the current workspace keeps the two in lockstep. It also
     skips :func:`_handle_existing_config` — the create-or-delete choice belongs to authoring a config,
     not to changing one section of it.
@@ -1739,84 +1634,6 @@ def _save_section_update(workspace: str, manifest: dict) -> int:
     return 0
 
 
-def setup_mcp_command() -> int:
-    """Author the managed config's MCP servers (`ucode setup mcps`)."""
-    workspace, _, _ = _resolve_admin_workspace()
-    manifest = _manifest_for_edit(workspace)
-
-    print_section("Managed MCP servers")
-    print_note("Developers get these MCP servers registered automatically when they run ucode.")
-    from ucode.mcp import configure_mcp_command
-
-    # Snapshot the managed-shaped servers before the picker so a cancelled run on an empty local
-    # state can't delete a section the manifest still has: the picker returns 0 on Esc, and re-reading
-    # local state would otherwise overwrite the manifest with nothing.
-    before = _mcp_servers_from_state(load_state())
-    # Managed configs can't carry a Databricks app (its host isn't reconstructable from the
-    # workspace), so hide apps from the picker rather than let an admin pick one that is then
-    # dropped from the published config.
-    configure_mcp_command(exclude_sources={"apps"})
-    after = _mcp_servers_from_state(load_state())
-
-    # `after == before` isn't enough to call this a no-op: an admin who ran `ucode configure mcp`
-    # first arrives with those servers already registered, so confirming the picker leaves local state
-    # unchanged even though the manifest doesn't carry them yet. Also sync when local state already
-    # holds servers the manifest is missing — but only when servers are actually registered, so an Esc
-    # on an empty local state still can't wipe a published section.
-    manifest_servers = manifest.get("mcp_servers") or []
-    carries_unsaved = bool(after) and after != manifest_servers
-    if after == before and not carries_unsaved:
-        print_note("No changes to the MCP servers — the managed config is unchanged.")
-        return 0
-
-    if after:
-        manifest["mcp_servers"] = after
-        print_success(f"{len(after)} MCP server(s) in the managed config")
-    else:
-        # Deregistering every server locally is how an admin clears the section — there is no
-        # separate "remove them all" flag.
-        manifest.pop("mcp_servers", None)
-        print_note("No MCP servers are registered, so the managed config now carries none.")
-    return _save_section_update(workspace, manifest)
-
-
-def setup_skills_command(locations: list[str] | None = None) -> int:
-    """Author the managed config's skills (`ucode setup skills`).
-
-    ``locations`` comes from ``--location`` (already parsed to `<catalog>.<schema>` refs); when None
-    the admin is prompted and the answer is parsed the same way.
-    """
-    workspace, _, _ = _resolve_admin_workspace()
-    manifest = _manifest_for_edit(workspace)
-
-    print_section("Managed skills")
-    print_note("Developers get these skills downloaded automatically when they run ucode.")
-    if locations is None:
-        answer = prompt_for_text(
-            "Skill schemas to publish, comma-separated `catalog.schema` (blank to leave unchanged)",
-            default="",
-        )
-        # Route the interactive answer through the same parser as `--location` so `main` (missing the
-        # schema) is rejected here rather than published as a bogus skill name.
-        from ucode.cli import _parse_skill_locations
-
-        locations = _parse_skill_locations(answer)
-    # A blank answer / empty `--location` means "leave the skills alone". Returning before delegating
-    # matters: `configure_skills_mcp_command([])` is not a no-op — it registers the schema-less skills
-    # MCP connection into the admin's own agents.
-    if not locations:
-        print_note("No skill schemas given — the managed config's skills are unchanged.")
-        return 0
-
-    from ucode.mcp import configure_skills_mcp_command
-
-    configure_skills_mcp_command(locations)
-    skill_names = _skill_names_from_state(load_state()) or locations
-    manifest["skills"] = {"names": skill_names}
-    print_success(f"{len(skill_names)} skill schema(s) in the managed config")
-    return _save_section_update(workspace, manifest)
-
-
 def setup_budget_policy_command() -> int:
     """Author the managed config's tiered spend policy (`ucode setup spend-tiers`)."""
     workspace, _, token = _resolve_admin_workspace()
@@ -1857,7 +1674,7 @@ def setup_help_command() -> int:
     print_section("ucode setup")
     print_note(
         "A managed config is the coding setup your developers pull automatically — they run ucode "
-        "and get the agents, models, MCP servers, and skills you chose here. Admins only."
+        "and get the agents and models you chose here. Admins only."
     )
     print_note(
         "Each command below edits your local draft; nothing reaches the workspace until "
@@ -2097,7 +1914,5 @@ __all__ = [
     "setup_command",
     "setup_from_file",
     "setup_help_command",
-    "setup_mcp_command",
-    "setup_skills_command",
     "show_command",
 ]

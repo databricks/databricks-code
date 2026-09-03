@@ -3124,7 +3124,26 @@ class TestCodingAgentConfigCrudClients:
                 }
             )
         )
-        assert set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS) == emitted | {"spec_version"}
+        mask = set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS)
+        assert emitted | {"spec_version"} <= mask
+        assert mask - emitted - {"spec_version"} == {"mcp_servers", "skills"}
+
+    def test_update_mask_clears_legacy_mcp_and_skills(self):
+        from ucode.managed_setup import serialize_managed_config
+
+        payload = serialize_managed_config(
+            {
+                "default_agent": "claude",
+                "enabled_agents": {
+                    "claude": {"model_config": {"default_model": "system.ai.claude-opus-5"}}
+                },
+                "mcp_servers": [{"name": "databricks-sql", "type": "sql"}],
+                "skills": {"names": ["main.default"]},
+            }
+        )
+        assert "mcp_servers" not in payload
+        assert "skills" not in payload
+        assert {"mcp_servers", "skills"} <= set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS)
 
     def test_delete_returns_only_a_reason(self, monkeypatch):
         seen = {}

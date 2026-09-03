@@ -90,25 +90,21 @@ from ucode.managed_wizard import (
     setup_budget_policy_command,
     setup_command,
     setup_help_command,
-    setup_mcp_command,
-    setup_skills_command,
     show_command,
 )
 from ucode.mcp import (
     MCP_CLIENTS,
     SKILLS_MCP_KIND,
     add_mcp_command,
-    apply_managed_mcp_servers,
-    apply_managed_skills,
     configure_mcp_command,
     configure_skills_mcp_command,
+    migrate_off_managed_mcp_and_skills,
     purge_cross_workspace_mcp_residue,
     remove_mcp_command,
     revert_mcp_configs,
 )
 from ucode.skills_download import (
     configure_skills_download_command,
-    download_managed_skills_on_launch,
 )
 from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.claude_hooks import FIRST_PROMPT_SOCKET_ENV, ROUTE_FIRST_PROMPT_EVENT
@@ -211,23 +207,6 @@ def _print_managed_summary(
         model = managed_default_model(managed, tool)
         if model:
             lines.append(f"[bold]Model:[/bold] [magenta]{model}[/magenta]")
-    # Always listed, including when empty: "none configured" tells a developer their admin set none,
-    # which a missing row leaves ambiguous. Shown as the admin configured them — registering them
-    # locally is a separate change, hence "pending".
-    mcp_names = [
-        str(server.get("name"))
-        for server in (managed.get("mcp_servers") or [])
-        if isinstance(server, dict) and server.get("name")
-    ]
-    if mcp_names:
-        lines.append(f"[bold]MCPs:[/bold] {', '.join(mcp_names)} [dim](pending)[/dim]")
-    else:
-        lines.append("[bold]MCPs:[/bold] [dim]none configured[/dim]")
-    skill_names = [str(name) for name in ((managed.get("skills") or {}).get("names") or []) if name]
-    if skill_names:
-        lines.append(f"[bold]Skills:[/bold] {', '.join(skill_names)} [dim](pending)[/dim]")
-    else:
-        lines.append("[bold]Skills:[/bold] [dim]none configured[/dim]")
     lines.extend(_policy_summary_lines(managed))
     console.print(
         Panel("\n".join(lines), title="Workspace-managed config", style="green", expand=False)
@@ -339,8 +318,8 @@ def _maybe_run_admin_setup(workspace: str, profile: str | None) -> None:
         return
     print_note(
         "You're a workspace admin, and no managed coding agent config exists for this workspace "
-        "yet — let's set one up. Choose the agents, models, MCPs, and skills once and every "
-        "developer inherits them when they run `ucode`."
+        "yet — let's set one up. Choose the agents and models once and every developer "
+        "inherits them when they run `ucode`."
     )
     _run_setup_and_exit(workspace, profile, token)
 
@@ -1099,12 +1078,8 @@ def status() -> int:
     print_heading("State")
     print_kv("State file", str(STATE_PATH) if STATE_PATH.exists() else "missing")
     print_note("Use `ucode configure` to update workspace settings or configure new tools.")
-    print_note(
-        "Use `ucode configure mcp` to add Databricks MCP servers to configured coding tools."
-    )
-    print_note(
-        "Use `ucode configure skills` to set up Unity Catalog Skills for configured coding tools."
-    )
+    print_note("Use `ucode mcp` to add Databricks MCP servers to configured coding tools.")
+    print_note("Use `ucode skills` to set up Unity Catalog Skills for configured coding tools.")
     print_note("Use `ucode configure tracing` to log coding sessions to an MLflow experiment.")
     print_note("Use `ucode revert` to clear managed configs and restore prior files.")
     return 0
@@ -1161,8 +1136,8 @@ app = typer.Typer(
 )
 configure_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(configure_app, name="configure", help="Configure workspace and tool settings.")
-mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
-app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ucode.")
+mcp_app = typer.Typer(add_completion=False, no_args_is_help=False)
+app.add_typer(mcp_app, name="mcp", help="Register Databricks MCP servers on your coding tools.")
 setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(
     setup_app,
@@ -1254,7 +1229,7 @@ def mcp_add(
 ) -> None:
     """Add Databricks MCP servers to installed coding tools.
 
-    Like `ucode configure mcp`, but purely additive: it never removes MCP servers
+    Like `ucode mcp`, but purely additive: it never removes MCP servers
     that are already configured, only registers new ones. Pass --agents to target
     (and, if needed, set up) specific agents.
     """
@@ -1344,7 +1319,7 @@ def mcp_proxy_cmd(
     """Bridge a coding agent's stdio MCP transport to a Databricks MCP endpoint.
 
     Each configured client spawns this as a local stdio MCP server (see
-    `ucode configure mcp`); it forwards messages to ``--url`` and injects a
+    `ucode mcp`); it forwards messages to ``--url`` and injects a
     freshly-minted token on every upstream request, so it never expires
     mid-session. Not meant for interactive use — the agent manages this
     process's lifecycle."""
@@ -1765,99 +1740,6 @@ def _print_budget_panel(recommendation: dict, tool: str, managed: dict | None = 
         console.print(panel)
 
 
-def _register_managed_mcp_servers(managed: dict, tool: str, state: dict) -> None:
-    """Apply the managed config's MCP servers to ``tool`` and persist what was registered.
-
-    Persisting under ``managed_mcp_servers`` lets the next launch diff against it, so a server the
-    admin later removes from the config is unregistered rather than left behind. A failure here never
-    blocks the launch — the agent still starts, just without the workspace's MCP servers.
-    """
-    try:
-        registered = apply_managed_mcp_servers(
-            managed,
-            tool,
-            state["workspace"],
-            state.get("profile"),
-            use_pat=bool(state.get("use_pat")),
-        )
-    except RuntimeError as exc:
-        print_warning(f"Could not register your workspace's MCP servers: {exc}")
-        return
-    # Persist even when empty so a config that dropped its last server clears the prior registration.
-    others = [
-        server
-        for server in (state.get("managed_mcp_servers") or [])
-        if isinstance(server, dict) and tool not in (server.get("clients") or [])
-    ]
-    state["managed_mcp_servers"] = others + registered
-    save_state(state)
-    if registered:
-        names = ", ".join(str(server["name"]) for server in registered)
-        print_note(f"Registered workspace MCP server(s) for {TOOL_SPECS[tool]['display']}: {names}")
-
-
-def _managed_skill_locations(managed: dict) -> list[str]:
-    """The ``<catalog>.<schema>`` skill locations the admin published, or ``[]``."""
-    return [
-        loc
-        for loc in ((managed.get("skills") or {}).get("names") or [])
-        if isinstance(loc, str) and loc
-    ]
-
-
-def _download_managed_skills(managed: dict, state: dict) -> None:
-    """Download the admin-published skill schemas to disk (user scope).
-
-    Registering the skills MCP connection (see :func:`_apply_managed_skills`) exposes the skill
-    *tools* over the gateway, but the agent's ``/skills`` picker reads skill bundles from
-    ``~/.claude/skills`` / ``~/.agents/skills`` on disk. Without this download those directories stay
-    empty, so a workspace-published skill never shows up in ``/skills``. Skills already on disk are
-    left untouched, so a steady-state launch only lists each schema and writes nothing. Best-effort:
-    a failure here never blocks the launch.
-    """
-    locations = _managed_skill_locations(managed)
-    if not locations:
-        return
-    try:
-        token = get_databricks_token(state["workspace"], state.get("profile"))
-        written = download_managed_skills_on_launch(state["workspace"], token, locations)
-    except RuntimeError as exc:
-        print_warning(f"Could not download your workspace's skills: {exc}")
-        return
-    if written:
-        print_note(f"Downloaded workspace skill(s) to disk: {', '.join(written)}")
-
-
-def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
-    """Register the managed config's skill schemas on ``tool``'s skills MCP connection and disk.
-
-    Sibling of :func:`_register_managed_mcp_servers` for the skills registry: the managed config
-    lists the skill schemas the admin published, and nothing else on the launch path routes them to
-    the agent. ``apply_managed_skills`` persists the connection (and the applied set, for diffing a
-    later removal) into ``state`` itself, then ``_download_managed_skills`` writes the skill bundles
-    to disk so the agent's ``/skills`` picker lists them. A failure in either step never blocks the
-    launch.
-    """
-    try:
-        applied = apply_managed_skills(
-            state,
-            managed,
-            tool,
-            state["workspace"],
-            state.get("profile"),
-            use_pat=bool(state.get("use_pat")),
-        )
-    except RuntimeError as exc:
-        print_warning(f"Could not register your workspace's skills: {exc}")
-    else:
-        if applied:
-            names = ", ".join(applied)
-            print_note(
-                f"Registered workspace skill schema(s) for {TOOL_SPECS[tool]['display']}: {names}"
-            )
-    _download_managed_skills(managed, state)
-
-
 def _can_launch_from_cached_config(
     tool: str,
     state: dict,
@@ -1938,6 +1820,8 @@ def _launch_tool(
         if needs_auto_configure:
             _auto_configure_tool(tool)
         state = ensure_provider_state(tool)
+        if not is_dry_run():
+            migrate_off_managed_mcp_and_skills(state)
         # Remembered before the fallback below collapses the two cases: a managed config may not
         # silently override a provider the user typed on the command line (it errors instead).
         explicit_provider = provider
@@ -2139,13 +2023,6 @@ def _launch_tool(
             )
         if recommendation is not None:
             _print_budget_panel(recommendation, tool, managed)
-        # Register the managed config's MCP servers so they reach the agent's `/mcp` list. Nothing
-        # else on this path does it — the config only lists them — so without this a
-        # workspace-published server never shows up. `managed` is already None when the config is
-        # skipped (--skip-managed-config / feature off); --dry-run writes nothing.
-        if managed is not None and not is_dry_run():
-            _register_managed_mcp_servers(managed, tool, state)
-            _apply_managed_skills(managed, tool, state)
         if tool == "claude":
             if smart_routing_v2.enabled():
                 # Transient launch precedence for the v2 PTY's initial --model flag.
@@ -2529,7 +2406,7 @@ def cursor_cmd(ctx: typer.Context) -> None:
 
     Cursor is MCP-only: `cursor-agent` runs models on your own Cursor account, so
     ucode configures no models for it. Its Databricks MCP servers (added via
-    `ucode configure mcp`) run `ucode mcp-proxy`, which authenticates itself — so
+    `ucode mcp`) run `ucode mcp-proxy`, which authenticates itself — so
     this command is a thin convenience wrapper over `cursor-agent`, kept for
     symmetry with the other `ucode <agent>` launchers.
     """
@@ -2644,17 +2521,6 @@ def configure(
             "--disable-databricks-ai-tools to opt out.",
         ),
     ] = None,
-    mcp: Annotated[
-        str | None,
-        typer.Option(
-            "--mcp",
-            help="Also register the given Databricks MCP service(s) for the configured "
-            "coding agents, in one command. Pass a comma-separated list of fully-qualified "
-            "names like `system.ai.slack`. Combine with --agents to set up an agent and its "
-            "MCP servers together (e.g. `--agents claude --mcp system.ai.slack`); use without "
-            "--agents for MCP-only clients such as Cursor.",
-        ),
-    ] = None,
     tracing: Annotated[
         bool,
         typer.Option(
@@ -2715,8 +2581,8 @@ def configure(
         if profiles is not None:
             workspace_entries = _parse_profiles_option(profiles)
         # Whether the user named the workspace(s) via flags, captured before the resolver below
-        # may fill `workspace_entries` from a prompt — this, not the resolved value, decides the
-        # fully-interactive MCP prompt at the end.
+        # may fill `workspace_entries` from a prompt — this, not the resolved value, decides
+        # whether the optional-setup step is offered.
         flag_driven_workspace = workspace_entries is not None
         # Under a managed config, resolve (prompting when interactive) and set the target workspace
         # first, so the developer can switch workspaces; only then short-circuit if that workspace
@@ -2741,9 +2607,6 @@ def configure(
             agent = "claude"
         if enable_databricks_ai_tools is not None:
             skip_kwargs["databricks_ai_tools_enabled"] = enable_databricks_ai_tools
-        # Set True only in the fully-interactive branch below; gates the optional
-        # MCP setup prompt so flag-driven / scripted runs are never interrupted.
-        fully_interactive = False
         combined_optional_setup = False
         if agent is not None:
             tool = normalize_tool(agent)
@@ -2765,10 +2628,10 @@ def configure(
             # Cursor is MCP-only (no model routing), so it can't go through the
             # model-agent configure path. Split it out: model agents configure
             # normally; cursor only needs workspace state established here, and
-            # its MCP servers are added separately via `ucode configure mcp`
-            # (which picks cursor up through MCP_ONLY_CLIENTS). If cursor is the
-            # only agent, do a workspace-only configure so that later `configure
-            # mcp` run has a current workspace to target.
+            # its MCP servers are added separately via `ucode mcp` (which picks
+            # cursor up through MCP_ONLY_CLIENTS). If cursor is the only agent, do
+            # a workspace-only configure so a later `ucode mcp` run has a current
+            # workspace to target.
             requested = [a.strip().lower() for a in agents.split(",") if a.strip()]
             wants_cursor = "cursor" in requested
             model_agent_names = ",".join(a for a in requested if a != "cursor")
@@ -2801,19 +2664,6 @@ def configure(
             else:
                 # Neither model agents nor cursor -> empty/invalid --agents list.
                 _parse_agents_option(agents)
-        elif mcp is not None:
-            # MCP-only: `--mcp` without --agent(s) (e.g. Cursor, which isn't a
-            # model agent, or adding MCP servers to an already-configured setup).
-            # Configure just the workspace — no interactive agent picker — so the
-            # `--mcp` registration below has a current workspace to target.
-            if workspace_entries is None:
-                workspace_entries = [_prompt_for_configuration(None)]
-            _configure_shared_workspace_states(
-                workspace_entries,
-                tools=[],
-                force_login=not use_pat,
-                use_pat=use_pat,
-            )
         else:
             # Tool binaries are installed after the user picks which agents
             # they want, in configure_workspace_command.
@@ -2833,12 +2683,6 @@ def configure(
                     prompt_optional_updates=prompt_optional_updates,
                     **skip_kwargs,
                 )
-            # Only the no-agent, no-workspace path is truly interactive (the user
-            # picked agents/workspace via prompts); that's where we offer the MCP
-            # step below. Flag-driven runs stay scriptable. Keyed off whether the
-            # workspace came from a flag, not the now-resolved `workspace_entries`
-            # (which the managed-config resolver may have filled from a prompt).
-            fully_interactive = not flag_driven_workspace
         if tracing:
             # The workspaces were just configured, so enable tracing for them
             # directly instead of re-prompting. Fall back to the workspace that
@@ -2849,33 +2693,6 @@ def configure(
                 tracing_workspaces = [(current, None)] if current else None
             if tracing_workspaces:
                 configure_tracing_command(workspaces=tracing_workspaces)
-        if mcp is not None:
-            # The workspace + agents were just configured above, so the current
-            # workspace state now lists the agents whose MCP configs we should
-            # write. `--mcp` takes fully-qualified service names, which
-            # `configure_mcp_command` locates and registers without a picker
-            # (bare short names would need --location, which we don't accept here).
-            services = {name.strip() for name in mcp.split(",") if name.strip()}
-            if not services:
-                raise RuntimeError(
-                    "--mcp needs at least one fully-qualified MCP service name, e.g. "
-                    "`--mcp system.ai.slack`."
-                )
-            bare = sorted(name for name in services if name.count(".") < 2)
-            if bare:
-                raise RuntimeError(
-                    "--mcp names must be fully qualified `<catalog>.<schema>.<name>` "
-                    f"(got: {', '.join(bare)}). Use `ucode configure mcp` for the "
-                    "interactive picker."
-                )
-            configure_mcp_command(services=services)
-        if (
-            fully_interactive
-            and not combined_optional_setup
-            and not dry_run
-            and prompt_yes_no("Configure MCP servers now?")
-        ):
-            configure_mcp_command()
     except typer.Exit:
         # `typer.Exit` subclasses RuntimeError, so it has to be re-raised ahead of the handler
         # below. Otherwise a clean exit (e.g. `_reject_configure_under_managed_config` under a
@@ -2890,8 +2707,9 @@ def configure(
         raise typer.Exit(130) from None
 
 
-@configure_app.command("mcp")
-def configure_mcp(
+@mcp_app.callback(invoke_without_command=True)
+def mcp(
+    ctx: typer.Context,
     location: Annotated[
         str | None,
         typer.Option(
@@ -2914,7 +2732,13 @@ def configure_mcp(
         ),
     ] = None,
 ) -> None:
-    """Add Databricks MCP servers to installed coding tools."""
+    """Add Databricks MCP servers to installed coding tools.
+
+    Bare `ucode mcp` runs the interactive picker (replacing the registered servers with your
+    selection). Use the `add` / `remove` / `web-search` subcommands for additive or targeted changes.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
     # `--services` absent -> None (whole schema); present (even empty) -> the
     # explicit subset, so `--services ""` deselects everything.
     selected = None if services is None else {s.strip() for s in services.split(",") if s.strip()}
@@ -2928,8 +2752,8 @@ def configure_mcp(
         raise typer.Exit(130) from None
 
 
-@configure_app.command("skills")
-def configure_skills(
+@app.command("skills")
+def skills_cmd(
     location: Annotated[
         str | None,
         typer.Option("--location", help="Comma-separated `<catalog>.<schema>` skill scopes."),
@@ -3030,7 +2854,7 @@ def setup(
 ) -> None:
     """Choose the agents and models for your workspace's managed config (admins only).
 
-    MCP servers, skills, and the tiered spend policy have their own commands — see `ucode setup help`.
+    The tiered spend policy has its own command — see `ucode setup help`.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -3039,50 +2863,6 @@ def setup(
     try:
         install_databricks_cli()
         code = setup_command(from_file=from_file)
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("mcps")
-def setup_mcp_cmd() -> None:
-    """Choose the MCP servers the managed config gives developers (admins only)."""
-    # Same `typer.Exit`/RuntimeError ordering trap as the `setup` callback above.
-    try:
-        install_databricks_cli()
-        code = setup_mcp_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("skills")
-def setup_skills_cmd(
-    location: Annotated[
-        str | None,
-        typer.Option(
-            "--location",
-            help="Skill schemas to publish as `<catalog>.<schema>` (comma-separated for several). "
-            "Skips the prompt.",
-        ),
-    ] = None,
-) -> None:
-    """Choose the skills the managed config gives developers (admins only)."""
-    try:
-        install_databricks_cli()
-        # None means "prompt"; an explicit `--location` is parsed to the list to publish.
-        locations = None if location is None else _parse_skill_locations(location)
-        code = setup_skills_command(locations)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

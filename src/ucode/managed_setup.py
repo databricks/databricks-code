@@ -10,8 +10,9 @@ This module owns the admin-write half of the managed config, mirroring the devel
 
 The manifest shape here is exactly the one :func:`ucode.managed_config.normalize_managed_config`
 produces, so ``serialize`` then ``normalize`` round-trips to the input. The enum maps are derived by
-inverting that module's maps rather than restated, so a new agent or MCP type only has to be added
-once.
+inverting that module's maps rather than restated, so a new agent only has to be added once. The
+managed config carries agents/models/global policy/spend tiers only — MCP servers, skills, and
+tracing are personal configuration and are not part of this manifest.
 
 Local persistence is not duplicated here: the authored manifest is saved to and loaded from the one
 local file, ``~/.ucode/managed-state.json``, via :func:`ucode.managed_config.save_managed_state` and
@@ -33,14 +34,9 @@ from ucode.databricks import (
 )
 from ucode.managed_config import (
     AGENT_ENUM_TO_TOOL,
-    MCP_TYPE_ENUM_TO_TAG,
 )
 
-# ucode tool name -> CodingAgent proto enum, and ucode MCP type tag -> McpServerType proto enum.
-# Inverted from the read side's maps so the two directions cannot drift: adding an agent to
-# `managed_config._AGENT_ENUM_TO_TOOL` makes it serializable here automatically.
 AGENT_TOOL_TO_ENUM: dict[str, str] = {tool: enum for enum, tool in AGENT_ENUM_TO_TOOL.items()}
-MCP_TAG_TO_TYPE_ENUM: dict[str, str] = {tag: enum for enum, tag in MCP_TYPE_ENUM_TO_TAG.items()}
 
 # Agents whose model config carries a flat `models` list. Claude instead uses per-family slots
 # (`ClaudeDefaultModels`), and Codex has no model list at all — it selects exactly one model.
@@ -282,9 +278,10 @@ def serialize_managed_config(manifest: dict) -> dict:
     """Serialize ucode's internal manifest into a proto-JSON ``CodingAgentConfig``.
 
     The exact inverse of :func:`ucode.managed_config.normalize_managed_config`: tool names become
-    ``CODING_AGENT_*`` enums, MCP type tags become ``MCP_SERVER_TYPE_*``, and each agent's model
-    config is wrapped in its matching ``AgentModelConfig`` oneof variant. Agents and MCP types this
-    build doesn't recognize are dropped, mirroring the read side.
+    ``CODING_AGENT_*`` enums and each agent's model config is wrapped in its matching
+    ``AgentModelConfig`` oneof variant. Agents this build doesn't recognize are dropped, mirroring the
+    read side. The manifest carries agents/models/default-agent/tracing/budget policy — MCP servers
+    and skills are not serialized.
 
     Output-only proto fields (``workspace_id``, timestamps, user ids) are never emitted. ``name`` is
     carried through when present so an update path can address an existing resource; ``ucode publish``
@@ -312,27 +309,6 @@ def serialize_managed_config(manifest: dict) -> dict:
         ]
         if entries:
             payload["enabled_agents"] = entries
-
-    mcp_servers = manifest.get("mcp_servers")
-    if isinstance(mcp_servers, list):
-        servers: list[dict] = []
-        for server in mcp_servers:
-            if not isinstance(server, dict):
-                continue
-            server_name = server.get("name")
-            type_enum = MCP_TAG_TO_TYPE_ENUM.get(str(server.get("type") or ""))
-            if isinstance(server_name, str) and server_name and type_enum:
-                servers.append({"name": server_name, "type": type_enum})
-        if servers:
-            payload["mcp_servers"] = servers
-
-    skills = manifest.get("skills")
-    if isinstance(skills, dict):
-        names = skills.get("names")
-        if isinstance(names, list):
-            skill_names = [n for n in names if isinstance(n, str) and n]
-            if skill_names:
-                payload["skills"] = {"names": skill_names}
 
     tracing_table = manifest.get("tracing_table")
     if isinstance(tracing_table, str) and tracing_table:
@@ -422,7 +398,6 @@ def validate_manifest(manifest: dict, state: dict | None = None) -> list[str]:
     - ``default_agent`` is required once any agent configuration is present, must appear in
       ``enabled_agents``, and that agent must have a non-empty ``default_model``;
     - every ``enabled_agents`` key must be an agent this ucode build knows;
-    - each MCP server needs a name and a recognized type; skill names must be non-empty;
     - ``tracing_table`` must be non-empty when the key is present;
     - a ``budget_policy`` needs a ``budget_id``, and each tier needs a ``spending_percentage`` in
       [0, 1] (unique across tiers), a ``default_agent`` that appears in ``enabled_agents``, and a
@@ -466,29 +441,6 @@ def validate_manifest(manifest: dict, state: dict | None = None) -> list[str]:
     if known:
         for tool, agent_config in enabled_agents.items():
             errors.extend(_validate_agent_models(tool, agent_config, known))
-
-    mcp_servers = manifest.get("mcp_servers")
-    if isinstance(mcp_servers, list):
-        for index, raw_server in enumerate(mcp_servers, start=1):
-            if not isinstance(raw_server, dict):
-                errors.append(f"mcp_servers[{index}] must be an object.")
-                continue
-            server = _as_dict(raw_server)
-            if not server.get("name"):
-                errors.append(f"mcp_servers[{index}]: name is required.")
-            server_type = str(server.get("type") or "")
-            if server_type not in MCP_TAG_TO_TYPE_ENUM:
-                valid = ", ".join(sorted(MCP_TAG_TO_TYPE_ENUM))
-                errors.append(
-                    f"mcp_servers[{index}]: type '{server_type}' is not recognized "
-                    f"(valid: {valid})."
-                )
-
-    skills = manifest.get("skills")
-    if isinstance(skills, dict):
-        names = skills.get("names")
-        if isinstance(names, list) and any(not isinstance(name, str) or not name for name in names):
-            errors.append("skills.names must not contain empty names.")
 
     if "tracing_table" in manifest and not manifest.get("tracing_table"):
         errors.append("tracing_table must not be empty.")

@@ -11,12 +11,10 @@ import pytest
 
 from ucode.managed_config import (
     AGENT_ENUM_TO_TOOL,
-    MCP_TYPE_ENUM_TO_TAG,
     normalize_managed_config,
 )
 from ucode.managed_setup import (
     AGENT_TOOL_TO_ENUM,
-    MCP_TAG_TO_TYPE_ENUM,
     claude_family_for_model,
     claude_model_slots,
     model_families_for_agent,
@@ -84,11 +82,6 @@ def _full_manifest() -> dict:
                 },
             },
         },
-        "mcp_servers": [
-            {"name": "system.ai.github", "type": "mcp-service"},
-            {"name": "genie-space-id", "type": "genie-space"},
-        ],
-        "skills": {"names": ["system.ai.pdf-extraction"]},
         "tracing_table": "main.default.ucode-traces",
         "budget_policy": {
             "display_name": "eng-tiered-routing",
@@ -113,9 +106,6 @@ class TestEnumMaps:
     def test_agent_map_is_the_inverse_of_the_read_side(self):
         assert AGENT_TOOL_TO_ENUM == {tool: enum for enum, tool in AGENT_ENUM_TO_TOOL.items()}
 
-    def test_mcp_map_is_the_inverse_of_the_read_side(self):
-        assert MCP_TAG_TO_TYPE_ENUM == {tag: enum for enum, tag in MCP_TYPE_ENUM_TO_TAG.items()}
-
     def test_agent_map_round_trips(self):
         for tool, enum in AGENT_TOOL_TO_ENUM.items():
             assert AGENT_ENUM_TO_TOOL[enum] == tool
@@ -123,7 +113,6 @@ class TestEnumMaps:
     def test_inversion_is_lossless(self):
         # A duplicated tool name on the read side would silently collapse an entry here.
         assert len(AGENT_TOOL_TO_ENUM) == len(AGENT_ENUM_TO_TOOL)
-        assert len(MCP_TAG_TO_TYPE_ENUM) == len(MCP_TYPE_ENUM_TO_TAG)
 
 
 class TestRoundTrip:
@@ -151,11 +140,6 @@ class TestRoundTrip:
                 "enabled_agents": {tool: {"model_config": model_config}},
             }
             assert normalize_managed_config(serialize_managed_config(manifest)) == manifest, tool
-
-    def test_every_mcp_type_round_trips(self):
-        for tag in MCP_TAG_TO_TYPE_ENUM:
-            manifest = {"mcp_servers": [{"name": "some-server", "type": tag}]}
-            assert normalize_managed_config(serialize_managed_config(manifest)) == manifest, tag
 
 
 class TestSerialize:
@@ -223,12 +207,16 @@ class TestSerialize:
         variant = payload["enabled_agents"][0]["config"]["model_config"]["claude"]
         assert variant["model_provider_service"] == "main.default.anthropic-mps"
 
-    def test_mcp_types_map_to_proto_enums(self):
-        payload = serialize_managed_config(_full_manifest())
-        assert payload["mcp_servers"] == [
-            {"name": "system.ai.github", "type": "MCP_SERVER_TYPE_UC_SERVICE"},
-            {"name": "genie-space-id", "type": "MCP_SERVER_TYPE_GENIE"},
-        ]
+    def test_mcp_servers_and_skills_are_never_serialized(self):
+        payload = serialize_managed_config(
+            {
+                **_full_manifest(),
+                "mcp_servers": [{"name": "system.ai.github", "type": "mcp-service"}],
+                "skills": {"names": ["system.ai.pdf-extraction"]},
+            }
+        )
+        assert "mcp_servers" not in payload
+        assert "skills" not in payload
 
     def test_tracing_becomes_a_table_object(self):
         payload = serialize_managed_config(_full_manifest())
@@ -276,12 +264,6 @@ class TestSerialize:
         assert [entry["agent"] for entry in payload["enabled_agents"]] == [
             "CODING_AGENT_CLAUDE_CODE"
         ]
-
-    def test_unknown_mcp_type_is_dropped(self):
-        payload = serialize_managed_config(
-            {"mcp_servers": [{"name": "a", "type": "not-a-type"}, {"name": "b", "type": "sql"}]}
-        )
-        assert payload["mcp_servers"] == [{"name": "b", "type": "MCP_SERVER_TYPE_DATABRICKS_SQL"}]
 
     def test_empty_manifest_serializes_to_empty_payload(self):
         assert serialize_managed_config({}) == {}
@@ -614,17 +596,12 @@ class TestValidate:
         }
         assert validate_manifest(manifest, STATE) == []
 
-    def test_mcp_server_needs_a_name(self):
-        errors = validate_manifest({"mcp_servers": [{"type": "sql"}]})
-        assert any("name is required" in e for e in errors)
-
-    def test_mcp_server_needs_a_known_type(self):
-        errors = validate_manifest({"mcp_servers": [{"name": "a", "type": "bogus"}]})
-        assert any("is not recognized" in e for e in errors)
-
-    def test_empty_skill_name_is_rejected(self):
-        errors = validate_manifest({"skills": {"names": ["ok", ""]}})
-        assert any("skills.names" in e for e in errors)
+    def test_mcp_servers_and_skills_are_not_validated(self):
+        errors = validate_manifest(
+            {**_minimal_manifest(), "mcp_servers": [{"type": "bogus"}], "skills": {"names": [""]}},
+            STATE,
+        )
+        assert errors == []
 
     def test_empty_tracing_table_is_rejected(self):
         errors = validate_manifest({"tracing_table": ""})
@@ -904,7 +881,18 @@ class TestValidate:
     def test_errors_accumulate(self):
         manifest = {
             "default_agent": "codex",
-            "enabled_agents": {"claude": {}},
-            "mcp_servers": [{"type": "bogus"}],
+            "enabled_agents": {
+                "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}},
+                "not-an-agent": {},
+            },
+            "budget_policy": {
+                "tiers": [
+                    {
+                        "spending_percentage": 0.5,
+                        "default_agent": "claude",
+                        "default_model": "system.ai.claude-opus-4-8",
+                    }
+                ]
+            },
         }
         assert len(validate_manifest(manifest, STATE)) >= 3

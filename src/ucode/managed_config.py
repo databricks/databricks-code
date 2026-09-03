@@ -50,8 +50,8 @@ NO_MANAGED_CONFIG_MESSAGE = "No coding-agent config has been set up by your work
 
 # CodingAgent proto enum -> ucode tool name. Anything unrecognized (e.g. a newer agent this ucode
 # build doesn't know) is dropped during normalization rather than guessed at. Public because the
-# admin-write side (``managed_setup``) inverts these maps to serialize, so a new agent or MCP type
-# only has to be declared once.
+# admin-write side (``managed_setup``) inverts this map to serialize, so a new agent only has to be
+# declared once.
 AGENT_ENUM_TO_TOOL: dict[str, str] = {
     "CODING_AGENT_CLAUDE_CODE": "claude",
     "CODING_AGENT_CODEX": "codex",
@@ -59,18 +59,6 @@ AGENT_ENUM_TO_TOOL: dict[str, str] = {
     "CODING_AGENT_COPILOT": "copilot",
     "CODING_AGENT_PI": "pi",
     "CODING_AGENT_OPENCODE": "opencode",
-}
-
-# McpServerType proto enum -> ucode's short type tag. Mirrors the selection prefixes in ``mcp.py``;
-# the actual name->URL resolution happens there when the manifest is applied (a later change).
-MCP_TYPE_ENUM_TO_TAG: dict[str, str] = {
-    "MCP_SERVER_TYPE_UC_SERVICE": "mcp-service",
-    "MCP_SERVER_TYPE_EXTERNAL": "external",
-    "MCP_SERVER_TYPE_GENIE": "genie-space",
-    "MCP_SERVER_TYPE_VECTOR_SEARCH": "vector-search",
-    "MCP_SERVER_TYPE_UC_FUNCTIONS": "uc-functions",
-    "MCP_SERVER_TYPE_DATABRICKS_APP": "app",
-    "MCP_SERVER_TYPE_DATABRICKS_SQL": "sql",
 }
 
 
@@ -171,19 +159,6 @@ def _tracing_table(tracing: object) -> str | None:
     return _str(_as_dict(tracing).get("table"))
 
 
-def _normalize_mcp_servers(value: object) -> list[dict]:
-    if not isinstance(value, list):
-        return []
-    out: list[dict] = []
-    for entry in value:
-        entry_dict = _as_dict(entry)
-        name = _str(entry_dict.get("name"))
-        tag = MCP_TYPE_ENUM_TO_TAG.get(_str(entry_dict.get("type")) or "")
-        if name and tag:
-            out.append({"name": name, "type": tag})
-    return out
-
-
 def _normalize_budget_policy(value: object) -> dict | None:
     bp = _as_dict(value)
     if not bp:
@@ -218,8 +193,9 @@ def _normalize_budget_policy(value: object) -> dict | None:
 def normalize_managed_config(raw: dict) -> dict:
     """Normalize a raw ``CodingAgentConfig`` proto-JSON dict into ucode's internal shape.
 
-    The internal shape uses ucode's own tool names and short MCP type tags so downstream reconcile
-    and apply code never touches proto enum spellings. Unknown agents / MCP types are dropped.
+    The internal shape uses ucode's own tool names so downstream reconcile and apply code never
+    touches proto enum spellings. Unknown agents are dropped. MCP servers and skills are personal
+    configuration and are deliberately not read from the manifest.
     """
     raw = _as_dict(raw)
     result: dict = {}
@@ -241,12 +217,6 @@ def normalize_managed_config(raw: dict) -> dict:
             enabled_agents[tool] = agent_config
     if enabled_agents:
         result["enabled_agents"] = enabled_agents
-    mcp_servers = _normalize_mcp_servers(raw.get("mcp_servers"))
-    if mcp_servers:
-        result["mcp_servers"] = mcp_servers
-    skill_names = _str_list(_as_dict(raw.get("skills")).get("names"))
-    if skill_names:
-        result["skills"] = {"names": skill_names}
     tracing_table = _tracing_table(raw.get("tracing"))
     if tracing_table:
         result["tracing_table"] = tracing_table

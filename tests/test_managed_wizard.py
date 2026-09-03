@@ -71,129 +71,6 @@ class TestTracingReadback:
         assert wizard._tracing_table_from_state({"tracing": "on"}) is None
 
 
-class TestMcpServerFromUrl:
-    @pytest.mark.parametrize(
-        ("url", "expected"),
-        [
-            # mcp-service stores the dash form the launch path rebuilds the dotted URL from.
-            (
-                "https://ws.example.com/ai-gateway/mcp-services/system.ai.github",
-                ("system-ai-github", "mcp-service"),
-            ),
-            ("https://ws.example.com/api/2.0/mcp/external/jira-prod", ("jira-prod", "external")),
-            ("https://ws.example.com/api/2.0/mcp/genie/01ef", ("01ef", "genie-space")),
-            # vector-search / uc-functions store `<catalog>.<schema>`, not the local display slug.
-            (
-                "https://ws.example.com/api/2.0/mcp/vector-search/my_cat/my_schema",
-                ("my_cat.my_schema", "vector-search"),
-            ),
-            (
-                "https://ws.example.com/api/2.0/mcp/functions/dev_cat/dev_fixture",
-                ("dev_cat.dev_fixture", "uc-functions"),
-            ),
-            ("https://ws.example.com/api/2.0/mcp/sql", ("databricks-sql", "sql")),
-        ],
-    )
-    def test_known_urls(self, url, expected):
-        assert wizard._mcp_server_from_url(url) == expected
-
-    def test_apps_are_not_publishable(self):
-        # An app's host isn't reconstructable from the workspace + an id, so it can't be published.
-        assert (
-            wizard._mcp_server_from_url("https://mcp-myapp-123.aws.databricksapps.com/mcp") is None
-        )
-
-    def test_unknown_url_yields_none(self):
-        assert wizard._mcp_server_from_url("https://example.com/something/else") is None
-
-    def test_vector_search_needs_both_catalog_and_schema(self):
-        assert (
-            wizard._mcp_server_from_url("https://ws.example.com/api/2.0/mcp/functions/onlycat")
-            is None
-        )
-
-
-class TestMcpServersFromState:
-    def test_maps_registered_servers_to_name_and_type(self):
-        state = {
-            "mcp_servers": [
-                {
-                    "name": "databricks-github",
-                    "url": f"{WORKSPACE}/ai-gateway/mcp-services/system.ai.github",
-                },
-                {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
-            ]
-        }
-        # The published name comes from the URL (the identifier the server field holds), not the
-        # local display name.
-        assert wizard._mcp_servers_from_state(state) == [
-            {"name": "system-ai-github", "type": "mcp-service"},
-            {"name": "databricks-sql", "type": "sql"},
-        ]
-
-    def test_publishes_catalog_schema_for_uc_functions(self):
-        # The lossy local slug is replaced with the dotted catalog.schema the launch path can split.
-        state = {
-            "mcp_servers": [
-                {
-                    "name": "databricks-functions-dev-cat-dev-fixture",
-                    "url": f"{WORKSPACE}/api/2.0/mcp/functions/dev_cat/dev_fixture",
-                },
-            ]
-        }
-        assert wizard._mcp_servers_from_state(state) == [
-            {"name": "dev_cat.dev_fixture", "type": "uc-functions"},
-        ]
-
-    def test_skips_the_skills_registry_entry(self):
-        # Skills are published under the manifest's own `skills` field; including the MCP entry too
-        # would configure them twice.
-        from ucode.mcp import SKILLS_MCP_KIND
-
-        state = {
-            "mcp_servers": [
-                {
-                    "name": "databricks-skill-registry",
-                    "kind": SKILLS_MCP_KIND,
-                    "url": f"{WORKSPACE}/api/2.0/mcp/sql",
-                },
-                {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
-            ]
-        }
-        assert wizard._mcp_servers_from_state(state) == [{"name": "databricks-sql", "type": "sql"}]
-
-    def test_skips_apps_and_unclassifiable_servers(self):
-        state = {
-            "mcp_servers": [
-                {"name": "mystery", "url": "https://example.com/nope"},
-                {"name": "databricks-app-x", "url": "https://x-1.databricksapps.com/mcp"},
-            ]
-        }
-        assert wizard._mcp_servers_from_state(state) == []
-
-    def test_skips_entries_missing_name_or_url(self):
-        state = {
-            "mcp_servers": [
-                {"url": f"{WORKSPACE}/api/2.0/mcp/sql"},
-                {"name": "no-url"},
-                "not-a-dict",
-            ]
-        }
-        assert wizard._mcp_servers_from_state(state) == []
-
-    def test_empty_state_yields_nothing(self):
-        assert wizard._mcp_servers_from_state({}) == []
-
-    def test_output_validates_as_a_manifest(self):
-        state = {
-            "mcp_servers": [
-                {"name": "databricks-sql", "url": f"{WORKSPACE}/api/2.0/mcp/sql"},
-            ]
-        }
-        servers = wizard._mcp_servers_from_state(state)
-        assert validate_manifest({"mcp_servers": servers}) == []
-
-
 class TestAdminGate:
     def test_non_admin_is_rejected(self):
         with patch.object(wizard, "is_workspace_admin", return_value=False):
@@ -2143,8 +2020,6 @@ class TestCarryForwardSections:
     def test_all_optional_sections_survive_a_rerun(self):
         previous = {
             **AGENTS_ONLY,
-            "mcp_servers": [{"name": "system.ai.github", "type": "mcp-service"}],
-            "skills": {"names": ["main.default"]},
             "tracing_table": "main.default.traces",
             "budget_policy": {
                 "budget_id": BUDGET_ID,
@@ -2159,10 +2034,19 @@ class TestCarryForwardSections:
         }
         manifest = dict(AGENTS_ONLY)
         wizard._carry_forward_sections(previous, manifest)
-        assert manifest["mcp_servers"] == previous["mcp_servers"]
-        assert manifest["skills"] == previous["skills"]
         assert manifest["tracing_table"] == previous["tracing_table"]
         assert manifest["budget_policy"] == previous["budget_policy"]
+
+    def test_mcp_and_skills_are_not_carried(self):
+        previous = {
+            **AGENTS_ONLY,
+            "mcp_servers": [{"name": "system.ai.github", "type": "mcp-service"}],
+            "skills": {"names": ["main.default"]},
+        }
+        manifest = dict(AGENTS_ONLY)
+        wizard._carry_forward_sections(previous, manifest)
+        assert "mcp_servers" not in manifest
+        assert "skills" not in manifest
 
     def test_empty_previous_adds_nothing(self):
         manifest = dict(AGENTS_ONLY)
@@ -2196,13 +2080,16 @@ class TestCarryForwardSections:
 
 class TestNextSteps:
     def test_marks_configured_and_unconfigured_sections(self, capsys):
-        manifest = {**AGENTS_ONLY, "skills": {"names": ["main.default"]}}
-        wizard._print_next_steps(manifest)
+        wizard._print_next_steps(dict(AGENTS_ONLY))
         out = capsys.readouterr().out
-        assert "ucode setup mcps" in out
-        assert "ucode setup skills" in out
         assert "ucode setup spend-tiers" in out
+        assert "not configured" in out
         assert "ucode publish" in out
+
+        wizard._print_next_steps({**AGENTS_ONLY, "budget_policy": {"budget_id": BUDGET_ID}})
+        out = capsys.readouterr().out
+        assert "ucode setup spend-tiers" in out
+        assert "not configured" not in out
 
     def test_dry_run_says_nothing_was_saved(self, capsys, monkeypatch):
         monkeypatch.setattr(config_io_mod, "_dry_run", True)
@@ -2213,7 +2100,7 @@ class TestNextSteps:
 
 
 class TestSectionCommands:
-    """The `ucode setup mcps` / `skills` / `spend-tiers` section commands."""
+    """`ucode setup spend-tiers` — the one managed-config section command, strictly admin-only."""
 
     @staticmethod
     def _admin(**overrides):
@@ -2240,95 +2127,24 @@ class TestSectionCommands:
                 stack.enter_context(patch.object(wizard, name, value))
             return fn()
 
-    def test_mcp_requires_an_authored_config(self):
+    def test_requires_an_authored_config(self):
         # No manifest on disk → the command can't edit a section that doesn't exist.
         with pytest.raises(RuntimeError, match="ucode setup"):
-            self._run(wizard.setup_mcp_command)
+            self._run(wizard.setup_budget_policy_command)
 
-    def test_mcp_requires_enabled_agents(self):
+    def test_requires_enabled_agents(self):
         # A launch stores `{}` to mean "no managed config"; that must not count as authored.
         managed_config_mod.save_managed_state(WORKSPACE, {})
         with pytest.raises(RuntimeError, match="ucode setup"):
-            self._run(wizard.setup_mcp_command)
+            self._run(wizard.setup_budget_policy_command)
 
-    def test_mcp_writes_only_its_section(self):
-        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
-        servers = [{"name": "system.ai.github", "type": "mcp-service"}]
-        # The picker (imported lazily inside the command) registers servers into local state; fake
-        # that by having the before/after reads bracket a change.
-        reads = iter([[], servers])
-        with (
-            patch("ucode.mcp.configure_mcp_command", return_value=0) as picker,
-            patch.object(wizard, "_mcp_servers_from_state", side_effect=lambda *_: next(reads)),
-        ):
-            code = self._run(wizard.setup_mcp_command)
-        assert code == 0
-        assert picker.call_args.kwargs == {"exclude_sources": {"apps"}}
-        saved = managed_config_mod.load_managed_state(WORKSPACE)
-        assert saved["mcp_servers"] == servers
-        assert saved["enabled_agents"] == AGENTS_ONLY["enabled_agents"]
-
-    def test_mcp_cancel_is_a_no_op(self):
-        # Picker cancelled / nothing changed → the section is left exactly as it was.
-        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
-        with (
-            patch("ucode.mcp.configure_mcp_command", return_value=0),
-            patch.object(wizard, "_mcp_servers_from_state", return_value=[]),
-            patch.object(wizard, "save_managed_state") as save,
-        ):
-            code = self._run(wizard.setup_mcp_command)
-        assert code == 0
-        assert not save.called
-
-    def test_mcp_carries_forward_preregistered_servers(self):
-        # An admin who ran `ucode configure mcp` first arrives with those servers already registered,
-        # so the picker leaves local state unchanged (before == after). The manifest doesn't carry them
-        # yet, so `setup mcps` must still save them rather than report "no changes" and drop them.
-        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
-        servers = [{"name": "system.ai.github", "type": "mcp-service"}]
-        with (
-            patch("ucode.mcp.configure_mcp_command", return_value=0),
-            patch.object(wizard, "_mcp_servers_from_state", return_value=servers),
-        ):
-            code = self._run(wizard.setup_mcp_command)
-        assert code == 0
-        assert managed_config_mod.load_managed_state(WORKSPACE)["mcp_servers"] == servers
-
-    def test_mcp_not_admin_raises(self):
+    def test_not_admin_raises(self):
         managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
         with pytest.raises(RuntimeError, match="not an admin"):
             self._run(
-                wizard.setup_mcp_command,
+                wizard.setup_budget_policy_command,
                 admin_overrides={"is_workspace_admin": lambda *a, **k: False},
             )
-
-    def test_skills_location_bypasses_the_prompt(self):
-        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
-        with (
-            patch("ucode.mcp.configure_skills_mcp_command", return_value=0) as configure,
-            patch.object(wizard, "_skill_names_from_state", return_value=["main.default"]),
-            patch.object(wizard, "prompt_for_text") as prompt,
-        ):
-            code = self._run(lambda: wizard.setup_skills_command(["main.default"]))
-        assert code == 0
-        assert not prompt.called
-        configure.assert_called_once_with(["main.default"])
-        assert managed_config_mod.load_managed_state(WORKSPACE)["skills"] == {
-            "names": ["main.default"]
-        }
-
-    def test_skills_blank_answer_writes_nothing(self):
-        # A blank answer must not delegate: `configure_skills_mcp_command([])` is not a no-op.
-        managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
-        with (
-            patch("ucode.mcp.configure_skills_mcp_command") as configure,
-            patch.object(wizard, "prompt_for_text", return_value=""),
-            patch.object(wizard, "save_managed_state") as save,
-        ):
-            code = self._run(wizard.setup_skills_command)
-        assert code == 0
-        assert not configure.called
-        assert not save.called
 
     def test_budget_policy_offers_only_the_manifests_agents(self):
         managed_config_mod.save_managed_state(WORKSPACE, AGENTS_ONLY)
@@ -2374,8 +2190,6 @@ class TestSetupHelp:
         out = capsys.readouterr().out
         for command in (
             "ucode setup",
-            "ucode setup mcps",
-            "ucode setup skills",
             "ucode setup spend-tiers",
             "ucode setup show",
             "ucode publish",
@@ -2387,22 +2201,25 @@ class TestPublishDiff:
     def test_lists_added_removed_and_changed(self, capsys):
         existing = {
             "name": "cfg/1",
-            **AGENTS_ONLY,
-            "mcp_servers": [{"name": "system.ai.slack", "type": "mcp-service"}],
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}},
+                "codex": {"model_config": {"default_model": "system.ai.gpt-5-6"}},
+            },
         }
         incoming = {
             "default_agent": "claude",
             "enabled_agents": {
                 "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-9"}}
             },
-            "mcp_servers": [{"name": "system.ai.github", "type": "mcp-service"}],
+            "tracing_table": "main.default.traces",
         }
         changed = wizard._render_config_diff(existing, incoming, WORKSPACE)
         out = capsys.readouterr().out
         assert changed is True
         assert "CHANGE" in out and "claude-opus-4-8" in out and "claude-opus-4-9" in out
-        assert "ADD" in out and "system.ai.github" in out  # added server
-        assert "DELETE" in out and "system.ai.slack" in out  # removed server
+        assert "ADD" in out and "main.default.traces" in out
+        assert "DELETE" in out and "system.ai.gpt-5-6" in out
 
     def test_identical_configs_report_no_change(self, capsys):
         assert wizard._render_config_diff(AGENTS_ONLY, AGENTS_ONLY, WORKSPACE) is False
@@ -2929,11 +2746,7 @@ class TestCliWiring:
 
     @pytest.mark.parametrize(
         ("command", "target"),
-        [
-            ("mcps", "setup_mcp_command"),
-            ("skills", "setup_skills_command"),
-            ("spend-tiers", "setup_budget_policy_command"),
-        ],
+        [("spend-tiers", "setup_budget_policy_command")],
     )
     def test_section_subcommands_are_registered_and_called(self, command, target):
         with (
@@ -2945,19 +2758,13 @@ class TestCliWiring:
         assert fn.called
         assert "ERROR" not in _out(result)
 
-    def test_setup_skills_declares_location(self):
-        group = typer.main.get_command(app).commands["setup"]  # type: ignore[attr-defined]
-        skills = group.commands["skills"]  # type: ignore[attr-defined]
-        declared = {opt for param in skills.params for opt in param.opts}
-        assert "--location" in declared
+    def test_skills_is_a_top_level_command(self):
+        commands = typer.main.get_command(app).commands  # type: ignore[attr-defined]
+        assert "skills" in commands
 
-    def test_setup_skills_location_is_parsed_to_a_list(self):
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.setup_skills_command", return_value=0) as fn,
-        ):
-            runner.invoke(app, ["setup", "skills", "--location", "main.a,main.b"])
-        assert fn.call_args.args[0] == ["main.a", "main.b"]
+    def test_mcp_is_a_top_level_group(self):
+        group = typer.main.get_command(app).commands["mcp"]  # type: ignore[attr-defined]
+        assert {"add", "remove", "web-search"} <= set(group.commands)  # type: ignore[attr-defined]
 
     def test_setup_help_needs_no_auth(self):
         # `ucode setup help` reads the local draft only — it must not shell out to install the CLI.
@@ -2974,10 +2781,11 @@ class TestCliWiring:
         with (
             patch("ucode.cli.install_databricks_cli"),
             patch(
-                "ucode.cli.setup_mcp_command", side_effect=RuntimeError("run `ucode setup` first")
+                "ucode.cli.setup_budget_policy_command",
+                side_effect=RuntimeError("run `ucode setup` first"),
             ),
         ):
-            result = runner.invoke(app, ["setup", "mcps"])
+            result = runner.invoke(app, ["setup", "spend-tiers"])
         assert result.exit_code == 1
         assert "ucode setup" in _out(result)
 

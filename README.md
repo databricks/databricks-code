@@ -103,10 +103,10 @@ ucode configure --profiles DEFAULT --agents claude,codex --use-pat --skip-valida
 ### MCP servers (optional)
 
 ```bash
-ucode configure mcp
+ucode mcp
 ```
 
-Add Databricks MCP servers to installed MCP-capable tools: Codex, Claude Code, Gemini CLI, OpenCode, GitHub Copilot CLI, and Cursor Agent.
+Add Databricks MCP servers to installed MCP-capable tools: Codex, Claude Code, Gemini CLI, OpenCode, GitHub Copilot CLI, and Cursor Agent. MCP servers are personal, per-developer configuration — they are not part of a workspace's managed config.
 Options are shown in this order:
 
 - Discovered external MCP connections
@@ -125,21 +125,15 @@ The coding tool starts and stops the proxy as a child process; there's nothing e
 **Cursor** is MCP-only: `cursor-agent` runs models on your own Cursor account, so `ucode`
 configures no models for it — it only registers Databricks MCP servers in `~/.cursor/mcp.json`
 (via the same proxy). Include it with `ucode configure --agents cursor` or pick it in
-`ucode configure mcp`, then launch with `ucode cursor`.
+`ucode mcp`, then launch with `ucode cursor`.
 
-To set up an agent and its MCP server(s) in one command, pass `--mcp` with fully-qualified
-service name(s) to `ucode configure`:
-
-```bash
-ucode configure --agents claude --mcp system.ai.slack
-```
-
-`--mcp` also works without `--agents` for MCP-only clients (it configures just the workspace,
-then registers the servers); pass a comma-separated list to register several at once.
+MCP configuration lives entirely under `ucode mcp` — it is separate from `ucode configure`, which
+sets up workspaces and agent models. To register a specific service non-interactively, use
+`ucode mcp --services system.ai.slack` (or `ucode mcp add --services …` to keep existing servers).
 
 #### Add servers without replacing existing ones
 
-`ucode configure mcp` **replaces** the registered MCP servers with your selection — anything
+`ucode mcp` **replaces** the registered MCP servers with your selection — anything
 outside a `--location`/`--services` scope (or left unchecked in the picker) is removed. To
 **add** servers while leaving everything already configured in place, use `ucode mcp add`:
 
@@ -147,14 +141,14 @@ outside a `--location`/`--services` scope (or left unchecked in the picker) is r
 # Register a whole schema's services, keeping any servers already configured.
 ucode mcp add --location system.ai
 
-# Register just a subset (same name rules as `configure mcp --services`).
+# Register just a subset (same name rules as `ucode mcp --services`).
 ucode mcp add --services system.ai.slack,system.ai.github
 
 # No arguments launches the same interactive picker, but never removes servers.
 ucode mcp add
 ```
 
-`ucode mcp add` takes the same `--location` and `--services` options as `ucode configure mcp`;
+`ucode mcp add` takes the same `--location` and `--services` options as bare `ucode mcp`;
 the only difference is that it never removes servers outside the selection. In the interactive
 picker, servers you already have configured are shown as `(already configured)` and can't be
 toggled off — you only pick new ones to add.
@@ -189,20 +183,21 @@ on — and removes the ones you select from those tools. It needs no Databricks 
 
 ### Skills (optional)
 
-Configure Unity Catalog Skills for your coding tools with `ucode configure skills`:
+Configure Unity Catalog Skills for your coding tools with `ucode skills`. Skills are personal,
+per-developer configuration — they are not part of a workspace's managed config.
 
 ```bash
 # Utility tools only: register the schema-less skills MCP connection, no download.
-ucode configure skills
+ucode skills
 
 # Download mode: fetch every skill in the schema to disk (and register the connection).
-ucode configure skills --location main.default --path /abs/project/dir
+ucode skills --location main.default --path /abs/project/dir
 
 # Download a named subset of the schema's skills instead of all of them.
-ucode configure skills --location main.default --skill my-skill
+ucode skills --location main.default --skill my-skill
 
 # MCP mode: expose the schema's skills as MCP tools instead of downloading.
-ucode configure skills --location main.default,ml.prod --mcp
+ucode skills --location main.default,ml.prod --mcp
 ```
 
 - **Bare command** (no `--location`) registers the schema-less skills MCP connection — the
@@ -226,16 +221,18 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 
 Author the coding config your developers pick up automatically, instead of asking each of them to
 run `ucode configure` by hand. Restricted to workspace admins. `ucode setup help` prints the whole
-sequence; the short version is one command for the agents and models, then a command per optional
-section, then publish:
+sequence; the short version is one command for the agents and models, then the spend-tier command,
+then publish:
 
 ```bash
 ucode setup                 # agents and models (start here)
-ucode setup mcps            # managed MCP servers
-ucode setup skills          # managed skills
 ucode setup spend-tiers     # spend-based routing
-ucode publish                 # publish it to the workspace
+ucode publish               # publish it to the workspace
 ```
+
+A managed config carries **agents, models, the default agent, and a tiered spend policy only**.
+MCP servers and skills are personal, per-developer configuration (`ucode mcp` / `ucode skills`) and
+are never part of it.
 
 `ucode setup` walks through the agents to enable and which one bare `ucode` launches, then per agent:
 Databricks-hosted models or an external Model Provider Service and the models to expose. Interactive
@@ -247,16 +244,14 @@ session.
 Claude Code is asked one model per family (opus/sonnet/haiku/fable), since it selects models by family
 alias; any family can be skipped.
 
-The optional sections each edit their own part of the same config, so you can add an MCP server or
-change a spend tier later without walking the whole flow. `ucode setup skills --location
-main.default,other.schema` skips the prompt. `ucode setup spend-tiers` sets a tiered spend policy
-that switches the default agent and model as the workspace burns through a budget. Each section
-command also offers to publish right away, so you can apply changes incrementally; answering the
-section prompts also runs the matching `ucode configure` step, which does configure this machine.
+`ucode setup spend-tiers` edits just its own part of the same config, so you can change a spend tier
+later without walking the whole flow. It sets a tiered spend policy that switches the default agent
+and model as the workspace burns through a budget, and offers to publish right away so you can apply
+changes incrementally.
 
 Everything is written to `~/.ucode/managed-state.json` — the one local managed-config file — which
-`ucode publish` publishes. Re-running `ucode setup` keeps the MCP servers, skills, tracing table, and
-tiered spend policy already authored, rather than clearing them; to drop one, edit the file and reload
+`ucode publish` publishes. Re-running `ucode setup` keeps the tracing table and tiered spend policy
+already authored, rather than clearing them; to drop one, edit the file and reload
 it with `ucode setup --from-file`.
 
 ```bash
@@ -292,7 +287,8 @@ With `-f`/`--file`, `publish` reads a config file produced by `ucode export` and
 the same validation, diff, and confirmation flow. The file's `workspace` must match the configured
 workspace (it can never redirect publication elsewhere) and its `spec_version` must be a supported
 integer; server-owned fields (resource name, workspace ids, timestamps, user ids) and unknown fields
-are rejected rather than silently dropped.
+are rejected rather than silently dropped. Legacy `mcp_servers`/`skills` fields in an older exported
+file are ignored rather than rejected, since the managed config no longer carries them.
 
 ### Exporting the config
 
@@ -346,19 +342,18 @@ The output looks like:
 | `ucode claude --refresh` | Re-check Databricks, refresh models/configuration, and launch Claude Code |
 | `ucode configure --skip-validate` | Write configs without sending a test message through each agent |
 | `ucode configure --agents claude,codex,pi --skip-unavailable` | Configure the requested agents that are available; skip the rest with a warning |
-| `ucode configure --agents claude --mcp system.ai.slack` | Configure an agent and register its Databricks MCP server(s) in one command |
+| `ucode mcp` | Register Databricks MCP servers on your coding tools (interactive picker; replaces the registered set) |
+| `ucode mcp --services system.ai.slack` | Register specific MCP service(s) non-interactively (replaces the set) |
 | `ucode mcp add --location system.ai` | Register a schema's MCP servers, keeping any already configured (additive; never removes) |
 | `ucode mcp add --services system.ai.slack` | Register specific MCP server(s) without removing existing ones |
 | `ucode mcp add --agents claude --services system.ai.slack` | Set up the agent(s) if needed and register the server for them |
 | `ucode mcp remove` | Interactively unregister configured MCP servers from your coding tools |
 | `ucode mcp remove --agents codex` | Unregister selected servers from specific agents only |
-| `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
-| `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
-| `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
-| `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
+| `ucode skills` | Register the skills MCP connection (utility tools only); no skills download |
+| `ucode skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
+| `ucode skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
+| `ucode skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
 | `ucode setup` | Author the managed config's agents and models (workspace admins only) |
-| `ucode setup mcps` | Add or change the managed config's MCP servers |
-| `ucode setup skills [--location a.b,c.d]` | Add or change the managed config's skills |
 | `ucode setup spend-tiers` | Set the managed config's tiered spend routing policy |
 | `ucode setup help` | Walk through the whole setup sequence, marking what's already configured |
 | `ucode setup show` | Print the authored config and the payload `ucode publish` would publish |

@@ -24,6 +24,8 @@ from ucode.ui import normalize_workspace_url
 
 _ENVELOPE_FIELDS = ("workspace", "spec_version")
 
+_LEGACY_IGNORED_FIELDS = ("mcp_servers", "skills")
+
 
 def load_publish_payload(file_path: str | None) -> dict:
     """Return the source config dict for ``ucode publish``.
@@ -71,7 +73,8 @@ def parse_publish_payload(payload: object, workspace: str) -> tuple[dict, dict]:
     normalizes to the configured one (the file can never redirect publication elsewhere); a
     ``spec_version`` that is a JSON integer (not a boolean or float) equal to the supported version;
     no server-owned ``name``; and no unknown or lossy fields (anything normalization would silently
-    drop is rejected instead).
+    drop is rejected instead). Legacy ``mcp_servers`` / ``skills`` are the one exception — the managed
+    config no longer owns them, so they are dropped silently rather than rejected.
     """
     if not isinstance(payload, dict):
         raise RuntimeError(f"The config must be a JSON object, not a {type(payload).__name__}.")
@@ -102,7 +105,11 @@ def parse_publish_payload(payload: object, workspace: str) -> tuple[dict, dict]:
             f"{EXPORT_SPEC_VERSION}. Upgrade ucode, or re-export the config."
         )
 
-    config = {key: value for key, value in payload.items() if key not in _ENVELOPE_FIELDS}
+    config = {
+        key: value
+        for key, value in payload.items()
+        if key not in _ENVELOPE_FIELDS and key not in _LEGACY_IGNORED_FIELDS
+    }
     if "name" in config:
         raise RuntimeError(
             'The config includes a server-owned "name" field. Remove it — the workspace assigns the '

@@ -102,16 +102,13 @@ class TestNormalize:
             "system.ai.kimi-k2-7-code",
         ]
 
-    def test_mcp_servers_map_type_enums_to_tags(self):
-        mcp = normalize_managed_config(RAW_MANIFEST)["mcp_servers"]
-        assert mcp == [
-            {"name": "system.ai.github", "type": "mcp-service"},
-            {"name": "some-space-id", "type": "genie-space"},
-        ]
-
-    def test_skills_and_tracing_and_budget(self):
+    def test_mcp_servers_and_skills_are_dropped_on_read(self):
         cfg = normalize_managed_config(RAW_MANIFEST)
-        assert cfg["skills"] == {"names": ["system.ai.pdf-extraction"]}
+        assert "mcp_servers" not in cfg
+        assert "skills" not in cfg
+
+    def test_tracing_and_budget(self):
+        cfg = normalize_managed_config(RAW_MANIFEST)
         assert cfg["tracing_table"] == "main.default.ucode_traces"
         assert cfg["budget_policy"]["budget_id"] == "c6563b45-df9a-4b19-afb2-d42dc2b52576"
         assert cfg["budget_policy"]["tiers"][1]["default_agent"] == "opencode"
@@ -129,10 +126,6 @@ class TestNormalize:
     def test_unrecognized_agent_enum_dropped(self, agent_enum):
         raw = {"enabled_agents": [{"agent": agent_enum, "config": {}}]}
         assert "enabled_agents" not in normalize_managed_config(raw)
-
-    def test_unknown_mcp_type_dropped(self):
-        raw = {"mcp_servers": [{"name": "x", "type": "MCP_SERVER_TYPE_UNSPECIFIED"}]}
-        assert "mcp_servers" not in normalize_managed_config(raw)
 
     def test_empty_manifest_yields_empty_dict(self):
         assert normalize_managed_config({}) == {}
