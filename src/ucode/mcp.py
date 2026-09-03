@@ -29,10 +29,12 @@ from questionary.styles import merge_styles_default
 from ucode.agents import copilot, cursor, gemini, opencode
 from ucode.config_io import restore_file
 from ucode.databricks import (
+    PermissionDeniedError,
     apply_pat_environment,
     build_mcp_proxy_argv,
     build_mcp_service_url,
     build_skills_mcp_url,
+    consumer_access_reason,
     ensure_databricks_auth,
     get_databricks_token,
     list_all_mcp_services,
@@ -1333,8 +1335,13 @@ def _discover_mcp_source(label: str, discover: Callable[[], list[Any]]) -> list[
     try:
         with spinner(f"Discovering {label}..."):
             return discover()
+    except PermissionDeniedError:
+        # Consumer-only identities lack workspace access, so this source 403s for them.
+        # Skip it quietly (not as a scary warning) so setup completes (AIGTWY-4471).
+        print_note(f"Skipped {label} (no workspace access).")
+        return []
     except (RuntimeError, OSError) as exc:
-        # Discovery is best-effort: a failure here (auth error, network timeout)
+        # Discovery is best-effort: a failure here (network timeout, transient error)
         # skips just this source so the rest of the picker still works.
         print_warning(f"Skipped {label} ({exc}).")
         return []
@@ -1366,6 +1373,10 @@ def _discover_mcp_source_with_progress(
     try:
         with spinner(message):
             return discover(on_progress)
+    except PermissionDeniedError:
+        # See `_discover_mcp_source`: a consumer-only identity's 403 is a quiet skip.
+        print_note(f"Skipped {label} (no workspace access).")
+        return []
     except (RuntimeError, OSError) as exc:
         print_warning(f"Skipped {label} ({exc}).")
         return []
@@ -1675,17 +1686,33 @@ def _resolve_location_mcp_servers(
 
 
 # The first wizard step lets the user choose which sources to search. Each is a
-# (key, label, default_checked) triple. Vector Search and UC functions default
-# off because they walk the workspace (endpoints/catalogs/schemas) and are slow;
-# everything else is a cheap listing and defaults on.
-MCP_SEARCH_SOURCES = (
-    ("external", "External connections", True),
-    ("apps", "Databricks apps", True),
-    ("mcp-services", "MCP services", True),
-    ("genie", "Genie spaces", True),
-    ("vector-search", "Vector Search indexes (slower)", False),
-    ("uc-functions", "UC functions (slower)", False),
+# (key, label, default_checked) triple.
+#
+# Only MCP services (the `/ai-gateway/mcp-services/` path) are offered interactively:
+# it's the one source a consumer-only identity can reach. The V2 AI Gateway sources —
+# external connections, Databricks apps, Genie spaces, Vector Search, and UC functions,
+# all served under `/api/2.0/mcp/*` — were removed from the picker because consumer
+# entitlements don't grant access to V2 AI Gateway features. Workspace users who still
+# want one add it non-interactively with a typed `--services` selector (see
+# `V2_MCP_SELECTOR_PREFIXES` and `_configure_v2_mcp_selectors`).
+MCP_SEARCH_SOURCES = (("mcp-services", "MCP services", True),)
+
+# Typed `--services` selectors that name a V2 AI Gateway MCP server directly, e.g.
+# `vector-search:main.docs` or `uc-functions:main.tools`. These bypass the interactive
+# picker (which no longer offers V2 sources) so workspace users can still add them on
+# request; a consumer-only identity is blocked with a clear error before registering.
+V2_MCP_SELECTOR_PREFIXES = (
+    VECTOR_SEARCH_SELECTION_PREFIX,
+    UC_FUNCTIONS_SELECTION_PREFIX,
+    EXTERNAL_MCP_SELECTION_PREFIX,
+    GENIE_SPACE_SELECTION_PREFIX,
+    APP_MCP_SELECTION_PREFIX,
 )
+
+
+def _is_v2_mcp_selector(service: str) -> bool:
+    """Whether a `--services` entry is a typed V2 MCP selector (see `V2_MCP_SELECTOR_PREFIXES`)."""
+    return service.startswith(V2_MCP_SELECTOR_PREFIXES)
 
 
 def prompt_for_mcp_search_sources(exclude_sources: set[str] | None = None) -> set[str] | None:
@@ -1815,6 +1842,92 @@ def add_mcp_command(
     return configure_mcp_command(location=location, services=services, append=True, agents=agents)
 
 
+def _consumer_access_error(reason: str) -> str:
+    """The error shown when a consumer-only identity (no `workspace-access` entitlement) tries
+    to add a V2 AI Gateway MCP server."""
+    return (
+        "This identity has consumer-only access (no workspace-access entitlement), which can't "
+        "use V2 AI Gateway MCP servers (Vector Search, UC Functions, external connections, Genie, "
+        f"apps): {reason}. Ask a workspace admin for the workspace-access entitlement, or register "
+        "an MCP service instead (`ucode mcp add --location <catalog>.<schema>`)."
+    )
+
+
+def _configure_v2_mcp_selectors(
+    selectors: list[str],
+    *,
+    append: bool,
+    agents: set[str] | None,
+) -> int:
+    """Non-interactive add for V2 AI Gateway MCP servers named by typed `--services`
+    selectors (`vector-search:`/`uc-functions:`/`external:`/`genie-space:`/`app:`).
+
+    The interactive picker no longer offers these sources; this is how a workspace user
+    adds one on request. A provably consumer-only identity is blocked with a clear error
+    before any config is written (best-effort — see `consumer_access_reason`; the server-side
+    guard is SAFE-flag gated). Registration mirrors the interactive add path: additive under
+    ``append`` (`ucode mcp add`), an exact replacement otherwise (`ucode configure mcp`),
+    always preserving the skills connection."""
+    state = load_state()
+    workspace, profile, clients = setup_mcp_clients(
+        state, "Add MCP Servers" if append else "MCP Servers", agents=agents
+    )
+
+    token = get_databricks_token(workspace, profile)
+    reason = consumer_access_reason(workspace, token)
+    if reason is not None:
+        raise RuntimeError(_consumer_access_error(reason))
+
+    # `app:` selectors need the app's off-workspace URL, which only discovery knows. A 403 here
+    # is worded by whether it's a consumer identity or a workspace user missing apps permission.
+    available_app_servers: list[dict] = []
+    if any(s.startswith(APP_MCP_SELECTION_PREFIX) for s in selectors):
+        try:
+            available_app_servers = discover_app_mcp_servers(workspace, profile)
+        except PermissionDeniedError as exc:
+            if exc.consumer_only:
+                raise RuntimeError(_consumer_access_error(str(exc))) from exc
+            raise RuntimeError(
+                f"{exc} You have workspace access but lack permission to list Databricks apps; "
+                "ask the app owner to grant you access."
+            ) from exc
+
+    original_mcp_servers: list[dict] = list(state.get("mcp_servers") or [])
+    skills_servers = _skills_entries(original_mcp_servers)
+    picker_servers = [s for s in original_mcp_servers if s.get("kind") != SKILLS_MCP_KIND]
+    original_by_name = _servers_by_name(picker_servers)
+
+    working_mcp_servers: list[dict] = list(skills_servers)
+    working_names: set[str] = set()
+    for selection in selectors:
+        entry_name, url = _resolve_mcp_selection(selection, workspace, available_app_servers)
+        if entry_name in working_names:
+            continue
+        working_mcp_servers.append(
+            {"name": entry_name, "url": url, "auth": "proxy", "clients": clients}
+        )
+        working_names.add(entry_name)
+
+    if append:
+        working_mcp_servers = _union_missing(original_mcp_servers, working_mcp_servers)
+
+    changed = apply_mcp_server_changes(
+        original_mcp_servers,
+        working_mcp_servers,
+        clients,
+        workspace,
+        profile,
+        use_pat=bool(state.get("use_pat")),
+    )
+    if changed or original_mcp_servers != working_mcp_servers:
+        state["mcp_servers"] = working_mcp_servers
+        save_state(state)
+        added = sorted(working_names - set(original_by_name))
+        removed = [] if append else sorted(set(original_by_name) - working_names)
+        print_success(_mcp_change_summary(added, removed, clients))
+    return 0
+
+
 def configure_mcp_command(
     location: str | None = None,
     services: set[str] | None = None,
@@ -1831,6 +1944,21 @@ def configure_mcp_command(
     final server list is unioned with the already-configured servers, so nothing
     outside the current selection is removed. ``agents`` scopes the operation to
     that subset of configured MCP clients."""
+    if services is not None:
+        # A typed V2 MCP selector (`vector-search:main.docs`, `uc-functions:main.tools`,
+        # `external:conn`, `genie-space:<id>`, `app:<name>`) names a server the picker no
+        # longer offers. Route it through the dedicated non-interactive path so workspace
+        # users can still add it on request; consumer-only identities are blocked there.
+        v2_selectors = sorted(s for s in services if _is_v2_mcp_selector(s))
+        if v2_selectors:
+            other = sorted(s for s in services if not _is_v2_mcp_selector(s))
+            if other or location is not None:
+                raise RuntimeError(
+                    "V2 MCP selectors (vector-search:/uc-functions:/external:/genie-space:/app:) "
+                    "can't be combined with --location or plain MCP-service names in one call; add "
+                    "them in a separate command."
+                )
+            return _configure_v2_mcp_selectors(v2_selectors, append=append, agents=agents)
     if services is not None and location is None:
         # `--services` works standalone with full names (`system.ai.github`): the
         # `<catalog>.<schema>` to configure is derived from them. Bare short names
@@ -1890,11 +2018,18 @@ def configure_mcp_command(
 
     # Two-step wizard: (1) choose which sources to search, (2) pick servers from
     # the results. Pressing Left (←) in the picker returns to step 1, so the user
-    # can revise their source selection without restarting the command.
+    # can revise their source selection without restarting the command. When only
+    # one search source is available (MCP services — the V2 sources were removed),
+    # step 1 has nothing to choose, so skip it and go straight to the picker.
+    available_source_keys = [k for k, _, _ in MCP_SEARCH_SOURCES if k not in excluded_sources]
+    prompt_sources = len(available_source_keys) > 1
     while True:
-        sources = prompt_for_mcp_search_sources(exclude_sources=excluded_sources)
-        if sources is None:
-            return 0
+        if prompt_sources:
+            sources = prompt_for_mcp_search_sources(exclude_sources=excluded_sources)
+            if sources is None:
+                return 0
+        else:
+            sources = set(available_source_keys)
         discovered = _discover_selected_mcp_sources(workspace, profile, sources)
 
         selections = prompt_for_mcp_server_choices(
@@ -1905,7 +2040,7 @@ def configure_mcp_command(
             discovered["services"],
             discovered["vector_search"],
             discovered["uc_functions"],
-            allow_back=True,
+            allow_back=prompt_sources,
             additive=append,
         )
         if selections is None:
