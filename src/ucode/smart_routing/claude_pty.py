@@ -158,16 +158,21 @@ def first_prompt_hook_output(response: dict | None) -> dict | None:
     if not valid_model_name(model):
         return None
     assert isinstance(model, str)
+    display_model = response.get("display_model", model)
+    if not isinstance(display_model, str) or not display_model:
+        display_model = model
     rationale = response.get("rationale")
     return {
         "decision": "block",
-        "reason": format_routing_notice(model, rationale if isinstance(rationale, str) else None),
+        "reason": format_routing_notice(
+            display_model, rationale if isinstance(rationale, str) else None
+        ),
     }
 
 
 def serve_first_prompt_socket(
     path: Path,
-    route_prompt: Callable[[str], tuple[str, str]],
+    route_prompt: Callable[[str], tuple[str, str] | tuple[str, str, str]],
     on_blocked_prompt: Callable[[str, str], None],
     stop: threading.Event,
     *,
@@ -214,12 +219,18 @@ def serve_first_prompt_socket(
                             and prompt.strip()
                             and not is_command
                         ):
-                            model, rationale = route_prompt(prompt)
+                            routed = route_prompt(prompt)
+                            if len(routed) == 2:
+                                model, rationale = routed
+                                display_model = model
+                            else:
+                                model, display_model, rationale = routed
                             if valid_model_name(model):
                                 claimed = True
                                 response = {
                                     "action": "block",
                                     "model": model,
+                                    "display_model": display_model,
                                     "rationale": rationale,
                                 }
                                 blocked = (prompt, model)
@@ -269,7 +280,7 @@ def sync_winsize(master_fd: int, stdin_fd: int = 0) -> None:
 def run_claude_pty(
     argv: list[str],
     *,
-    route_prompt: Callable[[str], tuple[str, str]],
+    route_prompt: Callable[[str], tuple[str, str] | tuple[str, str, str]],
     socket_path: Path,
     prepare_model_switch: Callable[[str], None] = lambda _model: None,
     model_switch_persisted: Callable[[], bool] = lambda: True,

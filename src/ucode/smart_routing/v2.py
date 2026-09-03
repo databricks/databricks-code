@@ -21,6 +21,7 @@ from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import (
     build_auth_token_argv,
     get_databricks_token,
+    list_anthropic_model_catalog,
     list_anthropic_models,
 )
 from ucode.smart_routing import claude_routing, codex_interposer, routing
@@ -347,7 +348,7 @@ def launch_claude(
     os.environ[OAUTH_TOKEN_ENV_VAR] = token
     os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
     os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
-    model_ids, discovery_error = list_anthropic_models(workspace, token)
+    model_ids, display_names, discovery_error = list_anthropic_model_catalog(workspace, token)
     if not model_ids:
         raise RuntimeError(discovery_error or "Anthropic models endpoint returned no Claude models")
 
@@ -381,9 +382,13 @@ def launch_claude(
 
     model_setting = _ClaudeModelSettingGuard(user_settings_path)
 
-    def route_prompt(prompt: str) -> tuple[str, str]:
+    def route_prompt(prompt: str) -> tuple[str, str, str]:
         decision = _route_claude_prompt(state, token, prompt, model_ids)
-        return model_name(decision.model), decision.rationale
+        return (
+            model_name(decision.model),
+            display_names.get(decision.model, decision.model),
+            decision.rationale,
+        )
 
     print_note(
         "Smart routing v2: the first submitted prompt will select Claude Code's "

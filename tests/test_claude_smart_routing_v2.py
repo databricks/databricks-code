@@ -47,6 +47,18 @@ class TestFirstPromptHook:
 
         assert "Reason" not in result["reason"]
 
+    def test_displays_catalog_name_while_retaining_routable_model(self):
+        result = claude_pty.first_prompt_hook_output(
+            {
+                "action": "block",
+                "model": "anthropic-aigw-77df06ea-system.ai.glm-5-3-flash",
+                "display_model": "GLM 5.3 Flash",
+            }
+        )
+
+        assert "Selected Model : GLM 5.3 Flash" in result["reason"]
+        assert "anthropic-aigw-77df06ea" not in result["reason"]
+
     def test_blocks_once_then_allows_replay(self, tmp_path):
         socket_path = tmp_path / "first.sock"
         blocked: list[tuple[str, str]] = []
@@ -102,9 +114,10 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
         monkeypatch.setattr(
             v2,
-            "list_anthropic_models",
+            "list_anthropic_model_catalog",
             lambda *_args: (
                 ["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
+                {"system.ai.claude-sonnet-5": "Claude Sonnet 5"},
                 None,
             ),
         )
@@ -199,7 +212,9 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
         monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
-        monkeypatch.setattr(v2, "list_anthropic_models", lambda *_args: (["opus"], None))
+        monkeypatch.setattr(
+            v2, "list_anthropic_model_catalog", lambda *_args: (["opus"], {}, None)
+        )
 
         def fake_run(_argv, **_kwargs):
             user_settings.write_text(json.dumps({"model": "user-selected"}))
@@ -228,7 +243,9 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
         monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
-        monkeypatch.setattr(v2, "list_anthropic_models", lambda *_args: (["opus"], None))
+        monkeypatch.setattr(
+            v2, "list_anthropic_model_catalog", lambda *_args: (["opus"], {}, None)
+        )
 
         def fake_run(_argv, **kwargs):
             routed_model = "system.ai.claude-opus-4-8"
