@@ -7,8 +7,12 @@ import contextlib
 import json
 import os
 import re
+import subprocess
 import time
-from unittest.mock import MagicMock, patch
+import tomllib
+from importlib import metadata
+from pathlib import Path
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from typer.testing import CliRunner
@@ -85,6 +89,16 @@ class TestHelp:
         for tool in TOOLS:
             assert tool in result.output
 
+    @pytest.mark.parametrize("prog_name", ["ug", "ucode"])
+    def test_help_uses_invoked_name_and_names_ucode_as_an_alias(self, prog_name):
+        result = runner.invoke(app, ["--help"], prog_name=prog_name)
+        output = _strip_ansi(result.output)
+
+        assert result.exit_code == 0
+        assert f"Usage: {prog_name}" in output
+        assert "primary command is `ug`" in output
+        assert "`ucode` remains supported as an alias" in output
+
     @pytest.mark.parametrize("tool", TOOLS)
     def test_subcommand_help(self, tool):
         result = runner.invoke(app, [tool, "--help"])
@@ -101,6 +115,212 @@ class TestHelp:
         assert "--agents" in output
         assert "comma-separated list of agents" in flat
         assert "--workspaces" in output
+
+
+class TestProjectScripts:
+    def test_ug_and_ucode_are_equivalent_entry_points(self):
+        scripts = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())[
+            "project"
+        ]["scripts"]
+
+        assert scripts["ug"] == "ucode.cli:main"
+        assert scripts["ucode"] == "ucode.cli:main"
+
+
+class TestUpgrade:
+    @staticmethod
+    def _ok() -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    @staticmethod
+    def _which(command: str) -> str:
+        return f"/tools/{command}"
+
+    @staticmethod
+    def _requirement(distribution: str) -> str:
+        return f"{distribution} @ git+https://github.com/databricks/ucode"
+
+    def test_before_cutover_upgrades_ucode_normally_without_verification(self):
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run", return_value=self._ok()) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        assert run.call_args_list == [
+            call(
+                ["uv", "tool", "install", "--reinstall", self._requirement("ucode")],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        ]
+        assert "ucode upgraded" in result.output
+
+    def test_cutover_migrates_legacy_distribution_and_verifies_commands(self):
+        git_url = "git+https://github.com/databricks/ucode"
+        rename_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr=("Package metadata name `unity-gateway` does not match given name `ucode`"),
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("ucode.cli.shutil.which", side_effect=self._which),
+            patch(
+                "subprocess.run",
+                side_effect=[
+                    rename_failure,
+                    self._ok(),
+                    self._ok(),
+                    self._ok(),
+                    self._ok(),
+                ],
+            ) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        assert run.call_args_list == [
+            call(
+                ["uv", "tool", "install", "--reinstall", self._requirement("ucode")],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+            call(["uv", "tool", "uninstall", "ucode"], check=True),
+            call(["uv", "tool", "install", "--force", git_url], check=True),
+            call(
+                ["/tools/ug", "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+            call(
+                ["/tools/ucode", "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+        ]
+        assert "Migrated to `unity-gateway`" in result.output
+
+    def test_after_cutover_upgrades_unity_gateway_normally_without_verification(self):
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="unity-gateway"),
+            patch("subprocess.run", return_value=self._ok()) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        run.assert_called_once_with(
+            [
+                "uv",
+                "tool",
+                "install",
+                "--reinstall",
+                self._requirement("unity-gateway"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert "unity-gateway upgraded" in result.output
+
+    def test_unrelated_legacy_upgrade_failure_does_not_uninstall_ucode(self):
+        failure = subprocess.CompletedProcess(
+            [], 7, stdout="", stderr="Could not resolve host: github.com"
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run", return_value=failure) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 1
+        run.assert_called_once_with(
+            ["uv", "tool", "install", "--reinstall", self._requirement("ucode")],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert "left unchanged" in result.output
+        assert "ERROR 1" not in result.output
+
+    def test_cutover_install_failure_has_recovery_command(self):
+        rename_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr=("Package metadata name `unity-gateway` does not match given name `ucode`"),
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run") as run,
+        ):
+            run.side_effect = [
+                rename_failure,
+                self._ok(),
+                subprocess.CalledProcessError(7, ["uv", "tool", "install"]),
+            ]
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 1
+        assert "legacy `ucode` tool was removed" in result.output
+        assert "uv tool install --force git+https://github.com/databricks/ucode" in re.sub(
+            r"\s+", " ", result.output
+        )
+
+    def test_post_migration_verification_failure_is_actionable(self):
+        rename_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr=("Package metadata name `unity-gateway` does not match given name `ucode`"),
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("ucode.cli.shutil.which", return_value=None),
+            patch(
+                "subprocess.run",
+                side_effect=[rename_failure, self._ok(), self._ok()],
+            ),
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 1
+        assert "`ug` is not available on PATH" in result.output
+
+    def test_missing_uv_is_actionable(self):
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run", side_effect=FileNotFoundError),
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 1
+        assert "uv" in result.output.lower()
+
+    def test_installed_distribution_prefers_unity_gateway(self):
+        with patch("ucode.cli.metadata.version", return_value="1.0.0") as package_version:
+            from ucode.cli import _installed_cli_distribution
+
+            assert _installed_cli_distribution() == "unity-gateway"
+
+        package_version.assert_called_once_with("unity-gateway")
+
+    def test_installed_distribution_falls_back_to_ucode(self):
+        def package_version(distribution_name: str) -> str:
+            if distribution_name == "unity-gateway":
+                raise metadata.PackageNotFoundError
+            return "1.0.0"
+
+        with patch("ucode.cli.metadata.version", side_effect=package_version):
+            from ucode.cli import _installed_cli_distribution
+
+            assert _installed_cli_distribution() == "ucode"
 
 
 class TestVersion:
@@ -1561,6 +1781,18 @@ def test_launch_title(tool, expected):
     assert _launch_title(tool) == expected
 
 
+def test_cursor_launch_uses_unity_gateway_branding():
+    with (
+        patch("ucode.cli.shutil.which", return_value="/usr/local/bin/cursor-agent"),
+        patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+        patch("ucode.agents.cursor.launch"),
+    ):
+        result = runner.invoke(app, ["cursor"])
+
+    assert result.exit_code == 0, result.output
+    assert "Unity Gateway with Cursor" in result.output
+
+
 class TestCachedConfigPredicate:
     @staticmethod
     def _kwargs(**overrides):
@@ -2008,22 +2240,6 @@ class TestConfigureAgentFlag:
             result = runner.invoke(app, ["configure", "--agent", "claude-code"])
         assert result.exit_code == 0, result.output
         mock_cfg.assert_called_once_with("claude")
-
-    def test_upgrade_runs_uv_tool_install(self):
-        with patch("subprocess.run") as mock_run:
-            result = runner.invoke(app, ["upgrade"])
-        assert result.exit_code == 0, result.output
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
-        assert cmd[:3] == ["uv", "tool", "install"]
-        assert "--reinstall" in cmd
-        assert any("github.com/databricks/ucode" in s for s in cmd)
-
-    def test_upgrade_handles_uv_missing(self):
-        with patch("subprocess.run", side_effect=FileNotFoundError):
-            result = runner.invoke(app, ["upgrade"])
-        assert result.exit_code != 0
-        assert "uv" in result.output.lower()
 
     def test_agent_flag_rejects_unknown(self):
         with (
@@ -3419,7 +3635,7 @@ class TestConfigureDeprecation:
         assert exc.value.exit_code == 0
         out = capsys.readouterr().out
         assert "you're all set" in out
-        assert "Run `ucode`" in out
+        assert "Run `ug`" in out
 
     def test_fetches_the_config_rather_than_reading_a_cold_cache(self, monkeypatch):
         # The gap this guards: on a fresh machine the local cache is empty until the first launch,
@@ -3460,7 +3676,7 @@ class TestConfigureDeprecation:
             {
                 "workspace": "https://w",
                 "profile": None,
-                "command_label": "Configure Unity Gateway",
+                "command_label": "Configure unity-gateway CLI",
                 "token": "tok",
             }
         ]
@@ -3567,7 +3783,7 @@ class TestConfigureDeprecation:
             {
                 "workspace": "https://w",
                 "profile": None,
-                "command_label": "Configure Unity Gateway",
+                "command_label": "Configure unity-gateway CLI",
                 "token": "tok",
             }
         ]
@@ -3814,7 +4030,7 @@ class TestBareUcode:
         result, launched = self._run(monkeypatch, managed=None, is_admin=True)
         assert result.exit_code == 0, result.output
         assert launched == []
-        assert "ucode setup" in result.output
+        assert "ug setup" in result.output
 
     def test_non_admin_without_a_config_is_told_to_ask(self, monkeypatch):
         result, launched = self._run(monkeypatch, managed=None, is_admin=False)
@@ -3828,7 +4044,7 @@ class TestBareUcode:
         )
         assert result.exit_code == 0, result.output
         assert launched == []
-        assert "ucode setup" not in result.output
+        assert "ug setup" not in result.output
 
     def test_non_admin_without_a_config_sees_no_setup_when_feature_disabled(self, monkeypatch):
         result, launched = self._run(
@@ -3836,7 +4052,7 @@ class TestBareUcode:
         )
         assert result.exit_code == 0, result.output
         assert launched == []
-        assert "ucode setup" not in result.output
+        assert "ug setup" not in result.output
 
     def test_dry_run_uses_the_cache_and_does_not_fetch(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
