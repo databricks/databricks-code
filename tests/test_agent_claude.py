@@ -1044,7 +1044,14 @@ class TestClaudeLaunch:
             def wait(self):
                 return 0
 
-        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+        def start_proxy(
+            workspace,
+            profile,
+            port,
+            token_header,
+            force_refresh_near_expiry,
+            model_provider_service=None,
+        ):
             calls.append(
                 (
                     "proxy",
@@ -1053,6 +1060,7 @@ class TestClaudeLaunch:
                     port,
                     token_header,
                     force_refresh_near_expiry,
+                    model_provider_service,
                 )
             )
             return Server(), Cache(), Client()
@@ -1069,6 +1077,7 @@ class TestClaudeLaunch:
                     "profile": "test",
                     "claude_relayed": True,
                     "relayed_proxy_port": 12345,
+                    "_claude_launch_provider": "main.default.anthropic",
                 },
                 ["--debug"],
             )
@@ -1081,6 +1090,7 @@ class TestClaudeLaunch:
             12345,
             claude.gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
             False,
+            "main.default.anthropic",
         )
         assert calls[-3:] == [("stop",), ("shutdown",), ("close",)]
 
@@ -1227,17 +1237,84 @@ class TestClaudeLaunch:
         ],
     )
     def test_gateway_discovery_enabled_for_provider_launch(self, monkeypatch, provider_state):
-        calls: list[list[str]] = []
+        calls: list[tuple] = []
+
+        class Server:
+            server_address = ("127.0.0.1", 12345)
+
+            def serve_forever(self):
+                calls.append(("serve",))
+
+            def shutdown(self):
+                calls.append(("shutdown",))
+
+        class Cache:
+            token = "fresh-token"
+
+            def stop(self):
+                calls.append(("stop",))
+
+        class Client:
+            def close(self):
+                calls.append(("close",))
+
+        class Process:
+            def __init__(self, argv):
+                calls.append(("popen", argv))
+
+            def wait(self):
+                return 0
+
+        def start_proxy(
+            workspace,
+            profile,
+            port,
+            token_header,
+            force_refresh_near_expiry,
+            model_provider_service=None,
+        ):
+            calls.append(
+                (
+                    "proxy",
+                    workspace,
+                    profile,
+                    port,
+                    token_header,
+                    force_refresh_near_expiry,
+                    model_provider_service,
+                )
+            )
+            return Server(), Cache(), Client()
+
         monkeypatch.delenv(v2.ENV_VAR, raising=False)
         monkeypatch.setenv(claude.GATEWAY_MODEL_DISCOVERY_ENV_VAR, "1")
         monkeypatch.delenv("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", raising=False)
-        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
-        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+        monkeypatch.setattr(claude.gateway_proxy, "start_proxy", start_proxy)
+        monkeypatch.setattr(claude.subprocess, "Popen", Process)
 
-        claude.launch({"workspace": WS, **provider_state}, ["--debug"])
+        with pytest.raises(SystemExit) as exc:
+            claude.launch({"workspace": WS, **provider_state}, ["--debug"])
 
+        assert exc.value.code == 0
         assert os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
-        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
+        assert calls[:2] == [
+            (
+                "proxy",
+                WS,
+                None,
+                0,
+                claude.gateway_proxy.AUTHORIZATION_HEADER,
+                True,
+                "main.default.anthropic",
+            ),
+            ("serve",),
+        ]
+        assert calls[2][0] == "popen"
+        argv = calls[2][1]
+        assert argv[:2] == ["claude", "--settings"]
+        assert json.loads(argv[2])["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
+        assert argv[3:] == ["--debug"]
+        assert calls[3:] == [("stop",), ("shutdown",), ("close",)]
 
 
 class TestWriteToolConfigPrunesStaleModelEnv:
