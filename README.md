@@ -251,11 +251,13 @@ ucode skill add --skills main.default.my-skill,main.default.other-skill
 #### Remove shared skill MCP scopes
 
 `ucode skill remove --mcp` interactively removes developer-configured schemas from the shared
-skills MCP scope. Administrator-managed schemas are not offered, and the schema-less utility
-connection remains registered after its last schema is removed.
+skills MCP scope. With `--agents`, only those agents' additions are offered and removed; shared
+schemas remain inherited. Administrator-managed schemas are not offered, and the schema-less
+utility connection remains registered after its last schema is removed.
 
 ```bash
 ucode skill remove --mcp
+ucode skill remove --mcp --agents codex
 ```
 
 ### Managed config for a workspace (admins)
@@ -396,7 +398,7 @@ The output looks like:
 | `ucode skill add --location main.default --mcp --agents claude` | Set up selected agents if needed and add schemas only to their MCP scopes |
 | `ucode skill add --location main.default` | Download a schema's skills to disk without removing existing downloads |
 | `ucode skill add --skills main.default.my-skill` | Download a named subset of skills (bare names need `--location`; fully-qualified names stand alone) |
-| `ucode skill remove --mcp` | Interactively remove developer schemas from the shared skills MCP scope |
+| `ucode skill remove --mcp [--agents codex]` | Interactively remove developer schemas from shared or selected agent scopes |
 | `ucode setup` | Author the managed config's agents and models (workspace admins only) |
 | `ucode setup mcps` | Add or change the managed config's MCP servers |
 | `ucode setup skills [--location a.b,c.d]` | Add or change the managed config's skills |
