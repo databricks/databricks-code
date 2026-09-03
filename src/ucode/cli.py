@@ -44,7 +44,7 @@ from ucode.agents import (
 from ucode.agents.args import has_explicit_model_arg
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
-from ucode.config_io import is_dry_run, read_toml_safe, restore_file, set_dry_run
+from ucode.config_io import is_dry_run, restore_file, set_dry_run
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
@@ -62,7 +62,6 @@ from ucode.databricks import (
     is_model_provider_feature_unavailable,
     is_workspace_admin,
     list_model_provider_services,
-    list_mps_codex_models,
     list_profile_entries,
     list_tool_provider_services,
     normalize_workspace_url,
@@ -1059,7 +1058,9 @@ app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ug.")
 skill_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(skill_app, name="skill", help="Databricks Skills for your coding tools.")
 providers_app = typer.Typer(add_completion=False, no_args_is_help=True)
-app.add_typer(providers_app, name="providers", help="Inspect Model Provider Services on the workspace.")
+app.add_typer(
+    providers_app, name="providers", help="Inspect Model Provider Services on the workspace."
+)
 setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(
     setup_app,
@@ -3394,7 +3395,9 @@ def _verify_upgraded_commands() -> None:
 def providers_list_cmd(
     tool: Annotated[
         str | None,
-        typer.Option("--tool", help="Filter to services usable by a specific tool (claude, codex)."),
+        typer.Option(
+            "--tool", help="Filter to services usable by a specific tool (claude, codex)."
+        ),
     ] = None,
 ) -> None:
     """List Model Provider Services on the workspace."""
@@ -3419,12 +3422,16 @@ def providers_list_cmd(
         [
             s["name"],
             s["provider_type"],
-            ", ".join(s["targets"]) if s["targets"] else ("(all)" if s["allow_all_targets"] else "—"),
+            ", ".join(s["targets"])
+            if s["targets"]
+            else ("(all)" if s["allow_all_targets"] else "—"),
         ]
         for s in services
     ]
     print_section("Model Provider Services")
-    console.print(render_box_table(["Service", "Provider", "Targets"], rows, max_widths=[60, 20, 60]))
+    console.print(
+        render_box_table(["Service", "Provider", "Targets"], rows, max_widths=[60, 20, 60])
+    )
     if tool:
         console.print(muted(f"  Filtered to services usable by {tool}."))
 

@@ -362,8 +362,12 @@ class TestProviderServiceSupport:
     def test_claude_does_not_support_openai(self):
         assert not supports_provider_service("claude", "openai")
 
+    def test_pi_supports_anthropic_and_bedrock(self):
+        assert supports_provider_service("pi", "anthropic")
+        assert supports_provider_service("pi", "amazon_bedrock")
+
     def test_other_agents_have_no_provider_support(self):
-        for tool in ("gemini", "opencode", "pi", "copilot"):
+        for tool in ("gemini", "opencode", "copilot"):
             assert not supports_provider_service(tool, "anthropic"), tool
 
 
