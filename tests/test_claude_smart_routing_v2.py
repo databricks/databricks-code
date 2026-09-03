@@ -170,6 +170,7 @@ class TestV2Launch:
         assert captured["argv"][-1] == "--debug"
         assert captured["routed_model"] == (
             "system.ai.claude-sonnet-5[1m]",
+            "Claude Sonnet 5",
             "Selected for the parser task.",
         )
         assert {definition["model"] for definition in captured["agents"].values()} == {

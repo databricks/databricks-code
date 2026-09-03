@@ -230,9 +230,10 @@ def serve_first_prompt_socket(
                                 response = {
                                     "action": "block",
                                     "model": model,
-                                    "display_model": display_model,
                                     "rationale": rationale,
                                 }
+                                if display_model != model:
+                                    response["display_model"] = display_model
                                 blocked = (prompt, model)
                     except Exception as exc:  # noqa: BLE001 - hooks must fail open
                         log(f"[ERR] first-prompt request: {exc!r}")
