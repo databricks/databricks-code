@@ -227,12 +227,18 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 #### Add skill scopes without replacing existing ones
 
 `ucode skill add` registers skills additively, keeping anything already configured. With `--mcp` it
-adds the schemas to the connection's scope, otherwise it downloads their skills to disk. `--skills`
-narrows a download to a subset of one schema's skills.
+adds the schemas to every configured agent's scope, or only to `--agents` when supplied. Agents that
+are not configured yet are set up first. Without `--mcp`, it downloads skills to disk; download mode
+always writes both directory families and does not accept `--agents`. `--skills` narrows a download
+to a subset of one schema's skills. Each agent receives the shared location set plus its own
+agent-specific additions, with duplicates removed from the effective scope.
 
 ```bash
 # Add schemas to the skills MCP scope, keeping any already configured.
 ucode skill add --location main.default,ml.prod --mcp
+
+# Add a schema only to selected agents.
+ucode skill add --location main.default --mcp --agents claude,codex
 
 # Download a schema's skills to disk, keeping existing downloads.
 ucode skill add --location main.default
@@ -377,6 +383,7 @@ The output looks like:
 | `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
 | `ucode skill add --location main.default --mcp` | Add schemas to the skills MCP scope, keeping any already configured (additive; never replaces) |
+| `ucode skill add --location main.default --mcp --agents claude` | Set up selected agents if needed and add schemas only to their MCP scopes |
 | `ucode skill add --location main.default` | Download a schema's skills to disk without removing existing downloads |
 | `ucode skill add --skills main.default.my-skill` | Download a named subset of skills (bare names need `--location`; fully-qualified names stand alone) |
 | `ucode setup` | Author the managed config's agents and models (workspace admins only) |
