@@ -1491,7 +1491,11 @@ def skills_remove(
         ),
     ] = None,
 ) -> None:
-    """Interactively remove shared schemas or selected agents' additions."""
+    """Remove Databricks Skill schemas from coding tools.
+
+    MCP removal is interactive; ``--agents`` limits it to agent-specific additions.
+    Removing downloaded skills is not supported yet.
+    """
     try:
         if not mcp:
             raise RuntimeError(
@@ -3152,7 +3156,7 @@ def configure_mcp(
         raise typer.Exit(130) from None
 
 
-@configure_app.command("skills")
+@configure_app.command("skills", deprecated=True)
 def configure_skills(
     location: Annotated[
         str | None,
@@ -3193,6 +3197,16 @@ def configure_skills(
     """
     try:
         locations = _parse_skill_locations(location)
+        if locations:
+            print_warning(
+                "`ucode configure skills` is deprecated. Use `ucode skill add` to download "
+                "skills or add MCP scopes, and `ucode skill remove --mcp` to remove MCP scopes."
+            )
+        else:
+            print_warning(
+                "`ucode configure skills` is deprecated, but its bare utility-tools-only setup "
+                "has no replacement yet and remains supported."
+            )
         # `--skill` absent -> None (whole schema); present (even empty) -> the
         # explicit subset, so `--skill ""` downloads nothing.
         selected_skills = (
