@@ -136,11 +136,10 @@ class TestUpgrade:
     def _which(command: str) -> str:
         return f"/tools/{command}"
 
-    def test_before_cutover_upgrades_ucode_normally_and_verifies_commands(self):
+    def test_before_cutover_upgrades_ucode_normally_without_verification(self):
         with (
             patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
-            patch("ucode.cli.shutil.which", side_effect=self._which),
-            patch("subprocess.run", side_effect=[self._ok(), self._ok(), self._ok()]) as run,
+            patch("subprocess.run", return_value=self._ok()) as run,
         ):
             result = runner.invoke(app, ["upgrade"])
 
@@ -151,19 +150,7 @@ class TestUpgrade:
                 check=False,
                 capture_output=True,
                 text=True,
-            ),
-            call(
-                ["/tools/ug", "--version"],
-                check=False,
-                capture_output=True,
-                text=True,
-            ),
-            call(
-                ["/tools/ucode", "--version"],
-                check=False,
-                capture_output=True,
-                text=True,
-            ),
+            )
         ]
         assert "ucode upgraded" in result.output
 
@@ -216,22 +203,20 @@ class TestUpgrade:
         ]
         assert "Migrated to `unity-gateway`" in result.output
 
-    def test_after_cutover_upgrades_unity_gateway_normally_and_verifies_commands(self):
+    def test_after_cutover_upgrades_unity_gateway_normally_without_verification(self):
         with (
             patch("ucode.cli._installed_cli_distribution", return_value="unity-gateway"),
-            patch("ucode.cli.shutil.which", side_effect=self._which),
-            patch("subprocess.run", side_effect=[self._ok(), self._ok(), self._ok()]) as run,
+            patch("subprocess.run", return_value=self._ok()) as run,
         ):
             result = runner.invoke(app, ["upgrade"])
 
         assert result.exit_code == 0, result.output
-        assert run.call_args_list[0] == call(
+        run.assert_called_once_with(
             ["uv", "tool", "upgrade", "unity-gateway"],
             check=False,
             capture_output=True,
             text=True,
         )
-        assert all("uninstall" not in invocation.args[0] for invocation in run.call_args_list)
         assert "unity-gateway upgraded" in result.output
 
     def test_unrelated_legacy_upgrade_failure_does_not_uninstall_ucode(self):
@@ -252,6 +237,7 @@ class TestUpgrade:
             text=True,
         )
         assert "left unchanged" in result.output
+        assert "ERROR 1" not in result.output
 
     def test_cutover_install_failure_has_recovery_command(self):
         rename_failure = subprocess.CompletedProcess(
@@ -277,11 +263,20 @@ class TestUpgrade:
             r"\s+", " ", result.output
         )
 
-    def test_verification_failure_is_actionable(self):
+    def test_post_migration_verification_failure_is_actionable(self):
+        rename_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr=("Package metadata name `unity-gateway` does not match given name `ucode`"),
+        )
         with (
             patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
             patch("ucode.cli.shutil.which", return_value=None),
-            patch("subprocess.run", return_value=self._ok()),
+            patch(
+                "subprocess.run",
+                side_effect=[rename_failure, self._ok(), self._ok()],
+            ),
         ):
             result = runner.invoke(app, ["upgrade"])
 
@@ -3671,7 +3666,7 @@ class TestConfigureDeprecation:
             {
                 "workspace": "https://w",
                 "profile": None,
-                "command_label": "Configure ug",
+                "command_label": "Configure unity-gateway CLI",
                 "token": "tok",
             }
         ]
@@ -3778,7 +3773,7 @@ class TestConfigureDeprecation:
             {
                 "workspace": "https://w",
                 "profile": None,
-                "command_label": "Configure ug",
+                "command_label": "Configure unity-gateway CLI",
                 "token": "tok",
             }
         ]

@@ -360,13 +360,13 @@ def _run_setup_and_exit(workspace: str, profile: str | None, token: str | None =
     mapped to clean exit codes rather than bubbling up as unhandled errors.
     """
     try:
-        # Brand the flow as "Configure ug": it was reached through `ug configure`,
-        # not a bare `ug setup`, so its section headers use the product name rather than the
-        # bare command.
+        # Brand the flow as "Configure unity-gateway CLI": it was reached through
+        # `ug configure`, not a bare `ug setup`, so its section headers use the product
+        # name rather than the bare command.
         code = setup_command(
             workspace=workspace,
             profile=profile,
-            command_label="Configure ug",
+            command_label="Configure unity-gateway CLI",
             token=token,
         )
     except RuntimeError as exc:
@@ -3441,7 +3441,10 @@ def upgrade_cmd() -> None:
                 print_note("The existing installation was left unchanged.")
                 raise typer.Exit(1)
 
-        _verify_upgraded_commands()
+        if migrated:
+            _verify_upgraded_commands()
+    except typer.Exit:
+        raise
     except FileNotFoundError:
         print_err("`uv` was not found on PATH. Install uv to upgrade ug.")
         raise typer.Exit(1) from None

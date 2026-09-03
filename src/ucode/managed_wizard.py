@@ -1545,7 +1545,7 @@ def setup_command(
     launching setup after its admin offer. When ``workspace`` is None the flow prompts as usual.
 
     ``command_label`` brands the section headers to the invoking command: `ug configure` passes
-    "Configure ug" so a user who never typed `ug setup` isn't jarred by it (the
+    "Configure unity-gateway CLI" so a user who never typed `ug setup` isn't jarred by it (the
     standalone `ug setup` command keeps the default). References to specific sub-commands (`ucode
     setup mcps`, `ug apply`, …) stay verbatim — those are real command names, not branding.
 
