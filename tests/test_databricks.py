@@ -886,6 +886,28 @@ class TestResolveProviderService:
         assert service is None
         assert "not available" in error
 
+    def test_gemini_enterprise_ok_for_gemini(self, monkeypatch):
+        payload = {
+            "model_provider_services": [
+                {
+                    "name": "model-provider-services/main.schema1.gemini-svc",
+                    "config": {
+                        "provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_GEMINI_ENTERPRISE",
+                        "targets": [{"model": "gemini-3.5-flash"}],
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
+        )
+        service, error = db_mod.resolve_provider_service(
+            "gemini", "main.schema1.gemini-svc", WS, "token"
+        )
+        assert error is None
+        assert service["provider_type"] == "gemini_enterprise"
+        assert service["targets"] == ["gemini-3.5-flash"]
+
 
 class TestModelProviderFeatureUnavailable:
     def test_detects_feature_not_available(self):

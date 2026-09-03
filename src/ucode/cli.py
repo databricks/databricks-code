@@ -25,6 +25,7 @@ from ucode.agents import (
     install_tool_binary,
     normalize_tool,
     provider_permission_error,
+    resolve_gemini_provider_model,
     resolve_launch_model,
     resolve_provider_models,
     validate_all_tools,
@@ -781,10 +782,10 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
     """Interactively let the user route claude/codex through a Model Provider
     Service instead of Databricks models, and persist (or clear) the choice.
 
-    No-op for tools other than claude/codex. Falls back to Databricks when no
+    No-op for tools other than claude/codex/gemini. Falls back to Databricks when no
     matching provider services are found or the listing fails.
     """
-    if tool not in ("claude", "codex"):
+    if tool not in ("claude", "codex", "gemini"):
         return state
     display = TOOL_SPECS[tool]["display"]
 
@@ -1918,9 +1919,9 @@ def _launch_tool(
         forwarded_model = (
             explicit_model_arg_value(ctx.args) if tool in {"claude", "codex"} else None
         )
-        # `--model` is claude-only (no other launch command exposes it). Under a provider it selects
-        # which tier the service offers to launch on, rather than being rejected — see the provider
-        # branch below.
+        # `--model` is exposed by the claude and gemini launch commands. Under a provider it selects
+        # which of the service's targets/tiers to launch on, rather than being rejected — see the
+        # provider branch below.
         # An explicit --workspace targets that workspace for this launch (and
         # auto-configures it if unseen), so `ucode claude --provider ... --workspace ...`
         # works without a prior `ucode configure`.
@@ -2022,6 +2023,8 @@ def _launch_tool(
         # Validate the provider service before launching — it must exist, be a
         # provider type this tool can route to (e.g. claude can't use an OpenAI
         # or Foundry service), and, for Bedrock, expose Claude models to pin.
+        # Gemini is exempt: it validates the service and resolves its target in a single
+        # lookup via resolve_gemini_provider_model (below), and uses no family model map.
         provider_models = None
         relayed = False
         coding_agent_config_defaults = (
@@ -2029,7 +2032,7 @@ def _launch_tool(
             if tool == "claude" and managed is not None
             else {}
         )
-        if provider:
+        if provider and tool != "gemini":
             provider_models, error, relayed = resolve_provider_models(tool, state, provider)
             if error:
                 if managed is not None and provider == managed_provider_service(managed, tool):
@@ -2065,6 +2068,12 @@ def _launch_tool(
             # Relayed services forward --model to Claude Code's own flag at launch (below), not env.
             if tool == "claude" and not relayed and (model or provider_models):
                 route_root_model = resolve_provider_launch_model(model, provider_models or {})
+            if tool == "gemini":
+                # Gemini is the exception: the request still names a concrete model
+                # in the URL, so pin one of the service's targets (--model or default).
+                resolved_model, gemini_error = resolve_gemini_provider_model(state, provider, model)
+                if gemini_error:
+                    raise RuntimeError(gemini_error)
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
             # in as the explicit model rather than being applied afterwards: for codex the proto has
@@ -2117,6 +2126,9 @@ def _launch_tool(
                 print_kv("Model", forwarded_model)
             elif route_root_model:
                 print_kv("Model", route_root_model)
+            # Gemini pins a concrete target under a provider (held in resolved_model).
+            elif resolved_model:
+                print_kv("Model", resolved_model)
         elif forwarded_model:
             print_kv("Model", forwarded_model)
         elif model and tool == "claude":
@@ -2480,12 +2492,29 @@ def claude_cmd(
 @app.command("gemini", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def gemini_cmd(
     ctx: typer.Context,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            help="Route through a Unity Catalog Model Provider Service "
+            "(<catalog>.<schema>.<name>) that serves a Gemini model. Pass before any "
+            "`--` separator.",
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            help="Model to launch on. Under --provider, selects which of the service's "
+            "target models to use. Pass before any `--` separator.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
 ) -> None:
     """Launch Gemini CLI via Databricks."""
     _disable_managed_config_if_requested(skip_managed_config)
-    _launch_tool("gemini", ctx, skip_preflight=skip_preflight)
+    _launch_tool("gemini", ctx, provider=provider, model=model, skip_preflight=skip_preflight)
 
 
 @app.command(
