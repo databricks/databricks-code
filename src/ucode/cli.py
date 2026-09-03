@@ -1478,15 +1478,27 @@ def skills_remove(
             help="Remove schemas from the skills MCP connection instead of downloaded files.",
         ),
     ] = False,
+    agents: Annotated[
+        str | None,
+        typer.Option(
+            "--agents",
+            help="Limit removal to additions for these comma-separated coding agents.",
+        ),
+    ] = None,
 ) -> None:
-    """Interactively remove shared Skill schemas from the skills MCP connection."""
+    """Interactively remove shared schemas or selected agents' additions."""
     try:
         if not mcp:
             raise RuntimeError(
                 "Removing downloaded skills is not supported yet. Pass --mcp to remove "
                 "schemas from the skills MCP connection."
             )
-        remove_skills_command()
+        requested_agents = (
+            None
+            if agents is None
+            else ({agent.strip().lower() for agent in agents.split(",") if agent.strip()} or None)
+        )
+        remove_skills_command(agents=requested_agents)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

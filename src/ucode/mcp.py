@@ -2420,14 +2420,15 @@ def _prompt_for_skill_removal(
     return [str(value) for value in selection]
 
 
-def remove_skills_command() -> int:
-    """Interactively remove developer schemas from every client's effective scope."""
+def remove_skills_command(agents: set[str] | None = None) -> int:
+    """Interactively remove shared schemas or selected clients' additions."""
     state = load_state()
     workspace, profile, clients = setup_mcp_clients(
         state,
         "Remove Skills MCP",
         require_auth=False,
         action_note="Removing from",
+        agents=agents,
     )
     entry = _skills_entry(list(state.get("mcp_servers") or []))
     managed = {
@@ -2440,7 +2441,11 @@ def remove_skills_command() -> int:
     locations_by_client = {
         client: [
             location
-            for location in skill_locations_for_client(entry, client)
+            for location in (
+                skill_locations_for_client(entry, client)
+                if agents is None
+                else overrides.get(client, [])
+            )
             if location not in managed
         ]
         for client in clients
@@ -2456,11 +2461,24 @@ def remove_skills_command() -> int:
         return 0
 
     remove_locations = set(selection)
-    new_default = [location for location in default if location not in remove_locations]
-    overrides = {
-        client: [location for location in client_locations if location not in remove_locations]
-        for client, client_locations in overrides.items()
-    }
+    if agents is None:
+        new_default = [location for location in default if location not in remove_locations]
+        overrides = {
+            client: [location for location in client_locations if location not in remove_locations]
+            for client, client_locations in overrides.items()
+        }
+    else:
+        new_default = default
+        for client in clients:
+            _set_skill_location_override(
+                overrides,
+                client,
+                [
+                    location
+                    for location in overrides.get(client, [])
+                    if location not in remove_locations
+                ],
+            )
 
     _update_skills_mcp(
         state,
