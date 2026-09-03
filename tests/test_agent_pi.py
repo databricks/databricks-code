@@ -475,3 +475,127 @@ class TestManagedDefaultModel:
     def test_falls_back_to_pi_models_without_default(self):
         state = {"pi_models": ["system.ai.claude-opus-4-8"]}
         assert pi.default_model(state) == "system.ai.claude-opus-4-8"
+
+
+class TestRefreshTokenOnceBedrockPreservation:
+    """_refresh_token_once must preserve an existing databricks-bedrock provider block."""
+
+    def _setup(self, tmp_path, monkeypatch):
+        import ucode.agents.pi as pi_mod
+        import ucode.config_io as config_io_mod
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        config_file = tmp_path / "models.json"
+        settings_file = tmp_path / "settings.json"
+        monkeypatch.setattr(pi_mod, "PI_CONFIG_PATH", config_file)
+        monkeypatch.setattr(pi_mod, "PI_SETTINGS_PATH", settings_file)
+        monkeypatch.setattr(pi_mod, "PI_BACKUP_PATH", tmp_path / "pi-backup.json")
+        monkeypatch.setattr(pi_mod, "PI_SETTINGS_BACKUP_PATH", tmp_path / "pi-settings-backup.json")
+        return pi_mod, config_file, settings_file
+
+    def _state(self) -> dict:
+        return {
+            "workspace": WS,
+            "base_urls": {"pi": _base_urls()},
+            "claude_models": {"sonnet": "claude-sonnet"},
+            "codex_models": [],
+            "gemini_models": [],
+            "managed_configs": {},
+        }
+
+    def test_bedrock_block_survives_token_refresh(self, tmp_path, monkeypatch):
+        """Regression: token refresh must not clobber the databricks-bedrock provider block."""
+        pi_mod, config_file, settings_file = self._setup(tmp_path, monkeypatch)
+
+        # Pre-write a models.json that already has a bedrock provider block,
+        # as written by write_tool_config(..., provider=..., bedrock_targets=[...]).
+        bedrock_config = {
+            "model": "databricks-bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            "providers": {
+                "databricks-bedrock": {
+                    "baseUrl": f"{WS}/ai-gateway",
+                    "api": "bedrock-converse-stream",
+                    "apiKey": "old-token",
+                    "authHeader": True,
+                    "headers": {
+                        "User-Agent": "ucode/0.1.0 pi/0.74.0",
+                        "Databricks-Model-Provider-Service": "my-mps-provider",
+                    },
+                    "models": [
+                        {"id": "anthropic.claude-3-haiku-20240307-v1:0"},
+                        {"id": "anthropic.claude-3-sonnet-20240229-v1:0"},
+                    ],
+                }
+            },
+        }
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps(bedrock_config), encoding="utf-8")
+
+        with (
+            patch("ucode.agents.pi.get_databricks_token", return_value="new-token"),
+            patch("ucode.agents.pi.save_state"),
+        ):
+            token = pi_mod._refresh_token_once(self._state())
+
+        assert token == "new-token"
+
+        written = json.loads(config_file.read_text())
+        providers = written.get("providers", {})
+
+        # The bedrock provider block must still be present.
+        assert "databricks-bedrock" in providers
+
+        bedrock = providers["databricks-bedrock"]
+        # MPS header preserved.
+        assert bedrock["headers"]["Databricks-Model-Provider-Service"] == "my-mps-provider"
+        # Model ids preserved.
+        model_ids = [m["id"] for m in bedrock.get("models", [])]
+        assert "anthropic.claude-3-haiku-20240307-v1:0" in model_ids
+        assert "anthropic.claude-3-sonnet-20240229-v1:0" in model_ids
+        # Token refreshed.
+        assert bedrock["apiKey"] == "new-token"
+
+        # settings.json must pin defaultProvider to databricks-bedrock.
+        settings = json.loads(settings_file.read_text())
+        assert settings["defaultProvider"] == "databricks-bedrock"
+
+    def test_no_bedrock_block_uses_default_model(self, tmp_path, monkeypatch):
+        """Without a bedrock block, _refresh_token_once falls back to the normal path."""
+        pi_mod, config_file, settings_file = self._setup(tmp_path, monkeypatch)
+
+        # Config has only a Claude provider — no bedrock.
+        existing_config = {
+            "model": "databricks-claude/claude-sonnet",
+            "providers": {
+                "databricks-claude": {
+                    "baseUrl": f"{WS}/ai-gateway/anthropic",
+                    "api": "anthropic-messages",
+                    "apiKey": "old-token",
+                    "authHeader": True,
+                    "headers": {},
+                    "models": [{"id": "claude-sonnet"}],
+                }
+            },
+        }
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps(existing_config), encoding="utf-8")
+
+        with (
+            patch("ucode.agents.pi.get_databricks_token", return_value="new-token"),
+            patch("ucode.agents.pi.save_state"),
+        ):
+            token = pi_mod._refresh_token_once(self._state())
+
+        assert token == "new-token"
+
+        written = json.loads(config_file.read_text())
+        providers = written.get("providers", {})
+
+        # No bedrock block should be written.
+        assert "databricks-bedrock" in providers is False or "databricks-bedrock" not in providers
+        # Claude provider still present.
+        assert "databricks-claude" in providers
+
+        # settings.json must pin defaultProvider to databricks-claude (normal path).
+        settings = json.loads(settings_file.read_text())
+        assert settings["defaultProvider"] == "databricks-claude"

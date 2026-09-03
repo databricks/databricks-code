@@ -161,7 +161,11 @@ def render_overlay(
             "api": "bedrock-converse-stream",
             "apiKey": token,
             "authHeader": True,
-            "headers": {**ua_headers, "Databricks-Model-Provider-Service": provider},
+            # Pi's bedrock-converse-stream client (AWS SDK style) sets its own
+            # User-Agent; adding ours produces two `user-agent` values and the
+            # gateway rejects the request ("Header field ... must only have a
+            # single value"). Send only the MPS selector header here.
+            "headers": {"Databricks-Model-Provider-Service": provider},
             "models": [{"id": t} for t in bedrock_targets],
         }
         keys.append(["providers", "databricks-bedrock"])
@@ -286,6 +290,33 @@ def default_model(state: dict) -> str | None:
 
 
 def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> str:
+    # Preserve a Bedrock provider block across token refreshes. The block is
+    # self-describing: its MPS header + model ids are enough to re-render it,
+    # so a refresh keeps routing through Bedrock instead of dropping to a
+    # system-hosted model. When the config has no Bedrock block (a non-Bedrock
+    # session, or after a non-Bedrock reconfigure overwrote it), fall through
+    # to the normal path.
+    existing = read_json_safe(PI_CONFIG_PATH)
+    bedrock = (existing.get("providers") or {}).get("databricks-bedrock")
+    provider: str | None = None
+    bedrock_targets: list[str] | None = None
+    if isinstance(bedrock, dict):
+        headers = bedrock.get("headers") or {}
+        provider = headers.get("Databricks-Model-Provider-Service")
+        bedrock_targets = [
+            m["id"]
+            for m in (bedrock.get("models") or [])
+            if isinstance(m, dict) and isinstance(m.get("id"), str)
+        ] or None
+    if provider and bedrock_targets:
+        _, token = write_tool_config(
+            state,
+            bedrock_targets[0],
+            force_refresh=force_refresh,
+            provider=provider,
+            bedrock_targets=bedrock_targets,
+        )
+        return token
     model = default_model(state)
     if not model:
         raise RuntimeError("No Pi model is available on this workspace.")
