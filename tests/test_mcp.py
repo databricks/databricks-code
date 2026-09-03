@@ -2684,6 +2684,74 @@ class TestAddSkillsCommand:
         assert configured == []
 
 
+class TestRemoveSkillsCommand:
+    def _state(self):
+        return {
+            "workspace": WS,
+            "available_tools": ["claude", "codex"],
+            "mcp_servers": mcp._resolve_skills_mcp_servers(
+                WS, ["claude", "codex"], ["A.a", "B.b"], []
+            ),
+        }
+
+    def _stub(self, monkeypatch, state, selection):
+        configured: list[tuple[str, str]] = []
+        _stub_location_base(monkeypatch, state)
+        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["claude", "codex"])
+        monkeypatch.setattr(mcp, "_prompt_for_skill_removal", lambda scopes: selection)
+        monkeypatch.setattr(
+            mcp,
+            "configure_client_mcp_server",
+            lambda client, name, url, *a, **kw: configured.append((client, url)) or [],
+        )
+        monkeypatch.setattr(mcp, "save_state", lambda s: None)
+        return configured
+
+    def test_unscoped_remove_keeps_schemaless_connection(self, monkeypatch):
+        state = self._state()
+        configured = self._stub(monkeypatch, state, ["A.a", "B.b"])
+
+        assert mcp.remove_skills_command() == 0
+
+        entry = _find_skills(state["mcp_servers"])[0]
+        assert entry["skill_locations"] == []
+        assert configured == [
+            ("claude", f"{WS}/ai-gateway/skills/"),
+            ("codex", f"{WS}/ai-gateway/skills/"),
+        ]
+
+    def test_unscoped_remove_drops_an_empty_client_additions_list(self, monkeypatch):
+        state = self._state()
+        state["mcp_servers"] = mcp._resolve_skills_mcp_servers(
+            WS,
+            ["claude", "codex"],
+            ["A.a"],
+            [],
+            {"claude": ["C.c"]},
+        )
+        self._stub(monkeypatch, state, ["C.c"])
+
+        assert mcp.remove_skills_command() == 0
+
+        entry = _find_skills(state["mcp_servers"])[0]
+        assert mcp.SKILL_LOCATION_OVERRIDES_KEY not in entry
+
+    def test_managed_locations_are_not_offered(self, monkeypatch):
+        state = self._state()
+        state["managed_skill_locations"] = ["A.a"]
+        captured: dict[str, dict[str, list[str]]] = {}
+        _stub_location_base(monkeypatch, state)
+        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["claude", "codex"])
+        monkeypatch.setattr(
+            mcp,
+            "_prompt_for_skill_removal",
+            lambda scopes: captured.setdefault("scopes", scopes) and None,
+        )
+
+        assert mcp.remove_skills_command() == 0
+        assert captured["scopes"] == {"claude": ["B.b"], "codex": ["B.b"]}
+
+
 class TestRegisterSchemalessSkillsConnection:
     def _stub(self, monkeypatch):
         saved_states: list[dict] = []
