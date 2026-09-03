@@ -191,74 +191,55 @@ on — and removes the ones you select from those tools. It needs no Databricks 
 
 ### Skills (optional)
 
-Configure Unity Catalog Skills for your coding tools with `ucode configure skills`:
+Use `ucode skill add` to download Unity Catalog Skills or expose them through the skills MCP:
 
 ```bash
-# Utility tools only: register the schema-less skills MCP connection, no download.
-ucode configure skills
-
 # Download mode: fetch every skill in the schema to disk (and register the connection).
-ucode configure skills --location main.default --path /abs/project/dir
+ucode skill add --location main.default --path /abs/project/dir
 
-# Download a named subset of the schema's skills instead of all of them.
-ucode configure skills --location main.default --skill my-skill
+# Download named skills by bare name or fully-qualified name.
+ucode skill add --location main.default --skills my-skill,other-skill
+ucode skill add --skills main.default.my-skill,main.default.other-skill
 
-# MCP mode: expose the schema's skills as MCP tools instead of downloading.
-ucode configure skills --location main.default,ml.prod --mcp
+# Add schemas to every configured agent's MCP scope, keeping existing schemas.
+ucode skill add --location main.default,ml.prod --mcp
+
+# Add a schema only to selected agents, setting them up first if needed.
+ucode skill add --location main.default --mcp --agents claude,codex
 ```
 
-- **Bare command** (no `--location`) registers the schema-less skills MCP connection — the
-  cross-schema utility tools only — and downloads nothing. `--mcp` with no `--location` does the
-  same.
 - **Download mode** (with `--location`, no `--mcp`) writes each skill flat as `<leaf>/SKILL.md`
   (plus its bundled files) into both `.claude/skills/` and `.agents/skills/`. `--path` (an existing
   absolute project directory) is optional; when omitted, skills are written to user-level skill
-  directories. Any pre-existing skill dir prompts before it's overwritten. It then registers a
-  schema-less skills MCP connection, leaving any prior `--mcp` scope untouched.
-  `--skill <name>[,<name>…]` narrows the download to the named skills (by leaf name) from the schema
-  instead of all of them; requested names not found in the schema warn and are skipped. `--skill`
-  requires a single `--location`, is download-only, and is rejected with `--mcp`.
-- **MCP mode** (`--location … --mcp`) sets the connection's location set to exactly `<list>`
-  (override-only) and rebuilds its `?schema=` URL; no files are downloaded and `--path` is rejected.
+  directories. Any pre-existing skill dir prompts before it's overwritten. `--skills` narrows the
+  download to named securables. Bare names require one `--location`; fully-qualified names derive
+  it. Download mode always writes both directory families, so `--agents` is accepted only with
+  `--mcp`.
+- **MCP mode** (`--location … --mcp`) unions schemas into the selected agents' existing scopes.
+  Without `--agents`, it updates every configured agent. Each agent receives the shared location
+  set plus its own additions, with duplicates removed from the effective scope. No files are
+  downloaded.
 
 Each run prints the registered server, its URL, the configured agents, and its tools, and reminds
 you to run `ucode <agent>` (existing agent sessions need a restart before the MCP tools load).
 
-#### Add skill scopes without replacing existing ones
+#### Remove skill MCP scopes
 
-`ucode skill add` registers skills additively, keeping anything already configured. With `--mcp` it
-adds the schemas to every configured agent's scope, or only to `--agents` when supplied. Agents that
-are not configured yet are set up first. Without `--mcp`, it downloads skills to disk; download mode
-always writes both directory families and does not accept `--agents`. `--skills` narrows a download
-to a subset of one schema's skills. Each agent receives the shared location set plus its own
-agent-specific additions, with duplicates removed from the effective scope.
-
-```bash
-# Add schemas to the skills MCP scope, keeping any already configured.
-ucode skill add --location main.default,ml.prod --mcp
-
-# Add a schema only to selected agents.
-ucode skill add --location main.default --mcp --agents claude,codex
-
-# Download a schema's skills to disk, keeping existing downloads.
-ucode skill add --location main.default
-
-# Download a named subset, by bare name (with --location) or fully-qualified name.
-ucode skill add --location main.default --skills my-skill,other-skill
-ucode skill add --skills main.default.my-skill,main.default.other-skill
-```
-
-#### Remove shared skill MCP scopes
-
-`ucode skill remove --mcp` interactively removes developer-configured schemas from the shared
-skills MCP scope. With `--agents`, only those agents' additions are offered and removed; shared
-schemas remain inherited. Administrator-managed schemas are not offered, and the schema-less
-utility connection remains registered after its last schema is removed.
+`ucode skill remove --mcp` interactively lists developer-configured schemas and the agents using
+them. Without `--agents`, selected schemas are removed from the shared set and every agent-specific
+addition. With `--agents`, only those agents' additions are offered and removed; shared schemas
+remain inherited. The schema-less utility connection remains registered after its last schema is
+removed. Downloaded skill removal is not yet supported.
 
 ```bash
 ucode skill remove --mcp
 ucode skill remove --mcp --agents codex
 ```
+
+`ucode configure skills` is deprecated but remains available for existing scripts. Its MCP mode
+keeps its original replacement semantics, and its bare form remains the way to register only the
+schema-less utility connection during the transition.
+
 
 ### Managed config for a workspace (admins)
 
@@ -390,15 +371,12 @@ The output looks like:
 | `ucode mcp add --agents claude --services system.ai.slack` | Set up the agent(s) if needed and register the server for them |
 | `ucode mcp remove` | Interactively unregister configured MCP servers from your coding tools |
 | `ucode mcp remove --agents codex` | Unregister selected servers from specific agents only |
-| `ucode configure skills` | Register the skills MCP connection (utility tools only); no skills download |
-| `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
-| `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
-| `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
 | `ucode skill add --location main.default --mcp` | Add schemas to the skills MCP scope, keeping any already configured (additive; never replaces) |
 | `ucode skill add --location main.default --mcp --agents claude` | Set up selected agents if needed and add schemas only to their MCP scopes |
 | `ucode skill add --location main.default` | Download a schema's skills to disk without removing existing downloads |
 | `ucode skill add --skills main.default.my-skill` | Download a named subset of skills (bare names need `--location`; fully-qualified names stand alone) |
-| `ucode skill remove --mcp [--agents codex]` | Interactively remove developer schemas from shared or selected agent scopes |
+| `ucode skill remove --mcp [--agents codex]` | Interactively remove developer schemas from all or selected agent MCP scopes |
+| `ucode configure skills ...` | Deprecated compatibility command; existing behavior is preserved |
 | `ucode setup` | Author the managed config's agents and models (workspace admins only) |
 | `ucode setup mcps` | Add or change the managed config's MCP servers |
 | `ucode setup skills [--location a.b,c.d]` | Add or change the managed config's skills |
