@@ -166,8 +166,11 @@ def render_overlay(
         }
         keys.append(["providers", "databricks-bedrock"])
     resolved = _resolve_model_selector(model or "", claude_models, codex_models, gemini_models)
-    # When launching with a Bedrock provider, default to the first target.
-    if not resolved and "databricks-bedrock" in providers and bedrock_targets:
+    # Bedrock model IDs contain no `/` (e.g. `anthropic.claude-3-haiku-20240307-v1:0`), so
+    # _resolve_model_selector returns them unprefixed. _write_settings splits on `/` to get
+    # provider/model — without the prefix it gets an empty model_id and skips defaultProvider.
+    # Always force the `databricks-bedrock/` prefix when the Bedrock provider is active.
+    if "databricks-bedrock" in providers and bedrock_targets:
         resolved = f"databricks-bedrock/{bedrock_targets[0]}"
     overlay: dict = {"model": resolved}
     if providers:
