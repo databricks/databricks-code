@@ -88,9 +88,7 @@ def test_router_name_can_be_selected_with_environment_variable(monkeypatch):
 
     def fake_urlopen(request, timeout):
         captured["body"] = json.loads(request.data)
-        return _Response(
-            {"route_selection": [{"route_option": {"model": "gpt-5-6-sol"}}]}
-        )
+        return _Response({"route_selection": [{"route_option": {"model": "gpt-5-6-sol"}}]})
 
     monkeypatch.setattr(codex_routing.urllib.request, "urlopen", fake_urlopen)
 
