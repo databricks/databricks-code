@@ -2356,10 +2356,29 @@ def _union_locations(base: list[str], new: list[str]) -> list[str]:
     return merged
 
 
-def add_skills_command(locations: list[str]) -> int:
+def add_skills_command(locations: list[str], agents: set[str] | None = None) -> int:
     """Add ``locations`` to the skills MCP connection's scope, keeping any already configured."""
     state = load_state()
-    workspace, profile, clients = setup_mcp_clients(state, "Add Skills MCP")
-    merged = _union_locations(_skill_mcp_locations(state), locations)
-    _update_skills_mcp(state, workspace, profile, clients, merged)
+    workspace, profile, clients = setup_mcp_clients(state, "Add Skills MCP", agents=agents)
+    entry = _skills_entry(list(state.get("mcp_servers") or []))
+    default = _skill_mcp_locations(state)
+    overrides = _skill_location_overrides(entry)
+    if agents is None:
+        merged = _union_locations(default, locations)
+    else:
+        merged = default
+        for client in clients:
+            _set_skill_location_override(
+                overrides,
+                client,
+                _union_locations(overrides.get(client, []), locations),
+            )
+    _update_skills_mcp(
+        state,
+        workspace,
+        profile,
+        clients,
+        merged,
+        location_overrides=overrides,
+    )
     return 0
