@@ -136,6 +136,10 @@ class TestUpgrade:
     def _which(command: str) -> str:
         return f"/tools/{command}"
 
+    @staticmethod
+    def _requirement(distribution: str) -> str:
+        return f"{distribution} @ git+https://github.com/databricks/ucode"
+
     def test_before_cutover_upgrades_ucode_normally_without_verification(self):
         with (
             patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
@@ -146,7 +150,7 @@ class TestUpgrade:
         assert result.exit_code == 0, result.output
         assert run.call_args_list == [
             call(
-                ["uv", "tool", "upgrade", "ucode"],
+                ["uv", "tool", "install", "--reinstall", self._requirement("ucode")],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -181,7 +185,7 @@ class TestUpgrade:
         assert result.exit_code == 0, result.output
         assert run.call_args_list == [
             call(
-                ["uv", "tool", "upgrade", "ucode"],
+                ["uv", "tool", "install", "--reinstall", self._requirement("ucode")],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -212,7 +216,13 @@ class TestUpgrade:
 
         assert result.exit_code == 0, result.output
         run.assert_called_once_with(
-            ["uv", "tool", "upgrade", "unity-gateway"],
+            [
+                "uv",
+                "tool",
+                "install",
+                "--reinstall",
+                self._requirement("unity-gateway"),
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -231,7 +241,7 @@ class TestUpgrade:
 
         assert result.exit_code == 1
         run.assert_called_once_with(
-            ["uv", "tool", "upgrade", "ucode"],
+            ["uv", "tool", "install", "--reinstall", self._requirement("ucode")],
             check=False,
             capture_output=True,
             text=True,

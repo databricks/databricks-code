@@ -3403,6 +3403,7 @@ def upgrade_cmd() -> None:
     current_distribution = "unity-gateway"
     git_url = "git+https://github.com/databricks/ucode"
     installed_distribution = _installed_cli_distribution()
+    upgrade_requirement = f"{installed_distribution} @ {git_url}"
     migrated = False
     legacy_removed = False
 
@@ -3411,7 +3412,7 @@ def upgrade_cmd() -> None:
     print_kv("Installed distribution", installed_distribution)
     try:
         result = subprocess.run(
-            ["uv", "tool", "upgrade", installed_distribution],
+            ["uv", "tool", "install", "--reinstall", upgrade_requirement],
             check=False,
             capture_output=True,
             text=True,
