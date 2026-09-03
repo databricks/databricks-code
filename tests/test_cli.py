@@ -1260,6 +1260,16 @@ class TestSkillsRemoveCommand:
         remove.assert_called_once_with(agents={"claude", "codex"})
 
 
+class TestConfigureSkillsDeprecation:
+    def test_warns_and_keeps_legacy_dispatch(self):
+        with patch("ucode.cli.configure_skills_mcp_command") as configure:
+            result = runner.invoke(app, ["configure", "skills", "--location", "a.b", "--mcp"])
+
+        assert result.exit_code == 0, result.output
+        assert "deprecated" in _strip_ansi(result.output).lower()
+        configure.assert_called_once_with(["a.b"])
+
+
 class TestApplyManagedSkills:
     """The launch path both registers the skills MCP connection and downloads bundles to disk."""
 
