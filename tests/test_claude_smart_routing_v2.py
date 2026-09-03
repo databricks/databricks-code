@@ -261,6 +261,20 @@ class TestV2Launch:
 
 
 class TestSubagentRouting:
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("anthropic-aigw-73ea02b2-system.ai.glm-5-2", "glm-5-2"),
+            (
+                "anthropic-aigw-73ea02b-system.ai.glm-5-2",
+                "anthropic-aigw-73ea02b-system.ai.glm-5-2",
+            ),
+            ("system.ai.claude-opus-4-8", "claude-opus-4-8"),
+        ],
+    )
+    def test_normalizes_router_model_id(self, model, expected):
+        assert v2._claude_router_model_id(model) == expected
+
     def test_routes_anthropic_gateway_alias_by_embedded_model_id(self, monkeypatch):
         gateway_alias = "anthropic-aigw-73ea02b2-system.ai.glm-5-2"
         captured = {}
