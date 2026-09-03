@@ -2888,15 +2888,11 @@ def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | 
     return catalog.model_ids, catalog.error_msg
 
 
-def list_anthropic_model_catalog(
-    workspace: str, token: str
-) -> AnthropicModelCatalog:
+def list_anthropic_model_catalog(workspace: str, token: str) -> AnthropicModelCatalog:
     """Return advertised Anthropic model ids and their optional display names."""
     payload, reason = _get_anthropic_models_json(workspace, token)
     if payload is None:
-        return AnthropicModelCatalog(
-            model_ids=[], model_id_to_display_name={}, error_msg=reason
-        )
+        return AnthropicModelCatalog(model_ids=[], model_id_to_display_name={}, error_msg=reason)
 
     data = cast(dict, payload) if isinstance(payload, dict) else {}
     model_ids: list[str] = []
@@ -2913,9 +2909,7 @@ def list_anthropic_model_catalog(
             if isinstance(display_name, str) and display_name:
                 display_names[model_id] = display_name
     if model_ids:
-        return AnthropicModelCatalog(
-            model_ids=model_ids, model_id_to_display_name=display_names
-        )
+        return AnthropicModelCatalog(model_ids=model_ids, model_id_to_display_name=display_names)
     return AnthropicModelCatalog(
         model_ids=[],
         model_id_to_display_name={},
