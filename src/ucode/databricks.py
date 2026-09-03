@@ -1541,6 +1541,10 @@ _MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
     # GLM-4.6: 200k context, but the gateway caps output well below the model's
     # native 128k — pin 25k so requests aren't rejected.
     "glm": {"context": 200_000, "output": 25_000},
+    # Amazon Bedrock Nova (Micro/Lite/Pro), served over Converse: the gateway
+    # rejects an output cap of 10k or more ("model limit of 10000"), so pin a
+    # value safely under it. Claude/others have no known low cap and stay unset.
+    "nova": {"context": 300_000, "output": 8_192},
 }
 
 

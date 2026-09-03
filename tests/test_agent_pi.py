@@ -477,6 +477,33 @@ class TestManagedDefaultModel:
         assert pi.default_model(state) == "system.ai.claude-opus-4-8"
 
 
+class TestRenderOverlayBedrockLimits:
+    """Bedrock model entries pin known per-model token caps, and only those."""
+
+    def _bedrock_models(self, targets):
+        overlay, _ = pi.render_overlay(
+            targets[0],
+            "tok",
+            _base_urls(),
+            {},
+            [],
+            [],
+            provider="cat.sch.mps",
+            bedrock_targets=targets,
+        )
+        return overlay["providers"]["databricks-bedrock"]["models"]
+
+    def test_nova_target_pins_max_tokens(self):
+        entry = self._bedrock_models(["us.amazon.nova-lite-v1:0"])[0]
+        assert entry["id"] == "us.amazon.nova-lite-v1:0"
+        assert entry["maxTokens"] == 8192
+        assert entry["contextWindow"] == 300_000
+
+    def test_claude_target_has_no_cap(self):
+        entry = self._bedrock_models(["us.anthropic.claude-sonnet-4-20250514-v1:0"])[0]
+        assert entry == {"id": "us.anthropic.claude-sonnet-4-20250514-v1:0"}
+
+
 class TestRefreshTokenOnceBedrockPreservation:
     """_refresh_token_once must preserve an existing databricks-bedrock provider block."""
 

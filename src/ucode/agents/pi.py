@@ -46,6 +46,7 @@ from ucode.databricks import (
     build_pi_base_urls,
     classify_model_family,
     get_databricks_token,
+    model_token_limits,
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
@@ -98,6 +99,21 @@ def _resolve_model_selector(
     if model in gemini_models:
         return f"databricks-gemini/{model}"
     return model
+
+
+def _bedrock_model_entry(model_id: str) -> dict:
+    """A Pi model entry for a Bedrock target, pinning known token limits.
+
+    Some Bedrock models cap output well below what Pi requests by default (e.g.
+    Nova rejects a `maxTokens` of 10k or more), so pin `maxTokens`/`contextWindow`
+    when the model has a known limit. Models with no known limit are left unbounded.
+    """
+    entry: dict = {"id": model_id}
+    limits = model_token_limits(model_id)
+    if limits is not None:
+        entry["contextWindow"] = limits["context"]
+        entry["maxTokens"] = limits["output"]
+    return entry
 
 
 def render_overlay(
@@ -166,7 +182,7 @@ def render_overlay(
             # gateway rejects the request ("Header field ... must only have a
             # single value"). Send only the MPS selector header here.
             "headers": {"Databricks-Model-Provider-Service": provider},
-            "models": [{"id": t} for t in bedrock_targets],
+            "models": [_bedrock_model_entry(t) for t in bedrock_targets],
         }
         keys.append(["providers", "databricks-bedrock"])
     resolved = _resolve_model_selector(model or "", claude_models, codex_models, gemini_models)
