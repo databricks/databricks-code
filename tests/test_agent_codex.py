@@ -589,6 +589,41 @@ class TestCodexLaunch:
         assert runs == [["codex", "--profile", "ucode", "exec", "hi"]]
         assert fallbacks == []
 
+    def test_app_layers_ucode_profile_as_config_overrides(self, tmp_path, monkeypatch):
+        profile_path = tmp_path / "ucode.config.toml"
+        profile_path.write_text(
+            'model_provider = "ucode-databricks"\n\n'
+            "[model_providers.ucode-databricks]\n"
+            'name = "Databricks AI Gateway"\n'
+            'base_url = "https://example.databricks.com/ai-gateway/codex/v1"\n'
+            'wire_api = "responses"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", profile_path)
+        runs, launches = self._patch(monkeypatch, returncode=0, elapsed=0.2)
+
+        codex.launch({"workspace": WS}, ["app", "--new-window"])
+
+        assert runs == []
+        assert launches[0][:2] == ["codex", "app"]
+        assert "--profile" not in launches[0]
+        assert launches[0][-1] == "--new-window"
+        assert 'model_provider="ucode-databricks"' in launches[0]
+        provider_arg = next(
+            arg for arg in launches[0] if arg.startswith("model_providers.ucode-databricks=")
+        )
+        assert 'base_url = "https://example.databricks.com/ai-gateway/codex/v1"' in provider_arg
+
+    def test_app_requires_populated_ucode_profile(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", tmp_path / "missing.config.toml")
+        runs, launches = self._patch(monkeypatch, returncode=0, elapsed=0.2)
+
+        with pytest.raises(RuntimeError, match="ucode configure --agents codex"):
+            codex.launch({"workspace": WS}, ["app"])
+
+        assert runs == []
+        assert launches == []
+
     def test_fast_failure_relaunches_without_profile(self, monkeypatch):
         # codex rejects --profile on server-family subcommands at parse time —
         # a fast nonzero exit → relaunch without --profile.
