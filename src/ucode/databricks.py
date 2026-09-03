@@ -24,6 +24,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, cast, overload
@@ -68,6 +69,15 @@ _HTTP_GET_RETRY_BASE_SECONDS = 1.0
 _HTTP_GET_RETRY_MAX_SECONDS = 5.0
 _HTTP_GET_RETRY_AFTER_JITTER_SECONDS = 0.25
 _ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES = 2
+
+
+@dataclass(frozen=True)
+class AnthropicModelCatalog:
+    """Models advertised by AI Gateway's Anthropic endpoint."""
+
+    model_ids: list[str]
+    model_id_to_display_name: dict[str, str]
+    error_msg: str | None = None
 
 
 def _debug_enabled() -> bool:
@@ -2874,17 +2884,17 @@ def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | 
     using that mode must not apply ucode's legacy ``databricks-claude-*`` family
     validation.
     """
-    model_ids, _display_names, reason = list_anthropic_model_catalog(workspace, token)
-    return model_ids, reason
+    catalog = list_anthropic_model_catalog(workspace, token)
+    return catalog.model_ids, catalog.error_msg
 
 
 def list_anthropic_model_catalog(
     workspace: str, token: str
-) -> tuple[list[str], dict[str, str], str | None]:
+) -> AnthropicModelCatalog:
     """Return advertised Anthropic model ids and their optional display names."""
     payload, reason = _get_anthropic_models_json(workspace, token)
     if payload is None:
-        return [], {}, reason
+        return AnthropicModelCatalog([], {}, reason)
 
     data = cast(dict, payload) if isinstance(payload, dict) else {}
     model_ids: list[str] = []
@@ -2901,8 +2911,8 @@ def list_anthropic_model_catalog(
             if isinstance(display_name, str) and display_name:
                 display_names[model_id] = display_name
     if model_ids:
-        return model_ids, display_names, None
-    return [], {}, "AI Gateway returned no Anthropic model ids"
+        return AnthropicModelCatalog(model_ids, display_names)
+    return AnthropicModelCatalog([], {}, "AI Gateway returned no Anthropic model ids")
 
 
 def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], str | None]:

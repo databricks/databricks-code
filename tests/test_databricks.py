@@ -204,11 +204,13 @@ class TestDiscoverClaudeModels:
         }
         monkeypatch.setattr(db_mod, "_http_get_json", lambda *_args, **_kwargs: (payload, None))
 
-        models, display_names, reason = db_mod.list_anthropic_model_catalog(WS, "token")
+        catalog = db_mod.list_anthropic_model_catalog(WS, "token")
 
-        assert models == ["system.ai.glm-5-3-flash", "opaque-model-id"]
-        assert display_names == {"system.ai.glm-5-3-flash": "GLM 5.3 Flash"}
-        assert reason is None
+        assert catalog.model_ids == ["system.ai.glm-5-3-flash", "opaque-model-id"]
+        assert catalog.model_id_to_display_name == {
+            "system.ai.glm-5-3-flash": "GLM 5.3 Flash"
+        }
+        assert catalog.error_msg is None
 
     def test_selects_opus_4_8_when_advertised(self, monkeypatch):
         payload = {

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from ucode.agents import claude
+from ucode.databricks import AnthropicModelCatalog
 from ucode.smart_routing import claude_hooks, claude_pty, routing, v2
 
 
@@ -115,10 +116,9 @@ class TestV2Launch:
         monkeypatch.setattr(
             v2,
             "list_anthropic_model_catalog",
-            lambda *_args: (
+            lambda *_args: AnthropicModelCatalog(
                 ["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
                 {"system.ai.claude-sonnet-5": "Claude Sonnet 5"},
-                None,
             ),
         )
         monkeypatch.setattr(
@@ -213,7 +213,9 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
         monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
-        monkeypatch.setattr(v2, "list_anthropic_model_catalog", lambda *_args: (["opus"], {}, None))
+        monkeypatch.setattr(
+            v2, "list_anthropic_model_catalog", lambda *_args: AnthropicModelCatalog(["opus"], {})
+        )
 
         def fake_run(_argv, **_kwargs):
             user_settings.write_text(json.dumps({"model": "user-selected"}))
@@ -242,7 +244,9 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "APP_DIR", tmp_path)
         monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
-        monkeypatch.setattr(v2, "list_anthropic_model_catalog", lambda *_args: (["opus"], {}, None))
+        monkeypatch.setattr(
+            v2, "list_anthropic_model_catalog", lambda *_args: AnthropicModelCatalog(["opus"], {})
+        )
 
         def fake_run(_argv, **kwargs):
             routed_model = "system.ai.claude-opus-4-8"

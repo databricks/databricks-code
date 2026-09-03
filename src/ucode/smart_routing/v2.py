@@ -348,9 +348,12 @@ def launch_claude(
     os.environ[OAUTH_TOKEN_ENV_VAR] = token
     os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
     os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
-    model_ids, display_names, discovery_error = list_anthropic_model_catalog(workspace, token)
-    if not model_ids:
-        raise RuntimeError(discovery_error or "Anthropic models endpoint returned no Claude models")
+    catalog = list_anthropic_model_catalog(workspace, token)
+    if not catalog.model_ids:
+        raise RuntimeError(
+            catalog.error_msg or "Anthropic models endpoint returned no Claude models"
+        )
+    model_ids = catalog.model_ids
 
     run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     socket_path = APP_DIR / f"claude-v2-{run_id}.sock"
@@ -386,7 +389,7 @@ def launch_claude(
         decision = _route_claude_prompt(state, token, prompt, model_ids)
         return (
             model_name(decision.model),
-            display_names.get(decision.model, decision.model),
+            catalog.model_id_to_display_name.get(decision.model, decision.model),
             decision.rationale,
         )
 
