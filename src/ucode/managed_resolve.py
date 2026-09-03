@@ -1,6 +1,6 @@
 """Resolve the effective agent settings from the managed config plus local ucode state.
 
-The managed config (``~/.ucode/managed-state.json`` — authored by ``ucode setup`` and refreshed
+The managed config (``~/.ucode/managed-state.json`` — authored via ``ucode configure`` and refreshed
 from the workspace at launch, both through :mod:`ucode.managed_config`) and the developer's own
 ucode state (``~/.ucode/state.json``) stay separate files — they are never merged on disk. Instead
 this module resolves them *per key* at config-write time: whatever the manifest specifies wins, and
@@ -198,7 +198,7 @@ def managed_provider_family_models(managed: dict) -> dict[str, str] | None:
     Model Provider Service.
 
     The launch path pins each ``ANTHROPIC_DEFAULT_<FAMILY>_MODEL`` from this so a *managed* launch
-    uses exactly the versions the admin chose in ``ucode setup`` — rather than
+    uses exactly the versions the admin chose in ``ucode configure`` — rather than
     ``resolve_provider_models`` re-deriving "newest per family" from the service's live targets. It
     returns the manifest's own family slots (``{opus: id, sonnet: id, ...}``), i.e. what the wizard's
     per-family prompt authored.

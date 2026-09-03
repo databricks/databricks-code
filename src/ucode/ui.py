@@ -341,18 +341,58 @@ def normalize_workspace_url(workspace: str) -> str:
     return workspace.rstrip("/")
 
 
+def _preselected_row(
+    choices: list[questionary.Choice | questionary.Separator],
+    profiles: list[tuple[str, str]],
+    preselect: tuple[str, str | None] | None,
+) -> questionary.Choice | None:
+    """The profile row the picker should start on, or ``None`` to start at the top.
+
+    Matches on workspace URL, preferring the row whose profile name also matches, so a machine
+    already configured for a workspace lands on it instead of scrolling a long profile list.
+    Returns the ``Choice`` itself, which is what questionary validates a default against.
+    """
+    if not preselect or not preselect[0]:
+        return None
+    try:
+        wanted = normalize_workspace_url(preselect[0])
+    except ValueError:
+        return None
+    rows = [(host, name) for host, name in profiles if _same_workspace(host, wanted)]
+    if not rows:
+        return None
+    row = next((candidate for candidate in rows if candidate[1] == preselect[1]), rows[0])
+    return next(
+        (
+            choice
+            for choice in choices
+            if isinstance(choice, questionary.Choice) and choice.value == row
+        ),
+        None,
+    )
+
+
+def _same_workspace(host: str, normalized: str) -> bool:
+    try:
+        return normalize_workspace_url(host) == normalized
+    except ValueError:
+        return False
+
+
 def prompt_for_workspace(
     description: str,
     profiles: list[tuple[str, str]] | None = None,
+    preselect: tuple[str, str | None] | None = None,
 ) -> tuple[str, str | None]:
     """Ask the user for a workspace URL, offering profiles as quick-select.
 
     `profiles` is a list of (host_url, profile_name) tuples. Caller fetches
     them — `ui.py` stays Databricks-agnostic. Duplicate hosts (multiple
     profiles pointing at the same workspace) are shown separately; the picker
-    returns the exact (host, profile_name) the user selected. Returns
-    ``(url, profile_name)``; profile_name is ``None`` when the user typed a
-    URL manually.
+    returns the exact (host, profile_name) the user selected. `preselect` is an
+    optional (workspace_url, profile_name) the picker starts on, again supplied
+    by the caller. Returns ``(url, profile_name)``; profile_name is ``None``
+    when the user typed a URL manually.
     """
     console.print()
 
@@ -392,7 +432,12 @@ def prompt_for_workspace(
             ]
         )
         choice = questionary.select(
-            "Select workspace:", choices=choices, style=style, pointer="›", qmark=""
+            "Select workspace:",
+            choices=choices,
+            style=style,
+            pointer="›",
+            qmark="",
+            default=_preselected_row(choices, profiles, preselect),
         ).ask()
         if isinstance(choice, tuple):
             host, profile_name = choice

@@ -14,9 +14,9 @@ inverting that module's maps rather than restated, so a new agent only has to be
 managed config carries agents/models/global policy/spend tiers only — MCP servers, skills, and
 tracing are personal configuration and are not part of this manifest.
 
-Local persistence is not duplicated here: the authored manifest is saved to and loaded from the one
-local file, ``~/.ucode/managed-state.json``, via :func:`ucode.managed_config.save_managed_state` and
-:func:`ucode.managed_config.load_managed_state` — the same file the launch path pulls into.
+Local persistence is not duplicated here: the authored draft is saved to and loaded from the one
+local file, ``~/.ucode/managed-state.json``, via :func:`ucode.managed_config.save_draft_config` and
+:func:`ucode.managed_config.load_draft_config` — a slot kept separate from the launch-fetched copy.
 
 The interactive wizard that calls these helpers, and the publish step, live in
 :mod:`ucode.managed_wizard`.

@@ -116,7 +116,7 @@ class TestClosedStdinAborts:
     """Ctrl-D must reach the CLI as an abort, not as a traceback."""
 
     def test_percentage_without_a_default_raises_keyboard_interrupt(self):
-        # `ucode setup`'s tier prompt passes no default. EOFError has no handler above this call —
+        # `ucode configure spend-tiers`' tier prompt passes no default. EOFError has no handler above this call —
         # the setup command catches only RuntimeError and KeyboardInterrupt — so a bare EOFError
         # reached the admin as a raw traceback.
         with patch("ucode.ui.console.input", side_effect=EOFError):
@@ -412,6 +412,41 @@ class TestPromptForWorkspace:
         # header separator and the trailing "Enter a different URL" entry.
         host_choices = [c for c in choices if isinstance(getattr(c, "value", None), tuple)]
         assert [c.value for c in host_choices] == profiles
+
+    def test_preselects_the_row_matching_workspace_and_profile(self, monkeypatch):
+        profiles = [
+            ("https://a.cloud.databricks.com", "alpha"),
+            ("https://b.cloud.databricks.com", "beta"),
+        ]
+        captured = self._capture_select(monkeypatch, answer=profiles[1])
+        prompt_for_workspace(
+            "setup", profiles, preselect=("https://b.cloud.databricks.com", "beta")
+        )
+
+        default = captured["kwargs"]["default"]
+        assert default.value == profiles[1]
+        assert default in captured["choices"]
+
+    def test_preselect_matches_on_workspace_when_the_profile_differs(self, monkeypatch):
+        profiles = [
+            ("https://a.cloud.databricks.com", "alpha"),
+            ("https://b.cloud.databricks.com/", "beta"),
+            ("https://b.cloud.databricks.com", "beta-too"),
+        ]
+        captured = self._capture_select(monkeypatch, answer=profiles[1])
+        prompt_for_workspace("setup", profiles, preselect=("https://b.cloud.databricks.com", None))
+
+        assert captured["kwargs"]["default"].value == profiles[1]
+
+    def test_no_preselect_or_an_unknown_workspace_starts_at_the_top(self, monkeypatch):
+        profiles = [("https://a.cloud.databricks.com", "alpha")]
+        captured = self._capture_select(monkeypatch, answer=profiles[0])
+        prompt_for_workspace("setup", profiles)
+        assert captured["kwargs"]["default"] is None
+
+        captured = self._capture_select(monkeypatch, answer=profiles[0])
+        prompt_for_workspace("setup", profiles, preselect=("https://gone.databricks.com", "p"))
+        assert captured["kwargs"]["default"] is None
 
     def test_returns_normalized_url_with_profile(self, monkeypatch):
         # Picker handed back a URL with a trailing slash — normalize_workspace_url

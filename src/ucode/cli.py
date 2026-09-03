@@ -68,8 +68,10 @@ from ucode.managed_budget import (
 )
 from ucode.managed_config import (
     MANAGED_CONFIG_ENV_VAR,
+    fetch_published_config,
     get_model_recommendation,
-    load_managed_state,
+    load_draft_config,
+    load_published_config,
     managed_agent_config_enabled,
     refresh_managed_config,
 )
@@ -80,17 +82,18 @@ from ucode.managed_resolve import (
     managed_launch_model,
     managed_provider_family_models,
     managed_provider_service,
+    managed_state_overrides,
     managed_supplies_models,
     managed_unservable_models,
     recommended_agent,
     resolve_state,
 )
 from ucode.managed_wizard import (
+    author_managed_config,
+    configure_from_file,
+    configure_spend_tiers_command,
+    print_managed_next_steps,
     publish_command,
-    setup_budget_policy_command,
-    setup_command,
-    setup_help_command,
-    show_command,
 )
 from ucode.mcp import (
     MCP_CLIENTS,
@@ -133,6 +136,7 @@ from ucode.ui import (
     prompt_for_tools,
     prompt_for_workspace,
     prompt_yes_no,
+    prompt_yes_no_default,
     set_verbosity,
     spinner,
     status_badge,
@@ -234,115 +238,241 @@ def _print_managed_summary_abridged(managed: dict, state: dict, tool: str | None
     )
 
 
-def _confirm_managed_config_applied(managed: dict, workspace: str) -> None:
-    print_success("A managed config is published for your workspace — you're all set.")
-    _print_managed_summary(managed, {"workspace": workspace}, tool=None)
-    print_note("Run `ucode` to launch with your managed settings.")
+def _managed_drift_rows(managed: dict, state: dict, tool: str) -> list[str]:
+    """The human-readable settings the managed config would change for ``tool`` on this machine.
+
+    Compares the admin's config against the developer's current local state for the settings a launch
+    actually overlays (:func:`managed_state_overrides` plus the provider service), and returns one
+    ``old -> new`` line per real difference. Empty when nothing changes.
+    """
+    rows: list[str] = []
+    current_provider = get_provider_service(state, tool)
+    managed_provider = managed_provider_service(managed, tool)
+    if managed_provider and managed_provider != current_provider:
+        was = current_provider or "your discovered models"
+        rows.append(f"provider {was} -> {managed_provider}")
+    managed_model = managed_default_model(managed, tool)
+    if managed_model and not managed_provider:
+        overrides = managed_state_overrides(managed, tool)
+        if overrides:
+            rows.append(f"default model -> {managed_model}")
+    return rows
 
 
-def _resolve_workspace_then_maybe_reject(
+def _render_managed_drift(managed: dict, state: dict, tools: list[str]) -> None:
+    """Print, without prompting, what applying the managed config changes on this machine."""
+    lines: list[str] = []
+    for tool in tools:
+        rows = _managed_drift_rows(managed, state, tool)
+        display = TOOL_SPECS[tool]["display"]
+        if rows:
+            lines.append(f"[bold]{display}[/bold]: {'; '.join(rows)}")
+        else:
+            lines.append(f"[bold]{display}[/bold]: [dim]already matches[/dim]")
+    if lines:
+        console.print(Panel("\n".join(lines), title="Applying managed config", style="green"))
+
+
+def apply_managed_config_locally(managed: dict, workspace: str, profile: str | None) -> bool:
+    """Configure this machine's agents from the workspace's managed config, without prompting.
+
+    The launch path overlays the managed config on every ``ucode`` run (``resolve_state`` then
+    ``configure_tool``); this does the same at configure time so a developer is set up immediately.
+    Per enabled tool it discovers the workspace's models, overlays the admin's config, and writes the
+    agent's settings — the managed overlay is transient in ``state.json`` (``save_state`` restores the
+    developer's own values), exactly as at launch. Best-effort per tool: one agent's failure warns and
+    the rest still configure.
+
+    Returns whether the managed config governs this machine afterwards: false only when every enabled
+    agent failed, so a caller does not report completion right after warning about each failure. A
+    config that enables no agent ucode supports leaves nothing to apply and counts as applied.
+    """
+    tools = [t for t in managed_enabled_tools(managed) if t in TOOL_SPECS]
+    if not tools:
+        return True
+    configure_shared_state(workspace, profile=profile, tools=tools, force_login=False)
+    _render_managed_drift(managed, load_state(), tools)
+    applied = 0
+    for tool in tools:
+        display = TOOL_SPECS[tool]["display"]
+        try:
+            overlaid = resolve_state(managed, load_state(), tool)
+            provider = managed_provider_service(managed, tool)
+            if provider:
+                provider_models, error, relayed = resolve_provider_models(tool, overlaid, provider)
+                if error:
+                    print_warning(f"Could not apply the managed config for {display}: {error}")
+                    continue
+                if tool == "claude":
+                    authored = managed_provider_family_models(managed)
+                    if authored:
+                        provider_models = authored
+                result = configure_tool(
+                    tool,
+                    overlaid,
+                    None,
+                    provider=provider,
+                    provider_models=provider_models,
+                    relayed=relayed,
+                )
+            else:
+                overlaid, resolved = resolve_launch_model(
+                    tool, overlaid, managed_default_model(managed, tool)
+                )
+                result = configure_tool(tool, overlaid, resolved)
+        except RuntimeError as exc:
+            print_warning(f"Could not apply the managed config for {display}: {exc}")
+            continue
+        save_state(result)
+        applied += 1
+    return applied > 0
+
+
+def _report_managed_apply(applied: bool, subject: str, *, final: bool = True) -> None:
+    """Report the outcome of :func:`apply_managed_config_locally` without over-claiming.
+
+    ``final`` is false when an admin authoring offer follows, where "Configuration complete" reads
+    wrong ahead of more configuration.
+    """
+    if not applied:
+        print_warning(f"Could not apply {subject} to this machine; see the warnings above.")
+        return
+    if final:
+        print_success(f"Configuration complete — this machine now uses {subject}.")
+    else:
+        print_success(f"This machine now uses {subject}.")
+
+
+def _prompt_admin_update_workspace() -> bool:
+    """Ask an admin whether to (re)author the workspace's managed config. Never auto-publishes.
+
+    Defaults to no on an empty answer or closed stdin: the machine is already configured by the time
+    this is asked, so a scripted run must finish cleanly rather than abort, and declining is the safe
+    default when the "yes" branch opens an interactive authoring session.
+    """
+    return prompt_yes_no_default(
+        "Update this workspace's managed configuration? (admins only)", default=False
+    )
+
+
+def _run_managed_configure_flow(
     workspace_entries: list[tuple[str, str | None]] | None,
+    *,
+    allow_interactive_authoring: bool = True,
 ) -> list[tuple[str, str | None]] | None:
-    """Resolve the workspace ``ucode configure`` targets, then branch on role + managed config.
+    """The managed-config-aware core of ``ucode configure``: resolve workspace, apply, offer authoring.
 
-    Enablement is both client- and server-side: the client-side ``ENABLE_MANAGED_AGENT_CONFIG`` env
-    var must be set for ``ucode`` to run any of this (the opt-in bug-bash gate below), and the
-    workspace's gateway must not report the feature disabled (``FEATURE_DISABLED``) — a config only
-    exists to adopt when the server side is on too.
+    Gated on the client-side ``ENABLE_MANAGED_AGENT_CONFIG`` opt-in; without it this returns
+    ``workspace_entries`` unchanged and the caller runs the plain local configure. When enabled, it
+    resolves and authenticates the target workspace, determines admin access **once**, and fetches the
+    published config with a clean feature-availability signal, then branches:
 
-    When managed coding-agent configs are enabled, ``ucode configure`` must still let a developer
-    switch workspaces — so resolve the target workspace up front (prompting when the interactive
-    path gave no ``--workspaces``/``--profiles``) and make it current *before* deciding what to do.
-    Then, gated by the client-side ``ENABLE_MANAGED_AGENT_CONFIG``, the four role/config paths are:
+    * **Backend feature unavailable** → applies the config last saved for this workspace when there
+      is one, as the launch path does, and exits; otherwise returns the entries so local
+      configuration still runs. Neither branch offers authoring or advises publishing.
+    * **A published config exists** → applies it to this machine and shows the drift inline (no
+      per-change approval), reports the outcome, and exits. An admin is then asked whether to update
+      the workspace config; yes runs the guided authoring, which saves a draft, applies that draft
+      here, and advises ``ucode publish`` — so completion is not claimed ahead of that offer.
+    * **No published config (feature on)** → a non-admin falls through to local configure (returns
+      entries). An admin runs the guided authoring, unless explicit local-configure options were
+      supplied; those options are honored by falling through to local configure rather than silently
+      ignoring them.
 
-    * **No managed config** → a workspace admin is dropped straight into the ``ucode setup``
-      authoring flow (``configure`` is replacing ``setup``) and the command exits with its code; a
-      non-admin's own ``configure`` proceeds, with the resolved entries returned so the caller
-      reuses them instead of re-prompting.
-    * **Managed config, non-admin** (or admin status unverifiable) → they're already set: the
-      launch path applies the config on every ``ucode`` run, so just show it and point them there.
-    * **Managed config, admin** → drop into the setup flow, whose existing-config menu lets them
-      adopt it (the same "you're all set" confirmation), re-author it, or delete it; the command exits.
+    ``allow_interactive_authoring`` is false when the caller supplied options that the interactive
+    managed-authoring flow cannot honor (for example ``--agents`` or ``--skip-validate``). It keeps
+    those options effective by returning to the ordinary local-configure flow.
 
-    Without the client-side flag set it returns ``workspace_entries`` unchanged and prompts nothing.
+    Returns the resolved entries when the caller should continue into local configure, or raises
+    ``typer.Exit`` when the managed flow has fully handled the run.
     """
     if not managed_agent_config_enabled():
+        return workspace_entries
+    # A managed config is per-workspace and this flow resolves exactly one, so several explicit
+    # workspaces go to local configure rather than silently configuring only the first.
+    if workspace_entries is not None and len(workspace_entries) > 1:
         return workspace_entries
     entries = workspace_entries or [_prompt_for_configuration(None)]
     workspace, profile = entries[0]
     set_current_workspace(workspace)
     ensure_databricks_auth(workspace, profile)
-    # Fetch, don't just read the local cache: on a fresh machine (or right after a reinstall) the
-    # cache is empty until the first launch, so a cache read would miss a config the workspace does
-    # publish and wrongly fall through to the local configure flow. `refresh_managed_config` reaches
-    # the workspace and never raises — it falls back to the persisted copy, then None, on failure.
-    with spinner("Loading..."):
-        managed, coding_agent_config_feature_disabled = refresh_managed_config(
-            {"workspace": workspace, "profile": profile}
-        )
-    if not managed:
-        if not coding_agent_config_feature_disabled:
-            _maybe_run_admin_setup(workspace, profile)
-        return entries
-    is_admin: bool | None = None
     try:
         token = get_databricks_token(workspace, profile)
     except RuntimeError:
-        token = None
-    if token is not None:
+        return entries
+    with spinner("Loading your workspace's managed config..."):
+        published, reason, feature_disabled = fetch_published_config(workspace, token)
+    if reason is not None:
+        published = load_published_config(workspace)
+        summary = " ".join(reason.split())
+        summary = summary if len(summary) <= 160 else summary[:157] + "..."
+        if not published:
+            if not feature_disabled:
+                print_warning(
+                    f"Could not read your workspace's managed config ({summary}); configuring your "
+                    "own settings for now. Re-run `ucode configure` once the workspace is reachable."
+                )
+            return entries
+        if feature_disabled:
+            print_note("Applying the managed config last saved for this workspace.")
+        else:
+            print_warning(
+                f"Could not read your workspace's managed config ({summary}); applying the last one "
+                "saved for this workspace."
+            )
+    # Skipped when the feature is off: nothing can be authored or published, so admin status cannot
+    # change the outcome.
+    is_admin = False
+    if not feature_disabled:
         with spinner("Checking your workspace permissions..."):
             is_admin = is_workspace_admin(workspace, token)
-    if is_admin:
-        _run_setup_and_exit(workspace, profile, token)
-    _confirm_managed_config_applied(managed, workspace)
+
+    if published:
+        applied = apply_managed_config_locally(published, workspace, profile)
+        offer_authoring = bool(is_admin) and allow_interactive_authoring
+        _report_managed_apply(applied, "your workspace's managed config", final=not offer_authoring)
+        if is_admin:
+            if allow_interactive_authoring:
+                if _prompt_admin_update_workspace():
+                    _author_and_advise(workspace, profile, token, published)
+            else:
+                print_note(
+                    "To update the workspace configuration, re-run `ucode configure` without "
+                    "local configuration options."
+                )
+        raise typer.Exit(0)
+
+    if not is_admin:
+        return entries
+    if not allow_interactive_authoring:
+        print_note(
+            "Using the requested local configuration options. To author a workspace configuration, "
+            "re-run `ucode configure` without them."
+        )
+        return entries
+    _author_and_advise(workspace, profile, token, None)
     raise typer.Exit(0)
 
 
-def _maybe_run_admin_setup(workspace: str, profile: str | None) -> None:
-    """When a workspace admin runs ``configure`` on a workspace with no managed config, drop straight
-    into the ``ucode setup`` authoring flow — ``configure`` is replacing ``setup``, so the admin
-    never has to invoke it themselves. On completion, exit with setup's own status code.
+def _author_and_advise(
+    workspace: str, profile: str | None, token: str, published: dict | None
+) -> None:
+    """Run the guided managed-config authoring (draft only), apply it locally, and exit.
 
-    A plain developer (and any caller whose admin status can't be verified) instead falls through to
-    the normal local-configure flow — this function just returns for them. The admin check is
-    best-effort: any failure to determine admin status (auth or SCIM unreachable) silently skips
-    setup and returns, so a developer is never blocked behind an authoring flow they can't complete.
+    Shared by both admin branches. Authoring saves a draft (it does not advise publishing itself);
+    the draft is then applied to this machine, so a `ucode configure` run always ends with the admin
+    on the config they just authored, and that outcome is reported here — *then* the publish advice is
+    printed, so completion always precedes it. Applying is a local preview, not a promotion: launches
+    overlay the *published* config, so the next `ucode <agent>` puts this machine back on the
+    published one until `ucode publish` promotes the draft. Never publishes.
     """
     try:
-        token = get_databricks_token(workspace, profile)
-    except RuntimeError:
-        return
-    with spinner("Checking your workspace permissions..."):
-        is_admin = is_workspace_admin(workspace, token)
-    if not is_admin:
-        return
-    print_note(
-        "You're a workspace admin, and no managed coding agent config exists for this workspace "
-        "yet — let's set one up. Choose the agents and models once and every developer "
-        "inherits them when they run `ucode`."
-    )
-    _run_setup_and_exit(workspace, profile, token)
-
-
-def _run_setup_and_exit(workspace: str, profile: str | None, token: str | None = None) -> None:
-    """Launch the ``ucode setup`` authoring flow in place, then exit with its status code.
-
-    Reuses the workspace/profile ``configure`` already resolved and authenticated against so setup
-    doesn't prompt for them again, and hands setup the same ``token`` the admin check already used
-    so setup's admin gate can't disagree with the routing decision (e.g. right after a credential
-    switch, where a second token fetch could resolve a different identity). ``setup_command`` handles
-    an already-existing config (offering to adopt or edit it). Its actionable failures and aborts are
-    mapped to clean exit codes rather than bubbling up as unhandled errors.
-    """
-    try:
-        # Brand the flow as "Configure Unity Gateway": it was reached through `ucode configure`,
-        # not a bare `ucode setup`, so its section headers use the product name rather than the
-        # bare command.
-        code = setup_command(
+        code = author_managed_config(
             workspace=workspace,
             profile=profile,
-            command_label="Configure Unity Gateway",
             token=token,
+            published=published,
+            command_label="ucode configure",
         )
     except RuntimeError as exc:
         print_err(str(exc))
@@ -350,6 +480,12 @@ def _run_setup_and_exit(workspace: str, profile: str | None, token: str | None =
     except KeyboardInterrupt:
         print_err("Interrupted.")
         raise typer.Exit(130) from None
+    if code == 0:
+        draft = load_draft_config(workspace)
+        if draft:
+            applied = apply_managed_config_locally(draft, workspace, profile)
+            _report_managed_apply(applied, "your authored config")
+        print_managed_next_steps(draft or {})
     raise typer.Exit(code or 0)
 
 
@@ -382,7 +518,10 @@ def _prompt_for_configuration(tool: str | None = None) -> tuple[str, str | None]
         desc = f"Configure {TOOL_SPECS[tool]['display']} to use your Databricks endpoint."
     with spinner("Loading Databricks workspaces and profiles..."):
         profiles = get_databricks_profiles()
-    return prompt_for_workspace(desc, profiles)
+    state = load_state()
+    workspace = state.get("workspace")
+    preselect = (workspace, state.get("profile")) if workspace else None
+    return prompt_for_workspace(desc, profiles, preselect=preselect)
 
 
 def _parse_agents_option(agents: str) -> list[str]:
@@ -993,7 +1132,7 @@ def status() -> int:
     # the local cache (no network): status is a quick, offline-safe glance, and the cache is what the
     # last launch persisted for this workspace.
     if workspace and managed_agent_config_enabled():
-        managed = load_managed_state(workspace)
+        managed = load_published_config(workspace)
         if managed:
             _print_managed_summary(managed, state, None)
 
@@ -1138,12 +1277,6 @@ configure_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(configure_app, name="configure", help="Configure workspace and tool settings.")
 mcp_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(mcp_app, name="mcp", help="Register Databricks MCP servers on your coding tools.")
-setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
-app.add_typer(
-    setup_app,
-    name="setup",
-    help="Author the workspace's managed coding config (admins only). See `ucode setup help`.",
-)
 
 
 def _version_callback(value: bool) -> None:
@@ -2166,9 +2299,9 @@ def _launch_managed_default(
     if not current:
         raise RuntimeError("No workspace configured. Run `ucode configure` first.")
     apply_pat_environment(state)
-    # --dry-run avoids the fetch but still applies the last saved config.
+    coding_agent_config_feature_disabled = False
     if dry_run:
-        managed = load_managed_state(current)
+        managed = load_published_config(current)
     else:
         with spinner("Loading..."):
             managed, coding_agent_config_feature_disabled = refresh_managed_config(state)
@@ -2210,10 +2343,11 @@ def _print_no_managed_config_guidance(workspace: str, profile: str | None) -> No
     with spinner("Checking your workspace permissions..."):
         is_admin = is_workspace_admin(workspace, token)
     if is_admin is False:
-        print_note("Ask a workspace admin to set one up with `ucode setup`.")
+        print_note("Ask a workspace admin to set one up with `ucode configure`.")
     else:
-        # None means the admin check itself failed; point at setup rather than a dead end.
-        print_note("Run `ucode setup` to configure one for your workspace, then `ucode publish`.")
+        print_note(
+            "Run `ucode configure` to configure one for your workspace, then `ucode publish`."
+        )
 
 
 @app.command("codex", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -2538,6 +2672,15 @@ def configure(
         ),
     ] = False,
     skip_managed_config: SkipManagedConfigOption = False,
+    from_file: Annotated[
+        str | None,
+        typer.Option(
+            "--from-file",
+            help="Admins only: load a hand-written managed config (JSON, in ucode's manifest shape) "
+            "as the local draft instead of running the interactive flow. Validated before it is "
+            "saved; nothing is published. Publish it with `ucode publish`.",
+        ),
+    ] = None,
     verbose: Annotated[
         str,
         typer.Option(
@@ -2556,6 +2699,45 @@ def configure(
         raise typer.Exit(2)
     set_dry_run(dry_run)
     set_verbosity(verbose)
+    if from_file is not None:
+        ignored = [
+            flag
+            for flag, given in (
+                ("--agent", agent is not None),
+                ("--agents", agents is not None),
+                ("--workspaces", workspaces is not None),
+                ("--profiles", profiles is not None),
+                ("--use-pat", use_pat),
+                ("--skip-validate", skip_validate),
+                ("--skip-unavailable", skip_unavailable),
+                ("--enable-fable/--disable-fable", enable_fable is not None),
+                (
+                    "--enable-databricks-ai-tools/--disable-databricks-ai-tools",
+                    enable_databricks_ai_tools is not None,
+                ),
+                ("--tracing", tracing),
+                ("--skip-upgrade", skip_upgrade),
+            )
+            if given
+        ]
+        if ignored:
+            print_err(
+                f"--from-file can't be combined with {', '.join(ignored)}. It saves a managed draft "
+                "for the current workspace and configures no agent. Run `ucode configure "
+                f"--from-file {from_file}` on its own, then re-run `ucode configure` with those "
+                "options."
+            )
+            raise typer.Exit(2)
+        try:
+            install_databricks_cli()
+            code = configure_from_file(from_file)
+        except RuntimeError as exc:
+            print_err(str(exc))
+            raise typer.Exit(1) from None
+        except KeyboardInterrupt:
+            print_err("Interrupted.")
+            raise typer.Exit(130) from None
+        raise typer.Exit(code or 0)
     prompt_optional_updates = not skip_upgrade
     try:
         install_databricks_cli()
@@ -2580,14 +2762,24 @@ def configure(
         workspace_entries = _parse_workspaces_option(workspaces) if workspaces is not None else None
         if profiles is not None:
             workspace_entries = _parse_profiles_option(profiles)
-        # Whether the user named the workspace(s) via flags, captured before the resolver below
-        # may fill `workspace_entries` from a prompt — this, not the resolved value, decides
-        # whether the optional-setup step is offered.
         flag_driven_workspace = workspace_entries is not None
-        # Under a managed config, resolve (prompting when interactive) and set the target workspace
-        # first, so the developer can switch workspaces; only then short-circuit if that workspace
-        # is already managed. Returns the resolved entries so the flow below doesn't prompt again.
-        workspace_entries = _resolve_workspace_then_maybe_reject(workspace_entries)
+        allow_interactive_managed_authoring = not any(
+            (
+                agent is not None,
+                agents is not None,
+                use_pat,
+                skip_validate,
+                skip_unavailable,
+                enable_fable is not None,
+                enable_databricks_ai_tools is not None,
+                tracing,
+                skip_upgrade,
+            )
+        )
+        workspace_entries = _run_managed_configure_flow(
+            workspace_entries,
+            allow_interactive_authoring=allow_interactive_managed_authoring,
+        )
         # Only forward the opt-in flags when set so existing call expectations
         # (and defaults) stay unchanged for the common interactive path.
         skip_kwargs: dict = {}
@@ -2607,7 +2799,6 @@ def configure(
             agent = "claude"
         if enable_databricks_ai_tools is not None:
             skip_kwargs["databricks_ai_tools_enabled"] = enable_databricks_ai_tools
-        combined_optional_setup = False
         if agent is not None:
             tool = normalize_tool(agent)
             install_tool_binary(
@@ -2840,77 +3031,25 @@ def configure_tracing(
         raise typer.Exit(130) from None
 
 
-@setup_app.callback(invoke_without_command=True)
-def setup(
-    ctx: typer.Context,
-    from_file: Annotated[
-        str | None,
-        typer.Option(
-            "--from-file",
-            help="Skip the interactive flow and load a hand-written managed config (JSON, in "
-            "ucode's manifest shape) instead. Validated before it is saved.",
-        ),
-    ] = None,
-) -> None:
-    """Choose the agents and models for your workspace's managed config (admins only).
+@configure_app.command("spend-tiers")
+def configure_spend_tiers() -> None:
+    """Route developers to cheaper agents as the workspace spends its budget (admins only).
 
-    The tiered spend policy has its own command — see `ucode setup help`.
+    The one managed-config section command: it edits the tiered spend policy in the local managed
+    draft, then advise `ucode publish` to apply it. Strictly admin-only — a non-admin gets an
+    actionable error and a non-zero exit.
     """
-    if ctx.invoked_subcommand is not None:
-        return
     # `typer.Exit` subclasses RuntimeError, so it must be raised outside the try — inside, the
     # `except RuntimeError` below would swallow it and report the exit code as an error message.
     try:
         install_databricks_cli()
-        code = setup_command(from_file=from_file)
+        code = configure_spend_tiers_command()
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
     except KeyboardInterrupt:
         print_err("Interrupted.")
         raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("spend-tiers")
-def setup_budget_policy_cmd() -> None:
-    """Route developers to cheaper agents as the workspace spends its budget (admins only)."""
-    try:
-        install_databricks_cli()
-        code = setup_budget_policy_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("help")
-def setup_help_cmd() -> None:
-    """Walk through the managed-config setup: every command, in order, and what's already done."""
-    # No auth and no CLI install: this reads the local draft only, so it works before `ucode
-    # configure` and on a machine without the Databricks CLI.
-    try:
-        code = setup_help_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("show")
-def setup_show_cmd() -> None:
-    """Print the authored managed config and the payload `ucode publish` would publish."""
-    try:
-        code = show_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
     if code:
         raise typer.Exit(code)
 
@@ -2934,11 +3073,9 @@ def publish_cmd(
     """Publish this workspace's managed coding config (workspace admins only).
 
     Always validates the manifest before publishing (and shows what would change, then confirms), so
-    there is no separate dry-run: `ucode setup` only ever writes a valid manifest, and a
+    there is no separate dry-run: `ucode configure` only ever writes a valid draft, and a
     hand-editing admin sees any error here before anything reaches the workspace.
     """
-    # See the `setup` callback: `typer.Exit` subclasses RuntimeError, so it must be raised after
-    # the try block or the handler below would report a successful exit as an error.
     try:
         install_databricks_cli()
         code = publish_command(file_path=file_path, yes=yes)

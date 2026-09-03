@@ -431,8 +431,6 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
         return None, f"network error: {exc.reason}"
 
 
-# Workspace group whose members are workspace admins. `ucode setup` / `ucode publish` are restricted
-# to this group because the coding-agent-config CRUD API enforces the same check server-side.
 WORKSPACE_ADMIN_GROUP = "admins"
 
 
@@ -447,10 +445,11 @@ def is_workspace_admin(workspace: str, token: str) -> bool | None:
     """Whether the caller is a workspace admin, via their SCIM `Me` group membership.
 
     Returns True/False, or None when the check itself could not be made (SCIM unreachable or a
-    malformed response). Callers should treat None as "unknown" and proceed optimistically rather
-    than blocking: the API enforces the same check server-side, so a false negative here would
-    needlessly stop a legitimate admin, while a false positive just surfaces the server's
-    PERMISSION_DENIED later.
+    malformed response). How to treat None is the caller's call, and both conventions are in use:
+    ``ucode publish`` proceeds optimistically, since the API enforces the same check server-side and a
+    false negative would needlessly stop a legitimate admin while a false positive just surfaces the
+    server's PERMISSION_DENIED later; ``ucode configure`` and the admin-only sections decline instead,
+    since opening an authoring session that cannot end in a publish is worse than asking for a retry.
     """
     payload = _scim_me(workspace, token)
     if payload is None:
@@ -1594,13 +1593,13 @@ def _get_model_services_page(
 # Successful model-service listings for this process, keyed by workspace. The listing is a paginated
 # walk of the whole metastore catalog, and several callers want different views of the same result
 # (`discover_model_services` buckets it per family, `discover_claude_models_unbucketed` keeps the raw
-# Claude ids), so a single `ucode setup` run would otherwise page it twice. Cached per process, not
+# Claude ids), so a single `ucode configure` run would otherwise page it twice. Cached per process, not
 # persisted: a long-lived process is not a thing here, and a new model appearing mid-command is not
 # worth a second walk. Failures are never cached, so a transient error still retries.
 _MODEL_SERVICES_CACHE: dict[str, list[str]] = {}
 
 # Same idea for the Model Provider Service listing (a different endpoint). It is workspace-wide and
-# filtered per agent afterwards, so `ucode setup` would otherwise re-list it once per MPS-capable
+# filtered per agent afterwards, so `ucode configure` would otherwise re-list it once per MPS-capable
 # agent. Keyed by ``(workspace, parent)`` — a schema-scoped listing is a different result set than
 # the metastore-wide one, so they must not share an entry.
 _MODEL_PROVIDER_SERVICES_CACHE: dict[tuple[str, str], list[dict]] = {}
@@ -2145,7 +2144,7 @@ def list_model_provider_services(
 
     A successful result is memoized per workspace for the life of the process, like the
     model-services listing: the listing is workspace-wide (filtered per agent afterwards by
-    :func:`service_usable_for_tool`), so without the memo `ucode setup` re-lists it once per
+    :func:`service_usable_for_tool`), so without the memo `ucode configure` re-lists it once per
     MPS-capable agent. Pass ``use_cache=False`` to force a fresh call.
     """
     # Keyed by workspace *and* parent: a `parent`-scoped listing holds only that schema's services,

@@ -2741,7 +2741,7 @@ class TestClassifyModelFamily:
 
 class TestModelServicesCache:
     """A successful listing is memoized per workspace: several callers want different views of the
-    same paginated walk (bucketed families vs the raw Claude ids), so one `ucode setup` run would
+    same paginated walk (bucketed families vs the raw Claude ids), so one `ucode configure` run would
     otherwise page the whole catalog twice."""
 
     @staticmethod
@@ -2767,7 +2767,7 @@ class TestModelServicesCache:
         assert calls["n"] == 1
 
     def test_the_two_discovery_helpers_share_one_walk(self, monkeypatch):
-        # The duplicate spinner in `ucode setup`: `discover_model_services` and
+        # The duplicate spinner in `ucode configure`: `discover_model_services` and
         # `discover_claude_models_unbucketed` both page the same endpoint.
         calls: dict = {}
         db_mod.clear_model_services_cache()
@@ -2818,7 +2818,7 @@ class TestModelServicesCache:
 
 class TestModelProviderServicesCache:
     """The MPS listing is workspace-wide and filtered per agent afterwards, so one call serves every
-    agent — `ucode setup` used to re-list it once per MPS-capable agent."""
+    agent — `ucode configure` used to re-list it once per MPS-capable agent."""
 
     @staticmethod
     def _counting_listing(calls: dict):

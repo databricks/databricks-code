@@ -50,6 +50,12 @@ class TestLoadPublishPayload:
         (tmp_path / "config.json").write_text(json.dumps(_payload()), encoding="utf-8")
         assert load_publish_payload("~/config.json")["workspace"] == WORKSPACE
 
+    def test_no_draft_error_names_no_specific_command(self):
+        """The message is shared with `ucode export`, so it must not tell a publisher to export."""
+        with pytest.raises(RuntimeError, match="No managed config draft found") as excinfo:
+            load_publish_payload(None)
+        assert "ucode export" not in str(excinfo.value)
+
     def test_missing_file_is_actionable(self, tmp_path):
         with pytest.raises(RuntimeError, match="No config file"):
             load_publish_payload(str(tmp_path / "absent.json"))

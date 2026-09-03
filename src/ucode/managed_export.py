@@ -1,14 +1,15 @@
 """`ucode export`: serialize the workspace's managed coding-agent config to portable JSON.
 
-Reads the local managed config (the one file :mod:`ucode.managed_config` owns, authored by
-``ucode setup`` and refreshed by a launch), validates and serializes it through the same path
-``ucode publish`` uses, and writes the external proto-JSON ``CodingAgentConfig`` — prefixed with the
-source ``workspace`` and a ``spec_version`` envelope, the format ``ucode publish -f <path>`` consumes
-— to stdout or a file.
+Reads the local managed config **draft** (the ``draft`` slot of the one file
+:mod:`ucode.managed_config` owns, authored by ``ucode configure``), validates and serializes it
+through the same path ``ucode publish`` uses, and writes the external proto-JSON ``CodingAgentConfig``
+— prefixed with the source ``workspace`` and a ``spec_version`` envelope, the format ``ucode publish
+-f <path>`` consumes — to stdout or a file.
 
-Deliberately read-only and offline: no auth, no admin check, no discovery, no publish, and no write
-except the explicitly requested ``--file`` output. That makes it role-agnostic (any developer can
-run it) and keeps the machine-readable stream on stdout uncontaminated by Rich output.
+Draft-only: the launch-fetched published snapshot is deliberately not an export source (a cached
+publication is not authored work). Read-only and offline otherwise: no auth, no admin check, no
+discovery, no publish, and no write except the explicitly requested ``--file`` output, keeping the
+machine-readable stream on stdout uncontaminated by Rich output.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ucode.managed_config import load_managed_state, managed_state_workspace
+from ucode.managed_config import load_draft_config, managed_state_workspace
 from ucode.managed_setup import serialize_managed_config, validate_manifest
 from ucode.state import load_state
 
@@ -37,16 +38,17 @@ def build_export_payload() -> dict:
     actionable message when no config is authored locally or the config fails structural validation.
     """
     workspace = load_state().get("workspace") or managed_state_workspace()
-    manifest = load_managed_state(workspace)
+    manifest = load_draft_config(workspace)
     if not manifest:
         raise RuntimeError(
-            "No managed coding-agent config found locally. Run `ucode setup` to author one, or run "
-            "`ucode` against a workspace that publishes one, then re-run `ucode export`."
+            "No managed config draft found locally. Only the draft you author with `ucode configure` "
+            "(admins only) can be exported or published — a fetched published config is not an "
+            "authoring source. Run `ucode configure` to author one, then re-run this command."
         )
     errors = validate_manifest(manifest, None)
     if errors:
         detail = "\n".join(f"  - {error}" for error in errors)
-        raise RuntimeError(f"The managed config is not valid, so it was not exported:\n{detail}")
+        raise RuntimeError(f"The managed config draft is not valid:\n{detail}")
     config = serialize_managed_config(manifest)
     for field in _SERVER_OWNED_FIELDS:
         config.pop(field, None)

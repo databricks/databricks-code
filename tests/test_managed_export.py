@@ -53,7 +53,7 @@ def _with_manifest(manifest: dict | None, workspace: str | None = WORKSPACE):
     """Patch the module's local reads so a test controls the source config without disk or network."""
     with (
         patch.object(export_mod, "load_state", return_value={"workspace": workspace}),
-        patch.object(export_mod, "load_managed_state", return_value=manifest),
+        patch.object(export_mod, "load_draft_config", return_value=manifest),
     ):
         yield
 
@@ -90,9 +90,9 @@ class TestBuildPayload:
     def test_no_config_is_actionable(self):
         with (
             patch.object(export_mod, "load_state", return_value={}),
-            patch.object(export_mod, "load_managed_state", return_value=None),
+            patch.object(export_mod, "load_draft_config", return_value=None),
         ):
-            with pytest.raises(RuntimeError, match="No managed coding-agent config found"):
+            with pytest.raises(RuntimeError, match="No managed config draft found"):
                 export_mod.build_export_payload()
 
     def test_invalid_config_is_rejected(self):
@@ -102,7 +102,7 @@ class TestBuildPayload:
                 export_mod.build_export_payload()
 
     def test_falls_back_to_managed_state_workspace(self):
-        managed_config_mod.save_managed_state(WORKSPACE, FULL_MANIFEST)
+        managed_config_mod.save_draft_config(WORKSPACE, FULL_MANIFEST)
         with patch.object(export_mod, "load_state", return_value={}):
             payload = export_mod.build_export_payload()
         assert payload["default_agent"] == "CODING_AGENT_CLAUDE_CODE"
@@ -242,7 +242,7 @@ class TestExportCLI:
     def test_no_config_exits_nonzero(self):
         with (
             patch.object(export_mod, "load_state", return_value={}),
-            patch.object(export_mod, "load_managed_state", return_value=None),
+            patch.object(export_mod, "load_draft_config", return_value=None),
         ):
             result = runner.invoke(app, ["export"])
         assert result.exit_code == 1
