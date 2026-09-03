@@ -385,12 +385,12 @@ def launch_claude(
 
     model_setting = _ClaudeModelSettingGuard(user_settings_path)
 
-    def route_prompt(prompt: str) -> tuple[str, str, str]:
+    def route_prompt(prompt: str) -> claude_pty.FirstPromptRoute:
         decision = _route_claude_prompt(state, token, prompt, model_ids)
-        return (
-            model_name(decision.model),
-            catalog.model_id_to_display_name.get(decision.model, decision.model),
-            decision.rationale,
+        return claude_pty.FirstPromptRoute(
+            model=model_name(decision.model),
+            display_model=catalog.model_id_to_display_name.get(decision.model, decision.model),
+            rationale=decision.rationale,
         )
 
     print_note(

@@ -66,7 +66,9 @@ class TestFirstPromptHook:
         stop = threading.Event()
         claude_pty.serve_first_prompt_socket(
             socket_path,
-            lambda _prompt: ("sonnet", "Selected for a narrow task."),
+            lambda _prompt: claude_pty.FirstPromptRoute(
+                model="sonnet", display_model="sonnet", rationale="Selected for a narrow task."
+            ),
             lambda prompt, model: blocked.append((prompt, model)),
             stop,
         )
@@ -83,6 +85,7 @@ class TestFirstPromptHook:
             assert first == {
                 "action": "block",
                 "model": "sonnet",
+                "display_model": "sonnet",
                 "rationale": "Selected for a narrow task.",
             }
             assert replay == {"action": "allow"}
@@ -117,8 +120,8 @@ class TestV2Launch:
             v2,
             "list_anthropic_model_catalog",
             lambda *_args: AnthropicModelCatalog(
-                ["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
-                {"system.ai.claude-sonnet-5": "Claude Sonnet 5"},
+                model_ids=["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
+                model_id_to_display_name={"system.ai.claude-sonnet-5": "Claude Sonnet 5"},
             ),
         )
         monkeypatch.setattr(
@@ -168,10 +171,10 @@ class TestV2Launch:
         assert exc.value.code == 0
         assert captured["argv"][3:5] == ["--model", "opus"]
         assert captured["argv"][-1] == "--debug"
-        assert captured["routed_model"] == (
-            "system.ai.claude-sonnet-5[1m]",
-            "Claude Sonnet 5",
-            "Selected for the parser task.",
+        assert captured["routed_model"] == claude_pty.FirstPromptRoute(
+            model="system.ai.claude-sonnet-5[1m]",
+            display_model="Claude Sonnet 5",
+            rationale="Selected for the parser task.",
         )
         assert {definition["model"] for definition in captured["agents"].values()} == {
             "system.ai.claude-opus-4-8",
@@ -214,7 +217,9 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
         monkeypatch.setattr(
-            v2, "list_anthropic_model_catalog", lambda *_args: AnthropicModelCatalog(["opus"], {})
+            v2,
+            "list_anthropic_model_catalog",
+            lambda *_args: AnthropicModelCatalog(model_ids=["opus"], model_id_to_display_name={}),
         )
 
         def fake_run(_argv, **_kwargs):
@@ -245,7 +250,9 @@ class TestV2Launch:
         monkeypatch.setattr(v2, "get_databricks_token", lambda *_args, **_kwargs: "token")
         monkeypatch.setattr(v2, "build_auth_token_argv", lambda *_args, **_kwargs: ["ucode"])
         monkeypatch.setattr(
-            v2, "list_anthropic_model_catalog", lambda *_args: AnthropicModelCatalog(["opus"], {})
+            v2,
+            "list_anthropic_model_catalog",
+            lambda *_args: AnthropicModelCatalog(model_ids=["opus"], model_id_to_display_name={}),
         )
 
         def fake_run(_argv, **kwargs):
@@ -473,7 +480,9 @@ class TestPtyFlow:
         with pytest.raises(RuntimeError, match="Claude was not launched"):
             claude_pty.run_claude_pty(
                 ["claude"],
-                route_prompt=lambda _prompt: ("sonnet", ""),
+                route_prompt=lambda _prompt: claude_pty.FirstPromptRoute(
+                    model="sonnet", display_model="sonnet", rationale=""
+                ),
                 socket_path=tmp_path / "missing.sock",
             )
 
@@ -531,7 +540,11 @@ capture_path.write_text(json.dumps({
                 str(capture),
                 str(restored),
             ],
-            route_prompt=lambda _prompt: ("system.ai.claude-sonnet-5", ""),
+            route_prompt=lambda _prompt: claude_pty.FirstPromptRoute(
+                model="system.ai.claude-sonnet-5",
+                display_model="system.ai.claude-sonnet-5",
+                rationale="",
+            ),
             socket_path=socket_path,
             restore_model_setting=lambda: restored.write_text("restored"),
         )

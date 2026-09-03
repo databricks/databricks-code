@@ -23,6 +23,7 @@ import threading
 import time
 import tty
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 MAX_MODEL_NAME_LEN = 200
@@ -54,6 +55,15 @@ def valid_model_name(name: object) -> bool:
         and 0 < len(name) <= MAX_MODEL_NAME_LEN
         and bool(_MODEL_NAME_RE.fullmatch(name))
     )
+
+
+@dataclass(frozen=True)
+class FirstPromptRoute:
+    """The model switch and user-facing label for a first-prompt route."""
+
+    model: str
+    display_model: str
+    rationale: str
 
 
 class ConfirmationState:
@@ -172,7 +182,7 @@ def first_prompt_hook_output(response: dict | None) -> dict | None:
 
 def serve_first_prompt_socket(
     path: Path,
-    route_prompt: Callable[[str], tuple[str, str] | tuple[str, str, str]],
+    route_prompt: Callable[[str], FirstPromptRoute],
     on_blocked_prompt: Callable[[str, str], None],
     stop: threading.Event,
     *,
@@ -220,11 +230,9 @@ def serve_first_prompt_socket(
                             and not is_command
                         ):
                             routed = route_prompt(prompt)
-                            if len(routed) == 2:
-                                model, rationale = routed
-                                display_model = model
-                            else:
-                                model, display_model, rationale = routed
+                            model = routed.model
+                            display_model = routed.display_model
+                            rationale = routed.rationale
                             if valid_model_name(model):
                                 claimed = True
                                 response = {
@@ -232,8 +240,7 @@ def serve_first_prompt_socket(
                                     "model": model,
                                     "rationale": rationale,
                                 }
-                                if display_model != model:
-                                    response["display_model"] = display_model
+                                response["display_model"] = display_model
                                 blocked = (prompt, model)
                     except Exception as exc:  # noqa: BLE001 - hooks must fail open
                         log(f"[ERR] first-prompt request: {exc!r}")
@@ -281,7 +288,7 @@ def sync_winsize(master_fd: int, stdin_fd: int = 0) -> None:
 def run_claude_pty(
     argv: list[str],
     *,
-    route_prompt: Callable[[str], tuple[str, str] | tuple[str, str, str]],
+    route_prompt: Callable[[str], FirstPromptRoute],
     socket_path: Path,
     prepare_model_switch: Callable[[str], None] = lambda _model: None,
     model_switch_persisted: Callable[[], bool] = lambda: True,
