@@ -1236,6 +1236,23 @@ class TestSkillsAddCommand:
         mock_download.assert_not_called()
 
 
+class TestSkillsRemoveCommand:
+    def test_requires_mcp_until_download_removal_is_supported(self):
+        with patch("ucode.cli.remove_skills_command") as remove:
+            result = runner.invoke(app, ["skill", "remove"])
+
+        assert result.exit_code == 1
+        assert "Removing downloaded skills is not supported yet" in _strip_ansi(result.output)
+        remove.assert_not_called()
+
+    def test_mcp_remove_dispatches_global_removal(self):
+        with patch("ucode.cli.remove_skills_command") as remove:
+            result = runner.invoke(app, ["skill", "remove", "--mcp"])
+
+        assert result.exit_code == 0, result.output
+        remove.assert_called_once_with()
+
+
 class TestApplyManagedSkills:
     """The launch path both registers the skills MCP connection and downloads bundles to disk."""
 
