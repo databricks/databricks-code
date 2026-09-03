@@ -261,6 +261,45 @@ class TestV2Launch:
 
 
 class TestSubagentRouting:
+    def test_routes_anthropic_gateway_alias_by_embedded_model_id(self, monkeypatch):
+        gateway_alias = "anthropic-aigw-73ea02b2-system.ai.glm-5-2"
+        captured = {}
+        logged: list[str] = []
+        monkeypatch.setenv("SMART_ROUTER_NAME", "task_v2")
+
+        def fake_select(workspace, token, task, route_options, resolve, **kwargs):
+            captured["route_options"] = list(route_options)
+            captured["router_name"] = kwargs["router_name"]
+            return (
+                routing.RoutingDecision(
+                    model=resolve("glm-5-2"),
+                    raw_model="glm-5-2",
+                ),
+                None,
+            )
+
+        monkeypatch.setattr(routing, "select_route", fake_select)
+        decision, error = v2._request_claude_routing_decision(
+            "https://example.com",
+            "secret-token",
+            "inspect the parser",
+            ["system.ai.claude-opus-4-8", gateway_alias],
+            logged.append,
+        )
+
+        assert error is None
+        assert decision.model == gateway_alias
+        assert captured == {
+            "route_options": [
+                ("claude-opus-4-8", "claude"),
+                ("glm-5-2", "claude"),
+            ],
+            "router_name": "task_v2",
+        }
+        assert '"model":"glm-5-2","harness":"claude"' in logged[0]
+        assert '"router_name":"task_v2"' in logged[0]
+        assert "secret-token" not in logged[0]
+
     def test_routes_agent_prompt_with_initialized_model_menu(self, tmp_path, monkeypatch):
         captured = {}
         decisions_path = tmp_path / "decisions.jsonl"
