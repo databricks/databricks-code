@@ -2382,3 +2382,95 @@ def add_skills_command(locations: list[str], agents: set[str] | None = None) -> 
         location_overrides=overrides,
     )
     return 0
+
+
+def _prompt_for_skill_removal(
+    locations_by_client: dict[str, list[str]],
+) -> list[str] | None:
+    """Prompt for skill locations, showing which clients receive each one."""
+    choices: list[questionary.Choice | questionary.Separator] = []
+    ordered_locations = list(
+        dict.fromkeys(
+            location for locations in locations_by_client.values() for location in locations
+        )
+    )
+    for location in ordered_locations:
+        displays = [
+            str(MCP_CLIENTS[client]["display"])
+            for client, locations in locations_by_client.items()
+            if location in locations
+        ]
+        choices.append(
+            questionary.Choice(
+                title=f"{location} ({', '.join(displays)})",
+                value=location,
+                checked=False,
+            )
+        )
+    if not choices:
+        return []
+    selection = _scrolling_checkbox(
+        "Remove skill schemas:",
+        choices=choices,
+        style=_picker_style(),
+        instruction="(space to toggle, ctrl-a all, enter to remove, type to filter)",
+    ).ask()
+    if selection is None:
+        return None
+    return [str(value) for value in selection]
+
+
+def remove_skills_command() -> int:
+    """Interactively remove developer schemas from every client's effective scope."""
+    state = load_state()
+    workspace, profile, clients = setup_mcp_clients(
+        state,
+        "Remove Skills MCP",
+        require_auth=False,
+        action_note="Removing from",
+    )
+    entry = _skills_entry(list(state.get("mcp_servers") or []))
+    managed = {
+        location
+        for location in (state.get("managed_skill_locations") or [])
+        if isinstance(location, str) and location
+    }
+    default = _skill_mcp_locations(state)
+    overrides = _skill_location_overrides(entry)
+    locations_by_client = {
+        client: [
+            location
+            for location in skill_locations_for_client(entry, client)
+            if location not in managed
+        ]
+        for client in clients
+    }
+    if not any(locations_by_client.values()):
+        print_note("No developer skill schemas are configured to remove.")
+        return 0
+    selection = _prompt_for_skill_removal(locations_by_client)
+    if selection is None:
+        return 0
+    if not selection:
+        print_note("No skill schemas selected.")
+        return 0
+
+    remove_locations = set(selection)
+    new_default = [location for location in default if location not in remove_locations]
+    overrides = {
+        client: [location for location in client_locations if location not in remove_locations]
+        for client, client_locations in overrides.items()
+    }
+
+    _update_skills_mcp(
+        state,
+        workspace,
+        profile,
+        clients,
+        new_default,
+        location_overrides=overrides,
+    )
+    print_success(
+        f"Removed {len(remove_locations)} skill schema{'s' if len(remove_locations) != 1 else ''}."
+    )
+    return 0
