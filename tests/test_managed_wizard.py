@@ -1297,8 +1297,9 @@ class TestProviderServiceSpinner:
 
 class TestProviderServiceSelection:
     def test_agents_without_provider_support_skip_the_prompt(self):
+        # gemini has no provider type support; the prompt must be skipped entirely.
         with patch.object(wizard, "list_model_provider_services") as listing:
-            assert wizard._select_provider_service("opencode", WORKSPACE, "token") is None
+            assert wizard._select_provider_service("gemini", WORKSPACE, "token") is None
         assert not listing.called
 
     def test_feature_disabled_is_silent(self):

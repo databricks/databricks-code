@@ -2110,6 +2110,7 @@ _TOOL_PROVIDER_TYPES: dict[str, tuple[str, ...]] = {
     "claude": ("anthropic", "amazon_bedrock"),
     "codex": ("openai", "amazon_bedrock"),
     "gemini": ("gemini_enterprise",),
+    "opencode": ("amazon_bedrock",),
     "pi": ("anthropic", "amazon_bedrock"),
 }
 
@@ -3440,6 +3441,9 @@ def build_opencode_base_urls(workspace: str) -> dict[str, str]:
         "anthropic": build_tool_base_url("claude", workspace) + "/v1",
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
         "oss": f"{workspace}/ai-gateway/mlflow/v1",
+        # Bedrock routes through the standard gateway; MPS header selects the
+        # provider. Do NOT include the MPS name in the path.
+        "bedrock": f"{workspace}/ai-gateway",
     }
 
 

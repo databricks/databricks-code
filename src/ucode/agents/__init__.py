@@ -450,7 +450,7 @@ def configure_tool(
         # provider routing is claude/codex-only; every other tool needs a model —
         # except pi with a Bedrock provider, where targets replace the model list.
         # gemini under a provider still pins the service's target model in the URL.
-        if not model and not (tool == "pi" and provider and bedrock_targets):
+        if not model and not (tool in ("pi", "opencode") and provider and bedrock_targets):
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         if tool == "gemini":
             assert model is not None
@@ -460,6 +460,10 @@ def configure_tool(
             result = copilot.write_tool_config(state, model)
         elif tool == "pi":
             result = pi.write_tool_config(
+                state, model, provider=provider, bedrock_targets=bedrock_targets
+            )
+        elif tool == "opencode":
+            result = opencode.write_tool_config(
                 state, model, provider=provider, bedrock_targets=bedrock_targets
             )
         else:
