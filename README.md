@@ -228,9 +228,13 @@ you to run `ucode <agent>` (existing agent sessions need a restart before the MC
 
 `ucode skill add` registers skills additively, keeping anything already configured. With `--mcp` it
 adds the schemas to the connection's scope, otherwise it downloads their skills to disk. `--skills`
-narrows a download to a subset of one schema's skills.
+narrows a download to a subset of one schema's skills. With no selection flags, a searchable picker
+lists finalized skills visible in the metastore.
 
 ```bash
+# Browse the metastore and choose skills to download.
+ucode skill add
+
 # Add schemas to the skills MCP scope, keeping any already configured.
 ucode skill add --location main.default,ml.prod --mcp
 
@@ -376,6 +380,7 @@ The output looks like:
 | `ucode configure skills --location main.default [--path <dir>]` | Download a schema's skills to disk (under `<dir>`, or your home dir) and register a schema-less skills MCP connection |
 | `ucode configure skills --location main.default --skill my-skill` | Download only the named skill(s) from a schema (comma-separated for several) |
 | `ucode configure skills --location main.default --mcp` | Expose a schema's skills as MCP tools (override-only) instead of downloading |
+| `ucode skill add` | Interactively choose finalized metastore skills to download |
 | `ucode skill add --location main.default --mcp` | Add schemas to the skills MCP scope, keeping any already configured (additive; never replaces) |
 | `ucode skill add --location main.default` | Download a schema's skills to disk without removing existing downloads |
 | `ucode skill add --skills main.default.my-skill` | Download a named subset of skills (bare names need `--location`; fully-qualified names stand alone) |

@@ -110,6 +110,7 @@ from ucode.mcp import (
 )
 from ucode.skills_download import (
     configure_skills_download_command,
+    configure_skills_download_interactive_command,
     download_managed_skills_on_launch,
 )
 from ucode.smart_routing import v2 as smart_routing_v2
@@ -1359,8 +1360,9 @@ def skills_add(
     With ``--mcp``, adds the given schemas to the skills MCP connection's scope.
     Otherwise downloads each schema's skills to project-level skill directories under
     ``--path``, or to user-level skill directories when omitted, keeping
-    already-downloaded skills. ``--skills`` narrows a download to a subset of one
-    schema's skills, by bare name (with ``--location``) or fully-qualified
+    already-downloaded skills. With no selection flags, opens a searchable
+    metastore picker. ``--skills`` narrows a download to a subset of one schema's skills,
+    by bare name (with ``--location``) or fully-qualified
     ``<catalog>.<schema>.<name>``.
     """
     try:
@@ -1403,7 +1405,10 @@ def skills_add(
                 )
             locations = list(schemas)
         if not locations:
-            raise RuntimeError("--location is required for `ucode skill add`.")
+            if mcp:
+                raise RuntimeError("--location is required when using --mcp.")
+            configure_skills_download_interactive_command(path=path)
+            return
         if requested_skills is not None and len(locations) != 1:
             raise RuntimeError(
                 f"--skills requires a single --location (got: {', '.join(locations)})."

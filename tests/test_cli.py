@@ -1164,16 +1164,26 @@ class TestSkillsAddCommand:
         assert "must all share one" in _strip_ansi(result.output)
         mock_download.assert_not_called()
 
-    def test_without_location_exit_1(self):
+    def test_without_location_opens_download_picker(self):
         with (
             patch("ucode.cli.add_skills_command") as mock_add,
             patch("ucode.cli.configure_skills_download_command") as mock_download,
+            patch("ucode.cli.configure_skills_download_interactive_command") as mock_interactive,
         ):
             result = runner.invoke(app, ["skill", "add"])
+
+        assert result.exit_code == 0, result.output
+        mock_add.assert_not_called()
+        mock_download.assert_not_called()
+        mock_interactive.assert_called_once_with(path=None)
+
+    def test_mcp_without_location_exit_1(self):
+        with patch("ucode.cli.add_skills_command") as mock_add:
+            result = runner.invoke(app, ["skill", "add", "--mcp"])
+
         assert result.exit_code == 1
         assert "--location is required" in _strip_ansi(result.output)
         mock_add.assert_not_called()
-        mock_download.assert_not_called()
 
     def test_skill_with_mcp_exit_1(self):
         with (
