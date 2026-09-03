@@ -3050,6 +3050,7 @@ class GatewayProbe(NamedTuple):
     reachable: bool
     detail: str
     resource_available: bool = False
+    conclusive: bool = True
 
 
 def _version_neutral_gateway_detail(detail: str) -> str:
@@ -3062,17 +3063,13 @@ def _gateway_probe_result(
     reason: str | None,
     collection_key: str,
     resource_name: str,
-    empty_hint: str | None = None,
 ) -> GatewayProbe:
     if payload is None:
         return GatewayProbe(False, _version_neutral_gateway_detail(reason or "unknown error"))
     resources = payload.get(collection_key) if isinstance(payload, dict) else None
     if resources:
         return GatewayProbe(True, f"reachable, accessible {resource_name} returned", True)
-    detail = f"reachable, no accessible {resource_name}s returned"
-    if empty_hint:
-        detail = f"{detail}; {empty_hint}"
-    return GatewayProbe(True, detail)
+    return GatewayProbe(True, f"reachable, no accessible {resource_name}s returned")
 
 
 def _probe_ai_gateway_v2(workspace: str, token: str) -> GatewayProbe:
@@ -3087,17 +3084,35 @@ def _probe_ai_gateway_v2(workspace: str, token: str) -> GatewayProbe:
     )
 
 
+_MODEL_SERVICE_PROBE_PAGE_SIZE = 50
+_MODEL_SERVICE_PROBE_MAX_PAGES = 20
+_MODEL_SERVICE_EMPTY_DETAIL = (
+    "reachable, no accessible model services returned; "
+    "check USE CATALOG on system, and USE SCHEMA and EXECUTE on system.ai"
+)
+
+
 def _probe_ai_gateway_v3(workspace: str, token: str) -> GatewayProbe:
     hostname = workspace_hostname(workspace)
-    url = f"https://{hostname}/api/2.1/unity-catalog/model-services?page_size=1"
-    payload, reason = _http_get_json(url, token)
-    return _gateway_probe_result(
-        payload=payload,
-        reason=reason,
-        collection_key="model_services",
-        resource_name="model service",
-        empty_hint="check USE CATALOG on system, and USE SCHEMA and EXECUTE on system.ai",
-    )
+    base = f"https://{hostname}/api/2.1/unity-catalog/model-services"
+    page_token: str | None = None
+    for page in range(_MODEL_SERVICE_PROBE_MAX_PAGES):
+        params: dict[str, object] = {"page_size": _MODEL_SERVICE_PROBE_PAGE_SIZE}
+        if page_token:
+            params["page_token"] = page_token
+        payload, reason = _http_get_json(f"{base}?{urlencode(params)}", token)
+        if payload is None:
+            if page == 0:
+                return GatewayProbe(
+                    False, _version_neutral_gateway_detail(reason or "unknown error")
+                )
+            return GatewayProbe(True, "reachable", conclusive=False)
+        if isinstance(payload, dict) and payload.get("model_services"):
+            return GatewayProbe(True, "reachable, accessible model service returned", True)
+        page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
+        if not page_token:
+            return GatewayProbe(True, _MODEL_SERVICE_EMPTY_DETAIL)
+    return GatewayProbe(True, "reachable", conclusive=False)
 
 
 def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
@@ -3105,6 +3120,15 @@ def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
         f"Databricks rejected the access token for {workspace} ({reason}). "
         f"Try:\n"
         f"  databricks auth logout --host {workspace}\n"
+        f"  databricks auth login --host {workspace}"
+    )
+
+
+def _raise_ai_gateway_scope_failure(workspace: str, reason: str) -> NoReturn:
+    raise RuntimeError(
+        f"The access token for {workspace} is missing an OAuth scope required by the "
+        f"AI Gateway APIs ({reason}). Re-authenticate to mint a token with the needed "
+        f"scopes:\n"
         f"  databricks auth login --host {workspace}"
     )
 
@@ -3145,8 +3169,14 @@ def probe_unity_gateway_capabilities(workspace: str, token: str) -> GatewayProbe
     legacy_endpoint_probe = _probe_ai_gateway_v2(workspace, token)
     if legacy_endpoint_probe.reachable:
         return model_service_probe
+    if model_service_probe.reachable and not model_service_probe.conclusive:
+        return model_service_probe
     if _looks_like_definitive_auth_failure(legacy_endpoint_probe.detail):
         _raise_ai_gateway_auth_failure(workspace, legacy_endpoint_probe.detail)
+    if _looks_like_scope_failure(model_service_probe.detail):
+        _raise_ai_gateway_scope_failure(workspace, model_service_probe.detail)
+    if _looks_like_scope_failure(legacy_endpoint_probe.detail):
+        _raise_ai_gateway_scope_failure(workspace, legacy_endpoint_probe.detail)
     if _looks_like_permission_failure(model_service_probe.detail):
         _raise_model_service_permission_failure(
             workspace, model_service_probe.detail, legacy_endpoint_probe.detail
@@ -3172,6 +3202,19 @@ def _looks_like_definitive_auth_failure(reason: str) -> bool:
     if "HTTP 401" in reason:
         return True
     return "HTTP 400" in reason and "invalid token" in reason.lower()
+
+
+def _looks_like_scope_failure(reason: str) -> bool:
+    """True for a 403 that reports the OAuth *token* is missing a required scope.
+
+    Matched to the OAuth-token wording so a PAT's permission 403 -- which
+    re-login cannot fix -- is not misrouted to the re-login hint and instead
+    falls through to the grant guidance. The scopes the model-service and
+    legacy-endpoint APIs require differ, so this is only conclusive once both
+    probes have failed on it.
+    """
+    lowered = reason.lower()
+    return "http 403" in lowered and "oauth token" in lowered and "required scopes" in lowered
 
 
 def _looks_like_permission_failure(reason: str) -> bool:
