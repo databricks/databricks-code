@@ -194,7 +194,6 @@ def _request_claude_routing_decision(
     token: str,
     prompt: str,
     model_ids: list[str],
-    log: Callable[[str], None] | None = None,
 ) -> tuple[routing.RoutingDecision | None, str | None]:
     available: dict[str, str] = {}
     for model in _canonical_claude_models(model_ids):
@@ -202,24 +201,13 @@ def _request_claude_routing_decision(
     if not available:
         return None, "Anthropic models endpoint returned no Claude models"
     route_options = [(model, "claude") for model in available]
-    router_name = routing.configured_router_name()
-    if log is not None:
-        payload = {
-            "route_options": [
-                {"model": model, "harness": harness} for model, harness in route_options
-            ],
-            "task": {"prompt": prompt},
-            "route_selector": {"router_name": router_name},
-        }
-        url = workspace.rstrip("/") + routing.ROUTING_PATH
-        log(f"[ROUTE] request POST {url}: {json.dumps(payload, separators=(',', ':'))}")
     return routing.select_route(
         workspace,
         token,
         prompt,
         route_options,
         lambda selected: available.get(routing.normalize_model(selected)),
-        router_name=router_name,
+        router_name=routing.configured_router_name(),
         timeout=CLAUDE_ROUTE_SELECTION_TIMEOUT_S,
     )
 
@@ -229,7 +217,6 @@ def _route_claude_prompt(
     token: str,
     prompt: str,
     model_ids: list[str] | None = None,
-    log: Callable[[str], None] | None = None,
 ) -> routing.RoutingDecision:
     workspace = state.get("workspace")
     if not isinstance(workspace, str):
@@ -241,9 +228,7 @@ def _route_claude_prompt(
             raise RuntimeError(
                 discovery_error or "Anthropic models endpoint returned no Claude models"
             )
-    decision, error = _request_claude_routing_decision(
-        workspace, token, prompt, model_ids, log
-    )
+    decision, error = _request_claude_routing_decision(workspace, token, prompt, model_ids)
     if decision is None:
         raise RuntimeError(error or "router returned no Claude model selection")
     return decision
@@ -399,15 +384,8 @@ def launch_claude(
 
     model_setting = _ClaudeModelSettingGuard(user_settings_path)
 
-    def log_route_request(message: str) -> None:
-        try:
-            with open(CLAUDE_PTY_LOG, "a", encoding="utf-8") as handle:
-                handle.write(f"{time.strftime('%H:%M:%S')} {message}\n")
-        except OSError:
-            pass
-
     def route_prompt(prompt: str) -> tuple[str, str]:
-        decision = _route_claude_prompt(state, token, prompt, model_ids, log_route_request)
+        decision = _route_claude_prompt(state, token, prompt, model_ids)
         return model_name(decision.model), decision.rationale
 
     print_note(

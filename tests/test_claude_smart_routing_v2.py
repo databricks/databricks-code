@@ -264,7 +264,6 @@ class TestSubagentRouting:
     def test_routes_anthropic_gateway_alias_by_embedded_model_id(self, monkeypatch):
         gateway_alias = "anthropic-aigw-73ea02b2-system.ai.glm-5-2"
         captured = {}
-        logged: list[str] = []
         monkeypatch.setenv("SMART_ROUTER_NAME", "task_v2")
 
         def fake_select(workspace, token, task, route_options, resolve, **kwargs):
@@ -284,7 +283,6 @@ class TestSubagentRouting:
             "secret-token",
             "inspect the parser",
             ["system.ai.claude-opus-4-8", gateway_alias],
-            logged.append,
         )
 
         assert error is None
@@ -296,9 +294,6 @@ class TestSubagentRouting:
             ],
             "router_name": "task_v2",
         }
-        assert '"model":"glm-5-2","harness":"claude"' in logged[0]
-        assert '"router_name":"task_v2"' in logged[0]
-        assert "secret-token" not in logged[0]
 
     def test_routes_agent_prompt_with_initialized_model_menu(self, tmp_path, monkeypatch):
         captured = {}
