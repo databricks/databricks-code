@@ -2707,6 +2707,59 @@ class TestRemoveSkillsCommand:
         monkeypatch.setattr(mcp, "save_state", lambda s: None)
         return configured
 
+    def test_agent_scope_removes_from_only_selected_client(self, monkeypatch):
+        state = self._state()
+        entry = _find_skills(state["mcp_servers"])[0]
+        entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] = {"claude": ["C.c"]}
+        configured = self._stub(monkeypatch, state, ["C.c"])
+
+        assert mcp.remove_skills_command(agents={"claude"}) == 0
+
+        entry = _find_skills(state["mcp_servers"])[0]
+        assert entry["skill_locations"] == ["A.a", "B.b"]
+        assert entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] == {"claude": []}
+        assert mcp.skill_locations_for_client(entry, "claude") == ["A.a", "B.b"]
+        assert mcp.skill_locations_for_client(entry, "codex") == ["A.a", "B.b"]
+        assert configured == [("claude", f"{WS}/ai-gateway/skills/?schema=A.a&schema=B.b")]
+
+    def test_agent_scope_does_not_add_empty_overrides_to_other_selected_clients(self, monkeypatch):
+        state = self._state()
+        entry = _find_skills(state["mcp_servers"])[0]
+        entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] = {"claude": ["C.c"]}
+        self._stub(monkeypatch, state, ["C.c"])
+
+        assert mcp.remove_skills_command(agents={"claude", "codex"}) == 0
+
+        entry = _find_skills(state["mcp_servers"])[0]
+        assert entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] == {"claude": []}
+
+    def test_agent_scope_offers_only_agent_specific_additions(self, monkeypatch):
+        state = self._state()
+        entry = _find_skills(state["mcp_servers"])[0]
+        entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] = {"claude": ["B.b", "C.c"]}
+        captured: dict[str, dict[str, list[str]]] = {}
+        _stub_location_base(monkeypatch, state)
+        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["claude", "codex"])
+        monkeypatch.setattr(
+            mcp,
+            "_prompt_for_skill_removal",
+            lambda scopes: captured.setdefault("scopes", scopes) and None,
+        )
+
+        assert mcp.remove_skills_command(agents={"claude"}) == 0
+        assert captured["scopes"] == {"claude": ["B.b", "C.c"]}
+
+    def test_agent_scope_remains_explicit_when_removal_matches_default(self, monkeypatch):
+        state = self._state()
+        entry = _find_skills(state["mcp_servers"])[0]
+        entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] = {"claude": ["A.a", "B.b", "C.c"]}
+        self._stub(monkeypatch, state, ["C.c"])
+
+        assert mcp.remove_skills_command(agents={"claude"}) == 0
+
+        entry = _find_skills(state["mcp_servers"])[0]
+        assert entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] == {"claude": ["A.a", "B.b"]}
+
     def test_unscoped_remove_keeps_schemaless_connection(self, monkeypatch):
         state = self._state()
         configured = self._stub(monkeypatch, state, ["A.a", "B.b"])
