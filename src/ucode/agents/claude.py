@@ -54,7 +54,7 @@ from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_note, print_success, print_warning
 
-from .args import has_explicit_model_arg
+from .args import LaunchOptions, has_explicit_model_arg
 
 GATEWAY_MODEL_DISCOVERY_ENV_VAR = "ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY"
 CLAUDE_CONFIG_DIR = Path.home() / ".claude"
@@ -1377,19 +1377,24 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     raise SystemExit(returncode)
 
 
-def launch(state: dict, tool_args: list[str]) -> None:
+def launch(
+    state: dict,
+    tool_args: list[str],
+    *,
+    options: LaunchOptions,
+) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
         return
     first_prompt_routing = (
-        smart_routing_v2.enabled()
+        options.smart_routing
         and bool(workspace)
         and not _has_launch_model_override(state)
         and not has_explicit_model_arg(tool_args)
         and not _has_provider_launch(state)
-        and _uses_interactive_tui(tool_args)
+        and (options.explicit_prompt or _uses_interactive_tui(tool_args))
     )
     # Smart routing v2 needs Unix PTY support, which Windows does not provide.
     if first_prompt_routing and os.name == "nt":

@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class LaunchOptions:
+    """Invocation-scoped options shared by agent launchers."""
+
+    smart_routing: bool = False
+    explicit_prompt: bool = False
+
 
 def explicit_model_arg_value(tool_args: list[str]) -> str | None:
     """Return the last model selected before the harness's ``--`` separator."""

@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from ucode.agents import claude
+from ucode.agents import LaunchOptions, claude
 from ucode.smart_routing import claude_routing, v2
 from ucode.state import MANAGED_OVERLAY_KEY
 
@@ -1073,6 +1073,7 @@ class TestClaudeLaunch:
                     "relayed_proxy_port": 12345,
                 },
                 ["--debug"],
+                options=LaunchOptions(),
             )
 
         assert exc.value.code == 0
@@ -1094,7 +1095,11 @@ class TestClaudeLaunch:
             RuntimeError,
             match="Smart routing in Claude Code is currently not supported on Windows",
         ):
-            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+            claude.launch(
+                {"workspace": WS, "profile": "test"},
+                ["--debug"],
+                options=LaunchOptions(smart_routing=True),
+            )
 
     def test_default_launch_keeps_existing_auth_path(self, monkeypatch):
         calls: list[list[str]] = []
@@ -1104,7 +1109,7 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"], options=LaunchOptions())
 
         assert os.environ["OAUTH_TOKEN"] == "token"
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
@@ -1119,6 +1124,7 @@ class TestClaudeLaunch:
         claude.launch(
             {"workspace": WS, "_claude_launch_model": "system.ai.glm-5-2"},
             ["--debug"],
+            options=LaunchOptions(smart_routing=True),
         )
 
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
@@ -1138,7 +1144,7 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        claude.launch({"workspace": WS}, tool_args)
+        claude.launch({"workspace": WS}, tool_args, options=LaunchOptions(smart_routing=True))
 
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]]
         v2.launch_claude.assert_not_called()
@@ -1157,7 +1163,11 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        claude.launch({"workspace": WS, **provider_state}, ["--debug"])
+        claude.launch(
+            {"workspace": WS, **provider_state},
+            ["--debug"],
+            options=LaunchOptions(smart_routing=True),
+        )
 
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
         v2.launch_claude.assert_not_called()
@@ -1176,7 +1186,7 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        claude.launch({"workspace": WS}, tool_args)
+        claude.launch({"workspace": WS}, tool_args, options=LaunchOptions(smart_routing=True))
 
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]]
         v2.launch_claude.assert_not_called()
@@ -1188,7 +1198,7 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "_original_launch_model", lambda _state: None)
         monkeypatch.setattr(v2, "launch_claude", launch_v2)
 
-        claude.launch({"workspace": WS}, tool_args)
+        claude.launch({"workspace": WS}, tool_args, options=LaunchOptions(smart_routing=True))
 
         launch_v2.assert_called_once_with(
             {"workspace": WS},
@@ -1200,6 +1210,19 @@ class TestClaudeLaunch:
             launch_model_args=claude._launch_model_args,
             model_name=claude._maybe_add_1m_suffix,
         )
+
+    def test_v2_explicit_prompt_overrides_subcommand_shaped_text(self, monkeypatch):
+        launch_v2 = Mock()
+        monkeypatch.setattr(claude, "_original_launch_model", lambda _state: None)
+        monkeypatch.setattr(v2, "launch_claude", launch_v2)
+
+        claude.launch(
+            {"workspace": WS},
+            ["doctor"],
+            options=LaunchOptions(smart_routing=True, explicit_prompt=True),
+        )
+
+        launch_v2.assert_called_once()
 
     def test_v2_does_not_treat_option_value_as_positional_argument(self):
         assert claude._uses_interactive_tui(["--name", "doctor"]) is True
@@ -1215,7 +1238,7 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"], options=LaunchOptions())
 
         assert os.environ["OAUTH_TOKEN"] == "token"
         assert os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
