@@ -178,7 +178,7 @@ def _check_agent_clis() -> list[Check]:
                     "warn",
                     f"{current} installed; {latest} available",
                     Suggestion(
-                        f"Update {display} to {latest}?", lambda t=tool: update_tool_binary(t)
+                        f"Upgrade {display} to {latest}?", lambda t=tool: update_tool_binary(t)
                     ),
                 )
             )
