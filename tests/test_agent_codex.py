@@ -25,6 +25,35 @@ class TestCodexSpec:
         assert codex.SPEC["display"] == "Codex"
 
 
+class TestShouldUseSmartRouting:
+    @pytest.mark.parametrize(
+        ("tool_args", "explicit_prompt"),
+        [([], False), ([], True), (["fix this"], True)],
+    )
+    def test_accepts_only_explicit_tui_shapes(self, tool_args, explicit_prompt):
+        assert codex.should_use_smart_routing(tool_args, explicit_prompt=explicit_prompt) is True
+
+    @pytest.mark.parametrize(
+        "tool_args",
+        [
+            ["exec", "fix this"],
+            ["review"],
+            ["app-server"],
+            ["update"],
+            ["--model", "gpt-5.6-sol"],
+            ["--model", "gpt-5.6-sol", "--", "fix this"],
+            ["fix this"],
+            ["one", "two"],
+        ],
+    )
+    def test_rejects_all_other_invocation_shapes(self, tool_args):
+        assert codex.should_use_smart_routing(tool_args) is False
+
+    @pytest.mark.parametrize("tool_args", [["--model=x"], ["--model"], ["-m"]])
+    def test_explicit_model_bypasses_separator_opt_in(self, tool_args):
+        assert codex.should_use_smart_routing(tool_args, explicit_prompt=True) is False
+
+
 class TestHasUcodeConfig:
     def test_detects_profile_config(self, tmp_path, monkeypatch):
         config_path = tmp_path / "ucode.config.toml"

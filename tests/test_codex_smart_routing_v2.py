@@ -33,7 +33,13 @@ class TestLaunchCodex:
         with pytest.raises(RuntimeError, match="requires Codex 0.145.0 or newer; found 0.144.0"):
             codex.launch({"workspace": WS}, [])
 
-    def test_codex_launch_dispatches_when_flag_enabled(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("tool_args", "explicit_prompt"),
+        [([], False), ([], True), (["fix the parser"], True)],
+    )
+    def test_codex_launch_dispatches_only_for_explicit_tui_shapes(
+        self, monkeypatch, tool_args, explicit_prompt
+    ):
         calls = []
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(codex, "default_model", lambda state: "gpt-start")
@@ -44,16 +50,16 @@ class TestLaunchCodex:
             raise SystemExit(0)
 
         monkeypatch.setattr(v2, "launch_codex", launch_v2)
-        state = {"workspace": WS}
+        state = {"workspace": WS, "_codex_smart_routing_prompt": explicit_prompt}
 
         with pytest.raises(SystemExit) as exc:
-            codex.launch(state, ["--search"])
+            codex.launch(state, tool_args)
 
         assert exc.value.code == 0
         assert calls == [
             (
                 state,
-                ["--search"],
+                tool_args,
                 {
                     "binary": "codex",
                     "start_model": "gpt-start",
@@ -61,6 +67,37 @@ class TestLaunchCodex:
                 },
             )
         ]
+
+    @pytest.mark.parametrize(
+        "tool_args",
+        [
+            ["exec", "fix this"],
+            ["review"],
+            ["app-server"],
+            ["update"],
+            ["--model", "gpt-5.6-sol"],
+            ["--model", "gpt-5.6-sol", "--", "fix this"],
+            ["fix this"],
+        ],
+    )
+    def test_codex_launch_bypasses_routing_for_other_shapes(self, monkeypatch, tool_args):
+        runs = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.144.0")
+        monkeypatch.setattr(codex, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(v2, "launch_codex", lambda *args, **kwargs: pytest.fail("launched"))
+        monkeypatch.setattr(
+            codex.subprocess,
+            "run",
+            lambda argv: runs.append(argv) or codex.subprocess.CompletedProcess(argv, 0),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            codex.launch({"workspace": WS}, tool_args)
+
+        assert exc.value.code == 0
+        assert runs == [["codex", "--profile", "ucode", *tool_args]]
 
     def test_codex_launch_normalizes_cached_bootstrap_model(self, monkeypatch):
         calls = []

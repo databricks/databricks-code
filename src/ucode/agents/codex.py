@@ -494,11 +494,28 @@ def clear_model_preferences(state: dict) -> bool:
 _PROFILE_REJECTED_MAX_SECONDS = 3.0
 
 
+def should_use_smart_routing(tool_args: list[str], *, explicit_prompt: bool = False) -> bool:
+    """Return whether this invocation explicitly selects the routed TUI path.
+
+    Smart routing is intentionally opt-in by invocation shape: a bare Codex
+    launch, or a single prompt passed after ucode's explicit ``--`` boundary.
+    Commands and options (including ``--model``) use the ordinary launcher.
+    """
+    return not tool_args or (
+        explicit_prompt
+        and len(tool_args) <= 1
+        and not any(arg in {"-m", "--model"} or arg.startswith("--model=") for arg in tool_args)
+    )
+
+
 def launch(state: dict, tool_args: list[str]) -> None:
     clear_model_preferences(state)
     binary = SPEC["binary"]
     workspace = state.get("workspace")
-    if smart_routing_v2.enabled():
+    if smart_routing_v2.enabled() and should_use_smart_routing(
+        tool_args,
+        explicit_prompt=bool(state.get("_codex_smart_routing_prompt")),
+    ):
         version_text = agent_version(binary)
         parsed_version = _parse_version(version_text)
         if parsed_version is not None and parsed_version < MINIMUM_ROUTING_CODEX_VERSION:

@@ -12,7 +12,9 @@ from importlib import metadata
 from typing import Annotated
 
 import typer
+from click import Context as ClickContext
 from rich.panel import Panel
+from typer.core import TyperCommand
 
 from ucode.agents import (
     TOOL_SPECS,
@@ -1983,6 +1985,7 @@ def _can_launch_from_cached_config(
     model: str | None,
     explicit_provider: str | None,
     workspace_url: str | None,
+    smart_routing_enabled: bool | None = None,
 ) -> bool:
     """Return whether a normal Claude/Codex launch can use its cached config."""
     if tool not in CAN_USE_CACHED_CONFIG_AGENTS:
@@ -1991,7 +1994,10 @@ def _can_launch_from_cached_config(
     if refresh or model or explicit_provider is not None:
         return False
 
-    if tool == "codex" and smart_routing_v2.enabled():
+    if smart_routing_enabled is None:
+        smart_routing_enabled = smart_routing_v2.enabled()
+
+    if tool == "codex" and smart_routing_enabled:
         if not state.get("codex_models") or not state.get("oss_models"):
             return False
 
@@ -2029,6 +2035,13 @@ def _launch_tool(
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        codex_prompt_separator = tool == "codex" and _has_codex_prompt_separator(ctx)
+        smart_routing_enabled = smart_routing_v2.enabled() and (
+            tool != "codex"
+            or codex_agent.should_use_smart_routing(
+                ctx.args, explicit_prompt=codex_prompt_separator
+            )
+        )
         # Launchers such as isaac put their harness arguments after `--`, so the harness's own
         # `--model` lands in ctx.args instead of a ucode option. It still determines the effective
         # launch model and should therefore win in the launch summary.
@@ -2069,11 +2082,14 @@ def _launch_tool(
             model=model,
             explicit_provider=explicit_provider,
             workspace_url=workspace_url,
+            smart_routing_enabled=smart_routing_enabled,
         ):
             print_section(_launch_title(tool))
             if forwarded_model:
                 print_kv("Model", forwarded_model)
             print_success(f"Starting {TOOL_SPECS[tool]['display']}")
+            if tool == "codex" and codex_prompt_separator:
+                state = {**state, "_codex_smart_routing_prompt": True}
             launch_agent(tool, state, ctx.args)
             return
         # Fetched before `configure_shared_state` because it decides whether this agent may launch
@@ -2131,7 +2147,7 @@ def _launch_tool(
                 provider = managed_provider
         # Checked after the managed config settles `provider`: an admin-set provider must trip this
         # guard too, or routing would be persisted as on while a provider is active.
-        if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_v2.enabled() and provider:
+        if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_enabled and provider:
             raise RuntimeError(
                 f"{TOOL_SPECS[tool]['display']} smart routing cannot be enabled with "
                 "--provider. Launch without a Model Provider Service and try again."
@@ -2254,7 +2270,7 @@ def _launch_tool(
             print_kv("Model", route_root_model)
         elif resolved_model:
             print_kv("Model", resolved_model)
-        if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_v2.enabled() and not provider:
+        if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_enabled and not provider:
             print_kv("Smart routing", "enabled")
             print_note(
                 f"{TOOL_SPECS[tool]['display']} may require one-time hook review. Open "
@@ -2284,6 +2300,8 @@ def _launch_tool(
                     state["_claude_launch_model"] = launch_model
             if provider:
                 state["_claude_launch_provider"] = provider
+        elif tool == "codex" and codex_prompt_separator:
+            state = {**state, "_codex_smart_routing_prompt": True}
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args)
     except RuntimeError as exc:
@@ -2349,6 +2367,30 @@ WorkspaceOption = Annotated[
         "if not already configured.",
     ),
 ]
+
+
+_CODEX_SEPARATOR_SUFFIX_KEY = "ucode_codex_separator_suffix"
+
+
+class _CodexCommand(TyperCommand):
+    """Record Codex's ``--`` prompt separator before Click removes it."""
+
+    def parse_args(self, ctx: ClickContext, args: list[str]) -> list[str]:
+        try:
+            separator = args.index("--")
+        except ValueError:
+            pass
+        else:
+            ctx.meta[_CODEX_SEPARATOR_SUFFIX_KEY] = tuple(args[separator + 1 :])
+        return super().parse_args(ctx, args)
+
+
+def _has_codex_prompt_separator(ctx: typer.Context) -> bool:
+    suffix = ctx.meta.get(_CODEX_SEPARATOR_SUFFIX_KEY)
+    if not isinstance(suffix, tuple):
+        return False
+    suffix_args = list(suffix)
+    return ctx.args == suffix_args and len(suffix_args) <= 1
 
 
 @app.callback(invoke_without_command=True)
@@ -2469,7 +2511,11 @@ def _print_no_managed_config_guidance(workspace: str, profile: str | None) -> No
         print_note("Run `ug setup` to configure one for your workspace, then `ug publish`.")
 
 
-@app.command("codex", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+@app.command(
+    "codex",
+    cls=_CodexCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 def codex_cmd(
     ctx: typer.Context,
     provider: Annotated[
