@@ -271,7 +271,6 @@ class TestDiscoverModelServices:
                 _model_service("system.ai.claude-opus-4-8"),
                 _model_service("system.ai.claude-sonnet-4-6"),
                 _model_service("system.ai.gpt-5"),
-                _model_service("system.ai.gpt-5-6-astra"),
                 _model_service("system.ai.gemini-2-5-flash"),
                 _model_service("system.ai.gemini-3-5-flash"),
                 _model_service("system.ai.kimi-k2-7-code"),
@@ -1189,7 +1188,7 @@ class TestListAllMcpServices:
         assert reason == "no UC catalogs found"
 
 
-def _foundation_models_payload(names, api_type="gemini/v1/generateContent"):
+def _foundation_models_payload(names):
     return {
         "endpoints": [
             {
@@ -1199,7 +1198,7 @@ def _foundation_models_payload(names, api_type="gemini/v1/generateContent"):
                         {
                             "foundation_model": {
                                 "ai_gateway_v2_supported": True,
-                                "api_types": [api_type],
+                                "api_types": ["gemini/v1/generateContent"],
                             }
                         }
                     ]
@@ -1283,29 +1282,6 @@ class TestDiscoverGeminiModels:
 
         assert reason is None
         assert models == ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
-
-    def test_codex_discovery_drops_temporarily_disabled_astra(self, monkeypatch):
-        payload = _foundation_models_payload(
-            ["databricks-gpt-5-6-astra", "databricks-gpt-5-6-sol"],
-            api_type="openai/v1/responses",
-        )
-        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
-
-        models, reason = db_mod.discover_codex_models(WS, "token")
-
-        assert reason is None
-        assert models == ["databricks-gpt-5-6-sol"]
-
-    def test_codex_discovery_reports_when_only_astra_is_available(self, monkeypatch):
-        payload = _foundation_models_payload(
-            ["databricks-gpt-5-6-astra"], api_type="openai/v1/responses"
-        )
-        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
-
-        models, reason = db_mod.discover_codex_models(WS, "token")
-
-        assert models == []
-        assert reason == "only temporarily disabled Codex models are available"
 
 
 class TestResolvePatToken:

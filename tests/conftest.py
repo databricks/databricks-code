@@ -81,7 +81,14 @@ def e2e_state(e2e_workspace, e2e_token):
     """Full state dict mirroring what configure_shared_state produces."""
     claude_models = fetch_ai_gateway_claude_models(e2e_workspace, e2e_token)
     gemini_models = fetch_gemini_models(e2e_workspace, e2e_token)
-    codex_models = fetch_codex_models(e2e_workspace, e2e_token)
+    # Astra is currently advertised by discovery but does not serve requests.
+    # Keep it visible to production discovery while excluding it from live E2E
+    # invocations until the backend is working.
+    codex_models = [
+        model
+        for model in fetch_codex_models(e2e_workspace, e2e_token)
+        if "gpt-5-6-astra" not in model
+    ]
 
     opencode_models: dict = {}
     if claude_models:
