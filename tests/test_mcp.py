@@ -3057,7 +3057,6 @@ class TestV2McpSelectors:
         saved_states: list[dict] = []
         configured: list[tuple[str, str, str]] = []
         self._base_mocks(monkeypatch)
-        monkeypatch.setattr(mcp, "consumer_access_reason", lambda workspace, token: None)
         monkeypatch.setattr(
             mcp,
             "configure_client_mcp_server",
@@ -3083,15 +3082,17 @@ class TestV2McpSelectors:
             }
         ]
 
-    def test_non_interactive_v2_add_blocks_consumer(self, monkeypatch):
+    def test_app_add_permission_failure_is_actionable(self, monkeypatch):
         self._base_mocks(monkeypatch)
-        monkeypatch.setattr(
-            mcp, "consumer_access_reason", lambda workspace, token: "unreachable (HTTP 403)"
-        )
-        monkeypatch.setattr(mcp, "save_state", lambda state: pytest.fail("must not save on block"))
 
-        with pytest.raises(RuntimeError, match="consumer-only access"):
-            mcp.configure_mcp_command(services={"uc-functions:main.tools"})
+        def deny(workspace, profile=None):
+            raise mcp.PermissionDeniedError("Not authorized to list Databricks apps.")
+
+        monkeypatch.setattr(mcp, "discover_app_mcp_servers", deny)
+        monkeypatch.setattr(mcp, "save_state", lambda state: pytest.fail("must not save"))
+
+        with pytest.raises(RuntimeError, match="workspace access"):
+            mcp.configure_mcp_command(services={"app:my-app"})
 
     def test_v2_selector_cannot_combine_with_location(self, monkeypatch):
         monkeypatch.setattr(mcp, "load_state", lambda: pytest.fail("must not reach load_state"))

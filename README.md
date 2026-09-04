@@ -130,8 +130,8 @@ ucode mcp add --services genie-space:<space-id>
 ucode mcp add --services app:my-app
 ```
 
-A consumer-only identity that requests one of these is stopped with a clear error before any
-config is written.
+These require workspace access; a consumer-only identity is gated at the AI Gateway (which
+`ucode` already hits when it sets up models), not by this command.
 
 Every Databricks MCP server is registered as a local **stdio** server that runs `ug mcp-proxy`
 — a small bridge (shipped with `ug`) between the coding tool and the Databricks

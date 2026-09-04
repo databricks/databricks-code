@@ -1391,32 +1391,19 @@ def _extract_apps_payload(payload: object) -> list[dict]:
     raise RuntimeError("Databricks apps listing returned invalid JSON.")
 
 
-# The AI Gateway's WorkspaceAccessGuard (ai-gateway/src/WorkspaceAccessGuard.scala) rejects a
-# consumer-only identity — one without the `workspace-access` entitlement — with an HTTP 403
-# whose message names that entitlement. That message substring is the ONLY thing that tells a
-# consumer-only identity apart from a workspace user who merely lacks a grant on one resource:
-# the server returns the same 403 / JsonRpc FORBIDDEN for both otherwise (no distinct error code).
-_WORKSPACE_ACCESS_MARKER = "workspace-access"
-
-
-def _looks_like_consumer_access_failure(text: str | None) -> bool:
-    """Whether a 403 message indicates a consumer-only identity (missing the `workspace-access`
-    entitlement) rather than a per-resource permission denial."""
-    return bool(text) and _WORKSPACE_ACCESS_MARKER in text.lower()
-
-
 class PermissionDeniedError(RuntimeError):
     """A workspace API returned an authorization failure (HTTP 403 / permission denied).
 
-    ``consumer_only`` is ``True`` when the failure names the `workspace-access` entitlement —
-    i.e. a consumer-only identity with no workspace access at all — and ``False`` when it's a
-    workspace user who merely lacks a grant on the specific resource. Callers use this both to
-    skip V2 MCP discovery gracefully instead of blocking setup (see the discovery wrappers in
-    :mod:`ucode.mcp`) and to word the error for the right audience."""
+    Callers use this only to skip V2 MCP discovery gracefully instead of aborting setup (see the
+    discovery wrappers in :mod:`ucode.mcp`), while other errors still surface.
 
-    def __init__(self, message: str, *, consumer_only: bool = False) -> None:
-        super().__init__(message)
-        self.consumer_only = consumer_only
+    It deliberately does NOT try to distinguish a consumer-only identity (no `workspace-access`
+    entitlement) from a workspace user missing a grant on a specific resource: no service exposes
+    a signal that reliably tells them apart. The `workspace-access` entitlement is enforced with a
+    named 403 only on guarded AI Gateway / Model Serving *inference* and model-listing paths (which
+    ucode already exercises at model setup, so a consumer is gated there) — NOT on the Apps / UC /
+    Vector Search listing calls the MCP flow uses, which return an empty list or a generic ACL
+    denial for a consumer."""
 
 
 def _looks_like_cli_permission_error(stderr: str | None) -> bool:
@@ -1453,15 +1440,11 @@ def list_databricks_apps(workspace: str, profile: str | None = None) -> list[dic
         )
         return _extract_apps_payload(json.loads(result.stdout or "[]"))
     except subprocess.CalledProcessError as exc:
-        # A 403 here is either a consumer-only identity (no workspace access) or a workspace
-        # user lacking apps permission; classify by the workspace-access marker so callers can
-        # skip discovery gracefully (AIGTWY-4471) and word the error correctly. Other CLI
-        # failures stay hard errors.
+        # A 403 here means the caller isn't authorized to list apps (a consumer-only identity, or
+        # a workspace user without apps permission); raise PermissionDeniedError so callers can skip
+        # discovery gracefully (AIGTWY-4471). Other CLI failures stay hard errors.
         if _looks_like_cli_permission_error(exc.stderr):
-            raise PermissionDeniedError(
-                "Not authorized to list Databricks apps.",
-                consumer_only=_looks_like_consumer_access_failure(exc.stderr),
-            ) from exc
+            raise PermissionDeniedError("Not authorized to list Databricks apps.") from exc
         raise RuntimeError("Failed to list Databricks apps via `databricks apps list`.") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("Timed out while listing Databricks apps.") from exc
@@ -3295,22 +3278,6 @@ def _looks_like_scope_failure(reason: str) -> bool:
 
 def _looks_like_permission_failure(reason: str) -> bool:
     return "HTTP 403" in reason
-
-
-def consumer_access_reason(workspace: str, token: str) -> str | None:
-    """Return a reason string when the identity is provably consumer-only, else ``None``.
-
-    Consumer entitlements don't grant the `workspace-access` entitlement, so V2 AI Gateway
-    features (Vector Search, UC Functions, external/Genie/app MCP servers) can't work for them.
-    Probes the V2 AI Gateway and reports a failure ONLY when it carries the workspace-access
-    marker — the authoritative consumer signal. Best-effort and deliberately conservative:
-    returns ``None`` on any other outcome (reachable, empty listing, or an unrelated error) so a
-    workspace user is never wrongly blocked. Note the server-side guard is gated by the
-    `blockInferenceWithoutWorkspaceAccess` SAFE flag, so this fires only where that is ramped."""
-    probe = _probe_ai_gateway_v2(workspace, token)
-    if not probe.reachable and _looks_like_consumer_access_failure(probe.detail):
-        return probe.detail
-    return None
 
 
 CODING_AGENT_RECOMMEND_MODEL_PATH = "/api/ai-gateway/v2/coding-agent-configs:recommendModel"

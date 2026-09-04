@@ -34,7 +34,6 @@ from ucode.databricks import (
     build_mcp_proxy_argv,
     build_mcp_service_url,
     build_skills_mcp_url,
-    consumer_access_reason,
     ensure_databricks_auth,
     get_databricks_token,
     list_all_mcp_services,
@@ -1842,17 +1841,6 @@ def add_mcp_command(
     return configure_mcp_command(location=location, services=services, append=True, agents=agents)
 
 
-def _consumer_access_error(reason: str) -> str:
-    """The error shown when a consumer-only identity (no `workspace-access` entitlement) tries
-    to add a V2 AI Gateway MCP server."""
-    return (
-        "This identity has consumer-only access (no workspace-access entitlement), which can't "
-        "use V2 AI Gateway MCP servers (Vector Search, UC Functions, external connections, Genie, "
-        f"apps): {reason}. Ask a workspace admin for the workspace-access entitlement, or register "
-        "an MCP service instead (`ucode mcp add --location <catalog>.<schema>`)."
-    )
-
-
 def _configure_v2_mcp_selectors(
     selectors: list[str],
     *,
@@ -1862,34 +1850,27 @@ def _configure_v2_mcp_selectors(
     """Non-interactive add for V2 AI Gateway MCP servers named by typed `--services`
     selectors (`vector-search:`/`uc-functions:`/`external:`/`genie-space:`/`app:`).
 
-    The interactive picker no longer offers these sources; this is how a workspace user
-    adds one on request. A provably consumer-only identity is blocked with a clear error
-    before any config is written (best-effort — see `consumer_access_reason`; the server-side
-    guard is SAFE-flag gated). Registration mirrors the interactive add path: additive under
-    ``append`` (`ucode mcp add`), an exact replacement otherwise (`ucode configure mcp`),
-    always preserving the skills connection."""
+    The interactive picker no longer offers these sources; this is how a workspace user adds one
+    on request. These require workspace access, which consumer-only identities lack — but that's
+    enforced upstream at the AI Gateway (which ucode already hits during model setup), not here:
+    the listing calls this uses don't reliably signal consumer access (see `PermissionDeniedError`).
+    Registration mirrors the interactive add path: additive under ``append`` (`ucode mcp add`), an
+    exact replacement otherwise (`ucode configure mcp`), always preserving the skills connection."""
     state = load_state()
     workspace, profile, clients = setup_mcp_clients(
         state, "Add MCP Servers" if append else "MCP Servers", agents=agents
     )
 
-    token = get_databricks_token(workspace, profile)
-    reason = consumer_access_reason(workspace, token)
-    if reason is not None:
-        raise RuntimeError(_consumer_access_error(reason))
-
     # `app:` selectors need the app's off-workspace URL, which only discovery knows. A 403 here
-    # is worded by whether it's a consumer identity or a workspace user missing apps permission.
+    # means the caller can't list apps (no workspace access, or no apps permission).
     available_app_servers: list[dict] = []
     if any(s.startswith(APP_MCP_SELECTION_PREFIX) for s in selectors):
         try:
             available_app_servers = discover_app_mcp_servers(workspace, profile)
         except PermissionDeniedError as exc:
-            if exc.consumer_only:
-                raise RuntimeError(_consumer_access_error(str(exc))) from exc
             raise RuntimeError(
-                f"{exc} You have workspace access but lack permission to list Databricks apps; "
-                "ask the app owner to grant you access."
+                f"{exc} This needs workspace access to the Databricks apps listing; ask a "
+                "workspace admin if you're missing it."
             ) from exc
 
     original_mcp_servers: list[dict] = list(state.get("mcp_servers") or [])

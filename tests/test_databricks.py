@@ -1951,7 +1951,7 @@ class TestListDatabricksApps:
         with pytest.raises(RuntimeError, match="invalid JSON"):
             list_databricks_apps(WS)
 
-    def test_resource_permission_failure_is_not_consumer_only(self, monkeypatch):
+    def test_permission_failure_raises_permission_denied_error(self, monkeypatch):
         def fake_run(args, **kwargs):
             raise subprocess.CalledProcessError(
                 1, "databricks", stderr="Error: permission denied on apps"
@@ -1959,23 +1959,8 @@ class TestListDatabricksApps:
 
         monkeypatch.setattr(db_mod, "run", fake_run)
 
-        with pytest.raises(db_mod.PermissionDeniedError) as exc:
+        with pytest.raises(db_mod.PermissionDeniedError):
             list_databricks_apps(WS)
-        assert exc.value.consumer_only is False
-
-    def test_workspace_access_failure_is_consumer_only(self, monkeypatch):
-        def fake_run(args, **kwargs):
-            raise subprocess.CalledProcessError(
-                1,
-                "databricks",
-                stderr="Error: 403 The workspace-access entitlement is required.",
-            )
-
-        monkeypatch.setattr(db_mod, "run", fake_run)
-
-        with pytest.raises(db_mod.PermissionDeniedError) as exc:
-            list_databricks_apps(WS)
-        assert exc.value.consumer_only is True
 
     def test_non_permission_cli_failure_stays_generic_runtime_error(self, monkeypatch):
         def fake_run(args, **kwargs):
@@ -1986,43 +1971,6 @@ class TestListDatabricksApps:
         with pytest.raises(RuntimeError) as exc:
             list_databricks_apps(WS)
         assert not isinstance(exc.value, db_mod.PermissionDeniedError)
-
-
-class TestConsumerAccessReason:
-    def test_returns_reason_on_workspace_access_marker(self, monkeypatch):
-        detail = "HTTP 403: The workspace-access entitlement is required to query AI Gateway."
-        monkeypatch.setattr(
-            db_mod,
-            "_probe_ai_gateway_v2",
-            lambda workspace, token: db_mod.GatewayProbe(False, detail),
-        )
-        assert db_mod.consumer_access_reason(WS, "tok") == detail
-
-    def test_returns_none_when_reachable(self, monkeypatch):
-        monkeypatch.setattr(
-            db_mod,
-            "_probe_ai_gateway_v2",
-            lambda workspace, token: db_mod.GatewayProbe(True, "reachable", True),
-        )
-        assert db_mod.consumer_access_reason(WS, "tok") is None
-
-    def test_returns_none_on_permission_failure_without_marker(self, monkeypatch):
-        # A 403 that doesn't name the workspace-access entitlement is a resource-permission
-        # denial, not a consumer identity — don't wrongly block the workspace user.
-        monkeypatch.setattr(
-            db_mod,
-            "_probe_ai_gateway_v2",
-            lambda workspace, token: db_mod.GatewayProbe(False, "HTTP 403: missing USE_SCHEMA"),
-        )
-        assert db_mod.consumer_access_reason(WS, "tok") is None
-
-    def test_returns_none_on_non_permission_failure(self, monkeypatch):
-        monkeypatch.setattr(
-            db_mod,
-            "_probe_ai_gateway_v2",
-            lambda workspace, token: db_mod.GatewayProbe(False, "timeout (HTTP 500)"),
-        )
-        assert db_mod.consumer_access_reason(WS, "tok") is None
 
 
 class TestProbeUnityGatewayCapabilities:
