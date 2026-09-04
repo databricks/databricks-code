@@ -144,9 +144,9 @@ def _minimum_version_error(tool: str) -> str | None:
 
 def _required_update_message(tool: str) -> str | None:
     checker = getattr(_MODULES[tool], "required_update_message", None)
-    if not callable(checker):
-        return None
-    return checker()
+    if callable(checker):
+        return checker()
+    return _minimum_version_error(tool)
 
 
 def _too_new_downgrade(tool: str) -> tuple[str, str] | None:

@@ -95,6 +95,11 @@ class TestToolSpecs:
 
         assert agents_mod.tool_update_available("opencode") == ("1.18.15", "1.18.16")
 
+    def test_required_update_defaults_to_minimum_version_blocker(self, monkeypatch):
+        monkeypatch.setattr(agents_mod.codex, "minimum_version_error", lambda: "too old")
+
+        assert agents_mod._required_update_message("codex") == "too old"
+
 
 class TestInstallAiToolsForAgents:
     def _capture(self, monkeypatch):

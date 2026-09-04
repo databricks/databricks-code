@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import cast
 
 from ucode import gateway_proxy
+from ucode.agent_updates import version_requirement_error
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -99,24 +100,6 @@ CLAUDE_OPTIONAL_VALUE_OPTIONS = frozenset(
 )
 
 
-def _parse_version(value: str) -> tuple[int, int, int] | None:
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
-    if not match:
-        return None
-    major, minor, patch = match.groups()
-    return int(major), int(minor), int(patch)
-
-
-def _installed_version_status() -> tuple[str, bool] | None:
-    if os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) != "1" and not smart_routing_v2.enabled():
-        return None
-    version = agent_version(SPEC["binary"])
-    parsed = _parse_version(version)
-    if parsed is None:
-        return None
-    return version, parsed < MINIMUM_CLAUDE_VERSION
-
-
 def _minimum_version_requirement_message(version: str) -> str:
     feature = "Smart routing" if smart_routing_v2.enabled() else "Model discovery"
     return (
@@ -126,23 +109,13 @@ def _minimum_version_requirement_message(version: str) -> str:
 
 
 def minimum_version_error() -> str | None:
-    status = _installed_version_status()
-    if status is None:
+    if os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) != "1" and not smart_routing_v2.enabled():
         return None
-    version, is_too_old = status
-    if not is_too_old:
-        return None
-    return _minimum_version_requirement_message(version)
-
-
-def required_update_message() -> str | None:
-    status = _installed_version_status()
-    if status is None:
-        return None
-    version, is_too_old = status
-    if not is_too_old:
-        return None
-    return _minimum_version_requirement_message(version)
+    return version_requirement_error(
+        agent_version(SPEC["binary"]),
+        MINIMUM_CLAUDE_VERSION,
+        _minimum_version_requirement_message,
+    )
 
 
 def _resolve_web_search_model(state: dict) -> str | None:
