@@ -780,12 +780,14 @@ class TestOpencodeLaunch:
             pytest.skip("No OpenCode models available on this workspace")
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        xdg = tmp_path / "opencode-xdg"
-        config_path = xdg / "opencode" / "opencode.json"
+        config_path = tmp_path / "opencode-xdg" / "opencode" / "opencode.json"
         backup_path = tmp_path / "opencode-config.backup.json"
-        monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
         monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", config_path)
         monkeypatch.setattr(opencode, "OPENCODE_BACKUP_PATH", backup_path)
+        # ucode no longer redirects XDG_CONFIG_HOME, so the spawned opencode
+        # would read the developer's own ~/.config/opencode. Send it to an empty
+        # directory to keep the test hermetic.
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-xdg"))
 
         import sys
         import time
@@ -859,11 +861,11 @@ class TestOpencodeLaunch:
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
         xdg = tmp_path / "opencode-xdg"
-        monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
         monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", xdg / "opencode" / "opencode.json")
         monkeypatch.setattr(
             opencode, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-config.backup.json"
         )
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-xdg"))
         monkeypatch.setattr("ucode.state.save_state", lambda state: None)
         monkeypatch.setattr(
             "ucode.agents.opencode.get_databricks_token",
