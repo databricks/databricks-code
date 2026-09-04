@@ -1615,6 +1615,21 @@ _MODEL_SERVICES_CACHE: dict[str, list[str]] = {}
 # the metastore-wide one, so they must not share an entry.
 _MODEL_PROVIDER_SERVICES_CACHE: dict[tuple[str, str], list[dict]] = {}
 
+# Temporarily hide models that are advertised by discovery but are not yet
+# usable through ucode's Codex gateway path. Keep this at the shared discovery
+# boundary so both UC model services and the legacy foundation-model listing
+# agree on availability.
+_DISABLED_CODEX_MODELS = {"gpt-5-6-astra"}
+
+
+def _is_disabled_codex_model(model: str) -> bool:
+    name = model.lower()
+    if name.startswith("system.ai."):
+        name = name.removeprefix("system.ai.")
+    if name.startswith("databricks-"):
+        name = name.removeprefix("databricks-")
+    return name in _DISABLED_CODEX_MODELS
+
 
 def clear_model_services_cache() -> None:
     """Forget cached model-service listings (used by tests, and after a workspace switch)."""
@@ -1833,7 +1848,10 @@ def discover_model_services(
     # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
     _prefer_opus_4_8(claude_models, ids)
 
-    codex_models = sorted([m for m in ids if "gpt-" in m], key=model_version_sort_key)
+    codex_models = sorted(
+        [m for m in ids if "gpt-" in m and not _is_disabled_codex_model(m)],
+        key=model_version_sort_key,
+    )
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
 
     oss_models = [m for m in ids if any(family in m for family in _OSS_MODEL_FAMILIES)]
@@ -3057,9 +3075,13 @@ def discover_gemini_models(workspace: str, token: str) -> tuple[list[str], str |
 def discover_codex_models(workspace: str, token: str) -> tuple[list[str], str | None]:
     # Order newest model version first (like `discover_gemini_models`), so the picker's top choice
     # and default is e.g. gpt-5-4 rather than the alphabetically-first gpt-5.
-    return discover_endpoints_with_api_type(
+    models, reason = discover_endpoints_with_api_type(
         workspace, token, "openai/v1/responses", sort_key=model_version_sort_key
     )
+    enabled_models = [model for model in models if not _is_disabled_codex_model(model)]
+    if models and not enabled_models:
+        return [], "only temporarily disabled Codex models are available"
+    return enabled_models, reason
 
 
 def fetch_gemini_models(workspace: str, token: str) -> list[str]:
