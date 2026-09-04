@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import tomlkit
+from tomlkit.items import Item
+
+
+def _toml_item(value: object) -> Item:
+    """Convert nested Python values without creating regular TOML tables."""
+    if isinstance(value, dict):
+        item = tomlkit.inline_table()
+        for key, entry in value.items():
+            item[key] = _toml_item(entry)
+        return item
+    if isinstance(value, list):
+        item = tomlkit.array()
+        for entry in value:
+            item.append(_toml_item(entry))
+        return item
+    return tomlkit.item(value)
 
 
 def _toml_value(value: str | int | float | bool | list[object] | dict[str, object]) -> str:
-    if isinstance(value, dict):
-        item = tomlkit.inline_table()
-        item.update(value)
-        return item.as_string()
-    if isinstance(value, list) and any(isinstance(entry, dict) for entry in value):
-        wrapper = tomlkit.inline_table()
-        wrapper["value"] = value
-        rendered = wrapper.as_string()
-        return rendered.removeprefix("{value = ").removesuffix("}")
-    return tomlkit.item(value).as_string()
+    return _toml_item(value).as_string()
 
 
 def codex_config_args(config: dict) -> list[str]:
