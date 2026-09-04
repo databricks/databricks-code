@@ -7,13 +7,19 @@ import contextlib
 import json
 import os
 import re
+import subprocess
 import time
-from unittest.mock import MagicMock, patch
+import tomllib
+from importlib import metadata
+from pathlib import Path
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from typer.testing import CliRunner
 
+import ucode.databricks as db_mod
 from ucode.cli import app
+from ucode.databricks import GatewayProbe
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -28,6 +34,8 @@ def _strip_ansi(text: str) -> str:
 runner = CliRunner()
 
 TOOLS = ["codex", "claude", "gemini", "opencode"]
+
+MODEL_SERVICE_PROBE = GatewayProbe(True, "reachable, accessible model service returned", True)
 
 
 def _jwt(expires_at: float) -> str:
@@ -81,6 +89,16 @@ class TestHelp:
         for tool in TOOLS:
             assert tool in result.output
 
+    @pytest.mark.parametrize("prog_name", ["ug", "ucode"])
+    def test_help_uses_invoked_name_and_names_ucode_as_an_alias(self, prog_name):
+        result = runner.invoke(app, ["--help"], prog_name=prog_name)
+        output = _strip_ansi(result.output)
+
+        assert result.exit_code == 0
+        assert f"Usage: {prog_name}" in output
+        assert "primary command is `ug`" in output
+        assert "`ucode` remains supported as an alias" in output
+
     @pytest.mark.parametrize("tool", TOOLS)
     def test_subcommand_help(self, tool):
         result = runner.invoke(app, [tool, "--help"])
@@ -97,6 +115,212 @@ class TestHelp:
         assert "--agents" in output
         assert "comma-separated list of agents" in flat
         assert "--workspaces" in output
+
+
+class TestProjectScripts:
+    def test_ug_and_ucode_are_equivalent_entry_points(self):
+        scripts = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())[
+            "project"
+        ]["scripts"]
+
+        assert scripts["ug"] == "ucode.cli:main"
+        assert scripts["ucode"] == "ucode.cli:main"
+
+
+class TestUpgrade:
+    @staticmethod
+    def _ok() -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    @staticmethod
+    def _which(command: str) -> str:
+        return f"/tools/{command}"
+
+    @staticmethod
+    def _requirement(distribution: str) -> str:
+        return f"{distribution} @ git+https://github.com/databricks/ucode"
+
+    def test_before_cutover_upgrades_ucode_normally_without_verification(self):
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run", return_value=self._ok()) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        assert run.call_args_list == [
+            call(
+                ["uv", "tool", "install", "--reinstall", self._requirement("ucode")],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        ]
+        assert "ucode upgraded" in result.output
+
+    def test_cutover_migrates_legacy_distribution_and_verifies_commands(self):
+        git_url = "git+https://github.com/databricks/ucode"
+        rename_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr=("Package metadata name `unity-gateway` does not match given name `ucode`"),
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("ucode.cli.shutil.which", side_effect=self._which),
+            patch(
+                "subprocess.run",
+                side_effect=[
+                    rename_failure,
+                    self._ok(),
+                    self._ok(),
+                    self._ok(),
+                    self._ok(),
+                ],
+            ) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        assert run.call_args_list == [
+            call(
+                ["uv", "tool", "install", "--reinstall", self._requirement("ucode")],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+            call(["uv", "tool", "uninstall", "ucode"], check=True),
+            call(["uv", "tool", "install", "--force", git_url], check=True),
+            call(
+                ["/tools/ug", "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+            call(
+                ["/tools/ucode", "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+        ]
+        assert "Migrated to `unity-gateway`" in result.output
+
+    def test_after_cutover_upgrades_unity_gateway_normally_without_verification(self):
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="unity-gateway"),
+            patch("subprocess.run", return_value=self._ok()) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        run.assert_called_once_with(
+            [
+                "uv",
+                "tool",
+                "install",
+                "--reinstall",
+                self._requirement("unity-gateway"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert "unity-gateway upgraded" in result.output
+
+    def test_unrelated_legacy_upgrade_failure_does_not_uninstall_ucode(self):
+        failure = subprocess.CompletedProcess(
+            [], 7, stdout="", stderr="Could not resolve host: github.com"
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run", return_value=failure) as run,
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 1
+        run.assert_called_once_with(
+            ["uv", "tool", "install", "--reinstall", self._requirement("ucode")],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert "left unchanged" in result.output
+        assert "ERROR 1" not in result.output
+
+    def test_cutover_install_failure_has_recovery_command(self):
+        rename_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr=("Package metadata name `unity-gateway` does not match given name `ucode`"),
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run") as run,
+        ):
+            run.side_effect = [
+                rename_failure,
+                self._ok(),
+                subprocess.CalledProcessError(7, ["uv", "tool", "install"]),
+            ]
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 1
+        assert "legacy `ucode` tool was removed" in result.output
+        assert "uv tool install --force git+https://github.com/databricks/ucode" in re.sub(
+            r"\s+", " ", result.output
+        )
+
+    def test_post_migration_verification_failure_is_actionable(self):
+        rename_failure = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr=("Package metadata name `unity-gateway` does not match given name `ucode`"),
+        )
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("ucode.cli.shutil.which", return_value=None),
+            patch(
+                "subprocess.run",
+                side_effect=[rename_failure, self._ok(), self._ok()],
+            ),
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 1
+        assert "`ug` is not available on PATH" in result.output
+
+    def test_missing_uv_is_actionable(self):
+        with (
+            patch("ucode.cli._installed_cli_distribution", return_value="ucode"),
+            patch("subprocess.run", side_effect=FileNotFoundError),
+        ):
+            result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 1
+        assert "uv" in result.output.lower()
+
+    def test_installed_distribution_prefers_unity_gateway(self):
+        with patch("ucode.cli.metadata.version", return_value="1.0.0") as package_version:
+            from ucode.cli import _installed_cli_distribution
+
+            assert _installed_cli_distribution() == "unity-gateway"
+
+        package_version.assert_called_once_with("unity-gateway")
+
+    def test_installed_distribution_falls_back_to_ucode(self):
+        def package_version(distribution_name: str) -> str:
+            if distribution_name == "unity-gateway":
+                raise metadata.PackageNotFoundError
+            return "1.0.0"
+
+        with patch("ucode.cli.metadata.version", side_effect=package_version):
+            from ucode.cli import _installed_cli_distribution
+
+            assert _installed_cli_distribution() == "ucode"
 
 
 class TestVersion:
@@ -679,6 +903,39 @@ class TestClaudeModelFlag:
         assert mock_launch.call_args.args[1]["_claude_launch_provider"] == "main.default.anthropic"
 
 
+class TestGeminiProviderLaunch:
+    @staticmethod
+    def _launch(monkeypatch, resolve_provider_models):
+        state = dict(MINIMAL_STATE)
+        monkeypatch.setattr("ucode.cli.ensure_bootstrap_dependencies", lambda *a, **k: None)
+        monkeypatch.setattr("ucode.cli.load_state", lambda: state)
+        monkeypatch.setattr("ucode.cli.ensure_provider_state", lambda t: state)
+        monkeypatch.setattr("ucode.cli.configure_shared_state", lambda *a, **k: state)
+        monkeypatch.setattr("ucode.cli._fetch_managed_config", lambda s: (None, False))
+        monkeypatch.setattr("ucode.cli.resolve_provider_models", resolve_provider_models)
+        monkeypatch.setattr("ucode.cli.configure_tool", lambda *a, **k: state)
+        monkeypatch.setattr(
+            "ucode.cli.resolve_gemini_provider_model",
+            lambda s, p, m: ("gemini-3.5-flash", None),
+        )
+        mock_launch = MagicMock()
+        monkeypatch.setattr("ucode.cli.launch_agent", mock_launch)
+        return runner.invoke(app, ["gemini", "--provider", "cat.schema.svc"])
+
+    def test_prints_resolved_target_model(self, monkeypatch):
+        # The concrete target gemini pins must show in the launch summary (not just the provider).
+        result = self._launch(monkeypatch, lambda t, s, p: (None, None, False))
+        assert result.exit_code == 0, result.output
+        assert "Model: gemini-3.5-flash" in _strip_ansi(result.output)
+
+    def test_skips_resolve_provider_models(self, monkeypatch):
+        # Gemini resolves its own target, so the claude-family lookup must not run (no double fetch).
+        mock_rpm = MagicMock(return_value=(None, None, False))
+        result = self._launch(monkeypatch, mock_rpm)
+        assert result.exit_code == 0, result.output
+        mock_rpm.assert_not_called()
+
+
 class TestMcpSubcommands:
     def test_web_search_subcommand_help(self):
         result = runner.invoke(app, ["mcp", "web-search", "--help"])
@@ -731,6 +988,17 @@ class TestAuthTokenCommand:
         assert result.exit_code == 0
         fetch.assert_called_once_with("https://override", "prod", force_refresh=True)
 
+    def test_force_refresh_is_forwarded(self):
+        with (
+            patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
+            patch("ucode.cli.get_databricks_token", return_value="tok") as fetch,
+            patch("ucode.cli.create_databricks_user_token", return_value="short-tok") as create,
+        ):
+            result = runner.invoke(app, ["auth-token", "--force-refresh"])
+        assert result.exit_code == 0
+        fetch.assert_called_once_with("https://ws", None, force_refresh=True)
+        create.assert_called_once_with("https://ws", "tok", lifetime_seconds=10)
+
     def test_errors_without_workspace(self):
         with patch("ucode.cli.load_state", return_value={}):
             result = runner.invoke(app, ["auth-token"])
@@ -751,7 +1019,7 @@ class TestAuthTokenCommand:
             patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
             patch(
                 "ucode.cli.get_databricks_token",
-                side_effect=lambda w, p: os.environ.get("DATABRICKS_BEARER", ""),
+                side_effect=lambda w, p, **_kwargs: os.environ.get("DATABRICKS_BEARER", ""),
             ),
         ):
             result = runner.invoke(app, ["auth-token", "--use-pat", "--profile", "p"])
@@ -767,7 +1035,7 @@ class TestAuthTokenCommand:
             patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
             patch(
                 "ucode.cli.get_databricks_token",
-                side_effect=lambda w, p: os.environ.get("DATABRICKS_BEARER", ""),
+                side_effect=lambda w, p, **_kwargs: os.environ.get("DATABRICKS_BEARER", ""),
             ),
         ):
             result = runner.invoke(app, ["auth-token", "--use-pat", "--profile", "p"])
@@ -797,7 +1065,7 @@ class TestAuthTokenCommand:
             patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
             patch(
                 "ucode.cli.get_databricks_token",
-                side_effect=lambda w, p: os.environ.get("DATABRICKS_BEARER", ""),
+                side_effect=lambda w, p, **_kwargs: os.environ.get("DATABRICKS_BEARER", ""),
             ),
         ):
             result = runner.invoke(app, ["auth-token", "--use-pat", "--profile", "p"])
@@ -1048,6 +1316,127 @@ class TestConfigureSkillsCommand:
         assert "--path" in _strip_ansi(result.output)
         mock_mcp.assert_not_called()
         mock_download.assert_not_called()
+
+
+class TestSkillsAddCommand:
+    """`ucode skill add` is the additive sibling of `configure skills`: `--mcp`
+    unions schemas into the connection scope, the default mode downloads."""
+
+    def test_mcp_flag_unions_locations(self):
+        with patch("ucode.cli.add_skills_command") as mock_add:
+            result = runner.invoke(app, ["skill", "add", "--location", "a.b", "--mcp"])
+        assert result.exit_code == 0, result.output
+        mock_add.assert_called_once_with(["a.b"])
+
+    def test_comma_location_yields_multiple_schemas(self):
+        with patch("ucode.cli.add_skills_command") as mock_add:
+            result = runner.invoke(app, ["skill", "add", "--location", "a.b, c.d", "--mcp"])
+        assert result.exit_code == 0, result.output
+        mock_add.assert_called_once_with(["a.b", "c.d"])
+
+    def test_default_mode_dispatches_download(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["skill", "add", "--location", "a.b", "--path", "/tmp/s"])
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path="/tmp/s", skills=None)
+
+    def test_skill_filter_dispatches_download_with_subset(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["skill", "add", "--location", "a.b", "--skills", "s1, s2"])
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path=None, skills={"s1", "s2"})
+
+    def test_fully_qualified_skills_derive_location(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["skill", "add", "--skills", "a.b.s1, a.b.s2"])
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path=None, skills={"s1", "s2"})
+
+    def test_fully_qualified_skills_match_explicit_location(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(
+                app, ["skill", "add", "--location", "a.b", "--skills", "a.b.s1, a.b.s2"]
+            )
+        assert result.exit_code == 0, result.output
+        mock_download.assert_called_once_with(["a.b"], path=None, skills={"s1", "s2"})
+
+    def test_fully_qualified_skills_must_match_explicit_location(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["skill", "add", "--location", "a.b", "--skills", "c.d.s1"])
+        assert result.exit_code == 1
+        assert "must match --location `a.b`" in _strip_ansi(result.output)
+        mock_download.assert_not_called()
+
+    @pytest.mark.parametrize("skill", ["a.b", "a..s1", "a.b.c.d"])
+    def test_malformed_fully_qualified_skill_exit_1(self, skill):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["skill", "add", "--location", "a.b", "--skills", skill])
+        assert result.exit_code == 1
+        assert "must be bare names or fully qualified" in _strip_ansi(result.output)
+        mock_download.assert_not_called()
+
+    def test_bare_skills_without_location_exit_1(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["skill", "add", "--skills", "s1"])
+        assert result.exit_code == 1
+        assert "--skills short names need --location" in _strip_ansi(result.output)
+        mock_download.assert_not_called()
+
+    def test_fully_qualified_skills_across_schemas_exit_1(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(app, ["skill", "add", "--skills", "a.b.s1, c.d.s2"])
+        assert result.exit_code == 1
+        assert "must all share one" in _strip_ansi(result.output)
+        mock_download.assert_not_called()
+
+    def test_without_location_exit_1(self):
+        with (
+            patch("ucode.cli.add_skills_command") as mock_add,
+            patch("ucode.cli.configure_skills_download_command") as mock_download,
+        ):
+            result = runner.invoke(app, ["skill", "add"])
+        assert result.exit_code == 1
+        assert "--location is required" in _strip_ansi(result.output)
+        mock_add.assert_not_called()
+        mock_download.assert_not_called()
+
+    def test_skill_with_mcp_exit_1(self):
+        with (
+            patch("ucode.cli.add_skills_command") as mock_add,
+            patch("ucode.cli.configure_skills_download_command") as mock_download,
+        ):
+            result = runner.invoke(
+                app, ["skill", "add", "--location", "a.b", "--mcp", "--skills", "s1"]
+            )
+        assert result.exit_code == 1
+        assert "--skills" in _strip_ansi(result.output)
+        mock_add.assert_not_called()
+        mock_download.assert_not_called()
+
+    def test_path_with_mcp_exit_1(self):
+        with patch("ucode.cli.add_skills_command") as mock_add:
+            result = runner.invoke(
+                app, ["skill", "add", "--location", "a.b", "--mcp", "--path", "/tmp/s"]
+            )
+        assert result.exit_code == 1
+        assert "--path" in _strip_ansi(result.output)
+        mock_add.assert_not_called()
+
+    def test_skill_with_multiple_locations_exit_1(self):
+        with patch("ucode.cli.configure_skills_download_command") as mock_download:
+            result = runner.invoke(
+                app, ["skill", "add", "--location", "a.b, c.d", "--skills", "s1"]
+            )
+        assert result.exit_code == 1
+        assert "--skills requires a single --location" in _strip_ansi(result.output)
+        mock_download.assert_not_called()
+
+    def test_malformed_location_exit_1(self):
+        with patch("ucode.cli.add_skills_command") as mock_add:
+            result = runner.invoke(app, ["skill", "add", "--location", "a.b.c", "--mcp"])
+        assert result.exit_code == 1
+        assert "--location" in _strip_ansi(result.output)
+        mock_add.assert_not_called()
 
 
 class TestApplyManagedSkills:
@@ -1395,6 +1784,18 @@ def test_launch_title(tool, expected):
     from ucode.cli import _launch_title
 
     assert _launch_title(tool) == expected
+
+
+def test_cursor_launch_uses_unity_gateway_branding():
+    with (
+        patch("ucode.cli.shutil.which", return_value="/usr/local/bin/cursor-agent"),
+        patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
+        patch("ucode.agents.cursor.launch"),
+    ):
+        result = runner.invoke(app, ["cursor"])
+
+    assert result.exit_code == 0, result.output
+    assert "Unity Gateway with Cursor" in result.output
 
 
 class TestCachedConfigPredicate:
@@ -1844,22 +2245,6 @@ class TestConfigureAgentFlag:
             result = runner.invoke(app, ["configure", "--agent", "claude-code"])
         assert result.exit_code == 0, result.output
         mock_cfg.assert_called_once_with("claude")
-
-    def test_upgrade_runs_uv_tool_install(self):
-        with patch("subprocess.run") as mock_run:
-            result = runner.invoke(app, ["upgrade"])
-        assert result.exit_code == 0, result.output
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
-        assert cmd[:3] == ["uv", "tool", "install"]
-        assert "--reinstall" in cmd
-        assert any("github.com/databricks/ucode" in s for s in cmd)
-
-    def test_upgrade_handles_uv_missing(self):
-        with patch("subprocess.run", side_effect=FileNotFoundError):
-            result = runner.invoke(app, ["upgrade"])
-        assert result.exit_code != 0
-        assert "uv" in result.output.lower()
 
     def test_agent_flag_rejects_unknown(self):
         with (
@@ -2469,7 +2854,9 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "resolve_pat_token", lambda p: pat_token)
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
         monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
-        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: None)
+        monkeypatch.setattr(
+            cli_mod, "probe_unity_gateway_capabilities", lambda w, t: MODEL_SERVICE_PROBE
+        )
         monkeypatch.setattr(cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], None))
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
@@ -2491,6 +2878,107 @@ class TestConfigureSharedStateUsePat:
         assert os_mod.environ["DATABRICKS_BEARER"] == "dapi-pat"
         assert state["use_pat"] is True
         assert saved and saved[-1]["use_pat"] is True
+
+    def test_happy_path_prints_success_without_model_service_detail(self, monkeypatch, capsys):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+
+        cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        output = _strip_ansi(capsys.readouterr().out)
+        assert "Unity AI Gateway connected" in output
+        assert "Model service:" not in output
+
+    @pytest.mark.parametrize(
+        ("responses", "expected_model_service"),
+        [
+            (
+                [({}, None), ({"endpoints": []}, None)],
+                "reachable, no accessible model services returned; check USE CATALOG on system, "
+                "and USE SCHEMA and EXECUTE on system.ai",
+            ),
+            (
+                [
+                    (None, "HTTP 403 Forbidden"),
+                    ({"endpoints": [{"name": "databricks-gpt-5"}]}, None),
+                ],
+                "HTTP 403 Forbidden",
+            ),
+        ],
+        ids=[
+            "model-service-empty-legacy-empty",
+            "model-service-forbidden-legacy-resource",
+        ],
+    )
+    def test_prints_warning_when_model_service_not_detected(
+        self,
+        monkeypatch,
+        capsys,
+        responses,
+        expected_model_service,
+    ):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        response_iter = iter(responses)
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: next(response_iter))
+        monkeypatch.setattr(
+            cli_mod, "probe_unity_gateway_capabilities", db_mod.probe_unity_gateway_capabilities
+        )
+
+        cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        output = " ".join(_strip_ansi(capsys.readouterr().out).split())
+        assert f"Model service: {expected_model_service}" in output
+        assert "Unity AI Gateway connected" not in output
+        assert "(Legacy) endpoints:" not in output
+        assert "V2" not in output
+        assert "V3" not in output
+
+    @pytest.mark.parametrize(
+        ("responses", "error_match"),
+        [
+            (
+                [
+                    ({}, None),
+                    (
+                        None,
+                        "HTTP 404 Not Found: AI Gateway V2 is not available for CSP-enabled "
+                        "workspaces",
+                    ),
+                ],
+                "no accessible model services",
+            ),
+            (
+                [
+                    (None, "HTTP 404 Not Found: V3 unavailable"),
+                    (None, "HTTP 404 Not Found: V2 unavailable"),
+                ],
+                "neither model services",
+            ),
+            ([(None, "HTTP 401 Unauthorized")], "rejected the access token"),
+        ],
+        ids=[
+            "model-service-empty-legacy-unavailable",
+            "neither-path-reachable",
+            "invalid-token",
+        ],
+    )
+    def test_local_gateway_probe_failures_do_not_print_success(
+        self, monkeypatch, capsys, responses, error_match
+    ):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        response_iter = iter(responses)
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: next(response_iter))
+        monkeypatch.setattr(
+            cli_mod, "probe_unity_gateway_capabilities", db_mod.probe_unity_gateway_capabilities
+        )
+
+        with pytest.raises(RuntimeError, match=error_match) as excinfo:
+            cli_mod.configure_shared_state(self.WS, profile="DEFAULT")
+
+        output = _strip_ansi(capsys.readouterr().out)
+        assert "Unity AI Gateway connected" not in output
+        message = str(excinfo.value)
+        assert "v2" not in message.lower()
+        assert "v3" not in message.lower()
 
     def test_use_pat_without_pat_profile_raises(self, monkeypatch):
         cli_mod, logins, _, _ = self._stub_deps(monkeypatch, pat_token=None)
@@ -2790,7 +3278,9 @@ class TestConfigureSharedStateMcpCleanup:
         monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda w, p=None: None)
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
         monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
-        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: None)
+        monkeypatch.setattr(
+            cli_mod, "probe_unity_gateway_capabilities", lambda w, t: MODEL_SERVICE_PROBE
+        )
         monkeypatch.setattr(cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], None))
         monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
         monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
@@ -2850,7 +3340,9 @@ class TestConfigureSharedStateSkipDiscovery:
         monkeypatch.setattr(cli_mod, "run_databricks_login", lambda w, p: None)
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
         monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
-        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", lambda w, t: None)
+        monkeypatch.setattr(
+            cli_mod, "probe_unity_gateway_capabilities", lambda w, t: MODEL_SERVICE_PROBE
+        )
         monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
         monkeypatch.setattr(cli_mod, "save_state", lambda s: None)
 
@@ -2908,7 +3400,11 @@ class TestConfigureSharedStateSkipPreflight:
         monkeypatch.setattr(cli_mod, "run_databricks_login", _boom("run_databricks_login"))
         monkeypatch.setattr(cli_mod, "ensure_pat_bearer", _boom("ensure_pat_bearer"))
         monkeypatch.setattr(cli_mod, "get_databricks_token", _boom("get_databricks_token"))
-        monkeypatch.setattr(cli_mod, "ensure_ai_gateway", _boom("ensure_ai_gateway"))
+        monkeypatch.setattr(
+            cli_mod,
+            "probe_unity_gateway_capabilities",
+            _boom("probe_unity_gateway_capabilities"),
+        )
         monkeypatch.setattr(cli_mod, "discover_model_services", _boom("discover_model_services"))
         monkeypatch.setattr(cli_mod, "discover_codex_models", _boom("discover_codex_models"))
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: "resolved")
@@ -3144,7 +3640,7 @@ class TestConfigureDeprecation:
         assert exc.value.exit_code == 0
         out = capsys.readouterr().out
         assert "you're all set" in out
-        assert "Run `ucode`" in out
+        assert "Run `ug`" in out
 
     def test_fetches_the_config_rather_than_reading_a_cold_cache(self, monkeypatch):
         # The gap this guards: on a fresh machine the local cache is empty until the first launch,
@@ -3185,7 +3681,7 @@ class TestConfigureDeprecation:
             {
                 "workspace": "https://w",
                 "profile": None,
-                "command_label": "Configure Unity Gateway",
+                "command_label": "Configure unity-gateway CLI",
                 "token": "tok",
             }
         ]
@@ -3292,7 +3788,7 @@ class TestConfigureDeprecation:
             {
                 "workspace": "https://w",
                 "profile": None,
-                "command_label": "Configure Unity Gateway",
+                "command_label": "Configure unity-gateway CLI",
                 "token": "tok",
             }
         ]
@@ -3539,7 +4035,7 @@ class TestBareUcode:
         result, launched = self._run(monkeypatch, managed=None, is_admin=True)
         assert result.exit_code == 0, result.output
         assert launched == []
-        assert "ucode setup" in result.output
+        assert "ug setup" in result.output
 
     def test_non_admin_without_a_config_is_told_to_ask(self, monkeypatch):
         result, launched = self._run(monkeypatch, managed=None, is_admin=False)
@@ -3553,7 +4049,7 @@ class TestBareUcode:
         )
         assert result.exit_code == 0, result.output
         assert launched == []
-        assert "ucode setup" not in result.output
+        assert "ug setup" not in result.output
 
     def test_non_admin_without_a_config_sees_no_setup_when_feature_disabled(self, monkeypatch):
         result, launched = self._run(
@@ -3561,7 +4057,7 @@ class TestBareUcode:
         )
         assert result.exit_code == 0, result.output
         assert launched == []
-        assert "ucode setup" not in result.output
+        assert "ug setup" not in result.output
 
     def test_dry_run_uses_the_cache_and_does_not_fetch(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
@@ -3713,6 +4209,27 @@ class TestBudgetRecommendationAtLaunch:
             recommendation={"agent": "claude", "model": "system.ai.claude-haiku-4-5"},
         )
         assert cfg.call_args.args[2] == "system.ai.claude-haiku-4-5"
+
+    def test_passes_configured_claude_defaults_to_writer(self, monkeypatch):
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        managed = {
+            "enabled_agents": {
+                "claude": {
+                    "model_config": {
+                        "models": {
+                            "default_sonnet_model": "system.ai.claude-sonnet-4-6",
+                        }
+                    }
+                }
+            }
+        }
+
+        result, _calls, cfg = self._launch(monkeypatch, managed=managed)
+
+        assert result.exit_code == 0, result.output
+        assert cfg.call_args.kwargs["coding_agent_config_defaults"] == {
+            "sonnet": "system.ai.claude-sonnet-4-6"
+        }
 
     def test_another_agent_keeps_its_own_model_and_is_told_why(self, monkeypatch):
         # A tier's model belongs to the tier's agent; pinning it on claude would land a Kimi id in

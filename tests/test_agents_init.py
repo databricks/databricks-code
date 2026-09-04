@@ -81,6 +81,20 @@ class TestToolSpecs:
     def test_default_tool_is_codex(self):
         assert DEFAULT_TOOL == "codex"
 
+    def test_tool_update_available_uses_agent_override(self, monkeypatch):
+        monkeypatch.setattr(
+            agents_mod.opencode,
+            "is_update_available",
+            lambda: ("1.18.15", "1.18.16"),
+        )
+        monkeypatch.setattr(
+            agents_mod,
+            "available_npm_package_update",
+            lambda _package: (_ for _ in ()).throw(AssertionError("should use override")),
+        )
+
+        assert agents_mod.tool_update_available("opencode") == ("1.18.15", "1.18.16")
+
 
 class TestInstallAiToolsForAgents:
     def _capture(self, monkeypatch):
@@ -367,6 +381,118 @@ class TestResolveProviderModels:
         assert error == "boom"
         assert relayed is False
 
+    @pytest.mark.parametrize("tool", ["gemini", "codex"])
+    def test_non_claude_pins_no_family_map(self, monkeypatch, tool):
+        # Only claude pins a per-family map; codex ignores it and gemini resolves its own
+        # target, so a non-claude service must not be run through Claude-family logic.
+        self._patch(
+            monkeypatch,
+            {"provider_type": "gemini_enterprise", "targets": ["gemini-3.5-flash"]},
+            None,
+        )
+        models, error, relayed = agents_mod.resolve_provider_models(tool, self._STATE, "c.s.svc")
+        assert (models, error, relayed) == (None, None, False)
+
+
+class TestConfigureOneGeminiProvider:
+    _STATE = {"workspace": "https://ws.databricks.com", "profile": None}
+
+    def test_gemini_provider_resolves_target_before_configure(self, monkeypatch):
+        # Regression: configuring gemini through a provider must resolve a target model rather
+        # than passing model=None into configure_tool (whose gemini branch requires one).
+        monkeypatch.setattr(
+            agents_mod,
+            "resolve_gemini_provider_model",
+            lambda state, provider, model, **kw: ("gemini-3.5-flash", None),
+        )
+        captured = {}
+
+        def _fake_configure_tool(tool, state, model=None, **kwargs):
+            captured["tool"] = tool
+            captured["model"] = model
+            captured["provider"] = kwargs.get("provider")
+            return state
+
+        monkeypatch.setattr(agents_mod, "configure_tool", _fake_configure_tool)
+        agents_mod._configure_one("gemini", self._STATE, "c.s.g")
+        assert captured == {"tool": "gemini", "model": "gemini-3.5-flash", "provider": "c.s.g"}
+
+    def test_gemini_provider_resolution_error_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            agents_mod,
+            "resolve_gemini_provider_model",
+            lambda state, provider, model, **kw: (None, "pick a model"),
+        )
+        with pytest.raises(RuntimeError, match="pick a model"):
+            agents_mod._configure_one("gemini", self._STATE, "c.s.g")
+
+
+class TestResolveGeminiProviderModel:
+    _STATE = {"workspace": "https://ws.databricks.com", "profile": None}
+
+    def _patch(self, monkeypatch, service, error=None, persisted=None):
+        monkeypatch.setattr(agents_mod, "get_databricks_token", lambda w, p: "token")
+        monkeypatch.setattr(
+            agents_mod, "resolve_provider_service", lambda t, n, w, tok: (service, error)
+        )
+        # Hermetic: never read the developer's real ~/.gemini/ucode.env.
+        monkeypatch.setattr(agents_mod.gemini, "persisted_provider_model", lambda: persisted)
+
+    def test_sole_target_used_by_default(self, monkeypatch):
+        self._patch(monkeypatch, {"name": "c.s.g", "targets": ["gemini-3.5-flash"]})
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert (model, error) == ("gemini-3.5-flash", None)
+
+    def test_explicit_model_not_a_target_errors(self, monkeypatch):
+        self._patch(monkeypatch, {"name": "c.s.g", "targets": ["gemini-3.5-flash"]})
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", "gpt-5")
+        assert model is None
+        assert "is not a target" in error
+
+    def test_persisted_target_reused_for_multi_target(self, monkeypatch):
+        # A bare relaunch (no --model) of a multi-target service reuses the pinned model.
+        self._patch(
+            monkeypatch,
+            {"name": "c.s.g", "targets": ["gemini-3.5-flash", "gemini-3.5-pro"]},
+            persisted="gemini-3.5-pro",
+        )
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert (model, error) == ("gemini-3.5-pro", None)
+
+    def test_multi_target_without_choice_errors(self, monkeypatch):
+        # Multiple targets, nothing pinned, no --model → ask the user to choose.
+        self._patch(
+            monkeypatch,
+            {"name": "c.s.g", "targets": ["gemini-3.5-flash", "gemini-3.5-pro"]},
+            persisted=None,
+        )
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert model is None
+        assert "exposes several models" in error
+
+    def test_stale_persisted_ignored_falls_back_to_sole(self, monkeypatch):
+        # A pinned model that is no longer a target (e.g. after switching services) is ignored.
+        self._patch(
+            monkeypatch,
+            {"name": "c.s.g", "targets": ["gemini-3.5-flash"]},
+            persisted="gemini-3.5-pro",
+        )
+        model, error = agents_mod.resolve_gemini_provider_model(self._STATE, "c.s.g", None)
+        assert (model, error) == ("gemini-3.5-flash", None)
+
+    def test_prefetched_service_skips_lookup(self, monkeypatch):
+        # Passing a service dict must not trigger a token fetch or control-plane lookup.
+        def _boom(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError("should not fetch when service is provided")
+
+        monkeypatch.setattr(agents_mod, "get_databricks_token", _boom)
+        monkeypatch.setattr(agents_mod, "resolve_provider_service", _boom)
+        monkeypatch.setattr(agents_mod.gemini, "persisted_provider_model", lambda: None)
+        model, error = agents_mod.resolve_gemini_provider_model(
+            self._STATE, "c.s.g", None, service={"name": "c.s.g", "targets": ["gemini-3.5-flash"]}
+        )
+        assert (model, error) == ("gemini-3.5-flash", None)
+
 
 class TestInstallToolBinary:
     def test_non_strict_returns_false_when_npm_missing(self, monkeypatch):
@@ -404,6 +530,8 @@ class TestInstallToolBinary:
             "ucode.agents.prompt_yes_no",
             lambda prompt: (_ for _ in ()).throw(AssertionError("should not prompt")),
         )
+        monkeypatch.setattr("ucode.agents._required_update_message", lambda _: None)
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: None)
 
         assert install_tool_binary("opencode", strict=False, update_existing=True) is True
         assert calls == []
@@ -435,7 +563,7 @@ class TestInstallToolBinary:
             )
             is True
         )
-        assert calls and calls[0][:3] == ["npm", "install", "-g"]
+        assert calls == [["npm", "install", "-g", "opencode-ai@1"]]
 
     def test_too_new_tool_warns_and_downgrades_on_confirm(self, monkeypatch, capsys):
         """An installed build past its supported ceiling is offered as a

@@ -251,6 +251,9 @@ def tool_binary_installed(tool: str) -> bool:
 def tool_update_available(tool: str) -> tuple[str, str] | None:
     """Return ``(current, latest)`` when a newer agent CLI is published, else None.
     Read-only wrapper over the npm update check — for ``ucode doctor``."""
+    checker = getattr(_MODULES[tool], "is_update_available", None)
+    if callable(checker):
+        return checker()
     return available_npm_package_update(TOOL_SPECS[tool]["package"])
 
 
@@ -338,7 +341,61 @@ def resolve_provider_models(
     # model selection server-side for that tier, so there's nothing to reconcile.
     if relayed:
         return None, None, relayed
+    # Only Claude pins per-family model ids. Codex ignores this map, and gemini resolves
+    # its target through resolve_gemini_provider_model instead — so mapping their targets
+    # through Claude-family logic would be meaningless (see docstring).
+    if tool != "claude":
+        return None, None, relayed
     return map_claude_family_models(service.get("targets") or []) or None, None, relayed
+
+
+def resolve_gemini_provider_model(
+    state: dict,
+    provider: str,
+    explicit_model: str | None,
+    *,
+    service: dict | None = None,
+) -> tuple[str | None, str | None]:
+    """Pick the Gemini model to pin for a provider-service launch.
+
+    A Gemini Enterprise service routes by header but the request still names a
+    concrete model in the URL, so one of the service's declared targets must be
+    pinned. In precedence order: ``explicit_model`` (from ``--model``) when it
+    names a target; the model already pinned in the env file when it is still a
+    target (so a bare relaunch or reconfigure needn't re-pass ``--model``); the
+    sole target when the service declares exactly one; otherwise ask the user to
+    choose. Returns ``(model, error)``.
+
+    Pass ``service`` to reuse an already-fetched service dict and skip the
+    control-plane lookup (the launch/configure paths hold one).
+    """
+    if service is None:
+        token = get_databricks_token(state["workspace"], state.get("profile"))
+        service, error = resolve_provider_service("gemini", provider, state["workspace"], token)
+        if error or service is None:
+            return None, error or f"Model provider service '{provider}' was not found."
+    targets = [t for t in (service.get("targets") or []) if isinstance(t, str) and t]
+    if explicit_model:
+        if explicit_model in targets:
+            return explicit_model, None
+        available = ", ".join(targets) or "none"
+        return None, (
+            f"Model '{explicit_model}' is not a target of provider service '{provider}'. "
+            f"Available: {available}."
+        )
+    if not targets:
+        return None, f"Provider service '{provider}' exposes no models to launch."
+    # Reuse a previously pinned target so a bare relaunch/reconfigure keeps working without
+    # --model — but only when it is still one of the service's declared targets.
+    persisted = gemini.persisted_provider_model()
+    if persisted in targets:
+        return persisted, None
+    if len(targets) == 1:
+        return targets[0], None
+    return None, (
+        f"Provider service '{provider}' exposes several models "
+        f"({', '.join(targets)}); pass --model to choose one."
+    )
 
 
 def configure_tool(
@@ -350,6 +407,7 @@ def configure_tool(
     relayed: bool = False,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    coding_agent_config_defaults: dict[str, str] | None = None,
 ) -> dict:
     result: dict | tuple[dict, str]
     if tool == "codex":
@@ -368,13 +426,15 @@ def configure_tool(
             relayed=relayed,
             route_root_model=route_root_model,
             custom_model=custom_model,
+            coding_agent_config_defaults=coding_agent_config_defaults,
         )
     else:
-        # provider routing is claude/codex-only; every other tool needs a model.
+        # Every tool in this branch needs a model — including gemini under a provider,
+        # which still pins the service's target model in the URL.
         if not model:
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         if tool == "gemini":
-            result = gemini.write_tool_config(state, model)
+            result = gemini.write_tool_config(state, model, provider=provider)
         elif tool == "copilot":
             result = copilot.write_tool_config(state, model)
         elif tool == "pi":
@@ -457,6 +517,14 @@ def configure_single_tool(tool: str, state: dict) -> dict:
 def _configure_one(tool: str, state: dict, provider: str | None) -> dict:
     """Write one tool's config, routing through ``provider`` when set."""
     if provider:
+        if tool == "gemini":
+            # Gemini pins a concrete target in the URL, so configure must resolve one now —
+            # unlike claude/codex, its config writer requires a model. This also validates the
+            # service in a single lookup (no resolve_provider_models family map for gemini).
+            model, error = resolve_gemini_provider_model(state, provider, None)
+            if error:
+                raise RuntimeError(error)
+            return configure_tool(tool, state, model, provider=provider)
         provider_models, error, relayed = resolve_provider_models(tool, state, provider)
         if error:
             raise RuntimeError(error)

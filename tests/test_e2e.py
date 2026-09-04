@@ -27,7 +27,6 @@ from ucode.databricks import (
     build_tool_base_url,
     discover_model_services,
     discover_sql_warehouses,
-    ensure_ai_gateway,
     fetch_ai_gateway_claude_models,
     fetch_codex_models,
     fetch_gemini_models,
@@ -35,6 +34,7 @@ from ucode.databricks import (
     is_model_provider_feature_unavailable,
     list_model_provider_services,
     list_tool_provider_services,
+    probe_unity_gateway_capabilities,
     service_usable_for_tool,
     workspace_hostname,
 )
@@ -137,8 +137,8 @@ class TestDatabricksAuth:
 
 
 class TestAiGateway:
-    def test_ensure_ai_gateway_does_not_raise(self, e2e_workspace, e2e_token):
-        ensure_ai_gateway(e2e_workspace, e2e_token)
+    def test_probe_unity_gateway_capabilities_does_not_raise(self, e2e_workspace, e2e_token):
+        probe_unity_gateway_capabilities(e2e_workspace, e2e_token)
 
     def test_workspace_hostname_resolves(self, e2e_workspace):
         hostname = workspace_hostname(e2e_workspace)
@@ -410,6 +410,33 @@ class TestConfigureSubset:
 # Tests are skipped when the binary is not installed or no models are available.
 # ---------------------------------------------------------------------------
 
+# Model exclusions live here so a temporary outage can be scoped consistently
+# across every harness that exercises the affected model.
+E2E_MODEL_SKIP_HARNESSES: dict[str, frozenset[str]] = {
+    # Codex nano is unreliably slow and exceeds the E2E timeout.
+    "gpt-5-4-nano": frozenset({"codex"}),
+    # The CI OpenAI project cannot serve this snapshot in its geography.
+    "gpt-5-3-codex": frozenset({"codex", "pi"}),
+    # Bedrock Grok rejects request/tool shapes from these harnesses.
+    "grok": frozenset({"codex", "copilot", "pi"}),
+    # These Gemini endpoints hang OpenCode well past its E2E timeout.
+    "databricks-gemini-3-1-flash-lite": frozenset({"opencode"}),
+    # Codex-tuned and newer GPT endpoints do not support Copilot's MLflow chat route.
+    "-codex": frozenset({"copilot"}),
+    "gpt-5-5": frozenset({"copilot"}),
+    "gpt-5-6": frozenset({"copilot"}),
+    # Astra currently fails through these paths in prod-aws-us-east-1.
+    "astra": frozenset({"copilot", "pi", "web_search"}),
+}
+
+
+def _model_is_skipped(model: str, harness: str) -> bool:
+    normalized = model.lower()
+    return any(
+        fragment in normalized and harness in harnesses
+        for fragment, harnesses in E2E_MODEL_SKIP_HARNESSES.items()
+    )
+
 
 def _require_binary(binary: str):
     if not shutil.which(binary):
@@ -419,30 +446,20 @@ def _require_binary(binary: str):
 class TestCodexLaunch:
     """Run codex against every available codex model."""
 
-    # Substrings of model IDs that are known-incompatible with the codex CLI on
-    # Databricks today. Each entry should have a comment explaining why.
-    CODEX_INCOMPATIBLE_MODEL_FRAGMENTS = (
-        # nano endpoint is unreliably slow and times out past the 60s budget.
-        "gpt-5-4-nano",
-        # Discoverable and correctly configured, but the gateway's upstream OpenAI project can't
-        # serve this snapshot from the CI region: "The requested model snapshot is not available
-        # for your project's geography." The gateway relays that as a bare INTERNAL_ERROR
-        # ("invalid response from an upstream server"), so the launch fails after codex-cli
-        # exhausts its five reconnects. Nothing ucode writes can fix it.
-        "gpt-5-3-codex",
-        # Bedrock Grok rejects the Responses tool schema Codex sends (missing nested `function`).
-        "grok",
-    )
-
     def _codex_models(self, e2e_state: dict) -> list[str]:
         models = [
             model
             for model in (e2e_state.get("codex_models") or [])
-            if not any(frag in model for frag in self.CODEX_INCOMPATIBLE_MODEL_FRAGMENTS)
+            if not _model_is_skipped(model, "codex")
         ]
         if not models:
             pytest.skip("No Codex models available on this workspace")
         return models
+
+    def test_astra_is_not_skipped(self):
+        assert self._codex_models({"codex_models": ["databricks-gpt-6-astra"]}) == [
+            "databricks-gpt-6-astra"
+        ]
 
     def test_launch_codex_per_model(self, tmp_path, monkeypatch, e2e_state, e2e_workspace):
         """Parametrized inline — iterates over all codex models and asserts each works."""
@@ -749,21 +766,13 @@ class TestGeminiFreshInstall:
 class TestOpencodeLaunch:
     """Run OpenCode against the available native and OSS model providers."""
 
-    # Models that hang opencode well past 180s on the staging gateway with
-    # no stderr beyond the initial `> build · <model>` line, while every
-    # other configured model returns in ~3s. Backend-side latency we can't
-    # influence from this repo; skip rather than block CI.
-    SKIP_MODELS: frozenset[str] = frozenset(
-        {"databricks-gemini-3-1-flash-lite", "databricks-gemini-3-1-flash-lite-image"}
-    )
-
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
         """Return [(provider, model_id), ...] for all opencode models."""
         opencode_models: dict = e2e_state.get("opencode_models") or {}
         out: list[tuple[str, str]] = []
         for provider, models in opencode_models.items():
             for model in models or []:
-                if model in self.SKIP_MODELS:
+                if _model_is_skipped(model, "opencode"):
                     continue
                 out.append((provider, model))
         return out
@@ -892,29 +901,59 @@ class TestOpencodeLaunch:
             f"stdout={result.stdout[:300]!r} stderr={result.stderr[:500]!r}"
         )
 
+    def test_recovers_from_rejected_initial_token(
+        self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
+    ):
+        """Exercise the real OpenCode plugin's 401 refresh-and-retry path."""
+        import ucode.config_io as config_io_mod
+        from ucode.agents import opencode
+
+        _require_binary("opencode")
+        models = self._all_models(e2e_state)
+        if not models:
+            pytest.skip("No OpenCode models available on this workspace")
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        xdg = tmp_path / "opencode-xdg"
+        monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
+        monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", xdg / "opencode" / "opencode.json")
+        monkeypatch.setattr(
+            opencode, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-config.backup.json"
+        )
+        monkeypatch.setattr("ucode.state.save_state", lambda s: None)
+
+        _, model = models[0]
+        rejected_token = "ucode-intentionally-rejected-token"
+        opencode.write_tool_config(
+            {**e2e_state, "workspace": e2e_workspace},
+            model,
+            token=rejected_token,
+        )
+
+        env = opencode.build_runtime_env(rejected_token)
+        # CI authenticates this way; the helper subprocess inherits it and
+        # returns the known-good token after OpenCode's first request gets 401.
+        env["DATABRICKS_BEARER"] = e2e_token
+        result = _run_agent(
+            opencode.validate_cmd("opencode"),
+            env=env,
+            timeout=180,
+        )
+        combined = (result.stdout + result.stderr).strip()
+        assert result.returncode == 0 and combined, (
+            "OpenCode did not recover after its initial token was rejected: "
+            f"rc={result.returncode} stdout={result.stdout[:300]!r} "
+            f"stderr={result.stderr[:500]!r}"
+        )
+
 
 class TestCopilotLaunch:
     """Run copilot against every Claude/codex model via the MLflow chat-completions gateway.
 
     Gemini is excluded by design — Databricks' Gemini translator rejects the
-    `stream_options` field Copilot CLI sends. Some codex variants are also
-    incompatible upstream and are listed in COPILOT_INCOMPATIBLE_MODEL_FRAGMENTS.
+    `stream_options` field Copilot CLI sends. Other incompatible models are
+    scoped to Copilot in E2E_MODEL_SKIP_HARNESSES.
     """
-
-    # Substrings of model IDs that are known-incompatible with Copilot CLI on
-    # Databricks today. Each entry should have a comment explaining why.
-    COPILOT_INCOMPATIBLE_MODEL_FRAGMENTS = (
-        # Codex-tuned endpoints expose only openai/v1/responses and
-        # cursor/v1/chat/completions, not mlflow/v1/chat/completions.
-        "-codex",
-        # gpt-5.5 rejects function tools + reasoning_effort on /chat/completions
-        # ("Please use /v1/responses instead").
-        "gpt-5-5",
-        # gpt-5.6 models similarly reject /chat/completions with 404.
-        "gpt-5-6",
-        # Bedrock Grok rejects the gateway's llm/v1/chat task type.
-        "grok",
-    )
 
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
         """Return [(family, model_id), ...] for every model copilot can talk to."""
@@ -923,10 +962,14 @@ class TestCopilotLaunch:
         for family, model_id in _launchable_model_items(claude_models):
             out.append((f"claude-{family}", model_id))
         for model in e2e_state.get("codex_models") or []:
-            if any(frag in model for frag in self.COPILOT_INCOMPATIBLE_MODEL_FRAGMENTS):
+            if _model_is_skipped(model, "copilot"):
                 continue
             out.append(("codex", model))
         return out
+
+    def test_astra_is_skipped(self):
+        state = {"codex_models": ["databricks-gpt-6-astra", "databricks-gpt-5-4"]}
+        assert self._all_models(state) == [("codex", "databricks-gpt-5-4")]
 
     def test_launch_copilot_per_model(
         self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
@@ -977,24 +1020,21 @@ class TestPiLaunch:
     test exercises each one end-to-end through the validation path.
     """
 
-    INCOMPATIBLE_MODEL_FRAGMENTS = (
-        # The CI project's upstream OpenAI account cannot serve this snapshot in its geography.
-        "gpt-5-3-codex",
-        # Bedrock Grok currently rejects Pi's OpenAI request with HTTP 400.
-        "grok",
-    )
-
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
         claude_models: dict = e2e_state.get("claude_models") or {}
         for family, model_id in _launchable_model_items(claude_models):
             out.append((f"claude-{family}", model_id))
         for model in e2e_state.get("codex_models") or []:
-            if not any(fragment in model for fragment in self.INCOMPATIBLE_MODEL_FRAGMENTS):
+            if not _model_is_skipped(model, "pi"):
                 out.append(("codex", model))
         for model in e2e_state.get("gemini_models") or []:
             out.append(("gemini", model))
         return out
+
+    def test_astra_is_skipped(self):
+        state = {"codex_models": ["databricks-gpt-6-astra", "databricks-gpt-5-4"]}
+        assert self._all_models(state) == [("codex", "databricks-gpt-5-4")]
 
     def test_launch_pi_per_model(self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token):
         import ucode.config_io as config_io_mod
@@ -1064,10 +1104,19 @@ class TestPiLaunch:
 
 
 def _first_codex_model(e2e_state: dict) -> str:
-    models = e2e_state.get("codex_models") or []
+    models = [
+        model
+        for model in (e2e_state.get("codex_models") or [])
+        if not _model_is_skipped(model, "web_search")
+    ]
     if not models:
         pytest.skip("No Responses-API (codex) models available on this workspace")
     return models[0]
+
+
+def test_web_search_skips_astra():
+    state = {"codex_models": ["databricks-gpt-6-astra", "databricks-gpt-5-4"]}
+    assert _first_codex_model(state) == "databricks-gpt-5-4"
 
 
 class TestWebSearchResponsesApi:

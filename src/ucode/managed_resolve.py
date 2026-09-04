@@ -186,6 +186,13 @@ def managed_default_model(managed: dict, tool: str) -> str | None:
     return _str(_agent_model_config(managed, tool).get("default_model"))
 
 
+def managed_claude_family_models(managed: dict) -> dict[str, str] | None:
+    """Claude family models explicitly authored by Coding Agent Config."""
+
+    models = _manifest_models(managed, "claude")
+    return cast("dict[str, str]", models) if isinstance(models, dict) else None
+
+
 def managed_provider_family_models(managed: dict) -> dict[str, str] | None:
     """Claude's authored per-family models for launch, when a managed config routes it through a
     Model Provider Service.

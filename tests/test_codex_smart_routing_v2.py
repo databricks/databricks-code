@@ -10,31 +10,6 @@ from ucode.smart_routing import codex_interposer, codex_routing, v2
 WS = "https://example.databricks.com"
 
 
-class TestCodexConfigArgs:
-    def test_layers_provider_overrides_without_replacing_user_config(self, monkeypatch):
-        monkeypatch.setattr(codex, "ucode_version", lambda: "0.1.0")
-        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.148.0")
-
-        overlay = codex.render_overlay(
-            WS,
-            "gpt-5.6-luna",
-            "myprof",
-        )
-        args = v2._codex_config_args(overlay)
-
-        assert args[:4] == [
-            "--config",
-            'model_provider="ucode-databricks"',
-            "--config",
-            'model="gpt-5.6-luna"',
-        ]
-        provider_override = args[-1]
-        assert provider_override.startswith("model_providers.ucode-databricks={")
-        assert "/ai-gateway/codex/v1" in provider_override
-        assert 'command = "' in provider_override
-        assert '"myprof"' in provider_override
-
-
 def test_smart_routing_switch_message_is_boxed():
     message = v2.format_routing_notice("model-x", "Because X.")
 
@@ -487,15 +462,17 @@ class TestInterposerSession:
 
 
 def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
+    monkeypatch.delenv("SMART_ROUTER_NAME", raising=False)
     captured = {}
     logged = []
 
-    def select_route(workspace, token, task, route_options, resolve, *, timeout):
+    def select_route(workspace, token, task, route_options, resolve, *, router_name, timeout):
         captured.update(
             workspace=workspace,
             token=token,
             task=task,
             route_options=list(route_options),
+            router_name=router_name,
             timeout=timeout,
         )
         return (
@@ -528,6 +505,7 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
         "workspace": WS,
         "token": "same-oauth-token",
         "task": "Fix the parser",
+        "router_name": "task_v1",
         "timeout": codex_routing.REQUEST_TIMEOUT_S,
         "route_options": [
             ("kimi-k3-neo", "codex"),
