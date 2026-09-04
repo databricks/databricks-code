@@ -5,8 +5,10 @@ from __future__ import annotations
 import tomlkit
 from tomlkit.items import Item
 
+type TomlValue = str | int | float | bool | list[TomlValue] | dict[str, TomlValue]
 
-def _toml_item(value: object) -> Item:
+
+def _toml_item(value: TomlValue) -> Item:
     """Convert nested Python values without creating regular TOML tables."""
     if isinstance(value, dict):
         item = tomlkit.inline_table()
@@ -18,10 +20,16 @@ def _toml_item(value: object) -> Item:
         for entry in value:
             item.append(_toml_item(entry))
         return item
+    if isinstance(value, bool):
+        return tomlkit.item(value)
+    if isinstance(value, int):
+        return tomlkit.item(value)
+    if isinstance(value, float):
+        return tomlkit.item(value)
     return tomlkit.item(value)
 
 
-def _toml_value(value: str | int | float | bool | list[object] | dict[str, object]) -> str:
+def _toml_value(value: TomlValue) -> str:
     return _toml_item(value).as_string()
 
 
