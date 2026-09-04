@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
@@ -554,7 +555,6 @@ def launch(state: dict, tool_args: list[str]) -> None:
     # inherited (no capture), so Ctrl-C reaches codex directly and the resulting
     # KeyboardInterrupt propagates past the retry check — quitting an interactive
     # session is never mistaken for a --profile rejection.
-    import shutil
     resolved_binary = shutil.which(binary) or binary
     if not resolved_binary:
         raise RuntimeError(f"Unable to locate {binary} on PATH")
