@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 from typer.testing import CliRunner
 
+import ucode.cli as cli_mod
 import ucode.databricks as db_mod
 from ucode.cli import app
 from ucode.databricks import GatewayProbe
@@ -463,6 +464,28 @@ class TestSubcommandRouting:
 
         assert result.exit_code == 0, result.output
         assert captured == [("1", ["fix the parser"])]
+
+    @pytest.mark.parametrize(
+        ("args", "forwarded", "has_separator"),
+        [
+            (["codex", "--", "fix the parser"], ["fix the parser"], True),
+            (["codex", "--"], [], True),
+            (["claude", "--", "doctor"], ["doctor"], True),
+            (
+                ["codex", "--model", "gpt-5.6-sol", "--", "fix the parser"],
+                ["--model", "gpt-5.6-sol", "fix the parser"],
+                False,
+            ),
+        ],
+    )
+    def test_agent_records_prompt_separator(self, args, forwarded, has_separator):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, args)
+
+        assert result.exit_code == 0, result.output
+        ctx = mock_launch.call_args.args[1]
+        assert ctx.args == forwarded
+        assert cli_mod._has_explicit_prompt(ctx) is has_separator
 
     def test_codex_refresh_is_consumed_by_ucode(self):
         with patch("ucode.cli._launch_tool") as mock_launch:

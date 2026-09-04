@@ -27,6 +27,8 @@ from ucode.databricks import (
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 
+from .args import LaunchOptions
+
 OPENCODE_XDG_CONFIG_HOME = APP_DIR / "opencode-xdg"
 OPENCODE_CONFIG_DIR = OPENCODE_XDG_CONFIG_HOME / "opencode"
 OPENCODE_CONFIG_PATH = OPENCODE_CONFIG_DIR / "opencode.json"
@@ -391,7 +393,7 @@ def build_runtime_env(token: str, state: dict | None = None) -> dict[str, str]:
     return env
 
 
-def launch(state: dict, tool_args: list[str]) -> None:
+def launch(state: dict, tool_args: list[str], *, options: LaunchOptions) -> None:
     """Launch OpenCode with on-demand token refresh from its local plugin."""
     token = _configure_launch(state)
     env = build_runtime_env(token, state)

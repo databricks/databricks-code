@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ucode.agents import codex
+from ucode.agents import LaunchOptions, codex
 from ucode.config_io import read_toml_safe
 from ucode.smart_routing import codex_routing
 
@@ -23,6 +23,35 @@ class TestCodexSpec:
 
     def test_display(self):
         assert codex.SPEC["display"] == "Codex"
+
+
+class TestShouldUseSmartRouting:
+    @pytest.mark.parametrize(
+        ("tool_args", "explicit_prompt"),
+        [([], False), ([], True), (["fix this"], True)],
+    )
+    def test_accepts_only_explicit_tui_shapes(self, tool_args, explicit_prompt):
+        assert codex.should_use_smart_routing(tool_args, explicit_prompt=explicit_prompt) is True
+
+    @pytest.mark.parametrize(
+        "tool_args",
+        [
+            ["exec", "fix this"],
+            ["review"],
+            ["app-server"],
+            ["update"],
+            ["--model", "gpt-5.6-sol"],
+            ["--model", "gpt-5.6-sol", "--", "fix this"],
+            ["fix this"],
+            ["one", "two"],
+        ],
+    )
+    def test_rejects_all_other_invocation_shapes(self, tool_args):
+        assert codex.should_use_smart_routing(tool_args) is False
+
+    @pytest.mark.parametrize("tool_args", [["--model=x"], ["--model"], ["-m"]])
+    def test_explicit_model_bypasses_separator_opt_in(self, tool_args):
+        assert codex.should_use_smart_routing(tool_args, explicit_prompt=True) is False
 
 
 class TestHasUcodeConfig:
@@ -575,7 +604,7 @@ class TestCodexLaunch:
             codex, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
         )
         with pytest.raises(SystemExit) as exc:
-            codex.launch({"workspace": WS}, ["--search"])
+            codex.launch({"workspace": WS}, ["--search"], options=LaunchOptions())
         assert exc.value.code == 0
         assert os.environ["OAUTH_TOKEN"] == "fresh-token"
         assert runs == [["codex", "--profile", "ucode", "--search"]]
@@ -584,7 +613,7 @@ class TestCodexLaunch:
     def test_success_propagates_exit_without_retry(self, monkeypatch):
         runs, fallbacks = self._patch(monkeypatch, returncode=0, elapsed=0.2)
         with pytest.raises(SystemExit) as exc:
-            codex.launch({"workspace": WS}, ["exec", "hi"])
+            codex.launch({"workspace": WS}, ["exec", "hi"], options=LaunchOptions())
         assert exc.value.code == 0
         assert runs == [["codex", "--profile", "ucode", "exec", "hi"]]
         assert fallbacks == []
@@ -602,7 +631,7 @@ class TestCodexLaunch:
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", profile_path)
         runs, launches = self._patch(monkeypatch, returncode=0, elapsed=0.2)
 
-        codex.launch({"workspace": WS}, ["app", "--new-window"])
+        codex.launch({"workspace": WS}, ["app", "--new-window"], options=LaunchOptions())
 
         assert runs == []
         assert launches[0][:2] == ["codex", "app"]
@@ -619,7 +648,7 @@ class TestCodexLaunch:
         runs, launches = self._patch(monkeypatch, returncode=0, elapsed=0.2)
 
         with pytest.raises(RuntimeError, match="ucode configure --agents codex"):
-            codex.launch({"workspace": WS}, ["app"])
+            codex.launch({"workspace": WS}, ["app"], options=LaunchOptions())
 
         assert runs == []
         assert launches == []
@@ -629,7 +658,7 @@ class TestCodexLaunch:
         # a fast nonzero exit → relaunch without --profile.
         for args in (["app-server", "--listen", "u"], ["mcp-server"]):
             runs, fallbacks = self._patch(monkeypatch, returncode=1, elapsed=0.15)
-            codex.launch({"workspace": WS}, args)
+            codex.launch({"workspace": WS}, args, options=LaunchOptions())
             assert runs == [["codex", "--profile", "ucode", *args]]
             assert fallbacks == [["codex", *args]]
 
@@ -644,7 +673,7 @@ class TestCodexLaunch:
             "exec_or_spawn",
             lambda argv: warned_before_handoff.append(capsys.readouterr()),
         )
-        codex.launch({"workspace": WS}, ["app-server"])
+        codex.launch({"workspace": WS}, ["app-server"], options=LaunchOptions())
 
         # execvp replaces the process, so the warning must already be out by then.
         assert len(warned_before_handoff) == 1
@@ -666,7 +695,7 @@ class TestCodexLaunch:
         # (relaunching the user's prompt on their own OpenAI login).
         runs, fallbacks = self._patch(monkeypatch, returncode=1, elapsed=8.0)
         with pytest.raises(SystemExit) as exc:
-            codex.launch({"workspace": WS}, ["exec", "hi"])
+            codex.launch({"workspace": WS}, ["exec", "hi"], options=LaunchOptions())
         assert exc.value.code == 1
         assert fallbacks == []
 
@@ -674,7 +703,7 @@ class TestCodexLaunch:
         # The retry is gated on a *nonzero* exit; a fast clean exit just returns.
         runs, fallbacks = self._patch(monkeypatch, returncode=0, elapsed=0.15)
         with pytest.raises(SystemExit) as exc:
-            codex.launch({"workspace": WS}, [])
+            codex.launch({"workspace": WS}, [], options=LaunchOptions())
         assert exc.value.code == 0
         assert fallbacks == []
 

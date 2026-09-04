@@ -52,6 +52,8 @@ from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.ui import print_warning_err
 
+from .args import LaunchOptions
+
 CODEX_CONFIG_DIR = Path.home() / ".codex"
 CODEX_PROFILE_NAME = "ucode"
 CODEX_CONFIG_PATH = CODEX_CONFIG_DIR / f"{CODEX_PROFILE_NAME}.config.toml"
@@ -494,35 +496,34 @@ def clear_model_preferences(state: dict) -> bool:
 _PROFILE_REJECTED_MAX_SECONDS = 3.0
 
 
-def launch(state: dict, tool_args: list[str]) -> None:
+def should_use_smart_routing(tool_args: list[str], *, explicit_prompt: bool = False) -> bool:
+    """Return whether this invocation explicitly selects the routed TUI path.
+
+    Smart routing is intentionally opt-in by invocation shape: a bare Codex
+    launch, or a single prompt passed after ucode's explicit ``--`` boundary.
+    Commands and options (including ``--model``) use the ordinary launcher.
+    """
+    return not tool_args or (
+        explicit_prompt
+        and len(tool_args) <= 1
+        and not any(arg in {"-m", "--model"} or arg.startswith("--model=") for arg in tool_args)
+    )
+
+
+def launch(
+    state: dict,
+    tool_args: list[str],
+    *,
+    options: LaunchOptions,
+) -> None:
+    if options.smart_routing and should_use_smart_routing(
+        tool_args, explicit_prompt=options.explicit_prompt
+    ):
+        _launch_smart_routing(state, tool_args)
+        return
     clear_model_preferences(state)
     binary = SPEC["binary"]
     workspace = state.get("workspace")
-    if smart_routing_v2.enabled():
-        version_text = agent_version(binary)
-        parsed_version = _parse_version(version_text)
-        if parsed_version is not None and parsed_version < MINIMUM_ROUTING_CODEX_VERSION:
-            raise RuntimeError(
-                "Codex smart routing requires Codex "
-                f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version_text}."
-            )
-
-        def _app_server_start_model() -> str:
-            managed_model = default_model(state)
-            if managed_model:
-                return managed_model
-            models = routing_models(state)
-            if models:
-                return codex_model_id(models[0])
-            return APP_SERVER_SMART_ROUTING_STARTING_MODEL
-
-        smart_routing_v2.launch_codex(
-            state,
-            tool_args,
-            binary=binary,
-            start_model=_app_server_start_model(),
-            render_overlay=render_overlay,
-        )
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
     if tool_args[:1] == ["app"]:
@@ -573,6 +574,34 @@ def launch(state: dict, tool_args: list[str]) -> None:
         exec_or_spawn([binary, *tool_args])
         return  # unreachable in production (exec replaces the process)
     sys.exit(returncode)
+
+
+def _launch_smart_routing(state: dict, tool_args: list[str]) -> None:
+    """Launch the Codex TUI through the smart-routing interposer."""
+    clear_model_preferences(state)
+    binary = SPEC["binary"]
+    version_text = agent_version(binary)
+    parsed_version = _parse_version(version_text)
+    if parsed_version is not None and parsed_version < MINIMUM_ROUTING_CODEX_VERSION:
+        raise RuntimeError(
+            "Codex smart routing requires Codex "
+            f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version_text}."
+        )
+
+    managed_model = default_model(state)
+    models = routing_models(state)
+    start_model = (
+        managed_model
+        or (codex_model_id(models[0]) if models else None)
+        or APP_SERVER_SMART_ROUTING_STARTING_MODEL
+    )
+    smart_routing_v2.launch_codex(
+        state,
+        tool_args,
+        binary=binary,
+        start_model=start_model,
+        render_overlay=render_overlay,
+    )
 
 
 def disable_smart_routing(state: dict) -> bool:
