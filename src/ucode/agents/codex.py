@@ -505,14 +505,6 @@ def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if smart_routing_v2.enabled():
-        version_text = agent_version(binary)
-        parsed_version = _parse_version(version_text)
-        if parsed_version is not None and parsed_version < MINIMUM_ROUTING_CODEX_VERSION:
-            raise RuntimeError(
-                "Codex smart routing requires Codex "
-                f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version_text}."
-            )
-
         def _app_server_start_model() -> str:
             managed_model = default_model(state)
             if managed_model:

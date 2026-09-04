@@ -560,7 +560,9 @@ class TestInstallToolBinary:
         errors = iter(["must upgrade", None])
         monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: next(errors))
 
-        assert install_tool_binary(tool, update_existing=True) is True
+        # Native minimum-version blockers are repaired even on an ordinary
+        # launch, where update_existing is false.
+        assert install_tool_binary(tool) is True
         assert prompts == [f"Upgrade {display} if available?"]
         assert calls == [command]
 
@@ -577,7 +579,7 @@ class TestInstallToolBinary:
         monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: "still blocked")
 
         with pytest.raises(RuntimeError, match="still blocked"):
-            install_tool_binary(tool, update_existing=True)
+            install_tool_binary(tool)
 
     @pytest.mark.parametrize("tool", ["claude", "codex"])
     def test_unblocked_native_tool_does_not_check_or_prompt(self, monkeypatch, tool):

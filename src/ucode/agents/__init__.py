@@ -192,7 +192,8 @@ def install_tool_binary(
         too_new = _maybe_downgrade_too_new_tool(tool, prompt=prompt_optional_updates)
         version_error = _minimum_version_error(tool)
 
-        if update_existing and not too_new and version_error:
+        should_update = update_existing or tool in _NATIVE_UPGRADE_COMMANDS
+        if should_update and not too_new and version_error:
             print_warning(version_error)
             if (
                 tool in _NATIVE_UPGRADE_COMMANDS
