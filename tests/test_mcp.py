@@ -2459,6 +2459,25 @@ class TestConfigureSkillsMcpCommand:
 
         assert _find_skills(saved_states[-1]["mcp_servers"])[0]["skill_locations"] == ["X.x", "Y.y"]
 
+    def test_replacing_default_preserves_client_additions(self, monkeypatch):
+        saved_states: list[dict] = []
+        prior = mcp._resolve_skills_mcp_servers(
+            WS,
+            ["claude"],
+            ["old.default"],
+            [],
+            {"claude": ["claude.addition"]},
+        )
+        _stub_location_base(monkeypatch, _skills_state(prior))
+        monkeypatch.setattr(mcp, "configure_client_mcp_server", lambda *a, **kw: [])
+        monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
+
+        assert mcp.configure_skills_mcp_command(["new.default"]) == 0
+
+        entry = _find_skills(saved_states[-1]["mcp_servers"])[0]
+        assert entry["skill_locations"] == ["new.default"]
+        assert entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] == {"claude": ["claude.addition"]}
+
     def test_preserves_mcp_service_entries_across_set(self, monkeypatch):
         saved_states: list[dict] = []
         service_entry = {
@@ -2487,6 +2506,60 @@ class TestSkillMcpLocations:
     def test_empty_when_no_skills_entry(self):
         assert mcp._skill_mcp_locations(_skills_state([])) == []
         assert mcp._skill_mcp_locations(_skills_state()) == []
+
+    def test_ignores_malformed_default_locations(self):
+        entry = {"kind": mcp.SKILLS_MCP_KIND, "skill_locations": "not-a-list"}
+        state = _skills_state([entry])
+
+        assert mcp._skill_mcp_locations(state) == []
+        assert mcp.skill_locations_for_client(entry, "claude") == []
+
+    def test_client_override_extends_legacy_default(self):
+        entry = mcp._build_skills_entry(
+            WS,
+            ["common.schema"],
+            ["claude", "codex"],
+            {"claude": ["claude.only"]},
+        )
+
+        assert mcp.skill_locations_for_client(entry, "claude") == [
+            "common.schema",
+            "claude.only",
+        ]
+        assert mcp.skill_locations_for_client(entry, "codex") == ["common.schema"]
+
+    def test_equal_override_remains_durable_when_default_changes(self):
+        entry = mcp._build_skills_entry(
+            WS,
+            ["common.schema"],
+            ["claude", "codex"],
+            {"codex": ["common.schema"]},
+        )
+
+        assert entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] == {"codex": ["common.schema"]}
+
+        changed_default = mcp._build_skills_entry(
+            WS,
+            [],
+            ["claude", "codex"],
+            mcp._skill_location_overrides(entry),
+        )
+        assert mcp.skill_locations_for_client(changed_default, "claude") == []
+        assert mcp.skill_locations_for_client(changed_default, "codex") == ["common.schema"]
+
+    def test_default_and_override_are_deduped_into_effective_scope(self):
+        entry = {
+            "skill_locations": ["default.schema", "default.schema"],
+            mcp.SKILL_LOCATION_OVERRIDES_KEY: {
+                "codex": ["default.schema", "agent.schema", "agent.schema", ""],
+            },
+        }
+
+        assert mcp.skill_locations_for_client(entry, "claude") == ["default.schema"]
+        assert mcp.skill_locations_for_client(entry, "codex") == [
+            "default.schema",
+            "agent.schema",
+        ]
 
 
 class TestUnionLocations:
@@ -2883,6 +2956,31 @@ class TestApplyManagedSkills:
         assert entry["clients"] == ["claude"]
         assert state["managed_skill_locations"] == ["cat.sch"]
 
+    def test_keeps_managed_locations_in_the_launching_clients_additions(self, monkeypatch):
+        self._patch_apply(monkeypatch)
+        entry = mcp._resolve_skills_mcp_servers(
+            WS,
+            ["claude", "codex"],
+            ["shared.default"],
+            [],
+            {"codex": ["codex.own"]},
+        )[0]
+        state = {"workspace": WS, "mcp_servers": [entry]}
+
+        applied = mcp.apply_managed_skills(state, self._managed("managed.schema"), "claude", WS)
+
+        assert applied == ["managed.schema"]
+        entry = self._skills_entry(state["mcp_servers"])
+        assert entry["skill_locations"] == ["shared.default"]
+        assert entry[mcp.SKILL_LOCATION_OVERRIDES_KEY] == {
+            "codex": ["codex.own"],
+            "claude": ["managed.schema"],
+        }
+        assert mcp.skill_locations_for_client(entry, "claude") == [
+            "shared.default",
+            "managed.schema",
+        ]
+
     def test_preserves_developer_locations_and_drops_removed_managed_ones(self, monkeypatch):
         self._patch_apply(monkeypatch)
         # The developer configured `mine.own`; a prior launch applied `old.managed`, now dropped from
@@ -2947,6 +3045,21 @@ class TestApplyManagedSkills:
         }
         # Same config, same tool already registered: no change, so no note-worthy locations returned.
         assert mcp.apply_managed_skills(state, self._managed("cat.sch"), "claude", WS) == []
+
+    def test_registers_a_new_client_when_its_scope_already_matches(self, monkeypatch):
+        self._patch_apply(monkeypatch)
+        entry = mcp._resolve_skills_mcp_servers(WS, ["claude"], ["cat.sch"], [])[0]
+        state = {
+            "workspace": WS,
+            "managed_skill_locations": ["cat.sch"],
+            "mcp_servers": [entry],
+        }
+
+        applied = mcp.apply_managed_skills(state, self._managed("cat.sch"), "codex", WS)
+
+        assert applied == ["cat.sch"]
+        entry = self._skills_entry(state["mcp_servers"])
+        assert entry["clients"] == ["claude", "codex"]
 
     def test_non_client_tool_returns_empty(self, monkeypatch):
         monkeypatch.setattr(
