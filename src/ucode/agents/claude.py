@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import cast
 
 from ucode import gateway_proxy
-from ucode.agent_updates import version_requirement_error
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -100,6 +99,14 @@ CLAUDE_OPTIONAL_VALUE_OPTIONS = frozenset(
 )
 
 
+def _parse_version(value: str) -> tuple[int, int, int] | None:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
+    if not match:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
 def _minimum_version_requirement_message(version: str) -> str:
     feature = "Smart routing" if smart_routing_v2.enabled() else "Model discovery"
     return (
@@ -111,11 +118,11 @@ def _minimum_version_requirement_message(version: str) -> str:
 def minimum_version_error() -> str | None:
     if os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) != "1" and not smart_routing_v2.enabled():
         return None
-    return version_requirement_error(
-        agent_version(SPEC["binary"]),
-        MINIMUM_CLAUDE_VERSION,
-        _minimum_version_requirement_message,
-    )
+    version = agent_version(SPEC["binary"])
+    parsed = _parse_version(version)
+    if parsed is None or parsed >= MINIMUM_CLAUDE_VERSION:
+        return None
+    return _minimum_version_requirement_message(version)
 
 
 def _resolve_web_search_model(state: dict) -> str | None:

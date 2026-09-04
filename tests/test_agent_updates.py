@@ -5,9 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 
-import pytest
-
-from ucode.agent_updates import latest_version_below, published_versions, version_requirement_error
+from ucode.agent_updates import latest_version_below, published_versions
 
 _GEMINI_VERSIONS = [
     "0.43.0",
@@ -72,17 +70,3 @@ class TestLatestVersionBelow:
     def test_returns_none_when_nothing_qualifies(self, monkeypatch):
         _fake_published(monkeypatch, ["0.45.0", "0.46.0"])
         assert latest_version_below("@google/gemini-cli", (0, 45, 0)) is None
-
-
-class TestVersionRequirementError:
-    def test_formats_blocker_for_old_version(self):
-        assert (
-            version_requirement_error(
-                "2.1.247", (2, 1, 248), lambda version: f"blocked at {version}"
-            )
-            == "blocked at 2.1.247"
-        )
-
-    @pytest.mark.parametrize("version", ["2.1.248", "2.2.0", "unknown"])
-    def test_supported_or_unknown_version_is_not_blocked(self, version):
-        assert version_requirement_error(version, (2, 1, 248), str) is None

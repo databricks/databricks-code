@@ -1,4 +1,4 @@
-"""Shared coding-agent version checks and update helpers."""
+"""Update checks for npm-installed coding agent CLIs."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import json
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
 
 _BASE_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 _STABLE_VERSION_RE = re.compile(r"v?\d+\.\d+\.\d+$")
@@ -25,22 +24,6 @@ def _base_version(value: str) -> tuple[int, int, int] | None:
 def _is_stable(value: str) -> bool:
     """True for plain `X.Y.Z` releases (no prerelease/nightly/preview suffix)."""
     return bool(_STABLE_VERSION_RE.fullmatch(value.strip()))
-
-
-def version_requirement_error(
-    installed: str,
-    minimum: tuple[int, int, int],
-    message: Callable[[str], str],
-) -> str | None:
-    """Return an agent-specific error when ``installed`` is below ``minimum``.
-
-    Unknown or unparsable versions remain non-blocking, matching the existing
-    agent behavior. ``message`` receives the installed version text.
-    """
-    parsed = _base_version(installed)
-    if parsed is None or parsed >= minimum:
-        return None
-    return message(installed)
 
 
 def published_versions(package: str) -> list[str]:

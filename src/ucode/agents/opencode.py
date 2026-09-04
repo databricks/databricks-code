@@ -145,10 +145,6 @@ def _minimum_version_message() -> str | None:
     )
 
 
-def required_update_message() -> str | None:
-    return _minimum_version_message()
-
-
 def minimum_version_error() -> str | None:
     message = _minimum_version_message()
     if message is None:

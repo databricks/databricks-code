@@ -142,13 +142,6 @@ def _minimum_version_error(tool: str) -> str | None:
     return checker()
 
 
-def _required_update_message(tool: str) -> str | None:
-    checker = getattr(_MODULES[tool], "required_update_message", None)
-    if callable(checker):
-        return checker()
-    return _minimum_version_error(tool)
-
-
 def _too_new_downgrade(tool: str) -> tuple[str, str] | None:
     """Return (installed_version, downgrade_target) when the installed tool is
     too new to work, or None. Agents opt in by defining `too_new_downgrade`."""
@@ -197,20 +190,19 @@ def install_tool_binary(
         # against the gateway), so check it on every launch — not just when
         # auto-configuring — mirroring the minimum-version gate below.
         too_new = _maybe_downgrade_too_new_tool(tool, prompt=prompt_optional_updates)
-
-        if update_existing and not too_new:
-            required_update = _required_update_message(tool)
-            if required_update:
-                print_warning(required_update)
-                if (
-                    tool in _NATIVE_UPGRADE_COMMANDS
-                    and prompt_optional_updates
-                    and not prompt_yes_no(f"Upgrade {spec['display']} if available?")
-                ):
-                    raise RuntimeError(_minimum_version_error(tool) or required_update)
-                if not _update_installed_tool_binary(tool):
-                    raise RuntimeError(_minimum_version_error(tool) or required_update)
         version_error = _minimum_version_error(tool)
+
+        if update_existing and not too_new and version_error:
+            print_warning(version_error)
+            if (
+                tool in _NATIVE_UPGRADE_COMMANDS
+                and prompt_optional_updates
+                and not prompt_yes_no(f"Upgrade {spec['display']} if available?")
+            ):
+                raise RuntimeError(version_error)
+            if not _update_installed_tool_binary(tool):
+                raise RuntimeError(version_error)
+            version_error = _minimum_version_error(tool)
         if version_error:
             raise RuntimeError(version_error)
         return True

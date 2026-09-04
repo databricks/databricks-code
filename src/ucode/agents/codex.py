@@ -14,7 +14,6 @@ from pathlib import Path
 import tomlkit
 from tomlkit.exceptions import ParseError
 
-from ucode.agent_updates import version_requirement_error
 from ucode.codex_config import codex_config_args
 from ucode.config_io import (
     APP_DIR,
@@ -103,13 +102,13 @@ def minimum_version_error() -> str | None:
     """Return the active smart-routing version blocker, if any."""
     if not smart_routing_v2.enabled():
         return None
-    return version_requirement_error(
-        agent_version(SPEC["binary"]),
-        MINIMUM_ROUTING_CODEX_VERSION,
-        lambda version: (
-            "Codex smart routing requires Codex "
-            f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version}."
-        ),
+    version = agent_version(SPEC["binary"])
+    parsed = _parse_version(version)
+    if parsed is None or parsed >= MINIMUM_ROUTING_CODEX_VERSION:
+        return None
+    return (
+        "Codex smart routing requires Codex "
+        f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version}."
     )
 
 
