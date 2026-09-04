@@ -20,6 +20,8 @@ from ucode.agents import (
     ensure_tracing_mlflow_cli,
     tool_binary_installed,
     tool_update_available,
+    tool_uses_native_updater,
+    tool_version_error,
     tracing_mlflow_ok,
     update_tool_binary,
 )
@@ -168,6 +170,23 @@ def _check_agent_clis() -> list[Check]:
                 )
             )
             continue
+        if tool_uses_native_updater(tool):
+            blocker = tool_version_error(tool)
+            if blocker:
+                checks.append(
+                    Check(
+                        display,
+                        "warn",
+                        blocker,
+                        Suggestion(
+                            f"Upgrade {display} if available?",
+                            lambda t=tool: update_tool_binary(t),
+                        ),
+                    )
+                )
+            else:
+                checks.append(Check(display, "ok", "installed; upgrades managed by agent CLI"))
+            continue
         with spinner(f"Checking {display} for updates..."):
             update = tool_update_available(tool)
         if update:
@@ -178,7 +197,7 @@ def _check_agent_clis() -> list[Check]:
                     "warn",
                     f"{current} installed; {latest} available",
                     Suggestion(
-                        f"Upgrade {display} to {latest}?", lambda t=tool: update_tool_binary(t)
+                        f"Update {display} to {latest}?", lambda t=tool: update_tool_binary(t)
                     ),
                 )
             )

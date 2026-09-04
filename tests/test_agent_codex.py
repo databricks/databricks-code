@@ -25,6 +25,23 @@ class TestCodexSpec:
         assert codex.SPEC["display"] == "Codex"
 
 
+class TestMinimumVersion:
+    def test_smart_routing_old_version_requires_update(self, monkeypatch):
+        monkeypatch.setenv(codex.smart_routing_v2.ENV_VAR, "1")
+        monkeypatch.setattr(codex, "agent_version", lambda _binary: "0.144.0")
+
+        expected = "Codex smart routing requires Codex 0.145.0 or newer; found 0.144.0."
+        assert codex.minimum_version_error() == expected
+        assert codex.required_update_message() == expected
+
+    def test_old_version_is_not_blocked_without_smart_routing(self, monkeypatch):
+        monkeypatch.delenv(codex.smart_routing_v2.ENV_VAR, raising=False)
+        monkeypatch.setattr(codex, "agent_version", lambda _binary: "0.144.0")
+
+        assert codex.minimum_version_error() is None
+        assert codex.required_update_message() is None
+
+
 class TestHasUcodeConfig:
     def test_detects_profile_config(self, tmp_path, monkeypatch):
         config_path = tmp_path / "ucode.config.toml"

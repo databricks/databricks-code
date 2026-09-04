@@ -106,6 +106,24 @@ def _installed_version_status() -> tuple[str, bool] | None:
     return version, parsed < MINIMUM_CODEX_VERSION
 
 
+def minimum_version_error() -> str | None:
+    """Return the active smart-routing version blocker, if any."""
+    if not smart_routing_v2.enabled():
+        return None
+    version = agent_version(SPEC["binary"])
+    parsed = _parse_version(version)
+    if parsed is None or parsed >= MINIMUM_ROUTING_CODEX_VERSION:
+        return None
+    return (
+        "Codex smart routing requires Codex "
+        f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version}."
+    )
+
+
+def required_update_message() -> str | None:
+    return minimum_version_error()
+
+
 def _use_legacy_layout() -> bool:
     """Return True when the installed Codex CLI predates per-profile config files.
 

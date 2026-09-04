@@ -538,13 +538,15 @@ class TestInstallToolBinary:
         assert "Updating OpenCode..." not in capsys.readouterr().out
 
     @pytest.mark.parametrize(
-        ("tool", "display", "latest"),
+        ("tool", "display", "command"),
         [
-            ("claude", "Claude Code", "2.1.250"),
-            ("codex", "Codex", "0.150.0"),
+            ("claude", "Claude Code", ["claude", "upgrade"]),
+            ("codex", "Codex", ["codex", "update"]),
         ],
     )
-    def test_native_upgrade_prompts_and_uses_agent_cli(self, monkeypatch, tool, display, latest):
+    def test_blocked_native_tool_prompts_and_uses_agent_cli(
+        self, monkeypatch, tool, display, command
+    ):
         calls: list[list[str]] = []
         prompts: list[str] = []
 
@@ -553,21 +555,19 @@ class TestInstallToolBinary:
             "ucode.agents.subprocess.run",
             lambda args, **kwargs: calls.append(args) or subprocess.CompletedProcess(args, 0),
         )
-        monkeypatch.setattr("ucode.agents.tool_update_available", lambda _tool: ("old", latest))
         monkeypatch.setattr(
             "ucode.agents.prompt_yes_no", lambda prompt: prompts.append(prompt) or True
         )
-        monkeypatch.setattr("ucode.agents._required_update_message", lambda _: None)
+        monkeypatch.setattr("ucode.agents._required_update_message", lambda _: "must upgrade")
         monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: None)
 
         assert install_tool_binary(tool, update_existing=True) is True
-        assert prompts == [f"Upgrade {display} to {latest}?"]
-        assert calls == [[tool, "upgrade"]]
+        assert prompts == [f"Upgrade {display} if available?"]
+        assert calls == [command]
 
     @pytest.mark.parametrize("tool", ["claude", "codex"])
-    def test_native_upgrade_decline_does_not_run_command(self, monkeypatch, tool):
+    def test_blocked_native_tool_decline_raises_without_command(self, monkeypatch, tool):
         monkeypatch.setattr("ucode.agents.shutil.which", lambda binary: f"/usr/bin/{binary}")
-        monkeypatch.setattr("ucode.agents.tool_update_available", lambda _tool: ("old", "new"))
         monkeypatch.setattr("ucode.agents.prompt_yes_no", lambda _prompt: False)
         monkeypatch.setattr(
             "ucode.agents.subprocess.run",
@@ -575,8 +575,25 @@ class TestInstallToolBinary:
                 AssertionError("upgrade command should not run")
             ),
         )
+        monkeypatch.setattr("ucode.agents._required_update_message", lambda _: "must upgrade")
+        monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: "still blocked")
+
+        with pytest.raises(RuntimeError, match="still blocked"):
+            install_tool_binary(tool, update_existing=True)
+
+    @pytest.mark.parametrize("tool", ["claude", "codex"])
+    def test_unblocked_native_tool_does_not_check_or_prompt(self, monkeypatch, tool):
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda binary: f"/usr/bin/{binary}")
         monkeypatch.setattr("ucode.agents._required_update_message", lambda _: None)
         monkeypatch.setattr("ucode.agents._minimum_version_error", lambda _: None)
+        monkeypatch.setattr(
+            "ucode.agents.tool_update_available",
+            lambda _tool: (_ for _ in ()).throw(AssertionError("must not check npm")),
+        )
+        monkeypatch.setattr(
+            "ucode.agents.prompt_yes_no",
+            lambda _prompt: (_ for _ in ()).throw(AssertionError("must not prompt")),
+        )
 
         assert install_tool_binary(tool, update_existing=True) is True
 

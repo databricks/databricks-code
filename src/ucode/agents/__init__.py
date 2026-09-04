@@ -73,7 +73,10 @@ TOOL_ALIASES = {
 DEFAULT_TOOL = "codex"
 BUNDLE_VERSION = 1
 _MANAGED_SETTINGS_TOOLS = {"claude", "codex"}
-_NATIVE_UPGRADE_TOOLS = {"claude", "codex"}
+_NATIVE_UPGRADE_COMMANDS = {
+    "claude": ["claude", "upgrade"],
+    "codex": ["codex", "update"],
+}
 
 # ucode tool -> `databricks aitools` agent id. gemini/pi aren't supported.
 AITOOLS_AGENT_TOKENS = {
@@ -112,8 +115,8 @@ def _update_installed_tool_binary(tool: str, version: str | None = None) -> bool
     package = spec["package"]
     target = f"{package}@{version}" if version else package
 
-    if tool in _NATIVE_UPGRADE_TOOLS and version is None and shutil.which(binary):
-        command = [binary, "upgrade"]
+    if tool in _NATIVE_UPGRADE_COMMANDS and version is None and shutil.which(binary):
+        command = _NATIVE_UPGRADE_COMMANDS[tool]
     else:
         if not shutil.which("npm"):
             print_warning(f"`npm` is not available to update {spec['display']}; continuing.")
@@ -130,24 +133,6 @@ def _update_installed_tool_binary(tool: str, version: str | None = None) -> bool
     print_success(f"{spec['display']} is up to date")
     agent_version.cache_clear()
     return bool(shutil.which(binary))
-
-
-def _maybe_upgrade_installed_tool(tool: str, *, prompt: bool) -> bool:
-    """Offer a published upgrade for CLIs that provide their own upgrader.
-
-    npm remains a read-only source of installed/latest version information;
-    the actual upgrade is delegated to the agent CLI so its installation
-    method and release channel are preserved.
-    """
-    if tool not in _NATIVE_UPGRADE_TOOLS:
-        return False
-    update = tool_update_available(tool)
-    if not update:
-        return False
-    _current, latest = update
-    if prompt and prompt_yes_no(f"Upgrade {TOOL_SPECS[tool]['display']} to {latest}?"):
-        _update_installed_tool_binary(tool)
-    return True
 
 
 def _minimum_version_error(tool: str) -> str | None:
@@ -214,14 +199,15 @@ def install_tool_binary(
         too_new = _maybe_downgrade_too_new_tool(tool, prompt=prompt_optional_updates)
 
         if update_existing and not too_new:
-            upgrade_detected = _maybe_upgrade_installed_tool(tool, prompt=prompt_optional_updates)
             required_update = _required_update_message(tool)
-            if required_update and not (upgrade_detected and prompt_optional_updates):
-                # Required updates are forced regardless of prompt preference;
-                # the tool won't function on an unsupported version. When an
-                # interactive native upgrade was offered, declining it falls
-                # through to the actionable minimum-version error below.
+            if required_update:
                 print_warning(required_update)
+                if (
+                    tool in _NATIVE_UPGRADE_COMMANDS
+                    and prompt_optional_updates
+                    and not prompt_yes_no(f"Upgrade {spec['display']} if available?")
+                ):
+                    raise RuntimeError(_minimum_version_error(tool) or required_update)
                 if not _update_installed_tool_binary(tool):
                     raise RuntimeError(_minimum_version_error(tool) or required_update)
         version_error = _minimum_version_error(tool)
@@ -277,6 +263,8 @@ def tool_binary_installed(tool: str) -> bool:
 def tool_update_available(tool: str) -> tuple[str, str] | None:
     """Return ``(current, latest)`` when a newer agent CLI is published, else None.
     Read-only wrapper over the npm update check — for ``ucode doctor``."""
+    if tool in _NATIVE_UPGRADE_COMMANDS:
+        return None
     checker = getattr(_MODULES[tool], "is_update_available", None)
     if callable(checker):
         return checker()
@@ -287,6 +275,16 @@ def update_tool_binary(tool: str) -> bool:
     """Install the latest agent CLI, returning True on success. Public entry
     point over the internal updater so ``ucode doctor`` can apply the fix."""
     return _update_installed_tool_binary(tool)
+
+
+def tool_uses_native_updater(tool: str) -> bool:
+    """Whether upgrades are resolved and installed entirely by the agent CLI."""
+    return tool in _NATIVE_UPGRADE_COMMANDS
+
+
+def tool_version_error(tool: str) -> str | None:
+    """Return an active minimum-version blocker for a configured agent."""
+    return _minimum_version_error(tool)
 
 
 def tracing_mlflow_ok() -> bool:
