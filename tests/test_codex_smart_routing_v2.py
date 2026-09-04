@@ -10,31 +10,6 @@ from ucode.smart_routing import codex_interposer, codex_routing, v2
 WS = "https://example.databricks.com"
 
 
-class TestCodexConfigArgs:
-    def test_layers_provider_overrides_without_replacing_user_config(self, monkeypatch):
-        monkeypatch.setattr(codex, "ucode_version", lambda: "0.1.0")
-        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.148.0")
-
-        overlay = codex.render_overlay(
-            WS,
-            "gpt-5.6-luna",
-            "myprof",
-        )
-        args = v2._codex_config_args(overlay)
-
-        assert args[:4] == [
-            "--config",
-            'model_provider="ucode-databricks"',
-            "--config",
-            'model="gpt-5.6-luna"',
-        ]
-        provider_override = args[-1]
-        assert provider_override.startswith("model_providers.ucode-databricks={")
-        assert "/ai-gateway/codex/v1" in provider_override
-        assert 'command = "' in provider_override
-        assert '"myprof"' in provider_override
-
-
 def test_smart_routing_switch_message_is_boxed():
     message = v2.format_routing_notice("model-x", "Because X.")
 
@@ -49,10 +24,20 @@ def test_smart_routing_switch_message_is_boxed():
 
 
 class TestLaunchCodex:
+    def test_rejects_unsupported_codex_version(self, monkeypatch):
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.144.0")
+        monkeypatch.setattr(v2, "launch_codex", lambda *args, **kwargs: pytest.fail("launched"))
+
+        with pytest.raises(RuntimeError, match="requires Codex 0.145.0 or newer; found 0.144.0"):
+            codex.launch({"workspace": WS}, [])
+
     def test_codex_launch_dispatches_when_flag_enabled(self, monkeypatch):
         calls = []
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(codex, "default_model", lambda state: "gpt-start")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
 
         def launch_v2(state, tool_args, **kwargs):
             calls.append((state, tool_args, kwargs))
@@ -76,6 +61,26 @@ class TestLaunchCodex:
                 },
             )
         ]
+
+    def test_codex_launch_normalizes_cached_bootstrap_model(self, monkeypatch):
+        calls = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        monkeypatch.setattr(codex, "default_model", lambda state: None)
+
+        def launch_v2(state, tool_args, **kwargs):
+            calls.append(kwargs)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(v2, "launch_codex", launch_v2)
+
+        with pytest.raises(SystemExit):
+            codex.launch(
+                {"workspace": WS, "codex_models": ["system.ai.gpt-5-6-luna"]},
+                [],
+            )
+
+        assert calls[0]["start_model"] == "gpt-5.6-luna"
 
     def test_owns_app_server_interposer_and_tui_lifecycle(self, monkeypatch):
         processes = []
@@ -233,17 +238,40 @@ class TestLaunchCodex:
         assert "--model system.ai.gpt-5-6-sol" in routing_commands[0]
         assert "--model old" not in routing_commands[0]
 
-    def test_missing_cached_models_blocks_launch(self, monkeypatch):
+    def test_missing_cached_models_starts_with_bootstrap_model(self, monkeypatch):
         monkeypatch.setattr(v2, "get_databricks_token", lambda workspace, profile: "token")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "unknown")
+        monkeypatch.setattr(v2, "_free_port", lambda: 41001)
+        monkeypatch.setattr(v2, "_wait_for_app_server", lambda port, timeout: True)
+        monkeypatch.setattr(
+            v2.subprocess,
+            "Popen",
+            lambda *args, **kwargs: type(
+                "Process",
+                (),
+                {
+                    "wait": lambda self, timeout=None: 0,
+                    "terminate": lambda self: None,
+                    "kill": lambda self: None,
+                },
+            )(),
+        )
+        monkeypatch.setattr(
+            codex_interposer,
+            "start_interposer_thread",
+            lambda *args, **kwargs: (41002, lambda: None),
+        )
 
-        with pytest.raises(RuntimeError, match="ucode configure codex"):
+        with pytest.raises(SystemExit) as exc:
             v2.launch_codex(
                 {"workspace": WS},
                 [],
                 binary="codex",
-                start_model="gpt-start",
+                start_model="gpt-5.6-luna",
                 render_overlay=codex.render_overlay,
             )
+
+        assert exc.value.code == 0
 
 
 def test_interposer_startup_failure_is_propagated(monkeypatch):
@@ -368,7 +396,7 @@ class TestInterposerSession:
         assert json.loads(output)["params"]["model"] == "claude-opus-4-8"
         assert "Task classified as bugfix." in sess.switch_message
 
-    def test_shows_routing_notice_when_selected_model_is_already_active(self):
+    def test_maps_selected_uc_gpt_model_and_shows_routing_notice(self):
         def select(_prompt):
             return (
                 codex_interposer.routing.RoutingDecision(
@@ -387,14 +415,16 @@ class TestInterposerSession:
         )
         frame = self._turn_start("system.ai.gpt-5-6-luna")
 
-        assert sess.on_tui_frame(frame) == frame
+        output = sess.on_tui_frame(frame)
+        assert json.loads(output)["params"]["model"] == "gpt-5.6-luna"
         injected = sess.on_engine_frame(self._turn_started("turn-1"))
 
         assert [message["method"] for message in injected] == [
+            codex_interposer.SETTINGS_UPDATED,
             codex_interposer.ITEM_STARTED,
             codex_interposer.ITEM_COMPLETED,
         ]
-        assert "Selected Model : system.ai.gpt-5-6-luna" in (injected[0]["params"]["item"]["text"])
+        assert "Selected Model : gpt-5.6-luna" in (injected[1]["params"]["item"]["text"])
 
     def test_routes_first_prompt_to_oss_model(self):
         def select(_prompt):
@@ -432,15 +462,17 @@ class TestInterposerSession:
 
 
 def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
+    monkeypatch.delenv("SMART_ROUTER_NAME", raising=False)
     captured = {}
     logged = []
 
-    def select_route(workspace, token, task, route_options, resolve, *, timeout):
+    def select_route(workspace, token, task, route_options, resolve, *, router_name, timeout):
         captured.update(
             workspace=workspace,
             token=token,
             task=task,
             route_options=list(route_options),
+            router_name=router_name,
             timeout=timeout,
         )
         return (
@@ -473,6 +505,7 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
         "workspace": WS,
         "token": "same-oauth-token",
         "task": "Fix the parser",
+        "router_name": "task_v1",
         "timeout": codex_routing.REQUEST_TIMEOUT_S,
         "route_options": [
             ("kimi-k3-neo", "codex"),

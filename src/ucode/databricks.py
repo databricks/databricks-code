@@ -24,6 +24,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, cast, overload
@@ -51,7 +52,7 @@ UNIX_DATABRICKS_INSTALL_URL = (
 WINDOWS_DATABRICKS_INSTALL_URL = (
     "https://raw.githubusercontent.com/databricks/setup-cli/main/install.ps1"
 )
-AI_GATEWAY_V2_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
+AI_GATEWAY_DOCS_URL = "https://docs.databricks.com/aws/en/ai-gateway/overview-beta"
 ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
@@ -68,6 +69,15 @@ _HTTP_GET_RETRY_BASE_SECONDS = 1.0
 _HTTP_GET_RETRY_MAX_SECONDS = 5.0
 _HTTP_GET_RETRY_AFTER_JITTER_SECONDS = 0.25
 _ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES = 2
+
+
+@dataclass(frozen=True)
+class AnthropicModelCatalog:
+    """Models advertised by AI Gateway's Anthropic endpoint."""
+
+    model_ids: list[str]
+    model_id_to_display_name: dict[str, str]
+    error_msg: str | None = None
 
 
 def _debug_enabled() -> bool:
@@ -793,6 +803,38 @@ def ensure_databricks_cli_version() -> None:
         )
         _run_databricks_cli_installer(brew_subcommand="upgrade")
         ensure_databricks_cli_version()
+
+
+def databricks_cli_version() -> tuple[int, int, int] | None:
+    """Return the installed Databricks CLI's (major, minor, patch), or None if
+    the CLI is absent or its version can't be read/parsed. Unlike
+    ``ensure_databricks_cli_version`` this only reports — it never upgrades — so
+    ``ucode doctor`` can decide what to recommend."""
+    if not shutil.which("databricks"):
+        return None
+    try:
+        result = run(
+            ["databricks", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    raw = result.stdout or result.stderr or ""
+    output = (raw if isinstance(raw, str) else raw.decode(errors="replace")).strip()
+    return _parse_databricks_cli_version(output)
+
+
+def upgrade_databricks_cli() -> bool:
+    """Upgrade an already-installed Databricks CLI to the latest release.
+    Returns True on success, False if the installer failed."""
+    try:
+        _run_databricks_cli_installer(brew_subcommand="upgrade")
+    except RuntimeError:
+        return False
+    return True
 
 
 def install_databricks_cli() -> None:
@@ -2060,11 +2102,13 @@ def build_skills_mcp_url(workspace: str, locations: list[str]) -> str:
 # Maps the gateway routing dialect a coding tool speaks to the Model Provider
 # Service `provider_type`s it can be backed by. claude speaks Anthropic's API,
 # which both the `anthropic` and `amazon_bedrock` provider types serve (Bedrock
-# just exposes different model ids); codex speaks OpenAI's. Tags are the short
-# form produced by `_provider_type_tag` (e.g. `amazon_bedrock`).
+# just exposes different model ids); codex speaks OpenAI's; gemini speaks
+# Google's, served by a Gemini Enterprise provider. Tags are the short form
+# produced by `_provider_type_tag` (e.g. `amazon_bedrock`).
 _TOOL_PROVIDER_TYPES: dict[str, tuple[str, ...]] = {
     "claude": ("anthropic", "amazon_bedrock"),
     "codex": ("openai",),
+    "gemini": ("gemini_enterprise",),
 }
 
 # Provider types that expose Bedrock-style model ids (e.g.
@@ -2398,6 +2442,46 @@ def map_claude_family_models(targets: list[str]) -> dict[str, str]:
             best_key[family] = key
             result[family] = model_id
     return result
+
+
+# Claude Code starts every session on its opus tier, which the gateway 403s when a Model Provider
+# Service declares no opus target. When opus is missing, fall back to the most capable tier the
+# service does offer. opus > sonnet > haiku.
+_CLAUDE_LAUNCH_TIER_PREFERENCE = ("opus", "sonnet", "haiku")
+
+
+def resolve_provider_launch_model(model: str | None, provider_models: dict[str, str]) -> str | None:
+    """Pick the model a provider-routed Claude session starts on, or None to keep Claude Code's default.
+
+    ``provider_models`` maps the Claude families a service declares to their target ids (see
+    ``map_claude_family_models``). With an explicit ``model`` (``ucode claude --model``) the user's
+    choice wins: a family alias resolves to that tier's declared target (erroring when the service
+    doesn't offer it), any other value is trusted as a raw target id the service allows. Without one,
+    return None when the service offers opus — Claude Code's own default already works, so we avoid
+    setting ANTHROPIC_MODEL and the duplicate ``/model`` picker row it produces — else the most
+    capable tier the service does offer, so the launch doesn't dead-end on an unservable opus.
+    """
+    if model:
+        if model in ANTHROPIC_FAMILIES:
+            target = provider_models.get(model)
+            if not target:
+                available = ", ".join(sorted(provider_models)) or "none"
+                raise RuntimeError(
+                    f"This Model Provider Service does not offer a '{model}' model "
+                    f"(available families: {available})."
+                )
+            return target
+        return model
+    if provider_models.get("opus"):
+        return None
+    return next(
+        (
+            provider_models[fam]
+            for fam in _CLAUDE_LAUNCH_TIER_PREFERENCE
+            if provider_models.get(fam)
+        ),
+        None,
+    )
 
 
 # `list_vector_search_catalog_schemas` walks Vector Search endpoints+indexes.
@@ -2800,12 +2884,19 @@ def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | 
     using that mode must not apply ucode's legacy ``databricks-claude-*`` family
     validation.
     """
+    catalog = list_anthropic_model_catalog(workspace, token)
+    return catalog.model_ids, catalog.error_msg
+
+
+def list_anthropic_model_catalog(workspace: str, token: str) -> AnthropicModelCatalog:
+    """Return advertised Anthropic model ids and their optional display names."""
     payload, reason = _get_anthropic_models_json(workspace, token)
     if payload is None:
-        return [], reason
+        return AnthropicModelCatalog(model_ids=[], model_id_to_display_name={}, error_msg=reason)
 
     data = cast(dict, payload) if isinstance(payload, dict) else {}
     model_ids: list[str] = []
+    display_names: dict[str, str] = {}
     seen: set[str] = set()
     for model in data.get("data", []):
         if not isinstance(model, dict):
@@ -2814,9 +2905,16 @@ def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | 
         if isinstance(model_id, str) and model_id and model_id not in seen:
             seen.add(model_id)
             model_ids.append(model_id)
+            display_name = model.get("display_name")
+            if isinstance(display_name, str) and display_name:
+                display_names[model_id] = display_name
     if model_ids:
-        return model_ids, None
-    return [], "AI Gateway returned no Anthropic model ids"
+        return AnthropicModelCatalog(model_ids=model_ids, model_id_to_display_name=display_names)
+    return AnthropicModelCatalog(
+        model_ids=[],
+        model_id_to_display_name={},
+        error_msg="AI Gateway returned no Anthropic model ids",
+    )
 
 
 def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], str | None]:
@@ -2974,18 +3072,73 @@ def fetch_codex_models(workspace: str, token: str) -> list[str]:
     return models
 
 
-def _probe_ai_gateway_v2(workspace: str, token: str) -> tuple[bool, str | None]:
+class GatewayProbe(NamedTuple):
+    reachable: bool
+    detail: str
+    resource_available: bool = False
+    conclusive: bool = True
+
+
+def _version_neutral_gateway_detail(detail: str) -> str:
+    detail = re.sub(r"\bv3\b", "model service", detail, flags=re.IGNORECASE)
+    return re.sub(r"\bv2\b", "legacy endpoint", detail, flags=re.IGNORECASE)
+
+
+def _gateway_probe_result(
+    payload: dict | list | None,
+    reason: str | None,
+    collection_key: str,
+    resource_name: str,
+) -> GatewayProbe:
+    if payload is None:
+        return GatewayProbe(False, _version_neutral_gateway_detail(reason or "unknown error"))
+    resources = payload.get(collection_key) if isinstance(payload, dict) else None
+    if resources:
+        return GatewayProbe(True, f"reachable, accessible {resource_name} returned", True)
+    return GatewayProbe(True, f"reachable, no accessible {resource_name}s returned")
+
+
+def _probe_ai_gateway_v2(workspace: str, token: str) -> GatewayProbe:
     hostname = workspace_hostname(workspace)
     url = f"https://{hostname}/api/ai-gateway/v2/endpoints?page_size=1"
     payload, reason = _http_get_json(url, token)
-    return payload is not None, reason
+    return _gateway_probe_result(
+        payload=payload,
+        reason=reason,
+        collection_key="endpoints",
+        resource_name="endpoint",
+    )
 
 
-def _probe_ai_gateway_v3(workspace: str, token: str) -> tuple[bool, str | None]:
+_MODEL_SERVICE_PROBE_PAGE_SIZE = 50
+_MODEL_SERVICE_PROBE_MAX_PAGES = 20
+_MODEL_SERVICE_EMPTY_DETAIL = (
+    "reachable, no accessible model services returned; "
+    "check USE CATALOG on system, and USE SCHEMA and EXECUTE on system.ai"
+)
+
+
+def _probe_ai_gateway_v3(workspace: str, token: str) -> GatewayProbe:
     hostname = workspace_hostname(workspace)
-    url = f"https://{hostname}/api/2.1/unity-catalog/model-services?page_size=1"
-    payload, reason = _http_get_json(url, token)
-    return payload is not None, reason
+    base = f"https://{hostname}/api/2.1/unity-catalog/model-services"
+    page_token: str | None = None
+    for page in range(_MODEL_SERVICE_PROBE_MAX_PAGES):
+        params: dict[str, object] = {"page_size": _MODEL_SERVICE_PROBE_PAGE_SIZE}
+        if page_token:
+            params["page_token"] = page_token
+        payload, reason = _http_get_json(f"{base}?{urlencode(params)}", token)
+        if payload is None:
+            if page == 0:
+                return GatewayProbe(
+                    False, _version_neutral_gateway_detail(reason or "unknown error")
+                )
+            return GatewayProbe(True, "reachable", conclusive=False)
+        if isinstance(payload, dict) and payload.get("model_services"):
+            return GatewayProbe(True, "reachable, accessible model service returned", True)
+        page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
+        if not page_token:
+            return GatewayProbe(True, _MODEL_SERVICE_EMPTY_DETAIL)
+    return GatewayProbe(True, "reachable", conclusive=False)
 
 
 def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
@@ -2997,61 +3150,97 @@ def _raise_ai_gateway_auth_failure(workspace: str, reason: str) -> NoReturn:
     )
 
 
-def _raise_ai_gateway_v3_permission_failure(
-    workspace: str, v3_reason: str, v2_reason: str | None
-) -> NoReturn:
+def _raise_ai_gateway_scope_failure(workspace: str, reason: str) -> NoReturn:
     raise RuntimeError(
-        f"Databricks AI Gateway V3 access could not be verified on {workspace} ({v3_reason}). "
-        f"The V2 fallback also failed ({v2_reason or 'unknown error'}). The V3 probe requires "
-        "permission to list Unity Catalog model services. Verify USE CATALOG on `system` and "
-        "USE SCHEMA on `system.ai`."
+        f"The access token for {workspace} is missing an OAuth scope required by the "
+        f"AI Gateway APIs ({reason}). Re-authenticate to mint a token with the needed "
+        f"scopes:\n"
+        f"  databricks auth login --host {workspace}"
     )
 
 
-def _raise_ai_gateway_v2_permission_failure(
-    workspace: str, v2_reason: str, v3_reason: str | None
+def _raise_model_service_permission_failure(
+    workspace: str, model_service_reason: str, legacy_endpoint_reason: str
 ) -> NoReturn:
     raise RuntimeError(
-        f"Databricks AI Gateway V2 access could not be verified on {workspace} ({v2_reason}). "
-        f"The V3 probe also failed ({v3_reason or 'unknown error'}). Verify the caller's "
-        "workspace permissions for the AI Gateway V2 endpoints listing."
+        "Databricks Unity AI Gateway model service access could not be verified on "
+        f"{workspace} ({model_service_reason}). The legacy endpoint fallback also failed "
+        f"({legacy_endpoint_reason}). The model service probe requires permission to list "
+        "Unity Catalog model services. Verify USE CATALOG on `system`, and USE SCHEMA and "
+        "EXECUTE on `system.ai`."
     )
 
 
-def ensure_ai_gateway(workspace: str, token: str) -> None:
-    """Pass if either AI Gateway V2 or V3 is available."""
-    v3_ok, v3_reason = _probe_ai_gateway_v3(workspace, token)
-    if v3_ok:
-        return
-    if v3_reason and _looks_like_definitive_auth_failure(v3_reason):
-        _raise_ai_gateway_auth_failure(workspace, v3_reason)
+def _raise_legacy_endpoint_permission_failure(
+    workspace: str, legacy_endpoint_reason: str, model_service_reason: str
+) -> NoReturn:
+    raise RuntimeError(
+        "Databricks Unity AI Gateway legacy endpoint access could not be verified on "
+        f"{workspace} ({legacy_endpoint_reason}). The model service probe also failed "
+        f"({model_service_reason}). Verify the caller's workspace permissions for the legacy "
+        "endpoints listing."
+    )
 
-    v2_ok, v2_reason = _probe_ai_gateway_v2(workspace, token)
-    if v2_ok:
-        return
-    if v2_reason and _looks_like_definitive_auth_failure(v2_reason):
-        _raise_ai_gateway_auth_failure(workspace, v2_reason)
-    if v3_reason and _looks_like_permission_failure(v3_reason):
-        _raise_ai_gateway_v3_permission_failure(workspace, v3_reason, v2_reason)
-    if v2_reason and _looks_like_permission_failure(v2_reason):
-        _raise_ai_gateway_v2_permission_failure(workspace, v2_reason, v3_reason)
+
+def probe_unity_gateway_capabilities(workspace: str, token: str) -> GatewayProbe:
+    """Return the model service probe after verifying an available gateway path."""
+    model_service_probe = _probe_ai_gateway_v3(workspace, token)
+    if not model_service_probe.reachable and _looks_like_definitive_auth_failure(
+        model_service_probe.detail
+    ):
+        _raise_ai_gateway_auth_failure(workspace, model_service_probe.detail)
+    if model_service_probe.resource_available:
+        return model_service_probe
+
+    legacy_endpoint_probe = _probe_ai_gateway_v2(workspace, token)
+    if legacy_endpoint_probe.reachable:
+        return model_service_probe
+    if model_service_probe.reachable and not model_service_probe.conclusive:
+        return model_service_probe
+    if _looks_like_definitive_auth_failure(legacy_endpoint_probe.detail):
+        _raise_ai_gateway_auth_failure(workspace, legacy_endpoint_probe.detail)
+    if _looks_like_scope_failure(model_service_probe.detail):
+        _raise_ai_gateway_scope_failure(workspace, model_service_probe.detail)
+    if _looks_like_scope_failure(legacy_endpoint_probe.detail):
+        _raise_ai_gateway_scope_failure(workspace, legacy_endpoint_probe.detail)
+    if _looks_like_permission_failure(model_service_probe.detail):
+        _raise_model_service_permission_failure(
+            workspace, model_service_probe.detail, legacy_endpoint_probe.detail
+        )
+    if _looks_like_permission_failure(legacy_endpoint_probe.detail):
+        _raise_legacy_endpoint_permission_failure(
+            workspace, legacy_endpoint_probe.detail, model_service_probe.detail
+        )
 
     raise RuntimeError(
-        "Databricks AI Gateway is not enabled on this workspace: neither V3 "
-        f"({v3_reason or 'unknown error'}) nor V2 ({v2_reason or 'unknown error'}) is available. "
-        f"See {AI_GATEWAY_V2_DOCS_URL}"
+        "Databricks Unity AI Gateway is not enabled on this workspace: neither model services "
+        f"({model_service_probe.detail}) nor legacy endpoints ({legacy_endpoint_probe.detail}) "
+        f"are available. See {AI_GATEWAY_DOCS_URL}"
     )
 
 
 def _looks_like_definitive_auth_failure(reason: str) -> bool:
     """True when retrying another workspace API cannot rescue this token.
 
-    A 403 can be endpoint-specific authorization, so the version-agnostic
-    preflight must still try V3 before surfacing it as an auth failure.
+    A 403 can be endpoint-specific authorization, so the preflight must still
+    try the fallback before surfacing it as an auth failure.
     """
     if "HTTP 401" in reason:
         return True
     return "HTTP 400" in reason and "invalid token" in reason.lower()
+
+
+def _looks_like_scope_failure(reason: str) -> bool:
+    """True for a 403 that reports the OAuth *token* is missing a required scope.
+
+    Matched to the OAuth-token wording so a PAT's permission 403 -- which
+    re-login cannot fix -- is not misrouted to the re-login hint and instead
+    falls through to the grant guidance. The scopes the model-service and
+    legacy-endpoint APIs require differ, so this is only conclusive once both
+    probes have failed on it.
+    """
+    lowered = reason.lower()
+    return "http 403" in lowered and "oauth token" in lowered and "required scopes" in lowered
 
 
 def _looks_like_permission_failure(reason: str) -> bool:

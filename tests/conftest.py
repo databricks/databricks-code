@@ -28,11 +28,18 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     import ucode.databricks as databricks_mod
     import ucode.managed_files as managed_files_mod
     import ucode.state as state_mod
+    from ucode.agents import codex as codex_mod
 
     state_dir = tmp_path / ".ucode"
     state_dir.mkdir()
     monkeypatch.setattr(state_mod, "STATE_PATH", state_dir / "state.json")
     monkeypatch.setattr(config_io_mod, "APP_DIR", state_dir)
+    backup_dir = state_dir / "managed-backups"
+    monkeypatch.setattr(managed_files_mod, "MANAGED_BACKUP_DIR", backup_dir)
+    monkeypatch.setattr(
+        managed_files_mod, "MANAGED_BACKUP_MANIFEST_PATH", backup_dir / "manifest.json"
+    )
+    monkeypatch.setattr(codex_mod, "_managed_config_path", lambda: None)
 
     def reject_privileged_write(path, _desired_text):
         pytest.fail(
@@ -45,6 +52,7 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     # `ucode`/`ucode configure` do mid-test. Tests that exercise the managed path set it explicitly.
     monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
     monkeypatch.delenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", raising=False)
     # The model-services listing is memoized for the life of the process, so without this a cached
     # result would leak into the next test and make a stubbed listing look like it was never called.
     databricks_mod.clear_model_services_cache()
