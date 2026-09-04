@@ -123,15 +123,15 @@ reach the V2 AI Gateway. Workspace users add them non-interactively by naming th
 `--services` with a typed selector:
 
 ```bash
-ucode mcp add --services vector-search:main.docs
-ucode mcp add --services uc-functions:main.tools
-ucode mcp add --services external:my-connection
-ucode mcp add --services genie-space:<space-id>
-ucode mcp add --services app:my-app
+ug mcp add --services vector-search:main.docs
+ug mcp add --services uc-functions:main.tools
+ug mcp add --services external:my-connection
+ug mcp add --services genie-space:<space-id>
+ug mcp add --services app:my-app
 ```
 
 These require workspace access; a consumer-only identity is gated at the AI Gateway (which
-`ucode` already hits when it sets up models), not by this command.
+`ug` already hits when it sets up models), not by this command.
 
 Every Databricks MCP server is registered as a local **stdio** server that runs `ug mcp-proxy`
 — a small bridge (shipped with `ug`) between the coding tool and the Databricks
