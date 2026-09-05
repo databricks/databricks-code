@@ -416,8 +416,7 @@ def configure_tool(
     elif tool == "claude":
         # A Model Provider Service routes by header and pins no Databricks
         # model, so the usual "model required" guard doesn't apply to claude.
-        # `custom_model` (from `ucode claude --model`) likewise supplies the model.
-        if not model and not provider and not custom_model:
+        if not model and not provider:
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         result = claude.write_tool_config(
             state,

@@ -808,7 +808,7 @@ class TestClaudeModelFlag:
         assert "Model: system.ai.claude-opus-4-8" not in output
         assert mock_launch.call_args.args[2] == forwarded_args
 
-    def test_model_threads_to_claude_as_custom_model(self, monkeypatch):
+    def test_model_is_launch_scoped_for_claude(self, monkeypatch):
         monkeypatch.delenv("ENABLE_SMART_ROUTING_V2", raising=False)
         with (
             patch("ucode.cli.ensure_bootstrap_dependencies"),
@@ -822,11 +822,13 @@ class TestClaudeModelFlag:
         ):
             result = runner.invoke(app, ["claude", "--model", "cat.schema.claude-opus-5"])
         assert result.exit_code == 0, result.output
-        # Claude routes --model as custom_model (pinned into the family aliases by render_overlay),
-        # NOT as ANTHROPIC_MODEL — Claude Code validates that value and rejects a raw id.
-        assert mock_configure.call_args.kwargs["custom_model"] == "cat.schema.claude-opus-5"
+        # The model is passed through invocation-scoped LaunchOptions, not persisted in settings.
+        assert mock_configure.call_args.kwargs["custom_model"] is None
         assert mock_configure.call_args.kwargs["route_root_model"] is None
-        assert "_claude_launch_model" not in mock_launch.call_args.args[1]
+        assert (
+            mock_launch.call_args.kwargs["options"].claude_launch_model
+            == "cat.schema.claude-opus-5"
+        )
 
     def test_v2_model_sets_transient_launch_override(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")

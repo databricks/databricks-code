@@ -404,19 +404,6 @@ def render_overlay(
     _ = model  # API stability; no longer pinned via env.
     if route_root_model:
         env["ANTHROPIC_MODEL"] = route_root_model
-    # `ucode claude --model <id>` pins an arbitrary Databricks model id for this launch. It CANNOT
-    # go in ANTHROPIC_MODEL: Claude Code validates that value client-side against the models it knows
-    # (via the apiKeyHelper auth path ucode uses) and rejects a raw id with "may not exist ... run
-    # /model". The family-alias vars (ANTHROPIC_DEFAULT_*_MODEL) are passed through unchecked, so pin
-    # the id into all of them — a raw id carries no signal of its family (opus/sonnet/haiku), and
-    # overriding every slot makes the model take effect no matter which one Claude Code resolves
-    # (root session, a tier switch, or a subagent). Wins over the discovered-model aliases below.
-    if custom_model and not provider:
-        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = custom_model
-        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = custom_model
-        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = custom_model
-        if fable_enabled:
-            env["ANTHROPIC_DEFAULT_FABLE_MODEL"] = custom_model
     # A Bedrock-backed provider needs its provider-side ids pinned verbatim
     # (Claude Code's canonical names aren't routable there). These come from the
     # service's targets, already de-duped to one id per family upstream.
@@ -1363,6 +1350,8 @@ def launch(
         os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
+    if options.claude_launch_model:
+        os.environ["ANTHROPIC_MODEL"] = options.claude_launch_model
     exec_or_spawn(_build_claude_argv(binary, tool_args))
 
 

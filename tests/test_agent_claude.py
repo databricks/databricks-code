@@ -142,10 +142,8 @@ class TestRenderOverlay:
         )
         assert overlay["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "system.ai.claude-haiku-4-6"
 
-    def test_custom_model_pins_all_family_aliases(self):
-        # `ucode claude --model` pins the id into every family alias so it takes effect whichever
-        # slot Claude Code resolves — and NOT into ANTHROPIC_MODEL, which Claude Code validates and
-        # rejects for a raw Databricks id. It overrides the discovered-model aliases.
+    def test_custom_model_does_not_persist_model_selection(self):
+        # Explicit model selection is launch-scoped and must not be written to settings.
         overlay, _ = claude.render_overlay(
             WS,
             "s4",
@@ -153,22 +151,23 @@ class TestRenderOverlay:
             custom_model="main.aarushi.claude-opus-5",
         )
         env = overlay["env"]
-        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "main.aarushi.claude-opus-5"
-        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "main.aarushi.claude-opus-5"
-        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "main.aarushi.claude-opus-5"
         assert "ANTHROPIC_MODEL" not in env
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.sonnet"
+        assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in env
         # No [1m] suffix is appended to the custom id — it's passed through verbatim.
-        assert "[1m]" not in env["ANTHROPIC_DEFAULT_OPUS_MODEL"]
+        assert "main.aarushi.claude-opus-5" not in env.values()
 
-    def test_custom_model_pins_fable_alias_only_when_fable_enabled(self):
+    def test_custom_model_does_not_persist_fable_selection(self):
         without = claude.render_overlay(WS, "s4", claude_models={}, custom_model="main.x.m")[0][
             "env"
         ]
-        assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in without
+        assert "ANTHROPIC_MODEL" not in without
         with_fable = claude.render_overlay(
             WS, "s4", claude_models={}, custom_model="main.x.m", fable_enabled=True
         )[0]["env"]
-        assert with_fable["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "main.x.m"
+        assert "ANTHROPIC_MODEL" not in with_fable
+        assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in with_fable
 
     def test_sets_anthropic_base_url(self):
         overlay, _ = claude.render_overlay(WS, "s4")
@@ -1113,6 +1112,21 @@ class TestClaudeLaunch:
 
         assert os.environ["OAUTH_TOKEN"] == "token"
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
+
+    def test_launch_model_is_only_set_for_current_process(self, monkeypatch):
+        calls: list[list[str]] = []
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
+        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
+
+        claude.launch(
+            {"workspace": WS, "profile": "test"},
+            [],
+            options=LaunchOptions(claude_launch_model="cat.schema.model"),
+        )
+
+        assert os.environ["ANTHROPIC_MODEL"] == "cat.schema.model"
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH)]]
 
     @pytest.mark.parametrize(
         "tool_args",

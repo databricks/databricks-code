@@ -1998,6 +1998,7 @@ def _can_launch_from_cached_config(
     if smart_routing_enabled is None:
         smart_routing_enabled = smart_routing_v2.enabled()
 
+    # TODO(lilly): replace with codex/v1/models or custom catalog
     if tool == "codex" and smart_routing_enabled:
         if not state.get("codex_models") or not state.get("oss_models"):
             return False
@@ -2034,6 +2035,7 @@ def _launch_options(
 ) -> LaunchOptions:
     has_model_override = model is not None or explicit_model_arg_value(tool_args) is not None
     return LaunchOptions(
+        claude_launch_model=model if tool == "claude" and provider is None else None,
         launch_smart_routing=(
             # Smart routing is enabled globally.
             smart_routing_enabled
@@ -2253,9 +2255,7 @@ def _launch_tool(
                     resolved_model = managed_model
             # An explicit `--model` is the user's own choice and outranks everything above (managed
             # default, smart-routing pick). Non-claude agents take it as the resolved model, which
-            # their CLIs pass to the gateway verbatim. Claude is special (see custom_model below):
-            # Claude Code validates ANTHROPIC_MODEL client-side and rejects a raw Databricks id, so
-            # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
+            # Codex keeps an explicit --model in ctx.args and passes it to its CLI verbatim.
             if model and tool != "claude":
                 resolved_model = model
         state = configure_tool(
@@ -2266,10 +2266,8 @@ def _launch_tool(
             provider_models=provider_models,
             relayed=relayed,
             route_root_model=route_root_model,
-            # Under a provider, --model is honored via route_root_model (above), not custom_model —
-            # the latter pins a raw id into every family alias, which would clobber the service's
-            # per-family target pins.
-            custom_model=model if (tool == "claude" and not provider) else None,
+            # Claude's explicit model is launch-scoped and is passed through LaunchOptions below.
+            custom_model=None,
             coding_agent_config_defaults=coding_agent_config_defaults,
         )
         # Relayed = a Claude subscription: forward --model to Claude Code's own flag, like `-- --model X`.
