@@ -957,6 +957,9 @@ class TestCopilotLaunch:
         "gpt-5-5",
         # gpt-5.6 models similarly reject /chat/completions with 404.
         "gpt-5-6",
+        # gpt-6-astra rejects function tools + reasoning_effort on /chat/completions
+        # ("use /v1/responses or set reasoning_effort to 'none'"), like gpt-5-5/gpt-5-6.
+        "gpt-6-astra",
         # Bedrock Grok rejects the gateway's llm/v1/chat task type.
         "grok",
     )
