@@ -762,6 +762,25 @@ class TestWriteToolConfigManagedSettings:
         assert written["env"]["ANTHROPIC_BASE_URL"]
         assert written["apiKeyHelper"]
 
+    def test_managed_file_preserves_model_picker(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        picker = {
+            "replaceBuiltInOptions": True,
+            "options": [
+                {"model": "system.ai.claude-opus-4-8"},
+                {"model": "system.ai.glm-5-2"},
+            ],
+        }
+        existing = {str(FAKE_MANAGED_PATH): {"modelPicker": picker}}
+        self._patch(monkeypatch, private_writes, managed_writes, existing)
+        state = {"workspace": WS, "codex_models": []}
+
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+
+        written = json.loads(managed_writes[0][1])
+        assert written["modelPicker"] == picker
+
     def test_managed_file_strips_stale_gateway_model_discovery(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []

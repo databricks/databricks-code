@@ -707,6 +707,9 @@ def write_tool_config(
                 else:
                     target_env[key] = selected_default_model
         merged = deep_merge_dict(base, overlay_for_merge)
+        if enforce_model_default_hierarchy and "modelPicker" in base:
+            # Claude's managed modelPicker is administrator-owned; ucode must leave it intact.
+            merged["modelPicker"] = copy.deepcopy(base["modelPicker"])
         overlay_custom_headers = overlay_for_merge["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
         merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
             existing_custom_headers, overlay_custom_headers

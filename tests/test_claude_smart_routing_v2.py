@@ -64,9 +64,7 @@ class TestManagedModelPicker:
     def test_falls_back_to_user_settings_picker(self, tmp_path, monkeypatch):
         user_settings = tmp_path / "settings.json"
         user_settings.write_text(
-            json.dumps(
-                {"modelPicker": {"options": [{"model": "system.ai.claude-sonnet-5"}]}}
-            )
+            json.dumps({"modelPicker": {"options": [{"model": "system.ai.claude-sonnet-5"}]}})
         )
         monkeypatch.setattr(claude, "_managed_settings_path", lambda: tmp_path / "missing-managed")
         monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", tmp_path / "missing-ucode")
