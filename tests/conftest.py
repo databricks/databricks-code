@@ -52,9 +52,6 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(managed_files_mod, "_sudo_replace", reject_privileged_write)
-    # Isolate the managed-config opt-in from the developer's own shell: leaving it set changes what
-    # `ucode`/`ucode configure` do mid-test. Tests that exercise the managed path set it explicitly.
-    monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
     monkeypatch.delenv("ENABLE_CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", raising=False)
     # The model-services listing is memoized for the life of the process, so without this a cached

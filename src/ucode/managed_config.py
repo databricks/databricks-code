@@ -40,10 +40,6 @@ from ucode.ui import console, print_warning
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
 
-# Opt-in switch while the feature is in bug bash: unset means launches ignore managed configs
-# entirely and behave exactly as they did before.
-MANAGED_CONFIG_ENV_VAR = "ENABLE_MANAGED_AGENT_CONFIG"
-
 # Shown to a developer when their workspace has no admin-defined managed config yet — the normal
 # case, not an error. Kept here so the CLI (which surfaces it) uses one consistent message.
 NO_MANAGED_CONFIG_MESSAGE = "No coding-agent config has been set up by your workspace admin yet."
@@ -519,11 +515,3 @@ def _summarize_read_failure(reason: str) -> str:
         return status.strip()
     condensed = " ".join(reason.split())
     return condensed if len(condensed) <= 160 else condensed[:157] + "..."
-
-
-def managed_agent_config_enabled() -> bool:
-    """True when managed coding-agent configs are switched on for this run.
-
-    Opt-in while the feature is being bug-bashed: without the env var set, launches behave exactly
-    as they did before and never read the workspace's config."""
-    return os.environ.get(MANAGED_CONFIG_ENV_VAR, "").strip().lower() in ("1", "true", "yes")

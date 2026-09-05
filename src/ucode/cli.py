@@ -73,11 +73,9 @@ from ucode.managed_budget import (
     render_budget_panel,
 )
 from ucode.managed_config import (
-    MANAGED_CONFIG_ENV_VAR,
     ManagedConfigResult,
     get_model_recommendation,
     load_managed_state,
-    managed_agent_config_enabled,
     refresh_managed_config,
 )
 from ucode.managed_resolve import (
@@ -267,119 +265,6 @@ def _confirm_managed_config_applied(managed: dict, workspace: str) -> None:
     print_success("A managed config is published for your workspace — you're all set.")
     _print_managed_summary(managed, {"workspace": workspace}, tool=None)
     print_note("Run `ug` to launch with your managed settings.")
-
-
-def _resolve_workspace_then_maybe_reject(
-    workspace_entries: list[tuple[str, str | None]] | None,
-) -> list[tuple[str, str | None]] | None:
-    """Resolve the workspace ``ug configure`` targets, then branch on role + managed config.
-
-    Enablement is both client- and server-side: the client-side ``ENABLE_MANAGED_AGENT_CONFIG`` env
-    var must be set for ``ucode`` to run any of this (the opt-in bug-bash gate below), and the
-    workspace's gateway must not report the feature disabled (``FEATURE_DISABLED``) — a config only
-    exists to adopt when the server side is on too.
-
-    When managed coding-agent configs are enabled, ``ug configure`` must still let a developer
-    switch workspaces — so resolve the target workspace up front (prompting when the interactive
-    path gave no ``--workspaces``/``--profiles``) and make it current *before* deciding what to do.
-    Then, gated by the client-side ``ENABLE_MANAGED_AGENT_CONFIG``, the four role/config paths are:
-
-    * **No managed config** → a workspace admin is dropped straight into the ``ug setup``
-      authoring flow (``configure`` is replacing ``setup``) and the command exits with its code; a
-      non-admin's own ``configure`` proceeds, with the resolved entries returned so the caller
-      reuses them instead of re-prompting.
-    * **Managed config, non-admin** (or admin status unverifiable) → they're already set: the
-      launch path applies the config on every ``ucode`` run, so just show it and point them there.
-    * **Managed config, admin** → drop into the setup flow, whose existing-config menu lets them
-      adopt it (the same "you're all set" confirmation), re-author it, or delete it; the command exits.
-
-    Without the client-side flag set it returns ``workspace_entries`` unchanged and prompts nothing.
-    """
-    if not managed_agent_config_enabled():
-        return workspace_entries
-    entries = workspace_entries or [_prompt_for_configuration(None)]
-    workspace, profile = entries[0]
-    set_current_workspace(workspace)
-    ensure_databricks_auth(workspace, profile)
-    # Fetch, don't just read the local cache: on a fresh machine (or right after a reinstall) the
-    # cache is empty until the first launch, so a cache read would miss a config the workspace does
-    # publish and wrongly fall through to the local configure flow. `refresh_managed_config` reaches
-    # the workspace and never raises — it falls back to the persisted copy, then None, on failure.
-    with spinner("Loading..."):
-        managed, coding_agent_config_feature_disabled = refresh_managed_config(
-            {"workspace": workspace, "profile": profile}
-        )
-    if not managed:
-        if not coding_agent_config_feature_disabled:
-            _maybe_run_admin_setup(workspace, profile)
-        return entries
-    is_admin: bool | None = None
-    try:
-        token = get_databricks_token(workspace, profile)
-    except RuntimeError:
-        token = None
-    if token is not None:
-        with spinner("Checking your workspace permissions..."):
-            is_admin = is_workspace_admin(workspace, token)
-    if is_admin:
-        _run_setup_and_exit(workspace, profile, token)
-    _confirm_managed_config_applied(managed, workspace)
-    raise typer.Exit(0)
-
-
-def _maybe_run_admin_setup(workspace: str, profile: str | None) -> None:
-    """When a workspace admin runs ``configure`` on a workspace with no managed config, drop straight
-    into the ``ug setup`` authoring flow — ``configure`` is replacing ``setup``, so the admin
-    never has to invoke it themselves. On completion, exit with setup's own status code.
-
-    A plain developer (and any caller whose admin status can't be verified) instead falls through to
-    the normal local-configure flow — this function just returns for them. The admin check is
-    best-effort: any failure to determine admin status (auth or SCIM unreachable) silently skips
-    setup and returns, so a developer is never blocked behind an authoring flow they can't complete.
-    """
-    try:
-        token = get_databricks_token(workspace, profile)
-    except RuntimeError:
-        return
-    with spinner("Checking your workspace permissions..."):
-        is_admin = is_workspace_admin(workspace, token)
-    if not is_admin:
-        return
-    print_note(
-        "You're a workspace admin, and no managed coding agent config exists for this workspace "
-        "yet — let's set one up. Choose the agents, models, MCPs, and skills once and every "
-        "developer inherits them when they run `ug`."
-    )
-    _run_setup_and_exit(workspace, profile, token)
-
-
-def _run_setup_and_exit(workspace: str, profile: str | None, token: str | None = None) -> None:
-    """Launch the ``ug setup`` authoring flow in place, then exit with its status code.
-
-    Reuses the workspace/profile ``configure`` already resolved and authenticated against so setup
-    doesn't prompt for them again, and hands setup the same ``token`` the admin check already used
-    so setup's admin gate can't disagree with the routing decision (e.g. right after a credential
-    switch, where a second token fetch could resolve a different identity). ``setup_command`` handles
-    an already-existing config (offering to adopt or edit it). Its actionable failures and aborts are
-    mapped to clean exit codes rather than bubbling up as unhandled errors.
-    """
-    try:
-        # Brand the flow as "Configure unity-gateway CLI": it was reached through
-        # `ug configure`, not a bare `ug setup`, so its section headers use the product
-        # name rather than the bare command.
-        code = setup_command(
-            workspace=workspace,
-            profile=profile,
-            command_label="Configure unity-gateway CLI",
-            token=token,
-        )
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    raise typer.Exit(code or 0)
 
 
 def _print_discovery_diagnostics(state: dict) -> None:
@@ -1016,12 +901,7 @@ def status() -> int:
     if profile:
         print_kv("CLI profile", profile)
 
-    # When the workspace publishes a managed config and this run has the feature switched on, that
-    # admin-authored config is what launches actually apply — so surface the whole setup as one box
-    # here too, rather than leaving a developer to infer it from the per-agent rows below. Read from
-    # the local cache (no network): status is a quick, offline-safe glance, and the cache is what the
-    # last launch persisted for this workspace.
-    if workspace and managed_agent_config_enabled():
+    if workspace:
         managed = load_managed_state(workspace)
         if managed:
             _print_managed_summary(managed, state, None)
@@ -1804,15 +1684,11 @@ def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
 
 
 def _fetch_managed_config(state: dict) -> ManagedConfigResult:
-    """The workspace's managed config for this launch, or a manifest-less result when there is none.
+    """The workspace's managed config for this launch, plus whether the feature is disabled.
 
-    Returns a feature-disabled-free result when managed configs are switched off — either the feature
-    is disabled or the launch passed ``--skip-managed-config`` (which clears the enabling env var for
-    the process).
+    ``ManagedConfigResult(None, True)`` when the workspace has the feature disabled server-side;
+    ``ManagedConfigResult(None, False)`` when the feature is on but no config is published.
     """
-
-    if not managed_agent_config_enabled():
-        return ManagedConfigResult(None, False)
     with spinner("Loading..."):
         return refresh_managed_config(state)
 
@@ -1980,52 +1856,6 @@ def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
     _download_managed_skills(managed, state)
 
 
-def _can_launch_from_cached_config(
-    tool: str,
-    state: dict,
-    *,
-    refresh: bool,
-    model: str | None,
-    explicit_provider: str | None,
-    workspace_url: str | None,
-    smart_routing_enabled: bool | None = None,
-) -> bool:
-    """Return whether a normal Claude/Codex launch can use its cached config."""
-    if tool not in CAN_USE_CACHED_CONFIG_AGENTS:
-        return False
-
-    if refresh or model or explicit_provider is not None:
-        return False
-
-    if smart_routing_enabled is None:
-        smart_routing_enabled = smart_routing_v2.enabled()
-
-    # TODO(lilly): replace with codex/v1/models or custom catalog
-    if tool == "codex" and smart_routing_enabled:
-        if not state.get("codex_models") or not state.get("oss_models"):
-            return False
-
-    # If managed agent config is enabled, we cannot use the cached state in case the config changed.
-    if managed_agent_config_enabled():
-        return False
-
-    # `_launch_tool` selects an explicit workspace before loading state. A matching workspace here
-    # therefore means its cached state was selected (or it was just auto-configured) and is safe to
-    # launch. Keep rejecting a mismatched state rather than launching against the wrong workspace.
-    if workspace_url is not None and state.get("workspace") != normalize_workspace_url(
-        workspace_url
-    ):
-        return False
-
-    if tool == "claude":
-        return (
-            claude_agent.CLAUDE_SETTINGS_PATH.exists()
-            and claude_agent.managed_settings_are_current(state)
-            and claude_agent.gateway_model_discovery_setting_is_absent()
-        )
-    return codex_agent.has_ucode_config() and codex_agent.managed_config_is_current(state)
-
-
 def _launch_options(
     tool: str,
     tool_args: list[str],
@@ -2101,35 +1931,13 @@ def _launch_tool(
         # back to whatever `ug configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
         state = _migrate_legacy_smart_routing(state)
-        launch_options = _launch_options(
-            tool,
-            ctx.args,
-            smart_routing_enabled=smart_routing_enabled,
-            explicit_prompt=explicit_prompt,
-            model=model,
-            provider=provider,
-        )
-        if _can_launch_from_cached_config(
-            tool,
-            state,
-            refresh=refresh,
-            model=model,
-            explicit_provider=explicit_provider,
-            workspace_url=workspace_url,
-            smart_routing_enabled=launch_options.launch_smart_routing,
-        ):
-            print_section(_launch_title(tool))
-            if forwarded_model:
-                print_kv("Model", forwarded_model)
-            print_success(f"Starting {TOOL_SPECS[tool]['display']}")
-            launch_agent(tool, state, ctx.args, options=launch_options)
-            return
         # Fetched before `configure_shared_state` because it decides whether this agent may launch
         # at all and whether the model discovery below can be skipped.
         # Bare `ucode` already fetched one to choose the agent; refetching would double the
         # control-plane round trip and any fallback warning it printed.
+        coding_agent_config_feature_disabled = False
         if managed is None:
-            managed, _coding_agent_config_feature_disabled = _fetch_managed_config(state)
+            managed, coding_agent_config_feature_disabled = _fetch_managed_config(state)
         # Checked before discovery, which can take tens of seconds, so a blocked launch fails fast.
         _reject_disabled_agent(managed, tool)
         # Discovery exists to find models and isn't needed for managed config that already names them.
@@ -2162,7 +1970,7 @@ def _launch_tool(
                     f"Your workspace's managed config lists no {TOOL_SPECS[tool]['display']}-servable "
                     f"models ({', '.join(unservable)}); using your discovered models instead."
                 )
-        elif managed_agent_config_enabled():
+        elif not coding_agent_config_feature_disabled:
             print_note("No managed coding agent config found; using your own settings")
         if managed is not None:
             managed_provider = managed_provider_service(managed, tool)
@@ -2313,8 +2121,7 @@ def _launch_tool(
             _print_budget_panel(recommendation, tool, managed)
         # Register the managed config's MCP servers so they reach the agent's `/mcp` list. Nothing
         # else on this path does it — the config only lists them — so without this a
-        # workspace-published server never shows up. `managed` is already None when the config is
-        # skipped (--skip-managed-config / feature off); --dry-run writes nothing.
+        # workspace-published server never shows up. Skipped on --dry-run, which writes nothing.
         if managed is not None and not is_dry_run():
             _register_managed_mcp_servers(managed, tool, state)
             _apply_managed_skills(managed, tool, state)
@@ -2349,8 +2156,7 @@ def _launch_tool(
 # Launch-only escape hatch for managed/headless launchers (e.g. omnigent) that
 # have already run `ug configure`: skip the ~5-10s per-launch auth + AI
 # Gateway re-validation. Distinct from the configure-only `--skip-validate`,
-# which skips the model smoke test, and from `--skip-managed-config`, which
-# controls whether the workspace's managed config is applied.
+# which skips the model smoke test.
 SkipPreflightOption = Annotated[
     bool,
     typer.Option(
@@ -2364,32 +2170,6 @@ REFRESH_HELP = (
     "Refresh Databricks auth, gateway, models, managed config, and agent configuration before "
     "launching."
 )
-
-# Ignore the workspace's managed coding-agent config for this one command, on both
-# `ug configure` and the launchers. Accepted (and no-op) even when the managed-config
-# feature is off, so a headless launcher can always pass it.
-SkipManagedConfigOption = Annotated[
-    bool,
-    typer.Option(
-        "--skip-managed-config",
-        help="Ignore your workspace's managed coding-agent config for this run, as if managed "
-        "configs were switched off — use your own local settings instead.",
-        hidden=True,
-    ),
-]
-
-
-def _disable_managed_config_if_requested(skip_managed_config: bool) -> None:
-    """Make this process behave as though ``ENABLE_MANAGED_AGENT_CONFIG`` were never set.
-
-    ``managed_agent_config_enabled()`` reads the env var live and gates every managed-config path
-    (the launch fetch/apply, the budget read, MCP registration, the bare-``ucode`` agent picker, and
-    the ``configure`` reject-under-managed flow), so clearing it once here short-circuits them all
-    without threading a flag through each. Per-invocation only: it affects just the current command.
-    """
-    if skip_managed_config:
-        os.environ.pop(MANAGED_CONFIG_ENV_VAR, None)
-
 
 # Target this launch at a specific workspace, auto-configuring (and logging in)
 # if it hasn't been set up yet — so a launch needs no prior `ug configure`.
@@ -2449,7 +2229,6 @@ def default(
         ),
     ] = False,
     skip_preflight: SkipPreflightOption = False,
-    skip_managed_config: SkipManagedConfigOption = False,
     workspace: WorkspaceOption = None,
 ) -> None:
     """Configure and launch coding agents through Databricks AI Gateway.
@@ -2461,7 +2240,6 @@ def default(
     if ctx.invoked_subcommand is not None:
         return
     set_dry_run(dry_run)
-    _disable_managed_config_if_requested(skip_managed_config)
     try:
         _launch_managed_default(
             ctx, dry_run=dry_run, skip_preflight=skip_preflight, workspace=workspace
@@ -2484,16 +2262,14 @@ def _launch_managed_default(
     workspace: str | None,
 ) -> None:
     """Route bare ``ucode`` by whether the workspace publishes a managed config."""
-    if not managed_agent_config_enabled():
-        console.print(ctx.get_help())
-        return
     if workspace:
         set_current_workspace(normalize_workspace_url(workspace))
-    install_databricks_cli()
     state = load_state()
     current = state.get("workspace")
     if not current:
-        raise RuntimeError("No workspace configured. Run `ug configure` first.")
+        console.print(ctx.get_help())
+        return
+    install_databricks_cli()
     apply_pat_environment(state)
     coding_agent_config_feature_disabled = False
     if dry_run:
@@ -2501,9 +2277,14 @@ def _launch_managed_default(
     else:
         with spinner("Loading..."):
             managed, coding_agent_config_feature_disabled = refresh_managed_config(state)
-    if not managed and not coding_agent_config_feature_disabled:
-        _print_no_managed_config_guidance(current, state.get("profile"))
+    if coding_agent_config_feature_disabled:
+        print_note(
+            "Run `ug configure` to set up your coding agents, then launch one with "
+            "`ug <agent>` (for example `ug claude`)."
+        )
+        return
     if not managed:
+        _print_no_managed_config_guidance(current, state.get("profile"))
         return
     # The budget tier can move the org to a cheaper agent, so it outranks the config's
     # default_agent. Fetched here and handed to _launch_tool so it is read once per launch.
@@ -2569,7 +2350,6 @@ def codex_cmd(
         ),
     ] = False,
     skip_preflight: SkipPreflightOption = False,
-    skip_managed_config: SkipManagedConfigOption = False,
     workspace: WorkspaceOption = None,
     enable_smart_routing_flag: Annotated[
         bool,
@@ -2588,7 +2368,6 @@ def codex_cmd(
     ] = False,
 ) -> None:
     """Launch Codex via Databricks."""
-    _disable_managed_config_if_requested(skip_managed_config)
     if enable_smart_routing_flag and disable_smart_routing_flag:
         print_err("Use only one of --enable-smart-routing or --disable-smart-routing.")
         raise typer.Exit(1)
@@ -2642,7 +2421,6 @@ def claude_cmd(
         ),
     ] = False,
     skip_preflight: SkipPreflightOption = False,
-    skip_managed_config: SkipManagedConfigOption = False,
     workspace: WorkspaceOption = None,
     enable_model_discovery: Annotated[
         bool,
@@ -2669,7 +2447,6 @@ def claude_cmd(
     ] = False,
 ) -> None:
     """Launch Claude Code via Databricks."""
-    _disable_managed_config_if_requested(skip_managed_config)
     if enable_smart_routing_flag and disable_smart_routing_flag:
         print_err("Use only one of --enable-smart-routing or --disable-smart-routing.")
         raise typer.Exit(1)
@@ -2712,10 +2489,8 @@ def gemini_cmd(
         ),
     ] = None,
     skip_preflight: SkipPreflightOption = False,
-    skip_managed_config: SkipManagedConfigOption = False,
 ) -> None:
     """Launch Gemini CLI via Databricks."""
-    _disable_managed_config_if_requested(skip_managed_config)
     _launch_tool("gemini", ctx, provider=provider, model=model, skip_preflight=skip_preflight)
 
 
@@ -2725,10 +2500,8 @@ def gemini_cmd(
 def opencode_cmd(
     ctx: typer.Context,
     skip_preflight: SkipPreflightOption = False,
-    skip_managed_config: SkipManagedConfigOption = False,
 ) -> None:
     """Launch OpenCode via Databricks."""
-    _disable_managed_config_if_requested(skip_managed_config)
     _launch_tool("opencode", ctx, skip_preflight=skip_preflight)
 
 
@@ -2736,10 +2509,8 @@ def opencode_cmd(
 def copilot_cmd(
     ctx: typer.Context,
     skip_preflight: SkipPreflightOption = False,
-    skip_managed_config: SkipManagedConfigOption = False,
 ) -> None:
     """Launch GitHub Copilot CLI via Databricks."""
-    _disable_managed_config_if_requested(skip_managed_config)
     _launch_tool("copilot", ctx, skip_preflight=skip_preflight)
 
 
@@ -2747,10 +2518,8 @@ def copilot_cmd(
 def pi_cmd(
     ctx: typer.Context,
     skip_preflight: SkipPreflightOption = False,
-    skip_managed_config: SkipManagedConfigOption = False,
 ) -> None:
     """Launch Pi coding agent via Databricks."""
-    _disable_managed_config_if_requested(skip_managed_config)
     _launch_tool("pi", ctx, skip_preflight=skip_preflight)
 
 
@@ -2902,7 +2671,6 @@ def configure(
             "still applied.",
         ),
     ] = False,
-    skip_managed_config: SkipManagedConfigOption = False,
     verbose: Annotated[
         str,
         typer.Option(
@@ -2915,7 +2683,6 @@ def configure(
     """Configure workspace URL and AI Gateway."""
     if ctx.invoked_subcommand is not None:
         return
-    _disable_managed_config_if_requested(skip_managed_config)
     if verbose not in ("normal", "low"):
         print_err("--verbose must be one of: normal, low.")
         raise typer.Exit(2)
@@ -2945,14 +2712,7 @@ def configure(
         workspace_entries = _parse_workspaces_option(workspaces) if workspaces is not None else None
         if profiles is not None:
             workspace_entries = _parse_profiles_option(profiles)
-        # Whether the user named the workspace(s) via flags, captured before the resolver below
-        # may fill `workspace_entries` from a prompt — this, not the resolved value, decides the
-        # fully-interactive MCP prompt at the end.
         flag_driven_workspace = workspace_entries is not None
-        # Under a managed config, resolve (prompting when interactive) and set the target workspace
-        # first, so the developer can switch workspaces; only then short-circuit if that workspace
-        # is already managed. Returns the resolved entries so the flow below doesn't prompt again.
-        workspace_entries = _resolve_workspace_then_maybe_reject(workspace_entries)
         # Only forward the opt-in flags when set so existing call expectations
         # (and defaults) stay unchanged for the common interactive path.
         skip_kwargs: dict = {}
@@ -3066,9 +2826,7 @@ def configure(
                 )
             # Only the no-agent, no-workspace path is truly interactive (the user
             # picked agents/workspace via prompts); that's where we offer the MCP
-            # step below. Flag-driven runs stay scriptable. Keyed off whether the
-            # workspace came from a flag, not the now-resolved `workspace_entries`
-            # (which the managed-config resolver may have filled from a prompt).
+            # step below. Flag-driven runs stay scriptable.
             fully_interactive = not flag_driven_workspace
         if tracing:
             # The workspaces were just configured, so enable tracing for them
