@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from ucode.agents import copilot
 
 WS = "https://example.databricks.com"
+# >= MINIMUM_COPILOT_ANTHROPIC_VERSION, for tests that need the anthropic path reachable.
+NEW_ENOUGH_VERSION = "1.0.82"
 
 
 class TestCopilotSpec:
@@ -35,7 +39,14 @@ class TestRenderEnvOverlay:
     unrecognized COPILOT_MODEL (a Databricks catalog id) makes Copilot fall
     back to defaults that include sending `temperature`, which current-gen
     Claude models 400 on — hence the separate COPILOT_PROVIDER_MODEL_ID
-    (canonical name) / COPILOT_PROVIDER_WIRE_MODEL (actual wire id) split."""
+    (canonical name) / COPILOT_PROVIDER_WIRE_MODEL (actual wire id) split.
+
+    All of that only works on Copilot >= 1.0.81-6 (see TestSupportsAnthropicProvider),
+    so every test here mocks a new-enough installed version."""
+
+    @pytest.fixture(autouse=True)
+    def _new_enough_copilot(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: NEW_ENOUGH_VERSION)
 
     def test_claude_model_uses_anthropic_provider_type(self):
         env = copilot.render_env_overlay(WS, "claude-sonnet-4-6", "tok")
@@ -84,6 +95,76 @@ class TestRenderEnvOverlay:
     def test_sets_oauth_token_for_both_families(self):
         assert copilot.render_env_overlay(WS, "claude-sonnet-4-6", "tok")["OAUTH_TOKEN"] == "tok"
         assert copilot.render_env_overlay(WS, "gpt-5", "tok")["OAUTH_TOKEN"] == "tok"
+
+
+class TestOldCopilotFallsBackToOpenai:
+    """Below 1.0.81-6, Copilot always sends `temperature` on the anthropic
+    path regardless of model id, and current-gen Claude models 400 on it —
+    verified live (1.0.79, 1.0.80, 1.0.81-0 all fail; 1.0.81-6 onward works).
+    So an old Copilot must keep getting the openai path even for Claude
+    models: uncached, but that's the pre-fix status quo, not a regression."""
+
+    def test_old_version_keeps_claude_on_openai(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: "1.0.80")
+        env = copilot.render_env_overlay(WS, "system.ai.claude-sonnet-5", "tok")
+        assert env["COPILOT_PROVIDER_TYPE"] == "openai"
+        assert env["COPILOT_MODEL"] == "system.ai.claude-sonnet-5"
+
+    def test_unknown_version_keeps_claude_on_openai(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: "unknown")
+        env = copilot.render_env_overlay(WS, "system.ai.claude-sonnet-5", "tok")
+        assert env["COPILOT_PROVIDER_TYPE"] == "openai"
+
+    def test_new_enough_version_uses_anthropic(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: "1.0.81-6")
+        env = copilot.render_env_overlay(WS, "system.ai.claude-sonnet-5", "tok")
+        assert env["COPILOT_PROVIDER_TYPE"] == "anthropic"
+
+
+class TestSupportsAnthropicProvider:
+    def test_false_below_the_minimum_patch(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: "1.0.80")
+        assert copilot._supports_anthropic_provider() is False
+
+    def test_false_just_below_the_minimum_prerelease(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: "1.0.81-0")
+        assert copilot._supports_anthropic_provider() is False
+
+    def test_true_at_the_exact_minimum_prerelease(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: "1.0.81-6")
+        assert copilot._supports_anthropic_provider() is True
+
+    def test_true_above_the_minimum_prerelease(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: "1.0.81-7")
+        assert copilot._supports_anthropic_provider() is True
+
+    def test_true_for_the_final_release_of_the_minimum_version(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: "1.0.81")
+        assert copilot._supports_anthropic_provider() is True
+
+    def test_true_for_a_newer_minor_version(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: "1.0.83")
+        assert copilot._supports_anthropic_provider() is True
+
+    def test_false_when_version_cannot_be_determined(self, monkeypatch):
+        monkeypatch.setattr(copilot, "agent_version", lambda binary: "unknown")
+        assert copilot._supports_anthropic_provider() is False
+
+
+class TestParseCopilotVersion:
+    def test_parses_a_final_release(self):
+        assert copilot._parse_copilot_version("1.0.82") == (1, 0, 82, copilot._UNRELEASED)
+
+    def test_parses_a_prerelease(self):
+        assert copilot._parse_copilot_version("1.0.81-6") == (1, 0, 81, 6)
+
+    def test_a_final_release_sorts_after_its_prereleases(self):
+        final = copilot._parse_copilot_version("1.0.81")
+        prerelease = copilot._parse_copilot_version("1.0.81-14")
+        assert final > prerelease
+
+    def test_returns_none_for_unparseable_input(self):
+        assert copilot._parse_copilot_version("unknown") is None
 
 
 class TestIsClaudeModel:
@@ -140,6 +221,7 @@ class TestWriteToolConfig:
         monkeypatch.setattr(cp_mod, "COPILOT_ENV_PATH", env_path)
         monkeypatch.setattr(cp_mod, "COPILOT_BACKUP_PATH", tmp_path / "backup")
         monkeypatch.setattr(cp_mod, "save_state", lambda state: None)
+        monkeypatch.setattr(cp_mod, "agent_version", lambda binary: NEW_ENOUGH_VERSION)
 
         state = {"workspace": WS}
         cp_mod.write_tool_config(state, "system.ai.claude-sonnet-5", token="tok-a")

@@ -21,6 +21,14 @@ providers`, both confirmed live: Bearer auth, not the `x-api-key` that
 provider type sends by default (Databricks' gateway 401s on it); and a
 well-known model id kept separate from the actual wire id, or Copilot sends
 `temperature`, which current-gen Claude models reject. See render_env_overlay.
+
+That last part only works from Copilot 1.0.81-6 onward — verified live across
+1.0.79 through 1.0.83. Below it, Copilot always sends `temperature` on the
+`anthropic` path regardless of the model id, so Sonnet 5/Opus 5 (which reject
+it outright) 400 on every request; Haiku 4.5 tolerates `temperature` and
+would work either way, but the version gate below applies to every Claude
+model for simplicity. Below 1.0.81-6, Claude models keep the old `openai`
+path — uncached, but that's the status quo, not a regression.
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.state import mark_tool_managed, save_state
+from ucode.telemetry import agent_version
 
 COPILOT_CONFIG_DIR = Path.home() / ".copilot"
 COPILOT_ENV_PATH = COPILOT_CONFIG_DIR / "ucode.env"
@@ -88,6 +97,13 @@ _MODEL_SELECTION_KEYS = (
 )
 
 _CANONICAL_CLAUDE_MODEL_ID_RE = re.compile(r"claude-[a-z0-9]+(?:-[a-z0-9]+)*", re.IGNORECASE)
+
+# (major, minor, patch, prerelease) — see the module docstring. A version with
+# no prerelease suffix (a final release) is a 4th component of _UNRELEASED so
+# it always sorts after every prerelease of the same (major, minor, patch).
+MINIMUM_COPILOT_ANTHROPIC_VERSION = (1, 0, 81, 6)
+_UNRELEASED = 999_999
+_COPILOT_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-(\d+))?")
 
 
 def is_update_available() -> tuple[str, str] | None:
@@ -130,9 +146,22 @@ def _canonical_claude_model_id(model: str) -> str:
     return match.group(0) if match else model
 
 
+def _parse_copilot_version(value: str) -> tuple[int, int, int, int] | None:
+    match = _COPILOT_VERSION_RE.search(value)
+    if not match:
+        return None
+    major, minor, patch, pre = match.groups()
+    return int(major), int(minor), int(patch), int(pre) if pre is not None else _UNRELEASED
+
+
+def _supports_anthropic_provider() -> bool:
+    version = _parse_copilot_version(agent_version(SPEC["binary"]))
+    return version is not None and version >= MINIMUM_COPILOT_ANTHROPIC_VERSION
+
+
 def render_env_overlay(workspace: str, model: str, token: str) -> dict[str, str]:
     base_urls = build_copilot_base_urls(workspace)
-    if _is_claude_model(model):
+    if _is_claude_model(model) and _supports_anthropic_provider():
         return {
             "COPILOT_PROVIDER_TYPE": "anthropic",
             "COPILOT_PROVIDER_BASE_URL": base_urls["anthropic"],
