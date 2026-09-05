@@ -75,12 +75,18 @@ does not consume another model's allowance.
 | GPT-5.6 Sol | 2,000,000 | 1,800,000 |
 | GPT-5.6 Terra | 2,000,000 | 1,800,000 |
 | GPT-5.6 Luna | 2,000,000 | 1,800,000 |
+| Kimi K3 | 200,000 | 180,000 |
 
 The 90% target leaves headroom for estimation error and requests made outside Unity Gateway.
 Unity Gateway estimates input conservatively from the uncompressed JSON request size and records
 only timestamps, model keys, and estimates in `~/.ucode/codex-rate-limit-state.json`; prompts and
 credentials are never stored. When capacity is unavailable, the request waits and one short notice
 is written to stderr. Unknown/new models pass through until their published quota is added.
+
+When a Codex thread switches from a model that returns visible reasoning, such as Kimi K3, to an
+OpenAI reasoning model, Unity Gateway removes the nonportable `reasoning.content` field from the
+outbound replay request. The saved Codex transcript is not changed. OpenAI's replayable
+`encrypted_content` and all messages and tool calls remain intact.
 
 The limiter applies to normal, app, and smart-routed Codex launches. Caller-managed server commands
 such as `codex app-server` and `codex mcp-server` keep their existing launch path. To bypass the

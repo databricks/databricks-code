@@ -42,6 +42,7 @@ PUBLISHED_INPUT_TOKENS_PER_MINUTE = {
     "gpt56sol": 2_000_000,
     "gpt56terra": 2_000_000,
     "gpt56luna": 2_000_000,
+    "kimik3": 200_000,
 }
 DEFAULT_TARGET_LIMITS = {
     model: published * SAFETY_PERCENT // 100

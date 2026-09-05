@@ -19,6 +19,7 @@ from tomlkit.exceptions import ParseError
 from ucode import gateway_proxy
 from ucode.codex_config import codex_config_args
 from ucode.codex_rate_limit import SharedCodexRateLimiter
+from ucode.codex_request import sanitize_reasoning_replay
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -549,6 +550,7 @@ def _codex_request_proxy(state: dict) -> Iterator[str]:
         token_header=gateway_proxy.AUTHORIZATION_HEADER,
         force_refresh_near_expiry=True,
         upstream_base=f"{workspace.rstrip('/')}/ai-gateway/codex/",
+        request_transform=sanitize_reasoning_replay,
         request_gate=limiter,
     )
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)

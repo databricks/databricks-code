@@ -201,6 +201,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     cache: TokenCache
     client: httpx.Client
     token_header = AI_GATEWAY_TOKEN_HEADER
+    request_transform: Callable[[bytes], bytes] | None = None
     request_gate: Callable[[bytes], None] | None = None
 
     def log_message(self, format: str, *args: object) -> None:
@@ -227,6 +228,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             path=self.path.split("?", 1)[0],
         )
         try:
+            if self.request_transform is not None and body is not None:
+                body = self.request_transform(body)
             if self.request_gate is not None and body is not None:
                 self.request_gate(body)
             # First attempt with the current token.
@@ -380,6 +383,7 @@ def start_proxy(
     force_refresh_near_expiry: bool,
     *,
     upstream_base: str | None = None,
+    request_transform: Callable[[bytes], bytes] | None = None,
     request_gate: Callable[[bytes], None] | None = None,
 ) -> tuple[ThreadingHTTPServer, TokenCache, httpx.Client]:
     """Start the loopback refresh proxy + its background token refresher.
@@ -389,8 +393,9 @@ def start_proxy(
     still holds the socket). The caller reads ``server.server_address[1]`` for the
     actual port and points the coding agent at it. ``upstream_base`` defaults to
     Claude's Anthropic gateway path; callers for other APIs provide their own.
-    ``request_gate`` runs once per downstream request, before any upstream
-    attempt (including the retry-on-auth-failure path).
+    ``request_transform`` and ``request_gate`` run once per downstream request,
+    before any upstream attempt (including the retry-on-auth-failure path). The
+    gate receives the transformed body.
 
     Returns (server, cache, client); the caller runs the server (e.g. in a
     thread) and calls shutdown()/cache.stop()/client.close() on exit.
@@ -413,7 +418,12 @@ def start_proxy(
             "cache": cache,
             "client": client,
             "token_header": token_header,
-            "request_gate": request_gate,
+            # Functions stored directly on a class are descriptors and would
+            # otherwise receive the handler instance as an extra argument.
+            "request_transform": (
+                staticmethod(request_transform) if request_transform is not None else None
+            ),
+            "request_gate": staticmethod(request_gate) if request_gate is not None else None,
         },
     )
     try:

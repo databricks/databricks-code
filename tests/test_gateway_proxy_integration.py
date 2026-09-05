@@ -149,6 +149,7 @@ def _running_proxy(
     *,
     token_header=gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
     upstream_base=None,
+    request_transform=None,
     request_gate=None,
 ):
     """Start the real proxy pointed at `gateway`, yield its loopback URL, tear down."""
@@ -160,6 +161,7 @@ def _running_proxy(
         token_header=token_header,
         force_refresh_near_expiry=False,
         upstream_base=upstream_base,
+        request_transform=request_transform,
         request_gate=request_gate,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -179,12 +181,14 @@ class TestRelayedProxyEndToEnd:
         gw = make_gateway()
         gated = []
         body = b'{"model":"gpt-6-astra","input":"hello"}'
+        transformed = body.replace(b"hello", b"sanitized")
         with _running_proxy(
             gw,
             monkeypatch,
             _counting_token("fresh-db-token"),
             token_header=gateway_proxy.AUTHORIZATION_HEADER,
             upstream_base=f"{gw.base_url}/ai-gateway/codex/",
+            request_transform=lambda _body: transformed,
             request_gate=gated.append,
         ) as proxy_url:
             resp = httpx.post(
@@ -195,10 +199,11 @@ class TestRelayedProxyEndToEnd:
             )
 
         assert resp.status_code == 200
-        assert gated == [body]
+        assert gated == [transformed]
         request = gw.requests[-1]
         assert request.path == "/ai-gateway/codex/v1/responses"
         assert request.header("Authorization") == "Bearer fresh-db-token"
+        assert request.body == transformed
 
     def test_forwards_request_with_swap_header_and_passthrough(self, make_gateway, monkeypatch):
         # The whole relayed data-plane over real sockets: the proxy injects a fresh

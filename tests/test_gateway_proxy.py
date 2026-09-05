@@ -328,9 +328,11 @@ class _FakeClient:
     def __init__(self, responses):
         self._responses = list(responses)
         self.sent_tokens: list[str | None] = []
+        self.sent_bodies: list[bytes | None] = []
 
     def stream(self, _method, _url, headers, content):
         self.sent_tokens.append(headers.get(gateway_proxy.AI_GATEWAY_TOKEN_HEADER))
+        self.sent_bodies.append(content)
         return self._responses.pop(0)
 
 
@@ -392,18 +394,23 @@ class _Collect(io.RawIOBase):
 
 
 class TestRetryOn401:
-    def test_request_gate_runs_once_before_auth_retry(self):
+    def test_request_transform_and_gate_run_once_before_auth_retry(self):
         body = b'{"model":"gpt-6-astra"}'
+        transformed = body + b" "
+        transformed_bodies = []
         gated = []
         client = _FakeClient([_FakeResp(401, b"a"), _FakeResp(200, b"ok")])
         handler = _handle_handler(client, _FakeCache(), _Collect())
         handler.headers = {"Content-Length": str(len(body))}
         handler.rfile = io.BytesIO(body)
+        handler.request_transform = lambda value: transformed_bodies.append(value) or transformed
         handler.request_gate = gated.append
 
         handler._handle()
 
-        assert gated == [body]
+        assert transformed_bodies == [body]
+        assert gated == [transformed]
+        assert client.sent_bodies == [transformed, transformed]
 
     def test_401_forces_refresh_and_retries(self):
         # A stale swap token yields 401; the proxy force-refreshes and retries,
