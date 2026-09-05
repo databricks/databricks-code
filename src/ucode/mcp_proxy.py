@@ -111,9 +111,7 @@ def _fail_fast(message: str) -> None:
     raise SystemExit(AUTH_FAILURE_EXIT_CODE)
 
 
-def _build_token_auth(
-    workspace: str, profile: str | None, oauth_client_id: str | None = None
-):
+def _build_token_auth(workspace: str, profile: str | None, oauth_client_id: str | None = None):
     """Build an httpx ``Auth`` that injects a fresh bearer on every request.
 
     The base class comes from whichever httpx the SDK uses (see ``_httpx``), so
@@ -132,9 +130,7 @@ def _build_token_auth(
             # client times out, so translate it into a terminal ProxyAuthError the
             # caller reports cleanly.
             try:
-                auth_kwargs = (
-                    {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
-                )
+                auth_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
                 token = get_databricks_token(workspace, profile, **auth_kwargs)
             except RuntimeError as exc:
                 raise ProxyAuthError(str(exc)) from exc

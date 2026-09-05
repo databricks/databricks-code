@@ -315,9 +315,7 @@ def _resolve_workspace_then_maybe_reject(
     if not managed:
         if not coding_agent_config_feature_disabled:
             if oauth_client_id:
-                _maybe_run_admin_setup(
-                    workspace, profile, oauth_client_id=oauth_client_id
-                )
+                _maybe_run_admin_setup(workspace, profile, oauth_client_id=oauth_client_id)
             else:
                 _maybe_run_admin_setup(workspace, profile)
         return entries
@@ -675,9 +673,7 @@ def configure_shared_state(
             run_databricks_login(workspace, profile)
     else:
         if oauth_client_id:
-            ensure_databricks_auth(
-                workspace, profile, oauth_client_id=oauth_client_id
-            )
+            ensure_databricks_auth(workspace, profile, oauth_client_id=oauth_client_id)
         else:
             ensure_databricks_auth(workspace, profile)
     # After login the profile exists in ~/.databrickscfg, so a host->profile
@@ -1690,9 +1686,7 @@ def codex_router_hook_cmd(
         if not _oauth_token_is_fresh(token):
             try:
                 token_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
-                token = get_databricks_token(
-                    host, profile, force_refresh=True, **token_kwargs
-                )
+                token = get_databricks_token(host, profile, force_refresh=True, **token_kwargs)
             except RuntimeError:
                 return
     output = route_pre_tool_use(
@@ -2141,8 +2135,10 @@ def _launch_tool(
         # DATABRICKS_BEARER up front so every auth check below (and the
         # launched agent itself) uses the static token instead of OAuth.
         apply_pat_environment(existing)
-        needs_auto_configure = oauth_client_id is not None or not existing.get("workspace") or tool not in (
-            existing.get("available_tools") or []
+        needs_auto_configure = (
+            oauth_client_id is not None
+            or not existing.get("workspace")
+            or tool not in (existing.get("available_tools") or [])
         )
         ensure_bootstrap_dependencies(tool, update_existing=needs_auto_configure)
         if needs_auto_configure:

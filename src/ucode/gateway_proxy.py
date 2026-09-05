@@ -137,9 +137,7 @@ class TokenCache:
 
     def _refresh(self, *, force: bool) -> None:
         """Mint a token and record its expiry."""
-        token_kwargs = (
-            {"oauth_client_id": self._oauth_client_id} if self._oauth_client_id else {}
-        )
+        token_kwargs = {"oauth_client_id": self._oauth_client_id} if self._oauth_client_id else {}
         token = get_databricks_token(
             self._workspace, self._profile, force_refresh=force, **token_kwargs
         )

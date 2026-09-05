@@ -1355,9 +1355,7 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
         raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
 
     auth_kwargs = (
-        {"oauth_client_id": state["oauth_client_id"]}
-        if state.get("oauth_client_id")
-        else {}
+        {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
     )
     server, cache, client = gateway_proxy.start_proxy(
         workspace,
@@ -1432,9 +1430,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
         os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     if workspace:
         token_kwargs = (
-            {"oauth_client_id": state["oauth_client_id"]}
-            if state.get("oauth_client_id")
-            else {}
+            {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
         )
         os.environ["OAUTH_TOKEN"] = get_databricks_token(
             workspace, state.get("profile"), **token_kwargs

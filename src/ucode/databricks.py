@@ -915,7 +915,10 @@ class _CustomOAuthToken:
     scopes: tuple[str, ...]
 
     def is_fresh(self, *, force_refresh: bool = False) -> bool:
-        return not force_refresh and self.expires_at - time.time() >= CUSTOM_OAUTH_REFRESH_BUFFER_SECONDS
+        return (
+            not force_refresh
+            and self.expires_at - time.time() >= CUSTOM_OAUTH_REFRESH_BUFFER_SECONDS
+        )
 
 
 def _custom_oauth_cache_path(workspace: str, client_id: str) -> Path:
@@ -1080,25 +1083,29 @@ def _refresh_custom_oauth_token(
             "client_id": client_id,
         },
     )
-    return _custom_oauth_token_from_response(
-        payload, previous_refresh_token=token.refresh_token
-    )
+    return _custom_oauth_token_from_response(payload, previous_refresh_token=token.refresh_token)
 
 
 def _run_custom_oauth_browser_flow(workspace: str, client_id: str) -> _CustomOAuthToken:
     authorization_endpoint, token_endpoint = _custom_oauth_endpoints(workspace)
     state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(64)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-    authorization_url = f"{authorization_endpoint}?{urlencode({
-        'response_type': 'code',
-        'client_id': client_id,
-        'redirect_uri': CUSTOM_OAUTH_REDIRECT_URI,
-        'state': state,
-        'code_challenge': challenge,
-        'code_challenge_method': 'S256',
-        'scope': ' '.join(CUSTOM_OAUTH_SCOPES),
-    })}"
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    )
+    authorization_url = f"{authorization_endpoint}?{
+        urlencode(
+            {
+                'response_type': 'code',
+                'client_id': client_id,
+                'redirect_uri': CUSTOM_OAUTH_REDIRECT_URI,
+                'state': state,
+                'code_challenge': challenge,
+                'code_challenge_method': 'S256',
+                'scope': ' '.join(CUSTOM_OAUTH_SCOPES),
+            }
+        )
+    }"
     callback: dict[str, str] = {}
 
     class CallbackHandler(BaseHTTPRequestHandler):
@@ -1118,7 +1125,8 @@ def _run_custom_oauth_browser_flow(workspace: str, client_id: str) -> _CustomOAu
             self.end_headers()
             self.wfile.write(b"Databricks authentication complete. You may close this window.")
 
-        def log_message(self, _format: str, *args: object) -> None:
+        def log_message(self, format: str, *args: object) -> None:
+            _ = format, args
             return
 
     try:
@@ -1607,9 +1615,7 @@ def get_databricks_token_for_state(state: dict, *, force_refresh: bool = False) 
         raise RuntimeError("No workspace configured. Run `ug configure` first.")
     profile = state.get("profile") if isinstance(state.get("profile"), str) else None
     client_id = (
-        state.get("oauth_client_id")
-        if isinstance(state.get("oauth_client_id"), str)
-        else None
+        state.get("oauth_client_id") if isinstance(state.get("oauth_client_id"), str) else None
     )
     return get_databricks_token(
         workspace,

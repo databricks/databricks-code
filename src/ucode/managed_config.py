@@ -427,9 +427,7 @@ def refresh_managed_config(state: dict) -> tuple[dict | None, bool]:
         return None, False
     try:
         auth_kwargs = (
-            {"oauth_client_id": state["oauth_client_id"]}
-            if state.get("oauth_client_id")
-            else {}
+            {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
         )
         token = get_databricks_token(workspace, state.get("profile"), **auth_kwargs)
     except RuntimeError as exc:

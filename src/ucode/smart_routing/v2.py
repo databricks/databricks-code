@@ -345,9 +345,7 @@ def launch_claude(
             "Smart routing v2 needs a configured workspace; run `ucode configure claude` first."
         )
     auth_kwargs = (
-        {"oauth_client_id": state["oauth_client_id"]}
-        if state.get("oauth_client_id")
-        else {}
+        {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
     )
     token = get_databricks_token(workspace, state.get("profile"), **auth_kwargs)
     os.environ[OAUTH_TOKEN_ENV_VAR] = token
@@ -466,13 +464,9 @@ def launch_codex(
 
     profile = state.get("profile")
     auth_kwargs = (
-        {"oauth_client_id": state["oauth_client_id"]}
-        if state.get("oauth_client_id")
-        else {}
+        {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
     )
-    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(
-        workspace, profile, **auth_kwargs
-    )
+    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, profile, **auth_kwargs)
     available_models = _cached_routing_models(state)
     if not available_models:
         print_note(

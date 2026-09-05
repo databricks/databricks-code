@@ -374,9 +374,7 @@ def resolve_gemini_provider_model(
     """
     if service is None:
         token_kwargs = (
-            {"oauth_client_id": state["oauth_client_id"]}
-            if state.get("oauth_client_id")
-            else {}
+            {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
         )
         token = get_databricks_token(state["workspace"], state.get("profile"), **token_kwargs)
         service, error = resolve_provider_service("gemini", provider, state["workspace"], token)

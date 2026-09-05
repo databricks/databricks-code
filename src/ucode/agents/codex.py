@@ -535,9 +535,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
         )
     if workspace:
         token_kwargs = (
-            {"oauth_client_id": state["oauth_client_id"]}
-            if state.get("oauth_client_id")
-            else {}
+            {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
         )
         os.environ["OAUTH_TOKEN"] = get_databricks_token(
             workspace, state.get("profile"), **token_kwargs

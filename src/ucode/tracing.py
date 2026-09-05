@@ -312,9 +312,7 @@ def _enable_tracing_for_state(state: dict) -> dict:
     profile = state.get("profile")
     apply_pat_environment(state)
     auth_kwargs = (
-        {"oauth_client_id": state["oauth_client_id"]}
-        if state.get("oauth_client_id")
-        else {}
+        {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
     )
     ensure_databricks_auth(workspace, profile, **auth_kwargs)
 

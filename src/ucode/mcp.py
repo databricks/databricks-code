@@ -308,9 +308,7 @@ def configure_client_mcp_server(
     # a Claude-only hint to load the server's tools at session start; other
     # clients don't support it and ignore it.
     auth_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
-    argv = build_mcp_proxy_argv(
-        url, workspace, profile, use_pat=use_pat, **auth_kwargs
-    )
+    argv = build_mcp_proxy_argv(url, workspace, profile, use_pat=use_pat, **auth_kwargs)
     if client == "claude":
         removed_scopes = [
             scope for scope in MCP_CLEANUP_SCOPES if remove_claude_mcp_server(name, scope)
@@ -1179,11 +1177,7 @@ def apply_managed_mcp_servers(
         workspace,
         profile,
         use_pat=use_pat,
-        **(
-            {"oauth_client_id": state["oauth_client_id"]}
-            if state.get("oauth_client_id")
-            else {}
-        ),
+        **({"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}),
     )
     return working
 
@@ -1241,11 +1235,7 @@ def apply_managed_skills(
         workspace,
         profile,
         use_pat=use_pat,
-        **(
-            {"oauth_client_id": state["oauth_client_id"]}
-            if state.get("oauth_client_id")
-            else {}
-        ),
+        **({"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}),
     )
     if not (changed or original != working or prev_managed != desired):
         return []
@@ -1526,11 +1516,7 @@ def apply_mcp_server_changes(
                     profile,
                     use_pat=use_pat,
                     always_load=al,
-                    **(
-                        {"oauth_client_id": oauth_client_id}
-                        if oauth_client_id
-                        else {}
-                    ),
+                    **({"oauth_client_id": oauth_client_id} if oauth_client_id else {}),
                 )
             )
         changed = True
@@ -2009,11 +1995,7 @@ def configure_mcp_command(
         workspace,
         profile,
         use_pat=bool(state.get("use_pat")),
-        **(
-            {"oauth_client_id": state["oauth_client_id"]}
-            if state.get("oauth_client_id")
-            else {}
-        ),
+        **({"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}),
     )
     if changed or original_mcp_servers != working_mcp_servers:
         state["mcp_servers"] = working_mcp_servers
@@ -2128,11 +2110,7 @@ def remove_mcp_command(agents: set[str] | None = None) -> int:
         workspace,
         profile,
         use_pat=bool(state.get("use_pat")),
-        **(
-            {"oauth_client_id": state["oauth_client_id"]}
-            if state.get("oauth_client_id")
-            else {}
-        ),
+        **({"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}),
     )
 
     # Update saved state: drop a fully-removed server, or keep it with the named
@@ -2242,11 +2220,7 @@ def _update_skills_mcp(
         clients,
         workspace,
         profile,
-        **(
-            {"oauth_client_id": state["oauth_client_id"]}
-            if state.get("oauth_client_id")
-            else {}
-        ),
+        **({"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}),
     )
     if changed or original != working:
         state["mcp_servers"] = working

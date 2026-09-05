@@ -141,10 +141,9 @@ class TestCustomOAuth:
         monkeypatch.setattr(
             db_mod,
             "get_custom_oauth_token",
-            lambda workspace, client_id, **kwargs: calls.append(
-                (workspace, client_id, kwargs)
-            )
-            or "custom-token",
+            lambda workspace, client_id, **kwargs: (
+                calls.append((workspace, client_id, kwargs)) or "custom-token"
+            ),
         )
 
         token = get_databricks_token(

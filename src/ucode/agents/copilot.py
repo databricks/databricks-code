@@ -150,9 +150,7 @@ def write_tool_config(
     backup_existing_file(COPILOT_ENV_PATH, COPILOT_BACKUP_PATH)
     if token is None:
         token_kwargs = (
-            {"oauth_client_id": state["oauth_client_id"]}
-            if state.get("oauth_client_id")
-            else {}
+            {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
         )
         token = get_databricks_token(
             state["workspace"], state.get("profile"), force_refresh=force_refresh, **token_kwargs

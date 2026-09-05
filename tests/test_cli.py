@@ -2907,10 +2907,9 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(
             cli_mod,
             "get_databricks_token",
-            lambda workspace, profile, **kwargs: token_calls.append(
-                (workspace, profile, kwargs)
-            )
-            or "token",
+            lambda workspace, profile, **kwargs: (
+                token_calls.append((workspace, profile, kwargs)) or "token"
+            ),
         )
 
         state = cli_mod.configure_shared_state(

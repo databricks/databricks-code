@@ -76,9 +76,7 @@ def _routing_hook_groups(state: dict) -> dict[str, list[dict]]:
 def _routing_hook_argv(state: dict, event: str) -> list[str]:
     workspace = str(state.get("workspace") or "")
     auth_kwargs = (
-        {"oauth_client_id": state["oauth_client_id"]}
-        if state.get("oauth_client_id")
-        else {}
+        {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
     )
     argv = [
         build_auth_token_argv(
