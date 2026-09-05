@@ -25,35 +25,6 @@ class TestCodexSpec:
         assert codex.SPEC["display"] == "Codex"
 
 
-class TestShouldUseSmartRouting:
-    @pytest.mark.parametrize(
-        ("tool_args", "explicit_prompt"),
-        [([], False), ([], True), (["fix this"], True)],
-    )
-    def test_accepts_only_explicit_tui_shapes(self, tool_args, explicit_prompt):
-        assert codex.should_use_smart_routing(tool_args, explicit_prompt=explicit_prompt) is True
-
-    @pytest.mark.parametrize(
-        "tool_args",
-        [
-            ["exec", "fix this"],
-            ["review"],
-            ["app-server"],
-            ["update"],
-            ["--model", "gpt-5.6-sol"],
-            ["--model", "gpt-5.6-sol", "--", "fix this"],
-            ["fix this"],
-            ["one", "two"],
-        ],
-    )
-    def test_rejects_all_other_invocation_shapes(self, tool_args):
-        assert codex.should_use_smart_routing(tool_args) is False
-
-    @pytest.mark.parametrize("tool_args", [["--model=x"], ["--model"], ["-m"]])
-    def test_explicit_model_bypasses_separator_opt_in(self, tool_args):
-        assert codex.should_use_smart_routing(tool_args, explicit_prompt=True) is False
-
-
 class TestHasUcodeConfig:
     def test_detects_profile_config(self, tmp_path, monkeypatch):
         config_path = tmp_path / "ucode.config.toml"
@@ -572,53 +543,10 @@ class TestCodexValidateCmd:
 
 
 class TestCodexLaunch:
-    """launch() runs codex with --profile first and relaunches without it only
-    when that attempt fails *fast* — codex's --profile rejection is a parse-time
-    error, so a fast nonzero exit means the subcommand didn't accept --profile.
-    A slow failure is a real session error and is propagated unchanged."""
+    """Normal launches layer the ucode profile as universal config overrides."""
 
     @staticmethod
-    def _patch(monkeypatch, *, returncode: int, elapsed: float):
-        """Stub subprocess.run to return `returncode` and make launch() perceive
-        `elapsed` seconds between its two time.monotonic() reads."""
-        runs: list[list[str]] = []
-        fallbacks: list[list[str]] = []
-
-        def fake_run(argv, **kwargs):
-            runs.append(argv)
-            return codex.subprocess.CompletedProcess(argv, returncode)
-
-        # launch() reads time.monotonic() once before run and once after.
-        clock = iter([100.0, 100.0 + elapsed])
-        monkeypatch.setattr(codex.subprocess, "run", fake_run)
-        monkeypatch.setattr(codex.time, "monotonic", lambda: next(clock))
-        monkeypatch.setattr(codex, "exec_or_spawn", lambda argv: fallbacks.append(argv))
-        monkeypatch.setattr(codex, "get_databricks_token", lambda workspace, profile=None: "tok")
-        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
-        return runs, fallbacks
-
-    def test_sets_oauth_token_and_runs_with_profile(self, monkeypatch):
-        monkeypatch.delenv("OAUTH_TOKEN", raising=False)
-        runs, fallbacks = self._patch(monkeypatch, returncode=0, elapsed=0.5)
-        monkeypatch.setattr(
-            codex, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
-        )
-        with pytest.raises(SystemExit) as exc:
-            codex.launch({"workspace": WS}, ["--search"], options=LaunchOptions())
-        assert exc.value.code == 0
-        assert os.environ["OAUTH_TOKEN"] == "fresh-token"
-        assert runs == [["codex", "--profile", "ucode", "--search"]]
-        assert fallbacks == []
-
-    def test_success_propagates_exit_without_retry(self, monkeypatch):
-        runs, fallbacks = self._patch(monkeypatch, returncode=0, elapsed=0.2)
-        with pytest.raises(SystemExit) as exc:
-            codex.launch({"workspace": WS}, ["exec", "hi"], options=LaunchOptions())
-        assert exc.value.code == 0
-        assert runs == [["codex", "--profile", "ucode", "exec", "hi"]]
-        assert fallbacks == []
-
-    def test_app_layers_ucode_profile_as_config_overrides(self, tmp_path, monkeypatch):
+    def _patch(tmp_path, monkeypatch):
         profile_path = tmp_path / "ucode.config.toml"
         profile_path.write_text(
             'model_provider = "ucode-databricks"\n\n'
@@ -628,84 +556,58 @@ class TestCodexLaunch:
             'wire_api = "responses"\n',
             encoding="utf-8",
         )
+        launches: list[list[str]] = []
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", profile_path)
-        runs, launches = self._patch(monkeypatch, returncode=0, elapsed=0.2)
+        monkeypatch.setattr(codex, "exec_or_spawn", lambda argv: launches.append(argv))
+        monkeypatch.setattr(codex, "get_databricks_token", lambda workspace, profile=None: "tok")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        return launches
 
-        codex.launch({"workspace": WS}, ["app", "--new-window"], options=LaunchOptions())
+    def test_sets_oauth_token(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("OAUTH_TOKEN", raising=False)
+        launches = self._patch(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            codex, "get_databricks_token", lambda workspace, profile=None: "fresh-token"
+        )
+        codex.launch({"workspace": WS}, ["--search"], options=LaunchOptions())
 
-        assert runs == []
-        assert launches[0][:2] == ["codex", "app"]
+        assert os.environ["OAUTH_TOKEN"] == "fresh-token"
+        assert launches[0][-1] == "--search"
+
+    @pytest.mark.parametrize(
+        "tool_args",
+        [
+            ["exec", "hi"],
+            ["update"],
+            ["app-server", "--listen", "stdio://"],
+            ["app", "--new-window"],
+        ],
+    )
+    def test_layers_profile_as_config_overrides(self, tmp_path, monkeypatch, tool_args):
+        launches = self._patch(tmp_path, monkeypatch)
+
+        codex.launch({"workspace": WS}, tool_args, options=LaunchOptions())
+
+        assert launches[0][0] == "codex"
         assert "--profile" not in launches[0]
-        assert launches[0][-1] == "--new-window"
+        assert launches[0][-len(tool_args) :] == tool_args
         assert 'model_provider="ucode-databricks"' in launches[0]
         provider_arg = next(
             arg for arg in launches[0] if arg.startswith("model_providers.ucode-databricks=")
         )
         assert 'base_url = "https://example.databricks.com/ai-gateway/codex/v1"' in provider_arg
 
-    def test_app_requires_populated_ucode_profile(self, tmp_path, monkeypatch):
+    def test_requires_populated_ucode_profile(self, tmp_path, monkeypatch):
         monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", tmp_path / "missing.config.toml")
-        runs, launches = self._patch(monkeypatch, returncode=0, elapsed=0.2)
+        launches = []
+        monkeypatch.setattr(codex, "exec_or_spawn", lambda argv: launches.append(argv))
+        monkeypatch.setattr(codex, "get_databricks_token", lambda *_args: "tok")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
 
         with pytest.raises(RuntimeError, match="ucode configure --agents codex"):
-            codex.launch({"workspace": WS}, ["app"], options=LaunchOptions())
+            codex.launch({"workspace": WS}, ["update"], options=LaunchOptions())
 
-        assert runs == []
         assert launches == []
-
-    def test_fast_failure_relaunches_without_profile(self, monkeypatch):
-        # codex rejects --profile on server-family subcommands at parse time —
-        # a fast nonzero exit → relaunch without --profile.
-        for args in (["app-server", "--listen", "u"], ["mcp-server"]):
-            runs, fallbacks = self._patch(monkeypatch, returncode=1, elapsed=0.15)
-            codex.launch({"workspace": WS}, args, options=LaunchOptions())
-            assert runs == [["codex", "--profile", "ucode", *args]]
-            assert fallbacks == [["codex", *args]]
-
-    def test_fallback_warns_on_stderr_before_handoff(self, monkeypatch, capsys):
-        # The fallback drops ucode's Databricks routing, so it must say so. The
-        # warning goes to *stderr*: `codex app-server` speaks JSON-RPC on stdout,
-        # and a warning there would corrupt the stream its caller parses.
-        warned_before_handoff = []
-        runs, fallbacks = self._patch(monkeypatch, returncode=1, elapsed=0.15)
-        monkeypatch.setattr(
-            codex,
-            "exec_or_spawn",
-            lambda argv: warned_before_handoff.append(capsys.readouterr()),
-        )
-        codex.launch({"workspace": WS}, ["app-server"], options=LaunchOptions())
-
-        # execvp replaces the process, so the warning must already be out by then.
-        assert len(warned_before_handoff) == 1
-        captured = warned_before_handoff[0]
-        err = " ".join(captured.err.split())  # unwrap Rich's width-based wrapping
-        # Attributes the flag to ucode (users never type --profile themselves)
-        # and points at codex's own error so it doesn't read as their mistake.
-        assert "ucode's `--profile`" in err
-        assert "error above" in err
-        # Names both config scopes Codex will resolve without the ucode profile.
-        assert str(codex.LEGACY_CODEX_CONFIG_PATH) in err
-        assert "OS-managed settings" in err
-        assert "instead of the ucode profile" in err
-        assert captured.out == ""
-
-    def test_slow_failure_does_not_retry(self, monkeypatch):
-        # A session that started and then failed (seconds) must NOT be re-run
-        # without --profile — that would silently drop ucode's Databricks routing
-        # (relaunching the user's prompt on their own OpenAI login).
-        runs, fallbacks = self._patch(monkeypatch, returncode=1, elapsed=8.0)
-        with pytest.raises(SystemExit) as exc:
-            codex.launch({"workspace": WS}, ["exec", "hi"], options=LaunchOptions())
-        assert exc.value.code == 1
-        assert fallbacks == []
-
-    def test_fast_success_does_not_retry(self, monkeypatch):
-        # The retry is gated on a *nonzero* exit; a fast clean exit just returns.
-        runs, fallbacks = self._patch(monkeypatch, returncode=0, elapsed=0.15)
-        with pytest.raises(SystemExit) as exc:
-            codex.launch({"workspace": WS}, [], options=LaunchOptions())
-        assert exc.value.code == 0
-        assert fallbacks == []
 
 
 class TestCodexManagedConfig:

@@ -9,8 +9,7 @@ from dataclasses import dataclass
 class LaunchOptions:
     """Invocation-scoped options shared by agent launchers."""
 
-    smart_routing: bool = False
-    explicit_prompt: bool = False
+    launch_smart_routing: bool = False
 
 
 def explicit_model_arg_value(tool_args: list[str]) -> str | None:

@@ -487,6 +487,33 @@ class TestSubcommandRouting:
         assert ctx.args == forwarded
         assert cli_mod._has_explicit_prompt(ctx) is has_separator
 
+    @pytest.mark.parametrize("tool", ["codex", "claude"])
+    @pytest.mark.parametrize(
+        ("tool_args", "explicit_prompt", "model", "provider", "expected"),
+        [
+            ([], False, None, None, True),
+            (["fix this"], True, None, None, True),
+            (["fix this"], False, None, None, False),
+            (["update"], False, None, None, False),
+            (["--model", "fixed"], False, None, None, False),
+            ([], False, "fixed", None, False),
+            ([], False, None, "catalog.schema.service", False),
+        ],
+    )
+    def test_codex_and_claude_share_smart_routing_policy(
+        self, tool, tool_args, explicit_prompt, model, provider, expected
+    ):
+        options = cli_mod._launch_options(
+            tool,
+            tool_args,
+            smart_routing_enabled=True,
+            explicit_prompt=explicit_prompt,
+            model=model,
+            provider=provider,
+        )
+
+        assert options.launch_smart_routing is expected
+
     def test_codex_refresh_is_consumed_by_ucode(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
             result = runner.invoke(app, ["codex", "--refresh"])

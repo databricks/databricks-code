@@ -31,16 +31,13 @@ class TestLaunchCodex:
         monkeypatch.setattr(v2, "launch_codex", lambda *args, **kwargs: pytest.fail("launched"))
 
         with pytest.raises(RuntimeError, match="requires Codex 0.145.0 or newer; found 0.144.0"):
-            codex.launch({"workspace": WS}, [], options=LaunchOptions(smart_routing=True))
+            codex.launch({"workspace": WS}, [], options=LaunchOptions(launch_smart_routing=True))
 
     @pytest.mark.parametrize(
         ("tool_args", "options"),
         [
-            ([], LaunchOptions(smart_routing=True)),
-            (
-                ["fix the parser"],
-                LaunchOptions(smart_routing=True, explicit_prompt=True),
-            ),
+            ([], LaunchOptions(launch_smart_routing=True)),
+            (["fix the parser"], LaunchOptions(launch_smart_routing=True)),
         ],
     )
     def test_codex_smart_routing_launch_dispatches_to_v2(self, monkeypatch, tool_args, options):
@@ -84,28 +81,25 @@ class TestLaunchCodex:
             ["fix this"],
         ],
     )
-    def test_codex_launch_bypasses_routing_for_other_shapes(self, monkeypatch, tool_args):
-        runs = []
+    def test_codex_launch_bypasses_routing_for_other_shapes(self, tmp_path, monkeypatch, tool_args):
+        launches = []
+        profile_path = tmp_path / "ucode.config.toml"
+        profile_path.write_text('model_provider = "ucode-databricks"\n', encoding="utf-8")
         monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", profile_path)
         monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
         monkeypatch.setattr(codex, "agent_version", lambda binary: "0.144.0")
         monkeypatch.setattr(codex, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(v2, "launch_codex", lambda *args, **kwargs: pytest.fail("launched"))
-        monkeypatch.setattr(
-            codex.subprocess,
-            "run",
-            lambda argv: runs.append(argv) or codex.subprocess.CompletedProcess(argv, 0),
+        monkeypatch.setattr(codex, "exec_or_spawn", lambda argv: launches.append(argv))
+
+        codex.launch(
+            {"workspace": WS},
+            tool_args,
+            options=LaunchOptions(),
         )
 
-        with pytest.raises(SystemExit) as exc:
-            codex.launch(
-                {"workspace": WS},
-                tool_args,
-                options=LaunchOptions(smart_routing=True),
-            )
-
-        assert exc.value.code == 0
-        assert runs == [["codex", "--profile", "ucode", *tool_args]]
+        assert launches == [["codex", "--config", 'model_provider="ucode-databricks"', *tool_args]]
 
     def test_codex_launch_normalizes_cached_bootstrap_model(self, monkeypatch):
         calls = []
@@ -123,7 +117,7 @@ class TestLaunchCodex:
             codex.launch(
                 {"workspace": WS, "codex_models": ["system.ai.gpt-5-6-luna"]},
                 [],
-                options=LaunchOptions(smart_routing=True),
+                options=LaunchOptions(launch_smart_routing=True),
             )
 
         assert calls[0]["start_model"] == "gpt-5.6-luna"
