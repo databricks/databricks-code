@@ -99,7 +99,7 @@ class TestToolSpecs:
 
 def test_launch_dispatches_invocation_options(monkeypatch):
     calls = []
-    options = LaunchOptions(smart_routing=True)
+    options = LaunchOptions(launch_smart_routing=True)
     monkeypatch.setattr(
         agents_mod.codex,
         "launch",

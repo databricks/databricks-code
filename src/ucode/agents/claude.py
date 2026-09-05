@@ -48,7 +48,6 @@ from ucode.smart_routing.claude_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
 )
-from ucode.smart_routing.claude_routing import CLAUDE_VALUE_OPTIONS
 from ucode.state import MANAGED_OVERLAY_KEY, get_provider_service, mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
@@ -77,26 +76,6 @@ SPEC: ToolSpec = {
 
 # Retained only to identify and remove state written by the legacy persisted opt-in.
 SMART_ROUTING_STATE_KEY = smart_routing_v2.LEGACY_STATE_KEY
-CLAUDE_NONINTERACTIVE_FLAGS = frozenset(
-    {"-p", "--print", "--bg", "--background", "--cloud", "-h", "--help", "-v", "--version"}
-)
-CLAUDE_SUBCOMMANDS = frozenset(
-    {"agents", "auth", "config", "doctor", "install", "mcp", "plugin", "setup-token", "update"}
-)
-CLAUDE_OPTIONAL_VALUE_OPTIONS = frozenset(
-    {
-        "-d",
-        "--debug",
-        "--from-pr",
-        "--prompt-suggestions",
-        "-r",
-        "--resume",
-        "--remote-control",
-        "--teleport",
-        "-w",
-        "--worktree",
-    }
-)
 
 
 def _parse_version(value: str) -> tuple[int, int, int] | None:
@@ -1195,43 +1174,11 @@ def _original_launch_model(state: dict) -> str | None:
     return default_model(state)
 
 
-def _has_launch_model_override(state: dict) -> bool:
-    override = state.get("_claude_launch_model")
-    return isinstance(override, str) and bool(override.strip())
-
-
 def _has_provider_launch(state: dict) -> bool:
     transient = state.get("_claude_launch_provider")
     return (isinstance(transient, str) and bool(transient.strip())) or bool(
         get_provider_service(state, "claude")
     )
-
-
-def _uses_interactive_tui(tool_args: list[str]) -> bool:
-    if any(arg in CLAUDE_NONINTERACTIVE_FLAGS for arg in tool_args):
-        return False
-
-    index = 0
-    while index < len(tool_args):
-        arg = tool_args[index]
-        if arg == "--":
-            return True
-        if arg in CLAUDE_VALUE_OPTIONS:
-            index += 2
-            continue
-        if arg in CLAUDE_OPTIONAL_VALUE_OPTIONS:
-            if index + 1 < len(tool_args) and not tool_args[index + 1].startswith("-"):
-                index += 2
-            else:
-                index += 1
-            continue
-        if arg.startswith("-"):
-            index += 1
-            continue
-        # Claude accepts an initial prompt positionally and still opens the TUI.
-        # Keep prompts inside the V2 PTY while bypassing utility subcommands.
-        return arg not in CLAUDE_SUBCOMMANDS
-    return True
 
 
 def _launch_model_args(tool_args: list[str], launch_model: str | None) -> list[str]:
@@ -1388,21 +1335,13 @@ def launch(
     if state.get("claude_relayed"):
         _launch_relayed(state, binary, tool_args)
         return
-    first_prompt_routing = (
-        options.smart_routing
-        and bool(workspace)
-        and not _has_launch_model_override(state)
-        and not has_explicit_model_arg(tool_args)
-        and not _has_provider_launch(state)
-        and (options.explicit_prompt or _uses_interactive_tui(tool_args))
-    )
     # Smart routing v2 needs Unix PTY support, which Windows does not provide.
-    if first_prompt_routing and os.name == "nt":
+    if options.launch_smart_routing and os.name == "nt":
         raise RuntimeError(
             "Smart routing in Claude Code is currently not supported on Windows. "
             "Please use Codex or disable smart routing."
         )
-    if first_prompt_routing:
+    if options.launch_smart_routing:
         smart_routing_v2.launch_claude(
             state,
             tool_args,

@@ -12,8 +12,8 @@ from importlib import metadata
 from typing import Annotated
 
 import typer
-from click import Context as ClickContext
 from rich.panel import Panel
+from typer._click import Context as ClickContext
 from typer.core import TyperCommand
 
 from ucode.agents import (
@@ -2023,6 +2023,32 @@ def _can_launch_from_cached_config(
     return codex_agent.has_ucode_config() and codex_agent.managed_config_is_current(state)
 
 
+def _launch_options(
+    tool: str,
+    tool_args: list[str],
+    *,
+    smart_routing_enabled: bool,
+    explicit_prompt: bool,
+    model: str | None,
+    provider: str | None,
+) -> LaunchOptions:
+    has_model_override = model is not None or explicit_model_arg_value(tool_args) is not None
+    return LaunchOptions(
+        launch_smart_routing=(
+            # Smart routing is enabled globally.
+            smart_routing_enabled
+            # Only Claude Code and Codex currently support smart routing.
+            and tool in CAN_USE_CACHED_CONFIG_AGENTS
+            # An explicit model selection must bypass smart routing.
+            and not has_model_override
+            # Smart routing does not currently support Model Provider Services.
+            and provider is None
+            # Route a bare agent launch or a prompt explicitly passed after `--`.
+            and (not tool_args or explicit_prompt)
+        )
+    )
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -2038,10 +2064,6 @@ def _launch_tool(
         tool = normalize_tool(tool_name)
         explicit_prompt = _has_explicit_prompt(ctx)
         smart_routing_enabled = smart_routing_v2.enabled()
-        launch_options = LaunchOptions(
-            smart_routing=smart_routing_enabled,
-            explicit_prompt=explicit_prompt,
-        )
         # Launchers such as isaac put their harness arguments after `--`, so the harness's own
         # `--model` lands in ctx.args instead of a ucode option. It still determines the effective
         # launch model and should therefore win in the launch summary.
@@ -2075,6 +2097,14 @@ def _launch_tool(
         # back to whatever `ug configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
         state = _migrate_legacy_smart_routing(state)
+        launch_options = _launch_options(
+            tool,
+            ctx.args,
+            smart_routing_enabled=smart_routing_enabled,
+            explicit_prompt=explicit_prompt,
+            model=model,
+            provider=provider,
+        )
         if _can_launch_from_cached_config(
             tool,
             state,
@@ -2082,7 +2112,7 @@ def _launch_tool(
             model=model,
             explicit_provider=explicit_provider,
             workspace_url=workspace_url,
-            smart_routing_enabled=smart_routing_enabled,
+            smart_routing_enabled=launch_options.launch_smart_routing,
         ):
             print_section(_launch_title(tool))
             if forwarded_model:
@@ -2298,6 +2328,14 @@ def _launch_tool(
                     state["_claude_launch_model"] = launch_model
             if provider:
                 state["_claude_launch_provider"] = provider
+        launch_options = _launch_options(
+            tool,
+            ctx.args,
+            smart_routing_enabled=smart_routing_enabled,
+            explicit_prompt=explicit_prompt,
+            model=model or (route_root_model if tool == "claude" else None),
+            provider=provider,
+        )
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
         launch_agent(tool, state, ctx.args, options=launch_options)
     except RuntimeError as exc:
