@@ -70,7 +70,7 @@ class TestRenderEnvOverlay:
     def test_claude_model_matches_case_insensitively(self):
         env = copilot.render_env_overlay(WS, "us.anthropic.Claude-Opus-4-8", "tok")
         assert env["COPILOT_PROVIDER_TYPE"] == "anthropic"
-        assert env["COPILOT_PROVIDER_MODEL_ID"] == "Claude-Opus-4-8"
+        assert env["COPILOT_PROVIDER_MODEL_ID"] == "claude-opus-4-8"
 
     def test_non_claude_model_uses_openai_provider_type(self):
         env = copilot.render_env_overlay(WS, "gpt-5", "t")
@@ -194,6 +194,20 @@ class TestCanonicalClaudeModelId:
 
     def test_falls_back_to_the_input_when_no_match(self):
         assert copilot._canonical_claude_model_id("weird-model") == "weird-model"
+
+    def test_lowercases_a_mixed_case_id(self):
+        assert (
+            copilot._canonical_claude_model_id("us.anthropic.Claude-Opus-4-8") == "claude-opus-4-8"
+        )
+
+    def test_lowercases_the_fallback_when_no_match(self):
+        assert copilot._canonical_claude_model_id("Weird-Model") == "weird-model"
+
+    def test_strips_a_trailing_bedrock_version_suffix(self):
+        assert copilot._canonical_claude_model_id("claude-opus-4-8-v1:0") == "claude-opus-4-8"
+
+    def test_strips_a_bedrock_version_suffix_without_a_colon_part(self):
+        assert copilot._canonical_claude_model_id("claude-opus-4-8-v1") == "claude-opus-4-8"
 
 
 class TestBuildRuntimeEnv:

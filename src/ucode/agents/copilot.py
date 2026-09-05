@@ -97,6 +97,11 @@ _MODEL_SELECTION_KEYS = (
 )
 
 _CANONICAL_CLAUDE_MODEL_ID_RE = re.compile(r"claude-[a-z0-9]+(?:-[a-z0-9]+)*", re.IGNORECASE)
+# Same Bedrock version-marker pattern usage.py's normalize_price_key strips,
+# e.g. "claude-opus-4-8-v1:0" -> "claude-opus-4-8" — Copilot's catalog doesn't
+# carry the AWS version suffix, so leaving it in re-triggers the "unrecognized
+# model" fallback (including the `temperature` send) this split is for.
+_BEDROCK_VERSION_SUFFIX_RE = re.compile(r"-v\d+(:\d+)?$")
 
 # (major, minor, patch, prerelease) — see the module docstring. A version with
 # no prerelease suffix (a final release) is a 4th component of _UNRELEASED so
@@ -142,8 +147,11 @@ def _is_claude_model(model: str) -> bool:
 def _canonical_claude_model_id(model: str) -> str:
     # e.g. "system.ai.claude-sonnet-5" -> "claude-sonnet-5" — the well-known
     # name Copilot needs to recognize the model (see render_env_overlay).
+    # Lowercased and stripped of any Bedrock version suffix so it matches
+    # Copilot's catalog regardless of the input's casing or source.
     match = _CANONICAL_CLAUDE_MODEL_ID_RE.search(model)
-    return match.group(0) if match else model
+    canonical = match.group(0).lower() if match else model.lower()
+    return _BEDROCK_VERSION_SUFFIX_RE.sub("", canonical)
 
 
 def _parse_copilot_version(value: str) -> tuple[int, int, int, int] | None:
