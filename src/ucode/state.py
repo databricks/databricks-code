@@ -161,8 +161,15 @@ def build_agent_state(state: dict) -> dict[str, dict]:
     base_urls_value = state.get("base_urls")
     base_urls = base_urls_value if isinstance(base_urls_value, dict) else {}
     use_pat = bool(state.get("use_pat"))
-    auth_command = build_auth_shell_command(workspace, profile, use_pat=use_pat)
-    auth_argv = build_auth_token_argv(workspace, profile, use_pat=use_pat)
+    oauth_client_id = (
+        state.get("oauth_client_id") if isinstance(state.get("oauth_client_id"), str) else None
+    )
+    auth_command = build_auth_shell_command(
+        workspace, profile, use_pat=use_pat, oauth_client_id=oauth_client_id
+    )
+    auth_argv = build_auth_token_argv(
+        workspace, profile, use_pat=use_pat, oauth_client_id=oauth_client_id
+    )
     claude_models_value = state.get("claude_models")
     claude_models: dict = claude_models_value if isinstance(claude_models_value, dict) else {}
     codex_models_value = state.get("codex_models")

@@ -3,8 +3,10 @@ discovery, AI Gateway checks, SQL warehouse discovery, URL builders."""
 
 from __future__ import annotations
 
+import base64
 import configparser
 import functools
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -12,10 +14,12 @@ import os
 import platform
 import random
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
 import time
+import webbrowser
 from collections.abc import Callable
 from concurrent.futures import (
     ThreadPoolExecutor,
@@ -24,8 +28,10 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, cast, overload
 from urllib import error as urllib_error
@@ -57,6 +63,10 @@ ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
 # v1.0.0 is the release that ships `databricks aitools`.
 MIN_DATABRICKS_CLI_VERSION = (1, 0, 0)
 TOKEN_REFRESH_INTERVAL_SECONDS = 1800
+CUSTOM_OAUTH_REFRESH_BUFFER_SECONDS = 1800
+CUSTOM_OAUTH_SCOPES = ("offline_access", "all-apis")
+CUSTOM_OAUTH_PORT = 8020
+CUSTOM_OAUTH_REDIRECT_URI = f"http://localhost:{CUSTOM_OAUTH_PORT}"
 # Substrings the Databricks CLI emits when it loses the token-cache write lock
 # to a concurrent `databricks auth token` (e.g. another ucode helper process or
 # MLflow tracing refreshing the shared ~/.databricks/token-cache.json at the same
@@ -897,11 +907,306 @@ def _profile_args(profile: str | None) -> list[str]:
     return ["--profile", profile] if profile else []
 
 
-def has_valid_databricks_auth(workspace: str, profile: str | None = None) -> bool:
+@dataclass(frozen=True)
+class _CustomOAuthToken:
+    access_token: str
+    refresh_token: str | None
+    expires_at: float
+    scopes: tuple[str, ...]
+
+    def is_fresh(self, *, force_refresh: bool = False) -> bool:
+        return not force_refresh and self.expires_at - time.time() >= CUSTOM_OAUTH_REFRESH_BUFFER_SECONDS
+
+
+def _custom_oauth_cache_path(workspace: str, client_id: str) -> Path:
+    """Return a stable cache path without putting hosts or client IDs in filenames."""
+    identity = f"{workspace.rstrip('/')}\0{client_id}".encode()
+    digest = hashlib.sha256(identity).hexdigest()[:24]
+    return Path.home() / ".databricks" / f"ucode-oauth-{digest}.json"
+
+
+def _load_custom_oauth_token(path: Path) -> _CustomOAuthToken | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None
+        access_token = payload.get("access_token")
+        refresh_token = payload.get("refresh_token")
+        expires_at = payload.get("expires_at")
+        scopes = payload.get("scopes")
+        if not isinstance(access_token, str) or not access_token:
+            return None
+        if refresh_token is not None and not isinstance(refresh_token, str):
+            return None
+        if not isinstance(expires_at, int | float):
+            return None
+        if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
+            return None
+        return _CustomOAuthToken(access_token, refresh_token, float(expires_at), tuple(scopes))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _save_custom_oauth_token(path: Path, token: _CustomOAuthToken) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
+    payload = {
+        "access_token": token.access_token,
+        "refresh_token": token.refresh_token,
+        "expires_at": token.expires_at,
+        "scopes": list(token.scopes),
+    }
+    try:
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(f"Could not write OAuth credential cache at {path}.") from exc
+
+
+@contextmanager
+def _custom_oauth_lock(path: Path, *, timeout: float = 330.0):
+    """Cross-platform lock file for refresh-token rotation and interactive login."""
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(fd, f"{os.getpid()}\n".encode())
+            os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                stale = time.time() - lock_path.stat().st_mtime > timeout
+            except OSError:
+                stale = False
+            if stale:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Timed out waiting for another ucode OAuth refresh.") from None
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+def _custom_oauth_endpoints(workspace: str) -> tuple[str, str]:
+    discovery_url = f"{workspace.rstrip('/')}/oidc/.well-known/oauth-authorization-server"
+    try:
+        with urllib_request.urlopen(discovery_url, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib_error.URLError) as exc:
+        raise RuntimeError(f"Could not discover OAuth endpoints for {workspace}.") from exc
+    authorization_endpoint = payload.get("authorization_endpoint")
+    token_endpoint = payload.get("token_endpoint")
+    if not isinstance(authorization_endpoint, str) or not isinstance(token_endpoint, str):
+        raise RuntimeError(f"OAuth discovery for {workspace} returned incomplete endpoints.")
+    return authorization_endpoint, token_endpoint
+
+
+def _custom_oauth_token_from_response(
+    payload: object,
+    *,
+    previous_refresh_token: str | None = None,
+) -> _CustomOAuthToken:
+    if not isinstance(payload, dict):
+        raise RuntimeError("The OAuth token endpoint returned an invalid response.")
+    access_token = payload.get("access_token")
+    expires_in = payload.get("expires_in")
+    if not isinstance(access_token, str) or not access_token:
+        raise RuntimeError("The OAuth token endpoint returned no access token.")
+    if not isinstance(expires_in, int | float):
+        raise RuntimeError("The OAuth token endpoint returned no token expiry.")
+    refresh_token = payload.get("refresh_token", previous_refresh_token)
+    if refresh_token is not None and not isinstance(refresh_token, str):
+        raise RuntimeError("The OAuth token endpoint returned an invalid refresh token.")
+    raw_scopes = payload.get("scope", " ".join(CUSTOM_OAUTH_SCOPES))
+    if isinstance(raw_scopes, str):
+        scopes = tuple(raw_scopes.split())
+    elif isinstance(raw_scopes, list) and all(isinstance(scope, str) for scope in raw_scopes):
+        scopes = tuple(raw_scopes)
+    else:
+        scopes = CUSTOM_OAUTH_SCOPES
+    return _CustomOAuthToken(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at=time.time() + float(expires_in),
+        scopes=scopes,
+    )
+
+
+def _post_custom_oauth_token(token_endpoint: str, params: dict[str, str]) -> object:
+    request = urllib_request.Request(
+        token_endpoint,
+        data=urlencode(params).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib_error.URLError) as exc:
+        raise RuntimeError("The OAuth token request failed.") from exc
+
+
+def _refresh_custom_oauth_token(
+    workspace: str, client_id: str, token: _CustomOAuthToken
+) -> _CustomOAuthToken:
+    if not token.refresh_token:
+        raise RuntimeError("The cached OAuth credential has no refresh token.")
+    _, token_endpoint = _custom_oauth_endpoints(workspace)
+    payload = _post_custom_oauth_token(
+        token_endpoint,
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": token.refresh_token,
+            "client_id": client_id,
+        },
+    )
+    return _custom_oauth_token_from_response(
+        payload, previous_refresh_token=token.refresh_token
+    )
+
+
+def _run_custom_oauth_browser_flow(workspace: str, client_id: str) -> _CustomOAuthToken:
+    authorization_endpoint, token_endpoint = _custom_oauth_endpoints(workspace)
+    state = secrets.token_urlsafe(24)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    authorization_url = f"{authorization_endpoint}?{urlencode({
+        'response_type': 'code',
+        'client_id': client_id,
+        'redirect_uri': CUSTOM_OAUTH_REDIRECT_URI,
+        'state': state,
+        'code_challenge': challenge,
+        'code_challenge_method': 'S256',
+        'scope': ' '.join(CUSTOM_OAUTH_SCOPES),
+    })}"
+    callback: dict[str, str] = {}
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib callback API
+            from urllib.parse import parse_qs
+
+            params = parse_qs(urlparse(self.path).query)
+            received_state = params.get("state", [""])[0]
+            if received_state != state:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"OAuth state did not match. You may close this window.")
+                return
+            callback["code"] = params.get("code", [""])[0]
+            callback["error"] = params.get("error_description", params.get("error", [""]))[0]
+            self.send_response(200 if callback["code"] else 400)
+            self.end_headers()
+            self.wfile.write(b"Databricks authentication complete. You may close this window.")
+
+        def log_message(self, _format: str, *args: object) -> None:
+            return
+
+    try:
+        server = HTTPServer(("localhost", CUSTOM_OAUTH_PORT), CallbackHandler)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not start the OAuth callback server on localhost:{CUSTOM_OAUTH_PORT}."
+        ) from exc
+    server.timeout = 1
+    print_note(f"If your browser does not open, visit:\n{authorization_url}")
+    webbrowser.open(authorization_url)
+    deadline = time.monotonic() + 300
+    try:
+        while "code" not in callback and "error" not in callback:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Timed out waiting for OAuth authentication in the browser.")
+            server.handle_request()
+    finally:
+        server.server_close()
+    if callback.get("error"):
+        raise RuntimeError(f"OAuth authentication failed: {callback['error']}")
+    code = callback.get("code")
+    if not code:
+        raise RuntimeError("OAuth authentication returned no authorization code.")
+    payload = _post_custom_oauth_token(
+        token_endpoint,
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": CUSTOM_OAUTH_REDIRECT_URI,
+            "code_verifier": verifier,
+            "client_id": client_id,
+        },
+    )
+    return _custom_oauth_token_from_response(payload)
+
+
+def get_custom_oauth_token(
+    workspace: str,
+    client_id: str,
+    *,
+    force_refresh: bool = False,
+    allow_interactive: bool = False,
+) -> str:
+    """Load or refresh a token for a user-supplied OAuth application."""
+    cache_path = _custom_oauth_cache_path(workspace, client_id)
+    token = _load_custom_oauth_token(cache_path)
+    if token and token.is_fresh(force_refresh=force_refresh):
+        return token.access_token
+
+    with _custom_oauth_lock(cache_path):
+        token = _load_custom_oauth_token(cache_path)
+        if token and token.is_fresh(force_refresh=force_refresh):
+            return token.access_token
+        if token and token.refresh_token:
+            try:
+                token = _refresh_custom_oauth_token(workspace, client_id, token)
+            except RuntimeError:
+                if not allow_interactive:
+                    raise
+            else:
+                _save_custom_oauth_token(cache_path, token)
+                return token.access_token
+        if not allow_interactive:
+            raise RuntimeError(
+                "The custom OAuth credential is missing or expired. Re-run "
+                f"`ug configure --workspaces {workspace} --oauth-client-id {client_id}`."
+            )
+        token = _run_custom_oauth_browser_flow(workspace, client_id)
+        _save_custom_oauth_token(cache_path, token)
+        return token.access_token
+
+
+def has_valid_databricks_auth(
+    workspace: str,
+    profile: str | None = None,
+    oauth_client_id: str | None = None,
+) -> bool:
     # Honor the CI short-circuit (see ``get_databricks_token``): if a
     # pre-fetched bearer is available, treat auth as valid and skip the
     # `databricks auth token` shell-out (which only knows user-OAuth).
     if os.environ.get("DATABRICKS_BEARER", "").strip():
+        return True
+    if oauth_client_id:
+        try:
+            get_custom_oauth_token(workspace, oauth_client_id)
+        except RuntimeError:
+            return False
         return True
     _log_auth_diagnostics()
     # Mirror run_databricks_login: when ~/.databrickscfg has multiple
@@ -1110,8 +1415,22 @@ def run_databricks_login(workspace: str, profile: str | None = None) -> None:
     print_success("Databricks authentication complete")
 
 
+def run_custom_oauth_login(workspace: str, client_id: str) -> None:
+    """Authenticate interactively with a user-supplied OAuth application."""
+    print_section("Databricks Login")
+    print_kv("Workspace", workspace)
+    print_kv("OAuth client ID", client_id)
+    print_note("A browser may open for Databricks OAuth authentication.")
+    get_custom_oauth_token(workspace, client_id, allow_interactive=True)
+    print_success("Databricks authentication complete")
+
+
 def ensure_databricks_auth(
-    workspace: str, profile: str | None = None, *, quiet: bool = False
+    workspace: str,
+    profile: str | None = None,
+    *,
+    quiet: bool = False,
+    oauth_client_id: str | None = None,
 ) -> None:
     """Check auth and login only if needed (used by launch path).
 
@@ -1120,12 +1439,15 @@ def ensure_databricks_auth(
     login that actually runs is never silent.
     """
     with spinner("Checking Databricks auth..."):
-        auth_is_valid = has_valid_databricks_auth(workspace, profile)
+        auth_is_valid = has_valid_databricks_auth(workspace, profile, oauth_client_id)
     if auth_is_valid:
         if not quiet:
             print_success(f"Databricks auth already available for {workspace}")
         return
-    run_databricks_login(workspace, profile)
+    if oauth_client_id:
+        run_custom_oauth_login(workspace, oauth_client_id)
+    else:
+        run_databricks_login(workspace, profile)
 
 
 def get_databricks_token(
@@ -1133,6 +1455,7 @@ def get_databricks_token(
     profile: str | None = None,
     *,
     force_refresh: bool = False,
+    oauth_client_id: str | None = None,
 ) -> str:
     # ``DATABRICKS_BEARER`` is the CI escape hatch: when set, skip the
     # `databricks auth token` subprocess entirely and return the pre-fetched
@@ -1144,6 +1467,33 @@ def get_databricks_token(
     if bearer:
         _debug("get_databricks_token", "using DATABRICKS_BEARER env var")
         return bearer
+    if oauth_client_id is None:
+        # Most callers already have hydrated workspace state and pass the client
+        # explicitly. This guarded lookup also covers older/shared call sites
+        # that address only a host/profile (MCP discovery, tracing, admin flows).
+        # Match the host before inheriting so a request for another workspace
+        # can never accidentally use the current workspace's OAuth application.
+        try:
+            from ucode.state import load_state
+
+            configured = load_state()
+        except (ImportError, OSError):
+            configured = {}
+        configured_workspace = configured.get("workspace")
+        configured_client_id = configured.get("oauth_client_id")
+        if (
+            isinstance(configured_workspace, str)
+            and configured_workspace.rstrip("/") == workspace.rstrip("/")
+            and isinstance(configured_client_id, str)
+            and configured_client_id
+        ):
+            oauth_client_id = configured_client_id
+    if oauth_client_id:
+        return get_custom_oauth_token(
+            workspace,
+            oauth_client_id,
+            force_refresh=force_refresh,
+        )
 
     _log_auth_diagnostics()
     # See has_valid_databricks_auth: resolve the profile from the host when
@@ -1248,6 +1598,25 @@ def get_databricks_token(
             f"{stale_profile_hint}"
         )
     return token
+
+
+def get_databricks_token_for_state(state: dict, *, force_refresh: bool = False) -> str:
+    """Fetch a token using the authentication mode persisted for a workspace."""
+    workspace = state.get("workspace")
+    if not isinstance(workspace, str) or not workspace:
+        raise RuntimeError("No workspace configured. Run `ug configure` first.")
+    profile = state.get("profile") if isinstance(state.get("profile"), str) else None
+    client_id = (
+        state.get("oauth_client_id")
+        if isinstance(state.get("oauth_client_id"), str)
+        else None
+    )
+    return get_databricks_token(
+        workspace,
+        profile,
+        force_refresh=force_refresh,
+        oauth_client_id=client_id,
+    )
 
 
 def _extract_connection_page(payload: object) -> tuple[list[dict], str | None]:
@@ -1430,7 +1799,11 @@ def _ucode_binary() -> str:
 
 
 def build_auth_token_argv(
-    workspace: str, profile: str | None = None, *, use_pat: bool = False
+    workspace: str,
+    profile: str | None = None,
+    *,
+    use_pat: bool = False,
+    oauth_client_id: str | None = None,
 ) -> list[str]:
     """Argv for the cross-platform token helper: `ucode auth-token ...`.
 
@@ -1443,11 +1816,18 @@ def build_auth_token_argv(
         argv += ["--profile", profile]
     if use_pat:
         argv.append("--use-pat")
+    if oauth_client_id:
+        argv += ["--oauth-client-id", oauth_client_id]
     return argv
 
 
 def build_mcp_proxy_argv(
-    url: str, workspace: str, profile: str | None = None, *, use_pat: bool = False
+    url: str,
+    workspace: str,
+    profile: str | None = None,
+    *,
+    use_pat: bool = False,
+    oauth_client_id: str | None = None,
 ) -> list[str]:
     """Argv for the stdio MCP bridge: `ucode mcp-proxy --url ... --host ...`.
 
@@ -1464,18 +1844,26 @@ def build_mcp_proxy_argv(
         argv += ["--profile", profile]
     if use_pat:
         argv.append("--use-pat")
+    if oauth_client_id:
+        argv += ["--oauth-client-id", oauth_client_id]
     return argv
 
 
 def build_auth_shell_command(
-    workspace: str, profile: str | None = None, *, use_pat: bool = False
+    workspace: str,
+    profile: str | None = None,
+    *,
+    use_pat: bool = False,
+    oauth_client_id: str | None = None,
 ) -> str:
     """Single-line, shell-quoted form of :func:`build_auth_token_argv`.
 
     Used where a tool wants the helper as one command *string* (Claude Code's
     `apiKeyHelper`). On every platform this resolves to the `ucode auth-token`
     executable rather than a POSIX shell pipeline, so no `sh`/`jq` is required."""
-    argv = build_auth_token_argv(workspace, profile, use_pat=use_pat)
+    argv = build_auth_token_argv(
+        workspace, profile, use_pat=use_pat, oauth_client_id=oauth_client_id
+    )
     if platform.system() == "Windows":
         return subprocess.list2cmdline(argv)
     return shlex.join(argv)

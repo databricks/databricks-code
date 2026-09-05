@@ -236,6 +236,12 @@ class TestRenderOverlay:
         assert "apiKeyHelper" in overlay
         assert WS in overlay["apiKeyHelper"]
 
+    def test_api_key_helper_uses_custom_oauth_client(self):
+        overlay, _ = claude.render_overlay(
+            WS, "s4", oauth_client_id="custom-client"
+        )
+        assert "--oauth-client-id custom-client" in overlay["apiKeyHelper"]
+
     def test_relayed_omits_api_key_helper(self):
         # Claude Code's own subscription OAuth must own Authorization; an
         # apiKeyHelper would outrank it.

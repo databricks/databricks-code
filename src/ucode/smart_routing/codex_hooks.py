@@ -81,10 +81,18 @@ def _routing_hook_argv(
     state: dict, event: str, *, available_models: list[str] | None = None
 ) -> list[str]:
     workspace = str(state.get("workspace") or "")
+    auth_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]}
+        if state.get("oauth_client_id")
+        else {}
+    )
     argv = [
-        build_auth_token_argv(workspace, state.get("profile"), use_pat=bool(state.get("use_pat")))[
-            0
-        ],
+        build_auth_token_argv(
+            workspace,
+            state.get("profile"),
+            use_pat=bool(state.get("use_pat")),
+            **auth_kwargs,
+        )[0],
         ROUTING_HOOK_COMMAND_MARKER,
         event,
     ]
@@ -96,6 +104,8 @@ def _routing_hook_argv(
         argv += ["--profile", profile]
     if state.get("use_pat"):
         argv.append("--use-pat")
+    if state.get("oauth_client_id"):
+        argv += ["--oauth-client-id", state["oauth_client_id"]]
     models = available_models if available_models is not None else routing_models(state)
     for model in models:
         if isinstance(model, str) and model:

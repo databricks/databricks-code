@@ -353,6 +353,7 @@ def render_overlay(
     disable_web_search: bool = False,
     profile: str | None = None,
     use_pat: bool = False,
+    oauth_client_id: str | None = None,
     provider: str | None = None,
     provider_models: dict[str, str] | None = None,
     fable_enabled: bool = False,
@@ -477,7 +478,12 @@ def render_overlay(
     if relayed:
         keys = [["env", k] for k in env]
     else:
-        overlay["apiKeyHelper"] = build_auth_shell_command(workspace, profile, use_pat=use_pat)
+        overlay["apiKeyHelper"] = build_auth_shell_command(
+            workspace,
+            profile,
+            use_pat=use_pat,
+            oauth_client_id=oauth_client_id,
+        )
         keys = [["apiKeyHelper"]] + [["env", k] for k in env]
 
     # Disable Claude Code's built-in WebSearch: it declares Anthropic's hosted
@@ -634,6 +640,7 @@ def write_tool_config(
         disable_web_search=web_search_model is not None,
         profile=state.get("profile"),
         use_pat=bool(state.get("use_pat")),
+        oauth_client_id=state.get("oauth_client_id"),
         provider=provider,
         provider_models=provider_models,
         fable_enabled=bool(state.get("fable_enabled")),
@@ -1347,12 +1354,18 @@ def _launch_relayed(state: dict, binary: str, tool_args: list[str]) -> None:
     if not isinstance(port, int):
         raise RuntimeError("Relayed proxy port was not configured; re-run `ucode claude`.")
 
+    auth_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]}
+        if state.get("oauth_client_id")
+        else {}
+    )
     server, cache, client = gateway_proxy.start_proxy(
         workspace,
         state.get("profile"),
         port,
         token_header=gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
         force_refresh_near_expiry=False,
+        **auth_kwargs,
     )
     # start_proxy falls back to an OS-assigned port when the cached one is taken
     # (stale proxy from a killed session). Reconcile settings + state to whatever
@@ -1418,7 +1431,14 @@ def launch(state: dict, tool_args: list[str]) -> None:
         # than persisting it in Claude's private or OS-managed settings.
         os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
     if workspace:
-        os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
+        token_kwargs = (
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        )
+        os.environ["OAUTH_TOKEN"] = get_databricks_token(
+            workspace, state.get("profile"), **token_kwargs
+        )
     exec_or_spawn(_build_claude_argv(binary, tool_args))
 
 

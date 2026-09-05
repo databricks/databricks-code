@@ -170,10 +170,16 @@ def is_update_available() -> tuple[str, str] | None:
 
 def render_auth_plugin(state: dict) -> str:
     """Render the local OpenCode plugin that refreshes Databricks auth on demand."""
+    auth_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]}
+        if state.get("oauth_client_id")
+        else {}
+    )
     argv = build_auth_token_argv(
         state["workspace"],
         state.get("profile"),
         use_pat=bool(state.get("use_pat")),
+        **auth_kwargs,
     )
     # A 401 must not return the same still-unexpired cached credential.
     argv.append("--force-refresh")
@@ -299,7 +305,12 @@ def write_tool_config(
 ) -> tuple[dict, str]:
     backup_existing_file(OPENCODE_CONFIG_PATH, OPENCODE_BACKUP_PATH)
     if token is None:
-        token = get_databricks_token(state["workspace"], state.get("profile"))
+        token_kwargs = (
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        )
+        token = get_databricks_token(state["workspace"], state.get("profile"), **token_kwargs)
     opencode_base_urls = state.get("base_urls", {}).get("opencode") or build_opencode_base_urls(
         state["workspace"]
     )
@@ -414,4 +425,9 @@ def validate_env(state: dict) -> dict[str, str]:
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError("No workspace configured.")
-    return build_runtime_env(get_databricks_token(workspace, state.get("profile")), state)
+    token_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
+    )
+    return build_runtime_env(
+        get_databricks_token(workspace, state.get("profile"), **token_kwargs), state
+    )

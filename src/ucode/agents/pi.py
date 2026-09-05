@@ -164,8 +164,13 @@ def write_tool_config(
 ) -> tuple[dict, str]:
     backup_existing_file(PI_CONFIG_PATH, PI_BACKUP_PATH)
     if token is None:
+        token_kwargs = (
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        )
         token = get_databricks_token(
-            state["workspace"], state.get("profile"), force_refresh=force_refresh
+            state["workspace"], state.get("profile"), force_refresh=force_refresh, **token_kwargs
         )
     pi_base_urls = state.get("base_urls", {}).get("pi") or build_pi_base_urls(state["workspace"])
     managed_families = _managed_model_families(state)
@@ -314,4 +319,7 @@ def validate_env(state: dict) -> dict[str, str]:
     workspace = state.get("workspace")
     if not workspace:
         raise RuntimeError("No workspace configured.")
-    return build_runtime_env(get_databricks_token(workspace, state.get("profile")))
+    token_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
+    )
+    return build_runtime_env(get_databricks_token(workspace, state.get("profile"), **token_kwargs))

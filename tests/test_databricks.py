@@ -78,6 +78,83 @@ class TestWorkspaceHostname:
             workspace_hostname("")
 
 
+class TestCustomOAuth:
+    def test_auth_argv_includes_custom_client_id(self):
+        argv = build_auth_token_argv(WS, oauth_client_id="custom-client")
+        assert argv[-2:] == ["--oauth-client-id", "custom-client"]
+
+    def test_fresh_cached_token_never_refreshes_or_opens_browser(self, tmp_path, monkeypatch):
+        cache = tmp_path / "token.json"
+        token = db_mod._CustomOAuthToken(
+            "fresh-access",
+            "refresh",
+            db_mod.time.time() + 7200,
+            db_mod.CUSTOM_OAUTH_SCOPES,
+        )
+        db_mod._save_custom_oauth_token(cache, token)
+        monkeypatch.setattr(db_mod, "_custom_oauth_cache_path", lambda w, c: cache)
+        monkeypatch.setattr(
+            db_mod,
+            "_refresh_custom_oauth_token",
+            lambda *args: pytest.fail("fresh token must not refresh"),
+        )
+        monkeypatch.setattr(
+            db_mod,
+            "_run_custom_oauth_browser_flow",
+            lambda *args: pytest.fail("silent token lookup must not open a browser"),
+        )
+
+        assert db_mod.get_custom_oauth_token(WS, "custom-client") == "fresh-access"
+        assert cache.stat().st_mode & 0o777 == 0o600
+
+    def test_expiring_token_refreshes_and_rotates_cache(self, tmp_path, monkeypatch):
+        cache = tmp_path / "token.json"
+        old = db_mod._CustomOAuthToken(
+            "old-access",
+            "old-refresh",
+            db_mod.time.time() + 60,
+            db_mod.CUSTOM_OAUTH_SCOPES,
+        )
+        new = db_mod._CustomOAuthToken(
+            "new-access",
+            "new-refresh",
+            db_mod.time.time() + 7200,
+            db_mod.CUSTOM_OAUTH_SCOPES,
+        )
+        db_mod._save_custom_oauth_token(cache, old)
+        monkeypatch.setattr(db_mod, "_custom_oauth_cache_path", lambda w, c: cache)
+        monkeypatch.setattr(db_mod, "_refresh_custom_oauth_token", lambda w, c, t: new)
+
+        assert db_mod.get_custom_oauth_token(WS, "custom-client") == "new-access"
+        assert db_mod._load_custom_oauth_token(cache) == new
+
+    def test_missing_cache_requires_interactive_configuration(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            db_mod, "_custom_oauth_cache_path", lambda w, c: tmp_path / "missing.json"
+        )
+        with pytest.raises(RuntimeError, match="--oauth-client-id custom-client"):
+            db_mod.get_custom_oauth_token(WS, "custom-client")
+
+    def test_get_databricks_token_dispatches_to_custom_oauth(self, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
+        calls = []
+        monkeypatch.setattr(
+            db_mod,
+            "get_custom_oauth_token",
+            lambda workspace, client_id, **kwargs: calls.append(
+                (workspace, client_id, kwargs)
+            )
+            or "custom-token",
+        )
+
+        token = get_databricks_token(
+            WS, "ignored-profile", force_refresh=True, oauth_client_id="custom-client"
+        )
+
+        assert token == "custom-token"
+        assert calls == [(WS, "custom-client", {"force_refresh": True})]
+
+
 class TestBuildDatabricksCliEnv:
     def test_sets_databricks_host(self):
         env = build_databricks_cli_env(WS)

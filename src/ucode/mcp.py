@@ -300,13 +300,17 @@ def configure_client_mcp_server(
     *,
     use_pat: bool = False,
     always_load: bool = False,
+    oauth_client_id: str | None = None,
 ) -> list[str]:
     # Every client registers the same `ucode mcp-proxy ...` stdio command; the
     # proxy forwards to `url` and refreshes the Databricks token itself. Only the
     # per-client registration syntax differs. `always_load` (skills registry) is
     # a Claude-only hint to load the server's tools at session start; other
     # clients don't support it and ignore it.
-    argv = build_mcp_proxy_argv(url, workspace, profile, use_pat=use_pat)
+    auth_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
+    argv = build_mcp_proxy_argv(
+        url, workspace, profile, use_pat=use_pat, **auth_kwargs
+    )
     if client == "claude":
         removed_scopes = [
             scope for scope in MCP_CLEANUP_SCOPES if remove_claude_mcp_server(name, scope)
@@ -1168,7 +1172,19 @@ def apply_managed_mcp_servers(
         for server in (state.get("managed_mcp_servers") or [])
         if isinstance(server, dict) and tool in (server.get("clients") or [])
     ]
-    apply_mcp_server_changes(previous, working, [tool], workspace, profile, use_pat=use_pat)
+    apply_mcp_server_changes(
+        previous,
+        working,
+        [tool],
+        workspace,
+        profile,
+        use_pat=use_pat,
+        **(
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        ),
+    )
     return working
 
 
@@ -1219,7 +1235,17 @@ def apply_managed_skills(
     original = list(state.get("mcp_servers") or [])
     working = _resolve_skills_mcp_servers(workspace, [tool], new_locations, original)
     changed = apply_mcp_server_changes(
-        original, working, [tool], workspace, profile, use_pat=use_pat
+        original,
+        working,
+        [tool],
+        workspace,
+        profile,
+        use_pat=use_pat,
+        **(
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        ),
     )
     if not (changed or original != working or prev_managed != desired):
         return []
@@ -1458,6 +1484,7 @@ def apply_mcp_server_changes(
     profile: str | None = None,
     *,
     use_pat: bool = False,
+    oauth_client_id: str | None = None,
 ) -> bool:
     original_by_name = _servers_by_name(original_servers)
     working_by_name = _servers_by_name(working_servers)
@@ -1492,7 +1519,18 @@ def apply_mcp_server_changes(
         for client in clients:
             work[client].append(
                 lambda c=client, n=name, u=url, al=always_load: configure_client_mcp_server(
-                    c, n, u, workspace, profile, use_pat=use_pat, always_load=al
+                    c,
+                    n,
+                    u,
+                    workspace,
+                    profile,
+                    use_pat=use_pat,
+                    always_load=al,
+                    **(
+                        {"oauth_client_id": oauth_client_id}
+                        if oauth_client_id
+                        else {}
+                    ),
                 )
             )
         changed = True
@@ -1869,6 +1907,11 @@ def configure_mcp_command(
             workspace,
             profile,
             use_pat=bool(state.get("use_pat")),
+            **(
+                {"oauth_client_id": state["oauth_client_id"]}
+                if state.get("oauth_client_id")
+                else {}
+            ),
         )
         if changed or original_mcp_servers_for_location != working_mcp_servers:
             state["mcp_servers"] = working_mcp_servers
@@ -1966,6 +2009,11 @@ def configure_mcp_command(
         workspace,
         profile,
         use_pat=bool(state.get("use_pat")),
+        **(
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        ),
     )
     if changed or original_mcp_servers != working_mcp_servers:
         state["mcp_servers"] = working_mcp_servers
@@ -2074,7 +2122,17 @@ def remove_mcp_command(agents: set[str] | None = None) -> int:
         if targets:
             removal_view.append({**server, "clients": targets})
     changed = apply_mcp_server_changes(
-        removal_view, [], clients, workspace, profile, use_pat=bool(state.get("use_pat"))
+        removal_view,
+        [],
+        clients,
+        workspace,
+        profile,
+        use_pat=bool(state.get("use_pat")),
+        **(
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        ),
     )
 
     # Update saved state: drop a fully-removed server, or keep it with the named
@@ -2178,7 +2236,18 @@ def _update_skills_mcp(
     """Rebuild the single skills connection for ``locations`` and persist it."""
     original = list(state.get("mcp_servers") or [])
     working = _resolve_skills_mcp_servers(workspace, clients, locations, original)
-    changed = apply_mcp_server_changes(original, working, clients, workspace, profile)
+    changed = apply_mcp_server_changes(
+        original,
+        working,
+        clients,
+        workspace,
+        profile,
+        **(
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        ),
+    )
     if changed or original != working:
         state["mcp_servers"] = working
         save_state(state)

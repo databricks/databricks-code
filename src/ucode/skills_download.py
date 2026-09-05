@@ -444,7 +444,12 @@ def configure_skills_download_command(
     ``download_skills``)."""
     state = load_state()
     workspace, profile, clients = setup_mcp_clients(state, "Skills")
-    token = get_databricks_token(workspace, profile)
+    auth_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]}
+        if state.get("oauth_client_id")
+        else {}
+    )
+    token = get_databricks_token(workspace, profile, **auth_kwargs)
 
     download_skills(workspace, token, locations, path, skills)
 

@@ -994,6 +994,27 @@ class TestAuthTokenCommand:
         assert result.exit_code == 0
         fetch.assert_called_once_with("https://ws", None, force_refresh=True)
 
+    def test_custom_client_id_from_state_is_forwarded(self):
+        with (
+            patch(
+                "ucode.cli.load_state",
+                return_value={
+                    "workspace": "https://ws",
+                    "oauth_client_id": "custom-client",
+                },
+            ),
+            patch("ucode.cli.get_databricks_token", return_value="tok") as fetch,
+        ):
+            result = runner.invoke(app, ["auth-token"])
+        assert result.exit_code == 0
+        assert result.stdout == "tok\n"
+        fetch.assert_called_once_with(
+            "https://ws",
+            None,
+            force_refresh=False,
+            oauth_client_id="custom-client",
+        )
+
     def test_errors_without_workspace(self):
         with patch("ucode.cli.load_state", return_value={}):
             result = runner.invoke(app, ["auth-token"])
@@ -2873,6 +2894,41 @@ class TestConfigureSharedStateUsePat:
         assert os_mod.environ["DATABRICKS_BEARER"] == "dapi-pat"
         assert state["use_pat"] is True
         assert saved and saved[-1]["use_pat"] is True
+
+    def test_custom_client_login_and_state_are_used_only_when_requested(self, monkeypatch):
+        cli_mod, logins, _, saved = self._stub_deps(monkeypatch, pat_token=None)
+        custom_logins = []
+        token_calls = []
+        monkeypatch.setattr(
+            cli_mod,
+            "run_custom_oauth_login",
+            lambda workspace, client_id: custom_logins.append((workspace, client_id)),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "get_databricks_token",
+            lambda workspace, profile, **kwargs: token_calls.append(
+                (workspace, profile, kwargs)
+            )
+            or "token",
+        )
+
+        state = cli_mod.configure_shared_state(
+            self.WS,
+            profile="DEFAULT",
+            force_login=True,
+            oauth_client_id="custom-client",
+        )
+
+        assert logins == []
+        assert custom_logins == [(self.WS, "custom-client")]
+        assert token_calls[0] == (
+            self.WS,
+            "DEFAULT",
+            {"oauth_client_id": "custom-client"},
+        )
+        assert state["oauth_client_id"] == "custom-client"
+        assert saved[-1]["oauth_client_id"] == "custom-client"
 
     def test_happy_path_prints_success_without_model_service_detail(self, monkeypatch, capsys):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")

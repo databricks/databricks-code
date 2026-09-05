@@ -141,8 +141,14 @@ def _provider_block(
     databricks_profile: str | None,
     use_pat: bool = False,
     provider: str | None = None,
+    oauth_client_id: str | None = None,
 ) -> dict:
-    auth_argv = build_auth_token_argv(workspace, databricks_profile, use_pat=use_pat)
+    auth_argv = build_auth_token_argv(
+        workspace,
+        databricks_profile,
+        use_pat=use_pat,
+        oauth_client_id=oauth_client_id,
+    )
     base_url = build_tool_base_url("codex", workspace)
     http_headers = {
         "User-Agent": f"ucode/{ucode_version()} codex/{agent_version('codex')}",
@@ -173,13 +179,14 @@ def render_overlay(
     databricks_profile: str | None = None,
     use_pat: bool = False,
     provider: str | None = None,
+    oauth_client_id: str | None = None,
 ) -> dict:
     overlay: dict = {"model_provider": CODEX_MODEL_PROVIDER_NAME}
     if model:
         overlay["model"] = model
     overlay["model_providers"] = {
         CODEX_MODEL_PROVIDER_NAME: _provider_block(
-            workspace, databricks_profile, use_pat, provider
+            workspace, databricks_profile, use_pat, provider, oauth_client_id
         ),
     }
     return overlay
@@ -191,6 +198,7 @@ def render_legacy_overlay(
     databricks_profile: str | None = None,
     use_pat: bool = False,
     provider: str | None = None,
+    oauth_client_id: str | None = None,
 ) -> dict:
     """Overlay for Codex CLI < 0.134.0, which only reads `~/.codex/config.toml`.
 
@@ -205,7 +213,7 @@ def render_legacy_overlay(
         "profiles": {CODEX_PROFILE_NAME: profile_block},
         "model_providers": {
             CODEX_MODEL_PROVIDER_NAME: _provider_block(
-                workspace, databricks_profile, use_pat, provider
+                workspace, databricks_profile, use_pat, provider, oauth_client_id
             ),
         },
     }
@@ -320,6 +328,7 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
             databricks_profile,
             use_pat=bool(state.get("use_pat")),
             provider=provider,
+            oauth_client_id=state.get("oauth_client_id"),
         )
         doc = read_toml_safe(LEGACY_CODEX_CONFIG_PATH)
         deep_merge_dict(doc, overlay)
@@ -345,6 +354,7 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         databricks_profile,
         use_pat=bool(state.get("use_pat")),
         provider=provider,
+        oauth_client_id=state.get("oauth_client_id"),
     )
 
     def compose(base: dict) -> dict:
@@ -524,7 +534,14 @@ def launch(state: dict, tool_args: list[str]) -> None:
             render_overlay=render_overlay,
         )
     if workspace:
-        os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
+        token_kwargs = (
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        )
+        os.environ["OAUTH_TOKEN"] = get_databricks_token(
+            workspace, state.get("profile"), **token_kwargs
+        )
     if tool_args[:1] == ["app"]:
         # `codex app` rejects --profile. Pass the ucode profile as --config
         # overrides instead, preserving its Databricks provider and auth

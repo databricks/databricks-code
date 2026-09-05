@@ -311,14 +311,19 @@ def _enable_tracing_for_state(state: dict) -> dict:
     configured = _configured_tracing_agents(state)
     profile = state.get("profile")
     apply_pat_environment(state)
-    ensure_databricks_auth(workspace, profile)
+    auth_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]}
+        if state.get("oauth_client_id")
+        else {}
+    )
+    ensure_databricks_auth(workspace, profile, **auth_kwargs)
 
     print_section("MLflow Tracing")
     print_kv("Workspace", workspace)
 
     # Running `ucode configure tracing` is itself the opt-in, so there's no
     # confirmation prompt; `--disable` is the explicit way back off.
-    token = get_databricks_token(workspace, profile)
+    token = get_databricks_token(workspace, profile, **auth_kwargs)
 
     # ucode does not create the experiment: an admin must have already
     # provisioned a `ucode-traces` experiment whose traces are backed by Unity

@@ -75,10 +75,18 @@ def _routing_hook_groups(state: dict) -> dict[str, list[dict]]:
 
 def _routing_hook_argv(state: dict, event: str) -> list[str]:
     workspace = str(state.get("workspace") or "")
+    auth_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]}
+        if state.get("oauth_client_id")
+        else {}
+    )
     argv = [
-        build_auth_token_argv(workspace, state.get("profile"), use_pat=bool(state.get("use_pat")))[
-            0
-        ],
+        build_auth_token_argv(
+            workspace,
+            state.get("profile"),
+            use_pat=bool(state.get("use_pat")),
+            **auth_kwargs,
+        )[0],
         ROUTING_HOOK_COMMAND_MARKER,
         event,
     ]
@@ -90,6 +98,8 @@ def _routing_hook_argv(state: dict, event: str) -> list[str]:
         argv += ["--profile", profile]
     if state.get("use_pat"):
         argv.append("--use-pat")
+    if state.get("oauth_client_id"):
+        argv += ["--oauth-client-id", state["oauth_client_id"]]
     # The route-subagent hook resolves the router's chosen arm back to a routable
     # workspace id, so it needs the discovered claude model ids.
     claude_models = state.get("claude_models")

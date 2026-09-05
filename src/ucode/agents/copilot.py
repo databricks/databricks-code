@@ -149,8 +149,13 @@ def write_tool_config(
 ) -> tuple[dict, str]:
     backup_existing_file(COPILOT_ENV_PATH, COPILOT_BACKUP_PATH)
     if token is None:
+        token_kwargs = (
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        )
         token = get_databricks_token(
-            state["workspace"], state.get("profile"), force_refresh=force_refresh
+            state["workspace"], state.get("profile"), force_refresh=force_refresh, **token_kwargs
         )
     overlay = render_env_overlay(state["workspace"], model, token)
     existing = parse_dotenv(COPILOT_ENV_PATH)
@@ -228,5 +233,8 @@ def validate_env(state: dict) -> dict[str, str]:
     model = default_model(state)
     if not model:
         raise RuntimeError("No Copilot model is available on this workspace.")
-    token = get_databricks_token(workspace, state.get("profile"))
+    token_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
+    )
+    token = get_databricks_token(workspace, state.get("profile"), **token_kwargs)
     return build_runtime_env(workspace, model, token)

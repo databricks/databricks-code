@@ -344,7 +344,12 @@ def launch_claude(
         raise RuntimeError(
             "Smart routing v2 needs a configured workspace; run `ucode configure claude` first."
         )
-    token = get_databricks_token(workspace, state.get("profile"))
+    auth_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]}
+        if state.get("oauth_client_id")
+        else {}
+    )
+    token = get_databricks_token(workspace, state.get("profile"), **auth_kwargs)
     os.environ[OAUTH_TOKEN_ENV_VAR] = token
     os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
     os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
@@ -361,7 +366,10 @@ def launch_claude(
 
     settings, remaining = compose_settings(tool_args)
     hook_executable = build_auth_token_argv(
-        workspace, state.get("profile"), use_pat=bool(state.get("use_pat"))
+        workspace,
+        state.get("profile"),
+        use_pat=bool(state.get("use_pat")),
+        **auth_kwargs,
     )[0]
     env = settings.setdefault("env", {})
     if not isinstance(env, dict):
@@ -457,7 +465,14 @@ def launch_codex(
         )
 
     profile = state.get("profile")
-    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, profile)
+    auth_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]}
+        if state.get("oauth_client_id")
+        else {}
+    )
+    os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(
+        workspace, profile, **auth_kwargs
+    )
     available_models = _cached_routing_models(state)
     if not available_models:
         print_note(
@@ -469,6 +484,7 @@ def launch_codex(
         start_model,
         state.get("profile"),
         use_pat=bool(state.get("use_pat")),
+        **auth_kwargs,
     )
     overlay["hooks"] = {
         "PreToolUse": _v2_pre_tool_use_hooks(state, available_models),
@@ -497,7 +513,7 @@ def launch_codex(
             app_server_url,
             available_models=available_models,
             workspace=workspace,
-            token_provider=lambda: get_databricks_token(workspace, profile),
+            token_provider=lambda: get_databricks_token(workspace, profile, **auth_kwargs),
             switch_message_fn=format_routing_notice,
             log_path=CODEX_INTERPOSER_LOG,
         )

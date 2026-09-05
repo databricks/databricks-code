@@ -332,7 +332,10 @@ def resolve_provider_models(
     """
     if not provider:
         return None, None, False
-    token = get_databricks_token(state["workspace"], state.get("profile"))
+    token_kwargs = (
+        {"oauth_client_id": state["oauth_client_id"]} if state.get("oauth_client_id") else {}
+    )
+    token = get_databricks_token(state["workspace"], state.get("profile"), **token_kwargs)
     service, error = resolve_provider_service(tool, provider, state["workspace"], token)
     if error or service is None:
         return None, error, False
@@ -370,7 +373,12 @@ def resolve_gemini_provider_model(
     control-plane lookup (the launch/configure paths hold one).
     """
     if service is None:
-        token = get_databricks_token(state["workspace"], state.get("profile"))
+        token_kwargs = (
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        )
+        token = get_databricks_token(state["workspace"], state.get("profile"), **token_kwargs)
         service, error = resolve_provider_service("gemini", provider, state["workspace"], token)
         if error or service is None:
             return None, error or f"Model provider service '{provider}' was not found."

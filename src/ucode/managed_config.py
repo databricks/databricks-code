@@ -426,7 +426,12 @@ def refresh_managed_config(state: dict) -> tuple[dict | None, bool]:
     if not workspace:
         return None, False
     try:
-        token = get_databricks_token(workspace, state.get("profile"))
+        auth_kwargs = (
+            {"oauth_client_id": state["oauth_client_id"]}
+            if state.get("oauth_client_id")
+            else {}
+        )
+        token = get_databricks_token(workspace, state.get("profile"), **auth_kwargs)
     except RuntimeError as exc:
         return _persisted_fallback(workspace, str(exc)), False
     managed, reason = get_managed_config(workspace, token)

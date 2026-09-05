@@ -86,6 +86,12 @@ class TestRenderOverlay:
         auth = overlay["model_providers"]["ucode-databricks"]["auth"]
         assert any(WS in arg for arg in auth["args"])
 
+    def test_auth_contains_custom_oauth_client(self):
+        overlay = codex.render_overlay(WS, oauth_client_id="custom-client")
+        auth = overlay["model_providers"]["ucode-databricks"]["auth"]
+        index = auth["args"].index("--oauth-client-id")
+        assert auth["args"][index + 1] == "custom-client"
+
     def test_auth_refresh_interval(self):
         overlay = codex.render_overlay(WS)
         auth = overlay["model_providers"]["ucode-databricks"]["auth"]

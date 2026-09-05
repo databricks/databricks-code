@@ -62,6 +62,7 @@ from ucode.databricks import (
     probe_unity_gateway_capabilities,
     resolve_pat_token,
     resolve_provider_launch_model,
+    run_custom_oauth_login,
     run_databricks_login,
 )
 from ucode.managed_budget import (
@@ -267,6 +268,7 @@ def _confirm_managed_config_applied(managed: dict, workspace: str) -> None:
 
 def _resolve_workspace_then_maybe_reject(
     workspace_entries: list[tuple[str, str | None]] | None,
+    oauth_client_id: str | None = None,
 ) -> list[tuple[str, str | None]] | None:
     """Resolve the workspace ``ug configure`` targets, then branch on role + managed config.
 
@@ -296,22 +298,32 @@ def _resolve_workspace_then_maybe_reject(
     entries = workspace_entries or [_prompt_for_configuration(None)]
     workspace, profile = entries[0]
     set_current_workspace(workspace)
-    ensure_databricks_auth(workspace, profile)
+    auth_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
+    ensure_databricks_auth(workspace, profile, **auth_kwargs)
     # Fetch, don't just read the local cache: on a fresh machine (or right after a reinstall) the
     # cache is empty until the first launch, so a cache read would miss a config the workspace does
     # publish and wrongly fall through to the local configure flow. `refresh_managed_config` reaches
     # the workspace and never raises — it falls back to the persisted copy, then None, on failure.
     with spinner("Loading..."):
         managed, coding_agent_config_feature_disabled = refresh_managed_config(
-            {"workspace": workspace, "profile": profile}
+            {
+                "workspace": workspace,
+                "profile": profile,
+                **({"oauth_client_id": oauth_client_id} if oauth_client_id else {}),
+            }
         )
     if not managed:
         if not coding_agent_config_feature_disabled:
-            _maybe_run_admin_setup(workspace, profile)
+            if oauth_client_id:
+                _maybe_run_admin_setup(
+                    workspace, profile, oauth_client_id=oauth_client_id
+                )
+            else:
+                _maybe_run_admin_setup(workspace, profile)
         return entries
     is_admin: bool | None = None
     try:
-        token = get_databricks_token(workspace, profile)
+        token = get_databricks_token(workspace, profile, **auth_kwargs)
     except RuntimeError:
         token = None
     if token is not None:
@@ -323,7 +335,12 @@ def _resolve_workspace_then_maybe_reject(
     raise typer.Exit(0)
 
 
-def _maybe_run_admin_setup(workspace: str, profile: str | None) -> None:
+def _maybe_run_admin_setup(
+    workspace: str,
+    profile: str | None,
+    *,
+    oauth_client_id: str | None = None,
+) -> None:
     """When a workspace admin runs ``configure`` on a workspace with no managed config, drop straight
     into the ``ug setup`` authoring flow — ``configure`` is replacing ``setup``, so the admin
     never has to invoke it themselves. On completion, exit with setup's own status code.
@@ -334,7 +351,8 @@ def _maybe_run_admin_setup(workspace: str, profile: str | None) -> None:
     setup and returns, so a developer is never blocked behind an authoring flow they can't complete.
     """
     try:
-        token = get_databricks_token(workspace, profile)
+        auth_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
+        token = get_databricks_token(workspace, profile, **auth_kwargs)
     except RuntimeError:
         return
     with spinner("Checking your workspace permissions..."):
@@ -408,6 +426,19 @@ def _prompt_for_configuration(tool: str | None = None) -> tuple[str, str | None]
     with spinner("Loading Databricks workspaces and profiles..."):
         profiles = get_databricks_profiles()
     return prompt_for_workspace(desc, profiles)
+
+
+def _get_state_token(state: dict, *, force_refresh: bool = False) -> str:
+    token_kwargs: dict = {}
+    if state.get("oauth_client_id"):
+        token_kwargs["oauth_client_id"] = state["oauth_client_id"]
+    if force_refresh:
+        token_kwargs["force_refresh"] = True
+    return get_databricks_token(
+        state["workspace"],
+        state.get("profile"),
+        **token_kwargs,
+    )
 
 
 def _parse_agents_option(agents: str) -> list[str]:
@@ -520,6 +551,7 @@ def configure_shared_state(
     skip_preflight: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    oauth_client_id: str | None = None,
 ) -> dict:
     """Log into Databricks, verify AI Gateway, fetch model lists, persist state.
 
@@ -547,6 +579,10 @@ def configure_shared_state(
     workspace = normalize_workspace_url(workspace)
     prior_state = load_state()
     previous_workspace = prior_state.get("workspace")
+    if oauth_client_id is None and not force_login and previous_workspace == workspace:
+        prior_client_id = prior_state.get("oauth_client_id")
+        if isinstance(prior_client_id, str) and prior_client_id:
+            oauth_client_id = prior_client_id
     if use_pat is None:
         use_pat = bool(prior_state.get("use_pat")) and previous_workspace == workspace
     if fable_enabled is None:
@@ -582,6 +618,10 @@ def configure_shared_state(
         state["use_pat"] = True
     else:
         state.pop("use_pat", None)
+    if oauth_client_id:
+        state["oauth_client_id"] = oauth_client_id
+    else:
+        state.pop("oauth_client_id", None)
     # Persist the Fable opt-in so launches keep pinning the family; an explicit
     # `configure --disable-fable` (fable_enabled=False) clears it.
     if fable_enabled:
@@ -629,9 +669,17 @@ def configure_shared_state(
         ensure_pat_bearer(profile, pat)
         ensure_databricks_auth(workspace, profile)
     elif force_login:
-        run_databricks_login(workspace, profile)
+        if oauth_client_id:
+            run_custom_oauth_login(workspace, oauth_client_id)
+        else:
+            run_databricks_login(workspace, profile)
     else:
-        ensure_databricks_auth(workspace, profile)
+        if oauth_client_id:
+            ensure_databricks_auth(
+                workspace, profile, oauth_client_id=oauth_client_id
+            )
+        else:
+            ensure_databricks_auth(workspace, profile)
     # After login the profile exists in ~/.databrickscfg, so a host->profile
     # lookup is reliable even when it returned nothing above.
     if profile is None:
@@ -639,7 +687,8 @@ def configure_shared_state(
         if profile:
             state["profile"] = profile
     with spinner("Verifying Unity AI Gateway..."):
-        token = get_databricks_token(workspace, profile)
+        token_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
+        token = get_databricks_token(workspace, profile, **token_kwargs)
         model_service_probe = probe_unity_gateway_capabilities(workspace, token)
     if model_service_probe.resource_available:
         print_success("Unity AI Gateway connected")
@@ -753,11 +802,13 @@ def _configure_shared_workspace_states(
     use_pat: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    oauth_client_id: str | None = None,
 ) -> list[dict]:
     if not workspaces:
         raise RuntimeError("At least one workspace must be provided.")
     states: list[dict] = []
     for workspace, profile in workspaces:
+        oauth_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
         states.append(
             configure_shared_state(
                 workspace,
@@ -767,6 +818,7 @@ def _configure_shared_workspace_states(
                 use_pat=use_pat,
                 fable_enabled=fable_enabled,
                 databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+                **oauth_kwargs,
             )
         )
     return states
@@ -800,7 +852,7 @@ def _maybe_select_provider_service(tool: str, state: dict) -> dict:
     # Probe first so we only offer the picker when it's actually usable. The
     # interactive path always reaches here, so explain any fallback rather than
     # silently dropping back to Databricks.
-    token = get_databricks_token(state["workspace"], state.get("profile"))
+    token = _get_state_token(state)
     with spinner("Checking for model provider services..."):
         names, reason = list_tool_provider_services(tool, state["workspace"], token)
     if reason is not None:
@@ -850,6 +902,7 @@ def configure_workspace_command(
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
     offer_optional_setup: bool = False,
+    oauth_client_id: str | None = None,
 ) -> int:
     if tool is not None and selected_tools is not None:
         raise RuntimeError("Use either --agent or --agents, not both.")
@@ -869,6 +922,7 @@ def configure_workspace_command(
             use_pat=use_pat,
             fable_enabled=fable_enabled,
             databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+            oauth_client_id=oauth_client_id,
         )
         state = states[0]
         state = configure_single_tool(tool, state)
@@ -908,6 +962,7 @@ def configure_workspace_command(
         use_pat=use_pat,
         fable_enabled=fable_enabled,
         databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+        oauth_client_id=oauth_client_id,
     )
     state = states[0]
     save_state(state)
@@ -1457,6 +1512,14 @@ def mcp_proxy_cmd(
             "with `ug configure --profiles <name> --use-pat`.",
         ),
     ] = False,
+    oauth_client_id: Annotated[
+        str | None,
+        typer.Option(
+            "--oauth-client-id",
+            help="Authenticate with this Databricks OAuth application's client ID. "
+            "The application must allow the standard Databricks CLI callback URI.",
+        ),
+    ] = None,
 ) -> None:
     """Bridge a coding agent's stdio MCP transport to a Databricks MCP endpoint.
 
@@ -1473,7 +1536,14 @@ def mcp_proxy_cmd(
         print_err("No workspace configured. Run `ug configure` first.")
         raise typer.Exit(1)
     profile = profile or state.get("profile")
-    serve(url, workspace, profile, use_pat=use_pat or bool(state.get("use_pat")))
+    oauth_client_id = oauth_client_id or state.get("oauth_client_id")
+    serve(
+        url,
+        workspace,
+        profile,
+        use_pat=use_pat or bool(state.get("use_pat")),
+        oauth_client_id=oauth_client_id,
+    )
 
 
 @app.command("auth-token", hidden=True)
@@ -1487,6 +1557,10 @@ def auth_token_cmd(
     use_pat: Annotated[
         bool, typer.Option("--use-pat", help="Read the profile's static PAT instead of OAuth.")
     ] = False,
+    oauth_client_id: Annotated[
+        str | None,
+        typer.Option("--oauth-client-id", help="Use a configured custom OAuth application."),
+    ] = None,
     force_refresh: Annotated[
         bool,
         typer.Option("--force-refresh", help="Force the Databricks CLI to mint a new token."),
@@ -1507,6 +1581,8 @@ def auth_token_cmd(
         print_err("No workspace configured. Run `ug configure` first.")
         raise typer.Exit(1)
     profile = profile or state.get("profile")
+    if oauth_client_id is None and state.get("workspace") == workspace:
+        oauth_client_id = state.get("oauth_client_id")
     if use_pat or state.get("use_pat"):
         # --use-pat explicitly means "serve the profile's static PAT". Fail
         # closed if it can't be read rather than falling through to OAuth —
@@ -1521,7 +1597,10 @@ def auth_token_cmd(
             )
             raise typer.Exit(1)
     try:
-        token = get_databricks_token(workspace, profile, force_refresh=force_refresh)
+        token_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
+        token = get_databricks_token(
+            workspace, profile, force_refresh=force_refresh, **token_kwargs
+        )
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
@@ -1551,6 +1630,7 @@ def codex_router_hook_cmd(
     host: Annotated[str | None, typer.Option("--host")] = None,
     profile: Annotated[str | None, typer.Option("--profile")] = None,
     use_pat: Annotated[bool, typer.Option("--use-pat")] = False,
+    oauth_client_id: Annotated[str | None, typer.Option("--oauth-client-id")] = None,
     model: Annotated[list[str] | None, typer.Option("--model")] = None,
 ) -> None:
     """Run a Codex smart-routing lifecycle hook."""
@@ -1609,7 +1689,10 @@ def codex_router_hook_cmd(
         token = os.environ.get("OAUTH_TOKEN", "").strip()
         if not _oauth_token_is_fresh(token):
             try:
-                token = get_databricks_token(host, profile, force_refresh=True)
+                token_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
+                token = get_databricks_token(
+                    host, profile, force_refresh=True, **token_kwargs
+                )
             except RuntimeError:
                 return
     output = route_pre_tool_use(
@@ -1629,6 +1712,7 @@ def claude_router_hook_cmd(
     host: Annotated[str | None, typer.Option("--host")] = None,
     profile: Annotated[str | None, typer.Option("--profile")] = None,
     use_pat: Annotated[bool, typer.Option("--use-pat")] = False,
+    oauth_client_id: Annotated[str | None, typer.Option("--oauth-client-id")] = None,
     model: Annotated[list[str] | None, typer.Option("--model")] = None,
     socket_path: Annotated[str | None, typer.Option("--socket")] = None,
 ) -> None:
@@ -1701,7 +1785,8 @@ def claude_router_hook_cmd(
         if use_pat and not ensure_pat_bearer(profile):
             return
         try:
-            token = get_databricks_token(host, profile)
+            token_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
+            token = get_databricks_token(host, profile, **token_kwargs)
         except RuntimeError:
             return
     output = smart_routing_v2.route_claude_pre_tool_use(
@@ -1715,14 +1800,19 @@ def claude_router_hook_cmd(
         sys.stdout.write(json.dumps(output))
 
 
-def _auto_configure_tool(tool: str) -> None:
+def _auto_configure_tool(tool: str, oauth_client_id: str | None = None) -> None:
     """First-time setup for a single tool — mirrors configure_workspace_command."""
     existing = load_state()
     workspace = existing.get("workspace")
     profile = existing.get("profile")
     if not workspace:
         workspace, profile = _prompt_for_configuration(tool)
-    state = configure_shared_state(workspace, profile=profile, tools=[tool])
+    state = configure_shared_state(
+        workspace,
+        profile=profile,
+        tools=[tool],
+        oauth_client_id=oauth_client_id,
+    )
 
     state = configure_single_tool(tool, state)
 
@@ -1845,7 +1935,7 @@ def _fetch_budget_recommendation(state: dict, managed: dict | None) -> dict | No
         try:
             recommendation, reason = get_model_recommendation(
                 state["workspace"],
-                get_databricks_token(state["workspace"], state.get("profile")),
+                _get_state_token(state),
             )
         except (RuntimeError, OSError) as exc:
             # A token that lapsed since the config refresh — or a Databricks CLI that isn't
@@ -1936,7 +2026,7 @@ def _download_managed_skills(managed: dict, state: dict) -> None:
     if not locations:
         return
     try:
-        token = get_databricks_token(state["workspace"], state.get("profile"))
+        token = _get_state_token(state)
         written = download_managed_skills_on_launch(state["workspace"], token, locations)
     except RuntimeError as exc:
         print_warning(f"Could not download your workspace's skills: {exc}")
@@ -2026,8 +2116,11 @@ def _launch_tool(
     managed: dict | None = None,
     recommendation: dict | None = None,
     model: str | None = None,
+    oauth_client_id: str | None = None,
 ) -> None:
     try:
+        if oauth_client_id and not workspace_url:
+            raise RuntimeError("--oauth-client-id requires --workspace on an agent launch.")
         tool = normalize_tool(tool_name)
         # Launchers such as isaac put their harness arguments after `--`, so the harness's own
         # `--model` lands in ctx.args instead of a ucode option. It still determines the effective
@@ -2048,12 +2141,15 @@ def _launch_tool(
         # DATABRICKS_BEARER up front so every auth check below (and the
         # launched agent itself) uses the static token instead of OAuth.
         apply_pat_environment(existing)
-        needs_auto_configure = not existing.get("workspace") or tool not in (
+        needs_auto_configure = oauth_client_id is not None or not existing.get("workspace") or tool not in (
             existing.get("available_tools") or []
         )
         ensure_bootstrap_dependencies(tool, update_existing=needs_auto_configure)
         if needs_auto_configure:
-            _auto_configure_tool(tool)
+            if oauth_client_id:
+                _auto_configure_tool(tool, oauth_client_id=oauth_client_id)
+            else:
+                _auto_configure_tool(tool)
         state = ensure_provider_state(tool)
         # Remembered before the fallback below collapses the two cases: a managed config may not
         # silently override a provider the user typed on the command line (it errors instead).
@@ -2350,6 +2446,15 @@ WorkspaceOption = Annotated[
     ),
 ]
 
+OAuthClientIdOption = Annotated[
+    str | None,
+    typer.Option(
+        "--oauth-client-id",
+        help="Authenticate with this Databricks OAuth application's client ID. "
+        "Only valid while configuring an explicit --workspace.",
+    ),
+]
+
 
 @app.callback(invoke_without_command=True)
 def default(
@@ -2491,6 +2596,7 @@ def codex_cmd(
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
     workspace: WorkspaceOption = None,
+    oauth_client_id: OAuthClientIdOption = None,
     enable_smart_routing_flag: Annotated[
         bool,
         typer.Option(
@@ -2524,6 +2630,7 @@ def codex_cmd(
             refresh=refresh,
             skip_preflight=skip_preflight,
             workspace_url=workspace,
+            oauth_client_id=oauth_client_id,
         )
 
 
@@ -2560,6 +2667,7 @@ def claude_cmd(
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
     workspace: WorkspaceOption = None,
+    oauth_client_id: OAuthClientIdOption = None,
     enable_model_discovery: Annotated[
         bool,
         typer.Option(
@@ -2604,6 +2712,7 @@ def claude_cmd(
             refresh=refresh,
             skip_preflight=skip_preflight,
             workspace_url=workspace,
+            oauth_client_id=oauth_client_id,
         )
 
 
@@ -2629,10 +2738,20 @@ def gemini_cmd(
     ] = None,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
+    workspace: WorkspaceOption = None,
+    oauth_client_id: OAuthClientIdOption = None,
 ) -> None:
     """Launch Gemini CLI via Databricks."""
     _disable_managed_config_if_requested(skip_managed_config)
-    _launch_tool("gemini", ctx, provider=provider, model=model, skip_preflight=skip_preflight)
+    _launch_tool(
+        "gemini",
+        ctx,
+        provider=provider,
+        model=model,
+        skip_preflight=skip_preflight,
+        workspace_url=workspace,
+        oauth_client_id=oauth_client_id,
+    )
 
 
 @app.command(
@@ -2642,10 +2761,18 @@ def opencode_cmd(
     ctx: typer.Context,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
+    workspace: WorkspaceOption = None,
+    oauth_client_id: OAuthClientIdOption = None,
 ) -> None:
     """Launch OpenCode via Databricks."""
     _disable_managed_config_if_requested(skip_managed_config)
-    _launch_tool("opencode", ctx, skip_preflight=skip_preflight)
+    _launch_tool(
+        "opencode",
+        ctx,
+        skip_preflight=skip_preflight,
+        workspace_url=workspace,
+        oauth_client_id=oauth_client_id,
+    )
 
 
 @app.command("copilot", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -2653,10 +2780,18 @@ def copilot_cmd(
     ctx: typer.Context,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
+    workspace: WorkspaceOption = None,
+    oauth_client_id: OAuthClientIdOption = None,
 ) -> None:
     """Launch GitHub Copilot CLI via Databricks."""
     _disable_managed_config_if_requested(skip_managed_config)
-    _launch_tool("copilot", ctx, skip_preflight=skip_preflight)
+    _launch_tool(
+        "copilot",
+        ctx,
+        skip_preflight=skip_preflight,
+        workspace_url=workspace,
+        oauth_client_id=oauth_client_id,
+    )
 
 
 @app.command("pi", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -2664,10 +2799,18 @@ def pi_cmd(
     ctx: typer.Context,
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
+    workspace: WorkspaceOption = None,
+    oauth_client_id: OAuthClientIdOption = None,
 ) -> None:
     """Launch Pi coding agent via Databricks."""
     _disable_managed_config_if_requested(skip_managed_config)
-    _launch_tool("pi", ctx, skip_preflight=skip_preflight)
+    _launch_tool(
+        "pi",
+        ctx,
+        skip_preflight=skip_preflight,
+        workspace_url=workspace,
+        oauth_client_id=oauth_client_id,
+    )
 
 
 @app.command("cursor", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -2750,6 +2893,14 @@ def configure(
             "CI / headless environments.",
         ),
     ] = False,
+    oauth_client_id: Annotated[
+        str | None,
+        typer.Option(
+            "--oauth-client-id",
+            help="Authenticate with this Databricks OAuth application's client ID. "
+            "The application must allow the standard Databricks CLI callback URI.",
+        ),
+    ] = None,
     skip_validate: Annotated[
         bool,
         typer.Option(
@@ -2849,6 +3000,8 @@ def configure(
                 "--use-pat requires --profiles. Pass the PAT-backed Databricks CLI "
                 "profile(s) explicitly, e.g. `ug configure --profiles DEFAULT --use-pat`."
             )
+        if use_pat and oauth_client_id:
+            raise RuntimeError("Use either --use-pat or --oauth-client-id, not both.")
         # Skipping only has meaning against an explicit agent list: the interactive
         # picker already offers just the available agents, and --agent names a
         # single agent whose absence is the whole answer.
@@ -2868,12 +3021,19 @@ def configure(
         # Under a managed config, resolve (prompting when interactive) and set the target workspace
         # first, so the developer can switch workspaces; only then short-circuit if that workspace
         # is already managed. Returns the resolved entries so the flow below doesn't prompt again.
-        workspace_entries = _resolve_workspace_then_maybe_reject(workspace_entries)
+        if oauth_client_id:
+            workspace_entries = _resolve_workspace_then_maybe_reject(
+                workspace_entries, oauth_client_id=oauth_client_id
+            )
+        else:
+            workspace_entries = _resolve_workspace_then_maybe_reject(workspace_entries)
         # Only forward the opt-in flags when set so existing call expectations
         # (and defaults) stay unchanged for the common interactive path.
         skip_kwargs: dict = {}
         if use_pat:
             skip_kwargs["use_pat"] = True
+        if oauth_client_id:
+            skip_kwargs["oauth_client_id"] = oauth_client_id
         if skip_validate:
             skip_kwargs["skip_validate"] = True
         # Only forward the Fable opt-in when the user passed the flag; `None`
@@ -2944,6 +3104,7 @@ def configure(
                     tools=[],
                     force_login=not use_pat,
                     use_pat=use_pat,
+                    oauth_client_id=oauth_client_id,
                 )
             else:
                 # Neither model agents nor cursor -> empty/invalid --agents list.
@@ -2960,6 +3121,7 @@ def configure(
                 tools=[],
                 force_login=not use_pat,
                 use_pat=use_pat,
+                oauth_client_id=oauth_client_id,
             )
         else:
             # Tool binaries are installed after the user picks which agents
