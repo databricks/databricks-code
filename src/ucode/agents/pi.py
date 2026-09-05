@@ -97,6 +97,78 @@ def _resolve_model_selector(
     return model
 
 
+def _pi_openai_model_entry(model_id: str) -> dict:
+    """Build a Pi Responses entry with model-specific reasoning controls.
+
+    Pi's generic custom-model defaults include levels that are not valid for
+    every OpenAI Responses model. Explicit null mappings hide those choices,
+    while string mappings translate Pi's ``off`` choice to the API's ``none``
+    value where the model supports it.
+    """
+    entry: dict = {"id": model_id}
+    normalized_id = model_id.rsplit("/", 1)[-1].lower()
+    for prefix in ("system.ai.", "databricks-"):
+        if normalized_id.startswith(prefix):
+            normalized_id = normalized_id[len(prefix) :]
+            break
+    normalized_id = normalized_id.replace(".", "-")
+
+    if normalized_id == "gpt-6-astra":
+        # Astra is reasoning-only and does not support `none`. Declare its
+        # actual limits because Pi otherwise applies a conservative custom
+        # model default of 128k context / 4k output.
+        entry.update(
+            {
+                "reasoning": True,
+                "input": ["text", "image"],
+                "contextWindow": 1_050_000,
+                "maxTokens": 128_000,
+            }
+        )
+        entry["thinkingLevelMap"] = {
+            "off": None,
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+    elif normalized_id.startswith("gpt-5-6-") or (
+        normalized_id.startswith("gpt-5-5") and not normalized_id.startswith("gpt-5-5-pro")
+    ):
+        # GPT-5.5 supports none/low/medium/high/xhigh; GPT-5.6 also supports
+        # max. Neither family supports Pi's generic minimal level.
+        entry["reasoning"] = True
+        entry["thinkingLevelMap"] = {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+        }
+        if normalized_id.startswith("gpt-5-6-"):
+            entry["thinkingLevelMap"]["max"] = "max"
+    elif normalized_id.startswith(("gpt-5-4-pro", "gpt-5-5-pro")):
+        # Pro variants support medium/high/xhigh only.
+        entry["reasoning"] = True
+        entry["thinkingLevelMap"] = {
+            "off": None,
+            "minimal": None,
+            "low": None,
+            "xhigh": "xhigh",
+        }
+    elif normalized_id.startswith("gpt-5-4"):
+        # GPT-5.4 standard/mini/nano support none/low/medium/high/xhigh.
+        entry["reasoning"] = True
+        entry["thinkingLevelMap"] = {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+        }
+    elif "gpt-5" in normalized_id:
+        # Older GPT-5 variants reject `none`; retain their established
+        # minimal/low/medium/high choices.
+        entry["reasoning"] = True
+        entry["thinkingLevelMap"] = {"off": None}
+    return entry
+
+
 def render_overlay(
     model: str,
     token: str,
@@ -134,7 +206,7 @@ def render_overlay(
             "apiKey": token,
             "authHeader": True,
             "headers": ua_headers,
-            "models": [{"id": m} for m in codex_models],
+            "models": [_pi_openai_model_entry(m) for m in codex_models],
         }
         keys.append(["providers", "databricks-openai"])
     if gemini_models:

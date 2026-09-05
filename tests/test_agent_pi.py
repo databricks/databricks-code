@@ -75,6 +75,65 @@ class TestRenderOverlayProviders:
         assert provider["api"] == "openai-responses"
         assert provider["baseUrl"] == f"{WS}/ai-gateway/codex/v1"
 
+    def test_gpt6_astra_exposes_supported_thinking_levels(self):
+        overlay, _ = _overlay("system.ai.gpt-6-astra", codex_models=["system.ai.gpt-6-astra"])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+
+        assert entry["reasoning"] is True
+        assert entry["input"] == ["text", "image"]
+        assert entry["contextWindow"] == 1_050_000
+        assert entry["maxTokens"] == 128_000
+        assert entry["thinkingLevelMap"] == {
+            "off": None,
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+
+    def test_newer_gpt_models_use_their_responses_effort_values(self):
+        overlay, _ = _overlay(
+            "system.ai.gpt-5-6-luna",
+            codex_models=[
+                "system.ai.gpt-5-4",
+                "system.ai.gpt-5-5",
+                "system.ai.gpt-5-6-luna",
+                "system.ai.gpt-5-5-pro",
+            ],
+        )
+        entries = {
+            entry["id"]: entry for entry in overlay["providers"]["databricks-openai"]["models"]
+        }
+
+        assert entries["system.ai.gpt-5-4"]["thinkingLevelMap"] == {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+        }
+        assert entries["system.ai.gpt-5-5"]["thinkingLevelMap"] == {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+        }
+        assert entries["system.ai.gpt-5-6-luna"]["thinkingLevelMap"] == {
+            "off": "none",
+            "minimal": None,
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+        assert entries["system.ai.gpt-5-5-pro"]["thinkingLevelMap"] == {
+            "off": None,
+            "minimal": None,
+            "low": None,
+            "xhigh": "xhigh",
+        }
+
+    def test_legacy_gpt5_keeps_its_compatible_levels(self):
+        overlay, _ = _overlay("gpt-5", codex_models=["gpt-5"])
+        entry = overlay["providers"]["databricks-openai"]["models"][0]
+
+        assert entry["reasoning"] is True
+        assert entry["thinkingLevelMap"] == {"off": None}
+
     def test_gemini_provider_uses_google_generative_ai(self):
         overlay, _ = _overlay("gemini-2", gemini_models=["gemini-2"])
         provider = overlay["providers"]["databricks-gemini"]
