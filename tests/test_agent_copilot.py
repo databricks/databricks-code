@@ -24,25 +24,95 @@ class TestCopilotSpec:
 
 
 class TestRenderEnvOverlay:
-    def test_sets_provider_base_url(self):
-        env = copilot.render_env_overlay(WS, "claude-sonnet-4-6", "tok")
-        assert env["COPILOT_PROVIDER_BASE_URL"] == f"{WS}/ai-gateway/mlflow/v1"
+    """Claude models get Copilot's native `anthropic` provider (so Copilot's own
+    cache_control logic runs); everything else (codex/gpt-5) stays on `openai`
+    against the MLflow gateway.
 
-    def test_sets_provider_type(self):
-        env = copilot.render_env_overlay(WS, "m", "t")
+    Verified live against a real workspace: Databricks' AI Gateway 401s on the
+    `x-api-key` auth Copilot's `anthropic` provider sends by default
+    (COPILOT_PROVIDER_API_KEY) — it wants `Authorization: Bearer`
+    (COPILOT_PROVIDER_BEARER_TOKEN, used for both provider types here). And an
+    unrecognized COPILOT_MODEL (a Databricks catalog id) makes Copilot fall
+    back to defaults that include sending `temperature`, which current-gen
+    Claude models 400 on — hence the separate COPILOT_PROVIDER_MODEL_ID
+    (canonical name) / COPILOT_PROVIDER_WIRE_MODEL (actual wire id) split."""
+
+    def test_claude_model_uses_anthropic_provider_type(self):
+        env = copilot.render_env_overlay(WS, "claude-sonnet-4-6", "tok")
+        assert env["COPILOT_PROVIDER_TYPE"] == "anthropic"
+
+    def test_claude_model_uses_native_anthropic_base_url(self):
+        env = copilot.render_env_overlay(WS, "claude-sonnet-4-6", "tok")
+        assert env["COPILOT_PROVIDER_BASE_URL"] == f"{WS}/ai-gateway/anthropic"
+
+    def test_claude_model_sets_bearer_token_not_api_key(self):
+        env = copilot.render_env_overlay(WS, "claude-sonnet-4-6", "tok123")
+        assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "tok123"
+        assert "COPILOT_PROVIDER_API_KEY" not in env
+
+    def test_claude_model_splits_canonical_id_from_wire_model(self):
+        env = copilot.render_env_overlay(WS, "system.ai.claude-sonnet-5", "tok")
+        assert env["COPILOT_PROVIDER_MODEL_ID"] == "claude-sonnet-5"
+        assert env["COPILOT_PROVIDER_WIRE_MODEL"] == "system.ai.claude-sonnet-5"
+        assert "COPILOT_MODEL" not in env
+
+    def test_claude_model_matches_case_insensitively(self):
+        env = copilot.render_env_overlay(WS, "us.anthropic.Claude-Opus-4-8", "tok")
+        assert env["COPILOT_PROVIDER_TYPE"] == "anthropic"
+        assert env["COPILOT_PROVIDER_MODEL_ID"] == "Claude-Opus-4-8"
+
+    def test_non_claude_model_uses_openai_provider_type(self):
+        env = copilot.render_env_overlay(WS, "gpt-5", "t")
         assert env["COPILOT_PROVIDER_TYPE"] == "openai"
 
-    def test_sets_model(self):
-        env = copilot.render_env_overlay(WS, "claude-sonnet-4-6", "tok")
-        assert env["COPILOT_MODEL"] == "claude-sonnet-4-6"
+    def test_non_claude_model_uses_mlflow_base_url(self):
+        env = copilot.render_env_overlay(WS, "gpt-5", "t")
+        assert env["COPILOT_PROVIDER_BASE_URL"] == f"{WS}/ai-gateway/mlflow/v1"
 
-    def test_sets_bearer_token(self):
-        env = copilot.render_env_overlay(WS, "m", "tok123")
+    def test_non_claude_model_sets_model_and_bearer_token(self):
+        env = copilot.render_env_overlay(WS, "gpt-5", "tok123")
+        assert env["COPILOT_MODEL"] == "gpt-5"
         assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "tok123"
+        assert "COPILOT_PROVIDER_API_KEY" not in env
+        assert "COPILOT_PROVIDER_MODEL_ID" not in env
+        assert "COPILOT_PROVIDER_WIRE_MODEL" not in env
 
     def test_sets_offline_true(self):
-        env = copilot.render_env_overlay(WS, "m", "t")
+        env = copilot.render_env_overlay(WS, "gpt-5", "t")
         assert env["COPILOT_OFFLINE"] == "true"
+
+    def test_sets_oauth_token_for_both_families(self):
+        assert copilot.render_env_overlay(WS, "claude-sonnet-4-6", "tok")["OAUTH_TOKEN"] == "tok"
+        assert copilot.render_env_overlay(WS, "gpt-5", "tok")["OAUTH_TOKEN"] == "tok"
+
+
+class TestIsClaudeModel:
+    def test_true_for_canonical_name(self):
+        assert copilot._is_claude_model("claude-sonnet-5") is True
+
+    def test_true_for_bedrock_style_slug(self):
+        assert copilot._is_claude_model("us.anthropic.claude-opus-4-8") is True
+
+    def test_false_for_codex(self):
+        assert copilot._is_claude_model("gpt-5") is False
+
+    def test_false_for_catalog_qualified_gpt(self):
+        assert copilot._is_claude_model("system.ai.gpt-5") is False
+
+
+class TestCanonicalClaudeModelId:
+    def test_strips_databricks_catalog_prefix(self):
+        assert copilot._canonical_claude_model_id("system.ai.claude-sonnet-5") == "claude-sonnet-5"
+
+    def test_strips_bedrock_region_and_provider_prefix(self):
+        result = copilot._canonical_claude_model_id("us.anthropic.claude-opus-4-8")
+        assert result == "claude-opus-4-8"
+
+    def test_leaves_bare_canonical_name_unchanged(self):
+        assert copilot._canonical_claude_model_id("claude-haiku-4-5") == "claude-haiku-4-5"
+
+    def test_falls_back_to_the_input_when_no_match(self):
+        assert copilot._canonical_claude_model_id("weird-model") == "weird-model"
 
 
 class TestBuildRuntimeEnv:
@@ -58,6 +128,31 @@ class TestBuildRuntimeEnv:
     def test_sets_oauth_token_for_mcp(self):
         env = copilot.build_runtime_env(WS, "m", "tok")
         assert env["OAUTH_TOKEN"] == "tok"
+
+
+class TestWriteToolConfig:
+    def test_switching_families_clears_the_stale_model_selection_keys(self, tmp_path, monkeypatch):
+        import ucode.agents.copilot as cp_mod
+        import ucode.config_io as config_io_mod
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        env_path = tmp_path / "ucode.env"
+        monkeypatch.setattr(cp_mod, "COPILOT_ENV_PATH", env_path)
+        monkeypatch.setattr(cp_mod, "COPILOT_BACKUP_PATH", tmp_path / "backup")
+        monkeypatch.setattr(cp_mod, "save_state", lambda state: None)
+
+        state = {"workspace": WS}
+        cp_mod.write_tool_config(state, "system.ai.claude-sonnet-5", token="tok-a")
+        written = config_io_mod.parse_dotenv(env_path)
+        assert written["COPILOT_PROVIDER_MODEL_ID"] == "claude-sonnet-5"
+        assert written["COPILOT_PROVIDER_WIRE_MODEL"] == "system.ai.claude-sonnet-5"
+        assert "COPILOT_MODEL" not in written
+
+        cp_mod.write_tool_config(state, "gpt-5", token="tok-b")
+        written = config_io_mod.parse_dotenv(env_path)
+        assert written["COPILOT_MODEL"] == "gpt-5"
+        assert "COPILOT_PROVIDER_MODEL_ID" not in written
+        assert "COPILOT_PROVIDER_WIRE_MODEL" not in written
 
 
 class TestMcpServerConfig:
@@ -191,6 +286,8 @@ class TestManagedKeys:
             "COPILOT_PROVIDER_TYPE",
             "COPILOT_PROVIDER_BASE_URL",
             "COPILOT_MODEL",
+            "COPILOT_PROVIDER_MODEL_ID",
+            "COPILOT_PROVIDER_WIRE_MODEL",
             "COPILOT_PROVIDER_BEARER_TOKEN",
             "COPILOT_OFFLINE",
             "OAUTH_TOKEN",
