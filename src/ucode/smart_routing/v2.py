@@ -72,6 +72,8 @@ def _model_picker_catalog() -> AnthropicModelCatalog | None:
             _managed_settings_path,
         )
 
+        # Hierarchy: managed settings, CLI-supplied settings (ucode-settings.json), local user
+        # settings, based on the modelPicker scope documented at https://code.claude.com/docs/en/settings-reference#modelpicker.
         paths = [_managed_settings_path(), CLAUDE_SETTINGS_PATH, CLAUDE_USER_SETTINGS_PATH]
     except (ImportError, OSError):
         return None
@@ -388,9 +390,7 @@ def launch_claude(
     os.environ[OAUTH_TOKEN_ENV_VAR] = token
     os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
     os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
-    # Enterprise managed settings may provide the authoritative model picker. Prefer
-    # those IDs so routing follows the administrator's curated list and avoids an
-    # unnecessary /anthropic/v1/models request.
+    # modelPicker takes priority over model discovery.
     catalog = _model_picker_catalog() or list_anthropic_model_catalog(workspace, token)
     if not catalog.model_ids:
         raise RuntimeError(
