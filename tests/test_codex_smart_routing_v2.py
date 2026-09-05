@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 
 import pytest
@@ -36,6 +37,7 @@ class TestLaunchCodex:
     def test_codex_launch_dispatches_when_flag_enabled(self, monkeypatch):
         calls = []
         monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setenv(codex.CODEX_RATE_LIMITER_ENV, "0")
         monkeypatch.setattr(codex, "default_model", lambda state: "gpt-start")
         monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
 
@@ -65,6 +67,7 @@ class TestLaunchCodex:
     def test_codex_launch_normalizes_cached_bootstrap_model(self, monkeypatch):
         calls = []
         monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.setenv(codex.CODEX_RATE_LIMITER_ENV, "0")
         monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
         monkeypatch.setattr(codex, "default_model", lambda state: None)
 
@@ -81,6 +84,33 @@ class TestLaunchCodex:
             )
 
         assert calls[0]["start_model"] == "gpt-5.6-luna"
+
+    def test_codex_launch_proxies_smart_routing_app_server(self, monkeypatch):
+        calls = []
+        monkeypatch.setenv(v2.ENV_VAR, "1")
+        monkeypatch.delenv(codex.CODEX_RATE_LIMITER_ENV, raising=False)
+        monkeypatch.setattr(codex, "default_model", lambda state: "gpt-5.6-sol")
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        monkeypatch.setattr(
+            codex,
+            "_codex_request_proxy",
+            lambda state: contextlib.nullcontext("http://127.0.0.1:43210/v1"),
+        )
+
+        def launch_v2(state, tool_args, **kwargs):
+            overlay = kwargs["render_overlay"](WS, "gpt-5.6-sol")
+            calls.append(overlay)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(v2, "launch_codex", launch_v2)
+
+        with pytest.raises(SystemExit) as exc:
+            codex.launch({"workspace": WS}, ["--search"])
+
+        assert exc.value.code == 0
+        provider = calls[0]["model_providers"]["ucode-databricks"]
+        assert provider["base_url"] == "http://127.0.0.1:43210/v1"
+        assert calls[0]["features.enable_request_compression"] is False
 
     def test_owns_app_server_interposer_and_tui_lifecycle(self, monkeypatch):
         processes = []

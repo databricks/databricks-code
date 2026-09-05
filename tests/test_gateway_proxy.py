@@ -392,6 +392,19 @@ class _Collect(io.RawIOBase):
 
 
 class TestRetryOn401:
+    def test_request_gate_runs_once_before_auth_retry(self):
+        body = b'{"model":"gpt-6-astra"}'
+        gated = []
+        client = _FakeClient([_FakeResp(401, b"a"), _FakeResp(200, b"ok")])
+        handler = _handle_handler(client, _FakeCache(), _Collect())
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.request_gate = gated.append
+
+        handler._handle()
+
+        assert gated == [body]
+
     def test_401_forces_refresh_and_retries(self):
         # A stale swap token yields 401; the proxy force-refreshes and retries,
         # this time succeeding, so Claude Code never sees the 401.

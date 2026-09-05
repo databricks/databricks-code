@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -566,6 +567,7 @@ class TestCodexLaunch:
         monkeypatch.setattr(codex, "exec_or_spawn", lambda argv: fallbacks.append(argv))
         monkeypatch.setattr(codex, "get_databricks_token", lambda workspace, profile=None: "tok")
         monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        monkeypatch.setenv(codex.CODEX_RATE_LIMITER_ENV, "0")
         return runs, fallbacks
 
     def test_sets_oauth_token_and_runs_with_profile(self, monkeypatch):
@@ -677,6 +679,154 @@ class TestCodexLaunch:
             codex.launch({"workspace": WS}, [])
         assert exc.value.code == 0
         assert fallbacks == []
+
+    def test_normal_launch_routes_provider_through_shared_limiter(self, tmp_path, monkeypatch):
+        profile_path = tmp_path / "ucode.config.toml"
+        profile_path.write_text(
+            'model_provider = "ucode-databricks"\n\n'
+            "[model_providers.ucode-databricks]\n"
+            'name = "Databricks AI Gateway"\n'
+            'base_url = "https://example.databricks.com/ai-gateway/codex/v1"\n'
+            'wire_api = "responses"\n',
+            encoding="utf-8",
+        )
+        runs = []
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", profile_path)
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        monkeypatch.setattr(codex, "get_databricks_token", lambda *args: "token")
+        monkeypatch.setattr(
+            codex,
+            "_codex_request_proxy",
+            lambda state: contextlib.nullcontext("http://127.0.0.1:43210/v1"),
+        )
+
+        def run(argv, **_kwargs):
+            runs.append(argv)
+            return codex.subprocess.CompletedProcess(argv, 0)
+
+        monkeypatch.setattr(codex.subprocess, "run", run)
+        monkeypatch.delenv(codex.CODEX_RATE_LIMITER_ENV, raising=False)
+
+        with pytest.raises(SystemExit) as exc:
+            codex.launch({"workspace": WS}, ["exec", "hello"])
+
+        assert exc.value.code == 0
+        argv = runs[0]
+        assert argv[:3] == ["codex", "--profile", "ucode"]
+        provider_arg = next(
+            arg for arg in argv if arg.startswith("model_providers.ucode-databricks=")
+        )
+        assert 'base_url = "http://127.0.0.1:43210/v1"' in provider_arg
+        assert "features.enable_request_compression=false" in argv
+        assert argv[-2:] == ["exec", "hello"]
+
+    def test_app_launch_routes_through_shared_limiter(self, tmp_path, monkeypatch):
+        profile_path = tmp_path / "ucode.config.toml"
+        profile_path.write_text(
+            'model_provider = "ucode-databricks"\n\n'
+            "[model_providers.ucode-databricks]\n"
+            'base_url = "https://example.databricks.com/ai-gateway/codex/v1"\n'
+            'wire_api = "responses"\n',
+            encoding="utf-8",
+        )
+        runs = []
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", profile_path)
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        monkeypatch.setattr(codex, "get_databricks_token", lambda *args: "token")
+        monkeypatch.setattr(
+            codex,
+            "_codex_request_proxy",
+            lambda state: contextlib.nullcontext("http://127.0.0.1:43210/v1"),
+        )
+
+        def run(argv, **_kwargs):
+            runs.append(argv)
+            return codex.subprocess.CompletedProcess(argv, 0)
+
+        monkeypatch.setattr(codex.subprocess, "run", run)
+        monkeypatch.delenv(codex.CODEX_RATE_LIMITER_ENV, raising=False)
+
+        with pytest.raises(SystemExit) as exc:
+            codex.launch({"workspace": WS}, ["app", "--new-window"])
+
+        assert exc.value.code == 0
+        assert runs[0][:2] == ["codex", "app"]
+        assert "--profile" not in runs[0]
+        assert "features.enable_request_compression=false" in runs[0]
+        provider_arg = next(
+            arg for arg in runs[0] if arg.startswith("model_providers.ucode-databricks=")
+        )
+        assert 'base_url = "http://127.0.0.1:43210/v1"' in provider_arg
+        assert runs[0][-1] == "--new-window"
+
+    def test_server_family_keeps_existing_non_proxy_path(self, monkeypatch):
+        runs = []
+        monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
+        monkeypatch.setattr(codex, "get_databricks_token", lambda *args: "token")
+        monkeypatch.setattr(
+            codex,
+            "_codex_request_proxy",
+            lambda state: pytest.fail("server-family command must not start a session proxy"),
+        )
+
+        def run(argv, **_kwargs):
+            runs.append(argv)
+            return codex.subprocess.CompletedProcess(argv, 0)
+
+        monkeypatch.setattr(codex.subprocess, "run", run)
+        monkeypatch.delenv(codex.CODEX_RATE_LIMITER_ENV, raising=False)
+
+        with pytest.raises(SystemExit) as exc:
+            codex.launch({"workspace": WS}, ["app-server", "--listen", "stdio://"])
+
+        assert exc.value.code == 0
+        assert runs == [["codex", "--profile", "ucode", "app-server", "--listen", "stdio://"]]
+
+    def test_proxy_lifecycle_uses_codex_gateway_and_authorization(self, monkeypatch):
+        calls = []
+
+        class Server:
+            server_address = ("127.0.0.1", 43210)
+
+            def serve_forever(self):
+                calls.append("serve")
+
+            def shutdown(self):
+                calls.append("shutdown")
+
+            def server_close(self):
+                calls.append("server_close")
+
+        class Cache:
+            def stop(self):
+                calls.append("cache_stop")
+
+        class Client:
+            def close(self):
+                calls.append("client_close")
+
+        def start_proxy(*args, **kwargs):
+            calls.append((args, kwargs))
+            return Server(), Cache(), Client()
+
+        monkeypatch.setattr(codex.gateway_proxy, "start_proxy", start_proxy)
+
+        with codex._codex_request_proxy({"workspace": WS, "profile": "test"}) as base_url:
+            assert base_url == "http://127.0.0.1:43210/v1"
+
+        args, kwargs = calls[0]
+        assert args == (WS, "test", 0)
+        assert kwargs["token_header"] == codex.gateway_proxy.AUTHORIZATION_HEADER
+        assert kwargs["force_refresh_near_expiry"] is True
+        assert kwargs["upstream_base"] == f"{WS}/ai-gateway/codex/"
+        assert isinstance(kwargs["request_gate"], codex.SharedCodexRateLimiter)
+        assert calls.count("serve") == 1
+        assert [call for call in calls[1:] if call != "serve"] == [
+            "cache_stop",
+            "shutdown",
+            "server_close",
+            "client_close",
+        ]
 
 
 class TestCodexManagedConfig:

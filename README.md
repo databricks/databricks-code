@@ -62,6 +62,32 @@ passed again. Smart routing uses the `task_v1` router by default. Power users ca
 router for a launch by setting `SMART_ROUTER_NAME`, for example
 `SMART_ROUTER_NAME=task_v2 ug codex --enable-smart-routing`.
 
+### Codex shared rate limiting
+
+Codex requests launched by `ug codex` share a local rolling 60-second input-token budget. This
+prevents several concurrent Codex sessions from independently exhausting the same Databricks
+Foundation Model API quota. Budgets are isolated by workspace and model, so traffic for one model
+does not consume another model's allowance.
+
+| Codex model | Published input tokens/minute | Local target |
+|---|---:|---:|
+| GPT-6 Astra | 200,000 | 180,000 |
+| GPT-5.6 Sol | 2,000,000 | 1,800,000 |
+| GPT-5.6 Terra | 2,000,000 | 1,800,000 |
+| GPT-5.6 Luna | 2,000,000 | 1,800,000 |
+
+The 90% target leaves headroom for estimation error and requests made outside Unity Gateway.
+Unity Gateway estimates input conservatively from the uncompressed JSON request size and records
+only timestamps, model keys, and estimates in `~/.ucode/codex-rate-limit-state.json`; prompts and
+credentials are never stored. When capacity is unavailable, the request waits and one short notice
+is written to stderr. Unknown/new models pass through until their published quota is added.
+
+The limiter applies to normal, app, and smart-routed Codex launches. Caller-managed server commands
+such as `codex app-server` and `codex mcp-server` keep their existing launch path. To bypass the
+limiter for one launch, use `UCODE_CODEX_RATE_LIMITER=0 ug codex`; that restores direct requests and
+may expose the session to 429 responses. See the current
+[Databricks Foundation Model API limits](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits).
+
 To configure all tools at once:
 
 ```bash

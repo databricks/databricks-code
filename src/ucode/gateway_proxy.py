@@ -1,4 +1,4 @@
-"""Loopback refresh proxy for Claude gateway requests.
+"""Loopback refresh proxy for coding-agent gateway requests.
 
 A relayed Model Provider Service authenticates the caller's own Anthropic
 subscription OAuth (which Claude Code owns in the `Authorization` header) and
@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
@@ -200,6 +201,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     cache: TokenCache
     client: httpx.Client
     token_header = AI_GATEWAY_TOKEN_HEADER
+    request_gate: Callable[[bytes], None] | None = None
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -225,6 +227,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             path=self.path.split("?", 1)[0],
         )
         try:
+            if self.request_gate is not None and body is not None:
+                self.request_gate(body)
             # First attempt with the current token.
             headers = forwarded_request_headers(self, self.cache.token, self.token_header)
             with self.client.stream(self.command, url, headers=headers, content=body) as resp:
@@ -374,18 +378,24 @@ def start_proxy(
     port: int,
     token_header: str,
     force_refresh_near_expiry: bool,
+    *,
+    upstream_base: str | None = None,
+    request_gate: Callable[[bytes], None] | None = None,
 ) -> tuple[ThreadingHTTPServer, TokenCache, httpx.Client]:
     """Start the loopback refresh proxy + its background token refresher.
 
     Binds ``port``, falling back to a fresh OS-assigned port when it is already
     in use (e.g. a prior session's proxy that was killed before its teardown ran
     still holds the socket). The caller reads ``server.server_address[1]`` for the
-    actual port and points Claude Code at it.
+    actual port and points the coding agent at it. ``upstream_base`` defaults to
+    Claude's Anthropic gateway path; callers for other APIs provide their own.
+    ``request_gate`` runs once per downstream request, before any upstream
+    attempt (including the retry-on-auth-failure path).
 
     Returns (server, cache, client); the caller runs the server (e.g. in a
     thread) and calls shutdown()/cache.stop()/client.close() on exit.
     """
-    upstream_base = f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
+    upstream_base = upstream_base or f"{workspace.rstrip('/')}/ai-gateway/anthropic/"
     cache = TokenCache(
         workspace,
         profile,
@@ -399,7 +409,12 @@ def start_proxy(
     handler = type(
         "BoundProxyHandler",
         (_ProxyHandler,),
-        {"cache": cache, "client": client, "token_header": token_header},
+        {
+            "cache": cache,
+            "client": client,
+            "token_header": token_header,
+            "request_gate": request_gate,
+        },
     )
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), handler)

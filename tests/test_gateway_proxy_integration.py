@@ -142,15 +142,25 @@ def _counting_token(value: str = "dbx-swap-token"):
 
 
 @contextlib.contextmanager
-def _running_proxy(gateway: _FakeGateway, monkeypatch, token_fn=None):
+def _running_proxy(
+    gateway: _FakeGateway,
+    monkeypatch,
+    token_fn=None,
+    *,
+    token_header=gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
+    upstream_base=None,
+    request_gate=None,
+):
     """Start the real proxy pointed at `gateway`, yield its loopback URL, tear down."""
     monkeypatch.setattr(gateway_proxy, "get_databricks_token", token_fn or _counting_token())
     server, cache, client = gateway_proxy.start_proxy(
         gateway.base_url,
         None,
         0,
-        token_header=gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
+        token_header=token_header,
         force_refresh_near_expiry=False,
+        upstream_base=upstream_base,
+        request_gate=request_gate,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -165,6 +175,31 @@ def _running_proxy(gateway: _FakeGateway, monkeypatch, token_fn=None):
 
 
 class TestRelayedProxyEndToEnd:
+    def test_codex_upstream_replaces_authorization_and_gates_body(self, make_gateway, monkeypatch):
+        gw = make_gateway()
+        gated = []
+        body = b'{"model":"gpt-6-astra","input":"hello"}'
+        with _running_proxy(
+            gw,
+            monkeypatch,
+            _counting_token("fresh-db-token"),
+            token_header=gateway_proxy.AUTHORIZATION_HEADER,
+            upstream_base=f"{gw.base_url}/ai-gateway/codex/",
+            request_gate=gated.append,
+        ) as proxy_url:
+            resp = httpx.post(
+                f"{proxy_url}/v1/responses",
+                headers={"Authorization": "Bearer stale-client-token"},
+                content=body,
+                timeout=10,
+            )
+
+        assert resp.status_code == 200
+        assert gated == [body]
+        request = gw.requests[-1]
+        assert request.path == "/ai-gateway/codex/v1/responses"
+        assert request.header("Authorization") == "Bearer fresh-db-token"
+
     def test_forwards_request_with_swap_header_and_passthrough(self, make_gateway, monkeypatch):
         # The whole relayed data-plane over real sockets: the proxy injects a fresh
         # swap token, passes the caller's Anthropic OAuth + the MPS routing header
