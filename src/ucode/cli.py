@@ -2047,7 +2047,7 @@ def _launch_options(
             and provider is None
             # Route a bare agent launch or a prompt explicitly passed after `--`.
             and (not tool_args or explicit_prompt)
-        )
+        ),
     )
 
 
