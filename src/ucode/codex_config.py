@@ -2,20 +2,34 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import tomlkit
 
 
+def _inline_compatible(value: object) -> object:
+    """Convert parsed TOML containers into inline-table-compatible values."""
+    if isinstance(value, Mapping):
+        return {key: _inline_compatible(entry) for key, entry in value.items()}
+    if isinstance(value, list):
+        return [_inline_compatible(entry) for entry in value]
+    return value
+
+
 def _toml_value(value: str | int | float | bool | list[object] | dict[str, object]) -> str:
-    if isinstance(value, dict):
+    normalized = _inline_compatible(value)
+    if isinstance(normalized, dict):
         item = tomlkit.inline_table()
-        item.update(value)
+        item.update(normalized)
         return item.as_string()
-    if isinstance(value, list) and any(isinstance(entry, dict) for entry in value):
+    if isinstance(normalized, list) and any(
+        isinstance(entry, dict) for entry in normalized
+    ):
         wrapper = tomlkit.inline_table()
-        wrapper["value"] = value
+        wrapper["value"] = normalized
         rendered = wrapper.as_string()
         return rendered.removeprefix("{value = ").removesuffix("}")
-    return tomlkit.item(value).as_string()
+    return tomlkit.item(normalized).as_string()
 
 
 def codex_config_args(config: dict) -> list[str]:
