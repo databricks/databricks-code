@@ -19,6 +19,7 @@ from ucode.codex_config import codex_config_args
 from ucode.config_io import APP_DIR, read_json_safe, read_toml_safe, write_json_file
 from ucode.constants import LOOPBACK_HOST
 from ucode.databricks import (
+    AnthropicModelCatalog,
     build_auth_token_argv,
     get_databricks_token,
     list_anthropic_model_catalog,
@@ -56,6 +57,45 @@ CLAUDE_ROUTED_AGENT_PROMPT = (
 # needed because Anthropic omits models from its catalog unless the model id contains "anthropic"
 # or "claude".
 _ANTHROPIC_AIGW_MODEL_RE = re.compile(r"^anthropic-aigw-[0-9a-fA-F]{8}-(.+)$")
+
+
+def _model_picker_catalog() -> AnthropicModelCatalog | None:
+    """Read model-picker rows using the managed-settings then ucode-settings waterfall.
+
+    A managed picker is authoritative for smart routing: its rows are the models the
+    administrator exposed, so there is no need to query the gateway catalog first.
+    """
+    try:
+        from ucode.agents.claude import (
+            CLAUDE_SETTINGS_PATH,
+            CLAUDE_USER_SETTINGS_PATH,
+            _managed_settings_path,
+        )
+
+        paths = [_managed_settings_path(), CLAUDE_SETTINGS_PATH, CLAUDE_USER_SETTINGS_PATH]
+    except (ImportError, OSError):
+        return None
+    for path in paths:
+        if path is None or not path.is_file():
+            continue
+        settings = read_json_safe(path)
+        picker_settings = settings.get("modelPicker") if isinstance(settings, dict) else None
+        picker = picker_settings.get("options") if isinstance(picker_settings, dict) else None
+        if not isinstance(picker, list):
+            continue
+        model_ids: list[str] = []
+        seen: set[str] = set()
+        for row in picker:
+            if not isinstance(row, dict) or not isinstance(row.get("model"), str):
+                continue
+            model_id = row["model"].strip()
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            model_ids.append(model_id)
+        if model_ids:
+            return AnthropicModelCatalog(model_ids, {})
+    return None
 
 
 def enabled() -> bool:
@@ -348,7 +388,10 @@ def launch_claude(
     os.environ[OAUTH_TOKEN_ENV_VAR] = token
     os.environ[GATEWAY_MODEL_DISCOVERY_ENV_VAR] = "1"
     os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
-    catalog = list_anthropic_model_catalog(workspace, token)
+    # Enterprise managed settings may provide the authoritative model picker. Prefer
+    # those IDs so routing follows the administrator's curated list and avoids an
+    # unnecessary /anthropic/v1/models request.
+    catalog = _model_picker_catalog() or list_anthropic_model_catalog(workspace, token)
     if not catalog.model_ids:
         raise RuntimeError(
             catalog.error_msg or "Anthropic models endpoint returned no Claude models"
