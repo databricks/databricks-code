@@ -552,6 +552,7 @@ def _codex_request_proxy(state: dict) -> Iterator[str]:
         upstream_base=f"{workspace.rstrip('/')}/ai-gateway/codex/",
         request_transform=sanitize_reasoning_replay,
         request_gate=limiter,
+        rate_limit_retry=limiter.retry_after_429,
     )
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()

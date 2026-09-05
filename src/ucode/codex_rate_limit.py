@@ -15,13 +15,15 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import re
 import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -32,6 +34,9 @@ BYTES_PER_ESTIMATED_TOKEN = 3
 SAFETY_PERCENT = 90
 STATE_FILE_NAME = "codex-rate-limit-state.json"
 LOCK_FILE_NAME = "codex-rate-limit.lock"
+RETRY_BACKOFF_BASE_SECONDS = 2.0
+RETRY_BACKOFF_MAX_SECONDS = 300.0
+RETRY_AFTER_JITTER_PERCENT = 10
 
 # Databricks Foundation Model API input-token-per-minute limits. Reservations
 # use only 90% so estimation error and requests outside this ucode process have
@@ -133,7 +138,7 @@ def _locked(lock_path: Path) -> Iterator[None]:
 
 
 def _empty_state() -> dict:
-    return {"version": 1, "buckets": {}}
+    return {"version": 2, "buckets": {}, "cooldowns": {}}
 
 
 def _read_state(path: Path) -> dict:
@@ -179,7 +184,49 @@ def _prune_state(state: dict, now: float) -> dict:
             events = _valid_recent_events(raw_events, now)
             if events:
                 clean[key] = events
-    return {"version": 1, "buckets": clean}
+    cooldowns: dict[str, float] = {}
+    raw_cooldowns = state.get("cooldowns")
+    if isinstance(raw_cooldowns, dict):
+        for key, raw_until in raw_cooldowns.items():
+            if (
+                isinstance(key, str)
+                and isinstance(raw_until, (int, float))
+                and not isinstance(raw_until, bool)
+                and now < float(raw_until)
+            ):
+                cooldowns[key] = float(raw_until)
+    return {"version": 2, "buckets": clean, "cooldowns": cooldowns}
+
+
+def _header(headers: Mapping[str, str], name: str) -> str | None:
+    """Read one response header from either a plain or case-insensitive map."""
+    value = headers.get(name)
+    if value is not None:
+        return value
+    lowered = name.lower()
+    for key, candidate in headers.items():
+        if key.lower() == lowered:
+            return candidate
+    return None
+
+
+def _retry_after_seconds(headers: Mapping[str, str], now: float) -> float | None:
+    """Parse Retry-After in either delta-seconds or HTTP-date form."""
+    value = _header(headers, "Retry-After")
+    if value is None:
+        return None
+    value = value.strip()
+    try:
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(value)
+        seconds = parsed.timestamp() - now
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _write_state(path: Path, state: dict) -> None:
@@ -220,6 +267,8 @@ class SharedCodexRateLimiter:
         clock: Callable[[], float] = time.time,
         sleeper: Callable[[float], None] = time.sleep,
         notice: Callable[[str, float], None] | None = None,
+        retry_notice: Callable[[str, float, int, bool], None] | None = None,
+        jitter: Callable[[], float] = random.random,
     ) -> None:
         app_dir = config_io.APP_DIR
         self.workspace = workspace.rstrip("/").lower()
@@ -229,6 +278,8 @@ class SharedCodexRateLimiter:
         self.clock = clock
         self.sleeper = sleeper
         self.notice = notice or self._default_notice
+        self.retry_notice = retry_notice or self._default_retry_notice
+        self.jitter = jitter
         self._unavailable_notice_sent = False
 
     @staticmethod
@@ -236,16 +287,35 @@ class SharedCodexRateLimiter:
         seconds = max(1, math.ceil(wait_seconds))
         sys.stderr.write(
             f"[ucode] Pausing a {model} request for about {seconds}s to stay under the "
-            "shared Databricks input-token limit.\n"
+            "shared Databricks rate limit.\n"
+        )
+        sys.stderr.flush()
+
+    @staticmethod
+    def _default_retry_notice(
+        model: str,
+        wait_seconds: float,
+        attempt: int,
+        used_retry_after: bool,
+    ) -> None:
+        seconds = max(1, math.ceil(wait_seconds))
+        source = "server Retry-After" if used_retry_after else "jittered backoff"
+        sys.stderr.write(
+            f"[ucode] {model} returned 429; keeping the thread alive and retrying in "
+            f"about {seconds}s ({source}, attempt {attempt}).\n"
         )
         sys.stderr.flush()
 
     def __call__(self, body: bytes) -> None:
         estimate = estimate_request(body)
-        if estimate is None:
-            return
-        model, model_key, estimated_tokens = estimate
         try:
+            # A 429 whose request body was unreadable creates a workspace-wide
+            # cooldown. Honor it even when this request is also unreadable or is
+            # for a model whose quota has not been added yet.
+            self.wait_for_cooldown(estimate[1] if estimate is not None else None)
+            if estimate is None:
+                return
+            model, model_key, estimated_tokens = estimate
             self.wait_for_capacity(model, model_key, estimated_tokens)
         except OSError as exc:
             # A local permissions/filesystem problem must not make the model
@@ -257,6 +327,103 @@ class SharedCodexRateLimiter:
                     f"({type(exc).__name__}); sending without a local throttle.\n"
                 )
                 sys.stderr.flush()
+
+    def _cooldown_keys(self, model_key: str | None) -> list[str]:
+        keys = [f"{self.workspace}|*"]
+        if model_key is not None:
+            keys.append(f"{self.workspace}|{model_key}")
+        return keys
+
+    def wait_for_cooldown(self, model_key: str | None) -> None:
+        """Wait for the latest applicable workspace/model 429 cooldown."""
+        while True:
+            now = self.clock()
+            with _locked(self.lock_path):
+                state = _prune_state(_read_state(self.state_path), now)
+                cooldowns = state["cooldowns"]
+                blocked_until = max(
+                    (float(cooldowns.get(key, 0.0)) for key in self._cooldown_keys(model_key)),
+                    default=0.0,
+                )
+                _write_state(self.state_path, state)
+            if blocked_until <= now:
+                return
+            self.sleeper(max(0.01, blocked_until - now))
+
+    def _fallback_retry_delay(self, attempt: int) -> float:
+        exponent = max(0, attempt - 1)
+        ceiling = min(
+            RETRY_BACKOFF_MAX_SECONDS,
+            RETRY_BACKOFF_BASE_SECONDS * (2 ** min(exponent, 30)),
+        )
+        # Equal jitter keeps meaningful backoff while preventing many local
+        # Codex processes from waking on exactly the same instant.
+        return ceiling * (0.5 + 0.5 * min(1.0, max(0.0, self.jitter())))
+
+    def _schedule_cooldown(self, model_key: str | None, delay: float, now: float) -> float:
+        """Claim one retry slot at the tail of the shared cooldown queue."""
+        bucket_key = self._cooldown_keys(model_key)[-1]
+        with _locked(self.lock_path):
+            state = _prune_state(_read_state(self.state_path), now)
+            cooldowns = state["cooldowns"]
+            scheduled_until = max(float(cooldowns.get(bucket_key, 0.0)), now) + delay
+            cooldowns[bucket_key] = scheduled_until
+            _write_state(self.state_path, state)
+        return scheduled_until
+
+    def _sleep_until(self, scheduled_until: float) -> None:
+        while True:
+            remaining = scheduled_until - self.clock()
+            if remaining <= 0:
+                return
+            self.sleeper(max(0.01, remaining))
+
+    def retry_after_429(
+        self,
+        body: bytes | None,
+        headers: Mapping[str, str],
+        attempt: int,
+    ) -> None:
+        """Publish a shared cooldown, then wait before an internal 429 retry.
+
+        The proxy calls this only after draining a 429 response. Recognized
+        models get an isolated bucket; unreadable/compressed bodies and future
+        models safely fall back to a workspace-wide bucket. No prompt, response,
+        header value, or credential is written to disk.
+        """
+        estimate = estimate_request(body) if body is not None else None
+        model = estimate[0] if estimate is not None else "Codex"
+        model_key = estimate[1] if estimate is not None else None
+        now = self.clock()
+        retry_after = _retry_after_seconds(headers, now)
+        used_retry_after = retry_after is not None
+        if retry_after is None:
+            delay = self._fallback_retry_delay(attempt)
+        else:
+            # Positive jitter preserves the server's minimum while spreading a
+            # local herd. Cap only the added jitter, never Retry-After itself.
+            extra_ceiling = min(5.0, max(0.1, retry_after * RETRY_AFTER_JITTER_PERCENT / 100))
+            delay = retry_after + extra_ceiling * min(1.0, max(0.0, self.jitter()))
+        delay = max(0.01, delay)
+
+        try:
+            # Appending rather than overwriting gives simultaneous 429s separate
+            # retry slots. Each blocked handler waits for its own slot, while new
+            # requests observe the tail and do not jump ahead of the queue.
+            scheduled_until = self._schedule_cooldown(model_key, delay, now)
+            actual_wait = max(0.01, scheduled_until - now)
+            self.retry_notice(model, actual_wait, attempt, used_retry_after)
+            self._sleep_until(scheduled_until)
+        except OSError as exc:
+            self.retry_notice(model, delay, attempt, used_retry_after)
+            if not self._unavailable_notice_sent:
+                self._unavailable_notice_sent = True
+                sys.stderr.write(
+                    "[ucode] Shared Codex rate limiter is unavailable "
+                    f"({type(exc).__name__}); using local 429 backoff only.\n"
+                )
+                sys.stderr.flush()
+            self.sleeper(delay)
 
     def wait_for_capacity(self, model: str, model_key: str, estimated_tokens: int) -> None:
         target = self.target_limits.get(model_key)

@@ -457,6 +457,58 @@ class TestRetryOn401:
         assert b"401" in bytes(out.data)  # the response is still relayed
 
 
+class TestRetryOn429:
+    def test_429_is_drained_waited_and_retried_inside_proxy(self):
+        body = b'{"model":"future-model","input":"hello"}'
+        first = _FakeResp(429, b'{"error":"slow down"}', {"Retry-After": "7"})
+        client = _FakeClient([first, _FakeResp(200, b"ok")])
+        out = _Collect()
+        handler = _handle_handler(client, _FakeCache(), out)
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        retries = []
+        handler.rate_limit_retry = lambda seen_body, headers, attempt: retries.append(
+            (seen_body, headers, attempt)
+        )
+
+        handler._handle()
+
+        assert first.read_called is True
+        assert client.sent_bodies == [body, body]
+        assert retries == [(body, {"Retry-After": "7"}, 1)]
+        assert b"429" not in bytes(out.data)
+        assert b"200" in bytes(out.data)
+        assert b"ok" in bytes(out.data)
+
+    def test_repeated_429s_increase_attempt_without_spending_client_retries(self):
+        responses = [
+            _FakeResp(429, b"one"),
+            _FakeResp(429, b"two"),
+            _FakeResp(200, b"ok"),
+        ]
+        client = _FakeClient(responses)
+        out = _Collect()
+        handler = _handle_handler(client, _FakeCache(), out)
+        attempts = []
+        handler.rate_limit_retry = lambda _body, _headers, attempt: attempts.append(attempt)
+
+        handler._handle()
+
+        assert attempts == [1, 2]
+        assert len(client.sent_bodies) == 3
+        assert b"429" not in bytes(out.data)
+        assert b"200" in bytes(out.data)
+
+    def test_429_is_relayed_when_no_retry_handler_is_configured(self):
+        client = _FakeClient([_FakeResp(429, b"limited")])
+        out = _Collect()
+
+        _handle_handler(client, _FakeCache(), out)._handle()
+
+        assert b"429" in bytes(out.data)
+        assert b"limited" in bytes(out.data)
+
+
 class TestStartProxyPortFallback:
     def test_falls_back_to_free_port_when_cached_port_busy(self, monkeypatch):
         # A stale proxy from a killed session can still hold the cached port; the

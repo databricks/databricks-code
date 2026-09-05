@@ -821,6 +821,7 @@ class TestCodexLaunch:
         assert kwargs["upstream_base"] == f"{WS}/ai-gateway/codex/"
         assert kwargs["request_transform"] is codex.sanitize_reasoning_replay
         assert isinstance(kwargs["request_gate"], codex.SharedCodexRateLimiter)
+        assert kwargs["rate_limit_retry"] == kwargs["request_gate"].retry_after_429
         assert calls.count("serve") == 1
         assert [call for call in calls[1:] if call != "serve"] == [
             "cache_stop",

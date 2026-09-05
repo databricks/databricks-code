@@ -47,10 +47,15 @@ class _FakeGateway:
     a streaming relay is exercised, not just a single write)."""
 
     def __init__(
-        self, status: int = 200, chunks: list[bytes] | None = None, sse_delay: float = 0.0
+        self,
+        status: int = 200,
+        chunks: list[bytes] | None = None,
+        sse_delay: float = 0.0,
+        statuses: list[int] | None = None,
     ):
         self.requests: list[_CapturedRequest] = []
         self._status = status
+        self._statuses = list(statuses) if statuses is not None else None
         self._chunks = chunks if chunks is not None else [b'{"ok":true}']
         self._sse_delay = sse_delay
         self._server: ThreadingHTTPServer | None = None
@@ -63,7 +68,13 @@ class _FakeGateway:
 
     def start(self) -> None:
         captured = self.requests
-        status, chunks, sse_delay = self._status, self._chunks, self._sse_delay
+        status, statuses, chunks, sse_delay = (
+            self._status,
+            self._statuses,
+            self._chunks,
+            self._sse_delay,
+        )
+        status_lock = threading.Lock()
 
         class Handler(BaseHTTPRequestHandler):
             def _serve(self) -> None:
@@ -77,7 +88,9 @@ class _FakeGateway:
                         body=body,
                     )
                 )
-                self.send_response(status)
+                with status_lock:
+                    response_status = statuses.pop(0) if statuses else status
+                self.send_response(response_status)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 for chunk in chunks:
@@ -151,6 +164,7 @@ def _running_proxy(
     upstream_base=None,
     request_transform=None,
     request_gate=None,
+    rate_limit_retry=None,
 ):
     """Start the real proxy pointed at `gateway`, yield its loopback URL, tear down."""
     monkeypatch.setattr(gateway_proxy, "get_databricks_token", token_fn or _counting_token())
@@ -163,6 +177,7 @@ def _running_proxy(
         upstream_base=upstream_base,
         request_transform=request_transform,
         request_gate=request_gate,
+        rate_limit_retry=rate_limit_retry,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -204,6 +219,26 @@ class TestRelayedProxyEndToEnd:
         assert request.path == "/ai-gateway/codex/v1/responses"
         assert request.header("Authorization") == "Bearer fresh-db-token"
         assert request.body == transformed
+
+    def test_codex_429_waits_and_retries_over_real_proxy_sockets(self, make_gateway, monkeypatch):
+        gw = make_gateway(statuses=[429, 200])
+        retries = []
+        body = b'{"model":"future-model","input":"hello"}'
+        with _running_proxy(
+            gw,
+            monkeypatch,
+            token_header=gateway_proxy.AUTHORIZATION_HEADER,
+            upstream_base=f"{gw.base_url}/ai-gateway/codex/",
+            rate_limit_retry=lambda seen_body, headers, attempt: retries.append(
+                (seen_body, headers, attempt)
+            ),
+        ) as proxy_url:
+            resp = httpx.post(f"{proxy_url}/v1/responses", content=body, timeout=10)
+
+        assert resp.status_code == 200
+        assert len(gw.requests) == 2
+        assert [request.body for request in gw.requests] == [body, body]
+        assert [(seen_body, attempt) for seen_body, _headers, attempt in retries] == [(body, 1)]
 
     def test_forwards_request_with_swap_header_and_passthrough(self, make_gateway, monkeypatch):
         # The whole relayed data-plane over real sockets: the proxy injects a fresh

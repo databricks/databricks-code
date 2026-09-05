@@ -22,9 +22,7 @@ def _toml_value(value: str | int | float | bool | list[object] | dict[str, objec
         item = tomlkit.inline_table()
         item.update(normalized)
         return item.as_string()
-    if isinstance(normalized, list) and any(
-        isinstance(entry, dict) for entry in normalized
-    ):
+    if isinstance(normalized, list) and any(isinstance(entry, dict) for entry in normalized):
         wrapper = tomlkit.inline_table()
         wrapper["value"] = normalized
         rendered = wrapper.as_string()

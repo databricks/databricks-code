@@ -83,7 +83,15 @@ The 90% target leaves headroom for estimation error and requests made outside Un
 Unity Gateway estimates input conservatively from the uncompressed JSON request size and records
 only timestamps, model keys, and estimates in `~/.ucode/codex-rate-limit-state.json`; prompts and
 credentials are never stored. When capacity is unavailable, the request waits and one short notice
-is written to stderr. Unknown/new models pass through until their published quota is added.
+is written to stderr. Unknown/new models pass through the proactive token-budget check until their
+published quota is added.
+
+Every upstream `429 Too Many Requests` response is also handled inside Unity Gateway instead of
+consuming Codex's finite retry budget. Unity Gateway honors `Retry-After` when present; otherwise it
+uses capped exponential backoff with jitter. The resulting cooldown is shared across local Codex
+processes for the same workspace and model. If the request body is unreadable or the model is new,
+the cooldown safely applies to the whole workspace. The original model and reasoning effort never
+change, and the thread keeps retrying until capacity returns or the user cancels it.
 
 When a Codex thread switches from a model that returns visible reasoning, such as Kimi K3, to an
 OpenAI reasoning model, Unity Gateway removes the nonportable `reasoning.content` field from the

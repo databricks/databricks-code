@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -197,3 +198,122 @@ def test_corrupt_state_is_replaced_under_lock(tmp_path):
 
     state = json.loads(state_path.read_text())
     assert state["buckets"]["https://workspace|gpt56luna"][0]["tokens"] == 3
+
+
+def test_retry_after_seconds_supports_delta_and_http_date():
+    now = datetime(2026, 9, 5, 16, 0, tzinfo=UTC).timestamp()
+
+    assert codex_rate_limit._retry_after_seconds({"Retry-After": "12"}, now) == 12
+    assert (
+        codex_rate_limit._retry_after_seconds({"retry-after": "Sat, 05 Sep 2026 16:00:30 GMT"}, now)
+        == 30
+    )
+    assert codex_rate_limit._retry_after_seconds({"Retry-After": "invalid"}, now) is None
+
+
+def test_429_honors_retry_after_and_publishes_model_cooldown(tmp_path):
+    now = [100.0]
+    sleeps = []
+    snapshots = []
+    notices = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        snapshots.append(json.loads((tmp_path / "state.json").read_text()))
+        now[0] += seconds
+
+    limiter = codex_rate_limit.SharedCodexRateLimiter(
+        "https://workspace",
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "state.lock",
+        target_limits={},
+        clock=lambda: now[0],
+        sleeper=sleep,
+        retry_notice=lambda *args: notices.append(args),
+        jitter=lambda: 0.0,
+    )
+
+    limiter.retry_after_429(_body("gpt-5.6-sol"), {"Retry-After": "5"}, 1)
+
+    assert sleeps == [5.0]
+    assert notices == [("gpt-5.6-sol", 5.0, 1, True)]
+    assert snapshots[0]["cooldowns"] == {"https://workspace|gpt56sol": 105.0}
+
+
+def test_unknown_model_429_uses_workspace_wide_cooldown(tmp_path):
+    now = [100.0]
+    snapshots = []
+
+    def sleep(seconds):
+        snapshots.append(json.loads((tmp_path / "state.json").read_text()))
+        now[0] += seconds
+
+    limiter = codex_rate_limit.SharedCodexRateLimiter(
+        "https://workspace",
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "state.lock",
+        target_limits={},
+        clock=lambda: now[0],
+        sleeper=sleep,
+        retry_notice=lambda *_args: None,
+        jitter=lambda: 0.0,
+    )
+
+    limiter.retry_after_429(_body("future-model"), {"Retry-After": "3"}, 1)
+
+    assert snapshots[0]["cooldowns"] == {"https://workspace|*": 103.0}
+
+
+def test_model_cooldown_does_not_pause_another_model(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "buckets": {},
+                "cooldowns": {"https://workspace|gpt56sol": 105.0},
+            }
+        )
+    )
+    sleeps = []
+    limiter = codex_rate_limit.SharedCodexRateLimiter(
+        "https://workspace",
+        state_path=state_path,
+        lock_path=tmp_path / "state.lock",
+        target_limits={},
+        clock=lambda: 100.0,
+        sleeper=sleeps.append,
+    )
+
+    limiter.wait_for_cooldown("gpt56terra")
+
+    assert sleeps == []
+
+
+def test_missing_retry_after_uses_capped_jittered_exponential_backoff(tmp_path):
+    limiter = codex_rate_limit.SharedCodexRateLimiter(
+        "https://workspace",
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "state.lock",
+        jitter=lambda: 0.0,
+    )
+
+    assert [limiter._fallback_retry_delay(attempt) for attempt in (1, 2, 3, 10)] == [
+        1.0,
+        2.0,
+        4.0,
+        150.0,
+    ]
+
+
+def test_concurrent_429s_claim_separate_shared_retry_slots(tmp_path):
+    common = {
+        "state_path": tmp_path / "state.json",
+        "lock_path": tmp_path / "state.lock",
+        "target_limits": {},
+    }
+    first = codex_rate_limit.SharedCodexRateLimiter("https://workspace", **common)
+    second = codex_rate_limit.SharedCodexRateLimiter("https://workspace", **common)
+
+    assert first._schedule_cooldown("gpt56sol", 5.0, 100.0) == 105.0
+    assert second._schedule_cooldown("gpt56sol", 5.0, 100.0) == 110.0
