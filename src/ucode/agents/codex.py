@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -37,13 +37,10 @@ from ucode.launcher import exec_or_spawn
 from ucode.managed_files import (
     OS,
     current_os,
-    managed_file_conflicts,
     managed_file_is_verified,
     managed_file_status,
-    managed_writes_allowed,
     mark_managed_file_verified,
     read_managed_file,
-    reconcile_managed_file,
     revert_managed_file,
 )
 from ucode.smart_routing import v2 as smart_routing_v2
@@ -370,7 +367,7 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         enabled=False,
     )
     write_toml_file(CODEX_CONFIG_PATH, doc)
-    _reconcile_managed_config(state, compose)
+    _migrate_and_check_managed_config(state)
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
     return state
@@ -402,13 +399,18 @@ def managed_config_is_current(state: dict) -> bool:
     path = _managed_config_path()
     if path is None:
         return True
-    required_scope = "managed" if managed_writes_allowed() else None
-    return managed_file_is_verified(state, "codex", path, required_scope=required_scope)
+    return managed_file_is_verified(state, "codex", path, required_scope="local-compatible")
 
 
 def managed_config_status(state: dict) -> tuple[Path | None, str, str]:
     path = _managed_config_path()
     status, backup = managed_file_status(state, "codex", path, parser=_parse_managed_config)
+    if (
+        path is not None
+        and status == "missing"
+        and managed_file_is_verified(state, "codex", path, required_scope="local-compatible")
+    ):
+        status = "compatible (local settings)"
     return path, status, backup
 
 
@@ -421,49 +423,57 @@ def revert_managed_config() -> str:
     )
 
 
-def _reconcile_managed_config(state: dict, compose: Callable[[dict], dict]) -> None:
-    """Reconcile Codex's highest-precedence config while preserving unrelated policy."""
+def _managed_provider_conflicts(doc: dict) -> list[str]:
+    """Return managed values that can bypass a launch-scoped ucode provider."""
+    conflicts: list[str] = []
+    managed_provider = doc.get("model_provider")
+    if managed_provider is not None and managed_provider != CODEX_MODEL_PROVIDER_NAME:
+        conflicts.append("model_provider")
+    providers = doc.get("model_providers")
+    ucode_provider = (
+        providers.get(CODEX_MODEL_PROVIDER_NAME) if isinstance(providers, Mapping) else None
+    )
+    if isinstance(ucode_provider, Mapping) and "base_url" in ucode_provider:
+        conflicts.append(f"model_providers.{CODEX_MODEL_PROVIDER_NAME}.base_url")
+    return conflicts
+
+
+def _migrate_and_check_managed_config(state: dict) -> None:
+    """Retire ucode's managed provider and verify that external policy will not bypass it.
+
+    Codex gives ``/etc/codex/managed_config.toml`` precedence over profile files and launch-time
+    config overrides. A provider persisted there therefore bypasses the per-launch loopback proxy
+    used for shared throttling and 429 retries. Restore ucode's recorded pre-write baseline, then
+    keep only a compatibility fingerprint for unrelated machine policy.
+    """
     path = _managed_config_path()
     if path is None:
-        print_warning_err(
-            "Machine-wide Codex settings aren't supported on this platform; skipped the managed "
-            "config."
-        )
         return
     if path.is_symlink():
         raise RuntimeError(
             f"Refusing to use Codex managed settings through symlink {path}. Replace it with a "
             "regular file or contact your administrator."
         )
+
+    # Releases only settings recorded as ucode-owned. The shared managed-file lifecycle restores
+    # the original baseline or performs a three-way revert when external policy changed later.
+    revert_managed_config()
     current_text = read_managed_file(path)
     try:
         existing = _parse_managed_config(current_text) if current_text is not None else {}
     except RuntimeError as exc:
         raise RuntimeError(
-            f"Cannot safely update Codex managed settings at {path}: {exc}. ucode did not modify "
+            f"Cannot safely inspect Codex managed settings at {path}: {exc}. ucode did not modify "
             "the file. Repair it or contact your administrator."
         ) from exc
-    managed_before = copy.deepcopy(existing)
-    desired_doc = compose(existing)
-    if not managed_writes_allowed():
-        conflicts = managed_file_conflicts(managed_before, desired_doc, MANAGED_KEYS)
-        if conflicts:
-            raise RuntimeError(
-                "Codex configuration cannot be applied non-interactively because OS-managed "
-                f"settings at {path} override ucode values: {', '.join(conflicts)}. Run `ucode "
-                "configure --agent codex` from an interactive terminal or contact your "
-                "administrator."
-            )
-        mark_managed_file_verified(state, "codex", path, scope="local-compatible")
-        return
-    reconcile_managed_file(
-        path,
-        tomlkit.dumps(desired_doc),
-        tool="codex",
-        display="Codex",
-        owned_paths=MANAGED_KEYS,
-    )
-    mark_managed_file_verified(state, "codex", path)
+    conflicts = _managed_provider_conflicts(existing)
+    if conflicts:
+        raise RuntimeError(
+            f"Codex cannot use ucode's shared rate limiter because OS-managed settings at {path} "
+            f"override the launch-scoped provider: {', '.join(conflicts)}. Remove those provider "
+            "settings or contact your administrator."
+        )
+    mark_managed_file_verified(state, "codex", path, scope="local-compatible")
 
 
 def default_model(state: dict) -> str | None:

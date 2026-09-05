@@ -2,19 +2,20 @@
 
 ## Summary
 
-Claude Code and Codex give OS-managed settings higher precedence than user settings. Previously,
-ucode could write only its local configuration while an existing machine-managed file silently
-overrode the gateway endpoint, authentication helper, provider headers, or model.
+Claude Code and Codex give OS-managed settings higher precedence than user settings. That is useful
+for Claude Code's stable gateway configuration, but a Codex provider at that scope overrides the
+per-launch loopback address used for shared throttling and 429 retries.
 
-The two stacked PRs make precedence handling deterministic:
+The shared managed-file lifecycle makes precedence handling deterministic:
 
 1. The Claude PR adds the shared managed-file lifecycle and applies it to Claude Code.
-2. The Codex PR reuses that lifecycle for TOML, applies it to Codex, and removes the old optional
-   managed-settings path.
+2. Codex reuses that lifecycle to retire provider settings older ucode versions installed and to
+   preserve unrelated machine policy.
 
-After both PRs merge, interactive configuration reconciles the agent's OS-managed file by default.
-Non-interactive and CI execution never elevates privileges and instead uses local settings when the
-managed file is compatible.
+Interactive Claude configuration reconciles its OS-managed file by default. Codex configuration
+keeps its provider in `~/.codex/ucode.config.toml` plus launch-time overrides. It restores the
+recorded pre-ucode managed baseline, then verifies that remaining machine policy cannot bypass that
+provider. Non-interactive and CI execution never elevates privileges.
 
 ## Configuration Files
 
@@ -23,8 +24,9 @@ managed file is compatible.
 | Claude Code | `~/.claude/ucode-settings.json` | Linux: `/etc/claude-code/managed-settings.json`; macOS: `/Library/Application Support/ClaudeCode/managed-settings.json` |
 | Codex | `~/.codex/ucode.config.toml` | `/etc/codex/managed_config.toml` |
 
-The local file is always written. The OS-managed file is additionally reconciled during interactive
-configuration, except for Claude subscription relay.
+The local file is always written. Claude's OS-managed file is additionally reconciled during
+interactive configuration, except for subscription relay. Codex's OS-managed file is inspected and
+fingerprinted but is not populated by current ucode versions.
 
 ## Interactive Detection
 
@@ -38,24 +40,23 @@ command shape in some flows and did not guard managed-file writes consistently.
 
 ## Behavior Matrix
 
-| Invocation | Managed file | Behavior |
+| Agent and invocation | Managed file | Behavior |
 | --- | --- | --- |
-| Interactive | Absent | Create it from the ucode configuration after recording an absent baseline. |
-| Interactive | Unrelated or partially populated | Preserve unrelated values and add or update all ucode-owned values. |
-| Interactive | Conflicting | Back up the baseline, replace the conflicting ucode-owned values, and verify. |
-| Interactive | Already identical | Continue without a backup, write, or `sudo` invocation. |
-| Non-interactive | Absent | Use the local ucode file. Do not create the managed file. |
-| Non-interactive | Ucode-owned values absent or equal | Use the local ucode file. Do not modify the managed file. |
-| Non-interactive | Ucode-owned value conflicts | Stop before launching because the higher-precedence value would override ucode. |
+| Claude, interactive | Absent or compatible | Record the baseline, add the stable gateway values, and verify. |
+| Claude, non-interactive | Absent or compatible | Use the local ucode file without invoking `sudo`. |
+| Codex, interactive | Contains tracked ucode provider values | Restore the pre-ucode baseline, preserving later external changes. |
+| Codex, non-interactive | Contains tracked ucode provider values | Stop and require one interactive migration; never invoke `sudo`. |
+| Codex, any | Absent or unrelated | Use the local profile and launch-scoped provider; record a compatibility fingerprint. |
+| Codex, any | Selects another provider or overrides `ucode-databricks.base_url` | Stop because the managed value would bypass the launch-scoped proxy. |
 | Any | Invalid, unreadable, or symlinked | Stop without modifying the file because precedence cannot be established safely. |
 
-`ucode configure`, first-time `ucode claude` or `ucode codex`, and later launches all use the same
-agent-specific reconciliation path. A first-time launch from an interactive terminal can therefore
-request administrator permission. A first-time non-interactive launch remains local-only.
+`ucode configure`, first-time agent launches, and later launches all use the same agent-specific
+compatibility path. A Codex launch requests administrator permission only when it must retire a
+tracked provider installed by an older ucode version.
 
-## Interactive Reconciliation
+## Claude Interactive Reconciliation
 
-For each agent, ucode:
+For Claude Code, ucode:
 
 1. Strictly parses the existing managed JSON or TOML document.
 2. Produces the desired document by applying the same gateway overlay used for the local ucode file.
@@ -66,9 +67,28 @@ For each agent, ucode:
 7. Reads the installed file back and verifies its exact contents.
 8. Records the last-applied snapshot, owned paths, and a launch fingerprint.
 
-An existing managed file is reconciled even when it does not currently conflict. This ensures every
-ucode-required value exists at the highest-precedence scope and avoids separate behavior for absent,
-partial, and conflicting files.
+An existing Claude managed file is reconciled even when it does not currently conflict. This
+ensures every stable gateway value exists at the highest-precedence scope.
+
+## Codex Launch-Scoped Provider
+
+Every normal `ug codex` launch starts a loopback proxy on an ephemeral port. The launch overlay
+replaces only `model_providers.ucode-databricks.base_url` with that address and disables request
+compression so the proxy can identify the model and estimate input tokens.
+
+Codex's system `managed_config.toml` has higher precedence than both the named ucode profile and
+launch overrides. Persisting the direct Databricks endpoint there therefore bypasses the proxy even
+when the child command visibly receives a loopback URL. Configuration now:
+
+1. Uses the managed-backup manifest to restore the exact pre-ucode baseline or perform a three-way
+   revert when external policy changed later.
+2. Preserves unrelated managed keys, including approval and model defaults.
+3. Rejects a remaining external `model_provider` selection or managed
+   `model_providers.ucode-databricks.base_url`.
+4. Fingerprints the compatible result so unchanged launches need only one `stat()` call.
+
+This means a bare `codex` command is not routed through Unity Gateway by current ucode versions. Use
+`ug codex` when the shared limiter, gateway authentication, and automatic 429 recovery are required.
 
 ## Privileged Write Transaction
 
@@ -215,7 +235,7 @@ administrator help.
 - Add Claude managed status and revert output.
 - Remove Claude's old managed-settings scope choice.
 
-### PR 2: Codex
+### PR 2: Codex (historical behavior)
 
 - Stack on the Claude PR and reuse the shared lifecycle with strict TOML parsing and serialization.
 - Make interactive Codex configuration reconcile OS-managed TOML by default.
@@ -224,3 +244,10 @@ administrator help.
 - Keep opt-in smart-routing hooks in the local Codex config rather than adding them by default to
   machine-managed policy.
 - Remove the remaining managed-settings scope schema, resolution, setup prompt, summary, and tests.
+
+### Codex launch-proxy amendment
+
+- Retire the direct managed provider using the existing baseline and three-way restore lifecycle.
+- Keep the provider in the named profile and launch overrides so every request reaches the
+  per-launch proxy.
+- Preserve unrelated system policy and block only values that would bypass the proxy.
