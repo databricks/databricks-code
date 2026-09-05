@@ -76,6 +76,8 @@ does not consume another model's allowance.
 | GPT-5.6 Terra | 2,000,000 | 1,800,000 |
 | GPT-5.6 Luna | 2,000,000 | 1,800,000 |
 | Kimi K3 | 200,000 | 180,000 |
+| Qwen3.5 122B A10B | 1,000,000 | 900,000 |
+| Qwen3-Next 80B A3B Instruct | 1,000,000 | 900,000 |
 
 The 90% target leaves headroom for estimation error and requests made outside Unity Gateway.
 Unity Gateway estimates input conservatively from the uncompressed JSON request size and records

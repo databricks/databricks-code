@@ -34,6 +34,12 @@ def _reserve_in_process(state_path: str, lock_path: str, count: int) -> None:
         ("databricks-gpt-5.6-terra", "gpt56terra", 2_000_000),
         ("eu/gpt-5-6-luna", "gpt56luna", 2_000_000),
         ("system.ai.kimi-k3", "kimik3", 200_000),
+        ("databricks-qwen35-122b-a10b", "qwen35122ba10b", 1_000_000),
+        (
+            "system.ai.qwen3-next-80b-a3b-instruct",
+            "qwen3next80ba3binstruct",
+            1_000_000,
+        ),
     ],
 )
 def test_estimates_every_known_codex_model(model, expected_key, published):
