@@ -26,6 +26,7 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     """
     import ucode.config_io as config_io_mod
     import ucode.databricks as databricks_mod
+    import ucode.managed_config as managed_config_mod
     import ucode.managed_files as managed_files_mod
     import ucode.state as state_mod
     from ucode.agents import codex as codex_mod
@@ -34,6 +35,9 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     state_dir.mkdir()
     monkeypatch.setattr(state_mod, "STATE_PATH", state_dir / "state.json")
     monkeypatch.setattr(config_io_mod, "APP_DIR", state_dir)
+    # MANAGED_STATE_PATH is bound from APP_DIR at import, so patching APP_DIR alone doesn't move it;
+    # rebind it or save_managed_state writes to the developer's real ~/.ucode/managed-state.json.
+    monkeypatch.setattr(managed_config_mod, "MANAGED_STATE_PATH", state_dir / "managed-state.json")
     backup_dir = state_dir / "managed-backups"
     monkeypatch.setattr(managed_files_mod, "MANAGED_BACKUP_DIR", backup_dir)
     monkeypatch.setattr(

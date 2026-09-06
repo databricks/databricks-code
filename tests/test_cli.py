@@ -4126,6 +4126,30 @@ class TestBareUcode:
         # The config bare `ucode` already read is handed down, so the launch path does not refetch.
         assert launched[0][1]["managed"] == self.MANAGED
 
+    def test_dry_run_with_no_cached_config_does_not_crash(self, monkeypatch):
+        # --dry-run doesn't fetch, so the feature-disabled flag is never assigned by the fetch path.
+        # With no cached config it must still be well-defined (defaults False) rather than raising
+        # UnboundLocalError when the guidance check reads it.
+        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
+        monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
+        monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
+        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
+        monkeypatch.setattr(
+            "ucode.cli.refresh_managed_config",
+            lambda state: pytest.fail("--dry-run must not fetch"),
+        )
+        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
+        # The no-config guidance checks admin status; stub the token/admin calls so the test
+        # doesn't shell out to the `databricks` binary (absent in CI).
+        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda *a, **k: "tok")
+        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda *a, **k: False)
+        monkeypatch.setattr(
+            "ucode.cli._launch_tool",
+            lambda *a, **k: pytest.fail("nothing to launch without a config"),
+        )
+        result = runner.invoke(app, ["--dry-run"])
+        assert result.exit_code == 0, result.output
+
     def test_skip_preflight_still_resolves_an_agent_from_the_managed_config(self, monkeypatch):
         # --skip-preflight is now only about auth/gateway re-validation, decoupled from managed
         # config, so bare `ucode --skip-preflight` still fetches the config and picks its agent.
