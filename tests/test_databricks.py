@@ -271,6 +271,7 @@ class TestDiscoverModelServices:
                 _model_service("system.ai.claude-opus-4-8"),
                 _model_service("system.ai.claude-sonnet-4-6"),
                 _model_service("system.ai.gpt-5"),
+                _model_service("system.ai.gpt-oss-120b"),
                 _model_service("system.ai.gemini-2-5-flash"),
                 _model_service("system.ai.gemini-3-5-flash"),
                 _model_service("system.ai.kimi-k2-7-code"),
@@ -299,6 +300,7 @@ class TestDiscoverModelServices:
         assert oss == [
             "system.ai.deepseek-v4-pro",
             "system.ai.glm-5-2",
+            "system.ai.gpt-oss-120b",
             "system.ai.kimi-k2-7-code",
         ]
 
@@ -1352,13 +1354,37 @@ class TestApplyPatEnvironment:
 
         assert "DATABRICKS_BEARER" not in os.environ
 
-    def test_existing_bearer_wins(self, monkeypatch):
+    def test_oauth_state_preserves_unscoped_ci_bearer(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_BEARER", "ci-bearer")
+
+        db_mod.apply_pat_environment({"use_pat": False, "profile": "DEFAULT"})
+
+        assert os.environ["DATABRICKS_BEARER"] == "ci-bearer"
+
+    def test_configured_pat_replaces_ambient_bearer(self, monkeypatch):
         monkeypatch.setenv("DATABRICKS_BEARER", "explicit-bearer")
         monkeypatch.setattr(db_mod, "resolve_pat_token", lambda p: "dapi-pat")
 
         db_mod.apply_pat_environment({"use_pat": True, "profile": "DEFAULT"})
 
-        assert os.environ["DATABRICKS_BEARER"] == "explicit-bearer"
+        assert os.environ["DATABRICKS_BEARER"] == "dapi-pat"
+
+    def test_missing_configured_pat_clears_ambient_bearer(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_BEARER", "other-workspace-token")
+        monkeypatch.setattr(db_mod, "resolve_pat_token", lambda p: None)
+
+        db_mod.apply_pat_environment({"use_pat": True, "profile": "DEFAULT"})
+
+        assert "DATABRICKS_BEARER" not in os.environ
+
+    def test_switching_to_oauth_clears_scoped_pat_state(self, monkeypatch):
+        monkeypatch.setattr(db_mod, "resolve_pat_token", lambda p: "dapi-pat")
+        db_mod.apply_pat_environment({"workspace": WS, "use_pat": True, "profile": "DEFAULT"})
+
+        db_mod.apply_pat_environment({"workspace": WS, "use_pat": False, "profile": "DEFAULT"})
+
+        assert "DATABRICKS_BEARER" not in os.environ
+        assert db_mod._SCOPED_BEARER is None
 
 
 class TestBuildAuthTokenArgv:
@@ -1506,6 +1532,68 @@ class TestFormatSubprocessResult:
         assert "useful diagnostic output" in formatted
         assert "no matching profile" in formatted
 
+    def test_redacts_tokens_from_failure_output(self):
+        secret = "sentinel-token-value"
+        result = subprocess.CompletedProcess(
+            args=["databricks", "auth", "token"],
+            returncode=1,
+            stdout=json.dumps({"access_token": secret, "error": "expired"}),
+            stderr=f"request failed bearer={secret}",
+        )
+
+        formatted = _format_subprocess_result(result)
+
+        assert secret not in formatted
+        assert "<redacted>" in formatted
+        assert "expired" in formatted
+
+    def test_redacts_bearer_headers_and_access_token_prose(self):
+        access_secret = "sentinel-plain-access-secret"
+        bearer_secret = "sentinel-bearer-secret"
+        result = subprocess.CompletedProcess(
+            args=["databricks", "auth", "token"],
+            returncode=1,
+            stdout=f"access token is {access_secret}",
+            stderr=f"Authorization: Bearer {bearer_secret}",
+        )
+
+        formatted = _format_subprocess_result(result)
+
+        assert access_secret not in formatted
+        assert bearer_secret not in formatted
+        assert formatted.count("<redacted>") >= 2
+
+
+class TestLogAuthDiagnostics:
+    def test_profiles_stderr_is_scrubbed_before_debug_logging(self, tmp_path, monkeypatch):
+        secret = "sentinel-profiles-bearer"
+        results = iter(
+            [
+                subprocess.CompletedProcess(["databricks", "--version"], 0, "v1", ""),
+                subprocess.CompletedProcess(
+                    ["databricks", "auth", "profiles"],
+                    1,
+                    "",
+                    f"Authorization: Bearer {secret}",
+                ),
+            ]
+        )
+        logged: list[str] = []
+        monkeypatch.setattr(db_mod, "_debug_enabled", lambda: True)
+        monkeypatch.setattr(db_mod, "_debug", lambda label, detail: logged.append(detail))
+        monkeypatch.setattr(db_mod.subprocess, "run", lambda *args, **kwargs: next(results))
+        monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-cfg"))
+        db_mod._log_auth_diagnostics.cache_clear()
+
+        try:
+            db_mod._log_auth_diagnostics()
+        finally:
+            db_mod._log_auth_diagnostics.cache_clear()
+
+        rendered = "\n".join(logged)
+        assert secret not in rendered
+        assert "<redacted>" in rendered
+
 
 class TestScrubDatabrickscfg:
     def test_redacts_token_value(self):
@@ -1579,6 +1667,18 @@ class TestScrubJson:
 
 
 class TestGetDatabricksToken:
+    @pytest.fixture(autouse=True)
+    def _isolated_bearer(self):
+        original_bearer = os.environ.pop("DATABRICKS_BEARER", None)
+        original_scope = db_mod._SCOPED_BEARER
+        db_mod._SCOPED_BEARER = None
+        yield
+        db_mod._SCOPED_BEARER = original_scope
+        if original_bearer is None:
+            os.environ.pop("DATABRICKS_BEARER", None)
+        else:
+            os.environ["DATABRICKS_BEARER"] = original_bearer
+
     def _fake_databricks(self, tmp_path, script: str) -> dict:
         fake = tmp_path / "databricks"
         fake.write_text(f"#!/bin/sh\n{script}\n")
@@ -1593,6 +1693,69 @@ class TestGetDatabricksToken:
         monkeypatch.setattr("os.environ", env)
         token = get_databricks_token(WS)
         assert token == "good-token"
+
+    def test_explicit_opt_in_allows_ci_bearer(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_BEARER", "ci-token")
+        monkeypatch.setattr(db_mod, "run", lambda *args, **kwargs: pytest.fail("CLI called"))
+
+        assert get_databricks_token(WS, allow_env_bearer=True) == "ci-token"
+
+    def test_ucode_installed_profile_pat_is_allowed_without_global_opt_in(self, monkeypatch):
+        original_bearer = os.environ.pop("DATABRICKS_BEARER", None)
+        original_scope = db_mod._SCOPED_BEARER
+        try:
+            assert ensure_pat_bearer("pat-profile", "profile-pat", workspace=WS) is True
+            monkeypatch.setattr(db_mod, "run", lambda *args, **kwargs: pytest.fail("CLI called"))
+
+            assert get_databricks_token(WS, profile="pat-profile") == "profile-pat"
+        finally:
+            db_mod._SCOPED_BEARER = original_scope
+            if original_bearer is None:
+                os.environ.pop("DATABRICKS_BEARER", None)
+            else:
+                os.environ["DATABRICKS_BEARER"] = original_bearer
+
+    def test_ucode_installed_pat_is_rejected_for_another_workspace(self, tmp_path, monkeypatch):
+        original_bearer = os.environ.pop("DATABRICKS_BEARER", None)
+        original_scope = db_mod._SCOPED_BEARER
+        try:
+            assert ensure_pat_bearer("pat-profile", "profile-pat", workspace=WS) is True
+            env = self._fake_databricks(
+                tmp_path,
+                'echo \'{"access_token": "workspace-b-token", "token_type": "Bearer"}\'',
+            )
+            monkeypatch.setattr("os.environ", env)
+
+            token = get_databricks_token(
+                "https://workspace-b.example",
+                profile="pat-profile",
+            )
+
+            assert token == "workspace-b-token"
+        finally:
+            db_mod._SCOPED_BEARER = original_scope
+            if original_bearer is None:
+                os.environ.pop("DATABRICKS_BEARER", None)
+            else:
+                os.environ["DATABRICKS_BEARER"] = original_bearer
+
+    def test_default_preserves_legacy_ci_bearer(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_BEARER", "ci-token")
+        monkeypatch.setattr(db_mod, "run", lambda *args, **kwargs: pytest.fail("CLI called"))
+
+        assert get_databricks_token(WS, profile="workspace-profile") == "ci-token"
+
+    def test_explicit_scope_ignores_ambient_bearer(self, tmp_path, monkeypatch):
+        env = self._fake_databricks(
+            tmp_path,
+            'echo \'{"access_token": "workspace-token", "token_type": "Bearer"}\'',
+        )
+        env["DATABRICKS_BEARER"] = "other-workspace-token"
+        monkeypatch.setattr("os.environ", env)
+
+        token = get_databricks_token(WS, profile="workspace-profile", allow_env_bearer=False)
+
+        assert token == "workspace-token"
 
     def test_strips_ambient_profile_when_profile_not_provided(self, tmp_path, monkeypatch):
         profile_log = tmp_path / "profile"
@@ -1623,6 +1786,49 @@ class TestGetDatabricksToken:
 
         assert db_mod.has_valid_databricks_auth(WS)
         assert profile_log.read_text() == ""
+
+    def test_has_valid_auth_ignores_unscoped_ambient_bearer(self, tmp_path, monkeypatch):
+        called = tmp_path / "called"
+        env = self._fake_databricks(
+            tmp_path,
+            f"touch {called}\n"
+            'echo \'{"access_token": "workspace-token", "token_type": "Bearer"}\'',
+        )
+        env["DATABRICKS_BEARER"] = "other-workspace-token"
+        monkeypatch.setattr("os.environ", env)
+
+        assert db_mod.has_valid_databricks_auth(
+            WS,
+            profile="workspace-profile",
+            allow_env_bearer=False,
+        )
+        assert called.exists()
+
+    def test_ensure_auth_forwards_fail_closed_ambient_bearer_policy(self, monkeypatch):
+        policies: list[bool] = []
+        logins: list[tuple[str, str | None]] = []
+        monkeypatch.setenv("DATABRICKS_BEARER", "sentinel-unscoped-bearer")
+        monkeypatch.setattr(
+            db_mod,
+            "has_valid_databricks_auth",
+            lambda _workspace, _profile=None, *, allow_env_bearer=True: (
+                policies.append(allow_env_bearer) or False
+            ),
+        )
+        monkeypatch.setattr(
+            db_mod,
+            "run_databricks_login",
+            lambda workspace, profile: logins.append((workspace, profile)),
+        )
+
+        db_mod.ensure_databricks_auth(
+            WS,
+            "explicit-profile",
+            allow_env_bearer=False,
+        )
+
+        assert policies == [False]
+        assert logins == [(WS, "explicit-profile")]
 
     def test_reauths_and_retries_when_token_empty(self, tmp_path, monkeypatch):
         call_count = tmp_path / "calls"
@@ -2765,6 +2971,7 @@ class TestClassifyModelFamily:
             ("databricks-claude-haiku-4-5", "haiku"),
             ("system.ai.claude-fable-5", "fable"),
             ("system.ai.gpt-5-3-codex", "codex"),
+            ("system.ai.gpt-oss-120b", "oss"),
             ("system.ai.gemini-3-flash", "gemini"),
             ("system.ai.kimi-k2-7-code", "oss"),
             ("system.ai.glm-4-6", "oss"),

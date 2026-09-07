@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 import tomlkit
 import tomlkit.exceptions
@@ -18,6 +18,7 @@ class ToolSpec(TypedDict):
     display: str
     config_path: Path
     backup_path: Path
+    install_method: NotRequired[Literal["npm", "external"]]
 
 
 APP_DIR = Path.home() / ".ucode"

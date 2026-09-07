@@ -40,7 +40,7 @@ from ucode.ui import (
     spinner,
 )
 
-from . import claude, codex, copilot, gemini, opencode, pi
+from . import claude, codex, copilot, gemini, hermes, opencode, pi
 from .args import explicit_model_arg_value as explicit_model_arg_value
 
 _MODULES = {
@@ -50,6 +50,7 @@ _MODULES = {
     "opencode": opencode,
     "copilot": copilot,
     "pi": pi,
+    "hermes": hermes,
 }
 
 TOOL_SPECS: dict[str, ToolSpec] = {name: module.SPEC for name, module in _MODULES.items()}
@@ -68,6 +69,7 @@ TOOL_ALIASES = {
     "opencode": "opencode",
     "copilot": "copilot",
     "pi": "pi",
+    "hermes": "hermes",
 }
 
 DEFAULT_TOOL = "codex"
@@ -100,7 +102,8 @@ def normalize_tool(tool: str) -> str:
     normalized = TOOL_ALIASES.get(tool.strip().lower())
     if not normalized:
         raise RuntimeError(
-            f"Unsupported tool '{tool}'. Use one of: codex, claude, gemini, opencode, copilot, pi."
+            f"Unsupported tool '{tool}'. Use one of: "
+            "codex, claude, gemini, opencode, copilot, pi, hermes."
         )
     return normalized
 
@@ -184,6 +187,18 @@ def install_tool_binary(
     binary = spec["binary"]
     package = spec["package"]
 
+    if spec.get("install_method") == "external":
+        if shutil.which(binary):
+            return True
+        message = (
+            f"{spec['display']} is not installed (`{binary}` was not found on PATH). "
+            "Install Hermes using its official installer, then retry."
+        )
+        if strict:
+            raise RuntimeError(message)
+        print_warning(message)
+        return False
+
     if shutil.which(binary):
         # A too-new build is a correctness blocker (the tool runs but misbehaves
         # against the gateway), so check it on every launch — not just when
@@ -236,6 +251,11 @@ def ensure_tool_binary_available(tool: str) -> None:
     binary = spec["binary"]
     if shutil.which(binary):
         return
+    if spec.get("install_method") == "external":
+        raise RuntimeError(
+            f"{spec['display']} is not installed (`{binary}` was not found on PATH). "
+            "Install Hermes using its official installer, then retry."
+        )
     raise RuntimeError(
         f"{spec['display']} is not installed (`{binary}` was not found on PATH). "
         f"Install it with `npm install -g {spec['package']}` or run "
@@ -432,13 +452,16 @@ def configure_tool(
         # Every tool in this branch needs a model — including gemini under a provider,
         # which still pins the service's target model in the URL.
         if not model:
-            raise RuntimeError(f"A {tool} model must be selected before configuration.")
+            display = TOOL_SPECS[tool]["display"]
+            raise RuntimeError(f"A {display} model must be selected before configuration.")
         if tool == "gemini":
             result = gemini.write_tool_config(state, model, provider=provider)
         elif tool == "copilot":
             result = copilot.write_tool_config(state, model)
         elif tool == "pi":
             result = pi.write_tool_config(state, model)
+        elif tool == "hermes":
+            result = hermes.write_tool_config(state, model)
         else:
             result = opencode.write_tool_config(state, model)
     # gemini/opencode/copilot/pi return (state, token); codex/claude return state
@@ -459,6 +482,11 @@ def check_gateway_endpoint(state: dict, tool: str) -> bool:
         return bool(state.get("opencode_models"))
     if tool == "codex":
         return bool(state.get("codex_models"))
+    if tool == "hermes":
+        return any(
+            bool(state.get(key))
+            for key in ("codex_models", "claude_models", "gemini_models", "oss_models")
+        )
     if tool == "gemini":
         return bool(state.get("gemini_models"))
     if tool == "copilot":
@@ -479,6 +507,7 @@ _TOOL_DISCOVERY_SOURCES: dict[str, tuple[str, ...]] = {
     "gemini": ("gemini",),
     "copilot": ("claude", "codex"),
     "pi": ("claude", "codex", "gemini"),
+    "hermes": ("codex", "claude", "gemini", "oss"),
 }
 
 

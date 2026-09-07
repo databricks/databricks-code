@@ -129,6 +129,39 @@ def _debug(label: str, detail: str) -> None:
 
 
 _SECRET_KEY_PATTERN = re.compile(r"(token|secret|password|bearer|api_key|apikey)", re.IGNORECASE)
+_SCOPED_BEARER: tuple[str, str | None, str] | None = None
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"\b([a-z0-9_]*(?:token|secret|password|bearer|api_key|apikey)[a-z0-9_]*\s*[:=]\s*)"
+    r"([^\s,;]+)",
+    re.IGNORECASE,
+)
+_TOKEN_VALUE_PATTERN = re.compile(
+    r"\bdapi[a-z0-9_-]{8,}\b|\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}\b",
+    re.IGNORECASE,
+)
+_BEARER_HEADER_PATTERN = re.compile(
+    r"(\bauthorization\s*:\s*bearer\s+)(\S+)",
+    re.IGNORECASE,
+)
+_ACCESS_TOKEN_PROSE_PATTERN = re.compile(
+    r"(\baccess[\s_-]+token\s+(?:is|=|:)\s*)(\S+)",
+    re.IGNORECASE,
+)
+
+
+def _scrub_subprocess_output(text: str) -> str:
+    """Redact structured and common plain-text credential forms from debug output."""
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    try:
+        structured = json.loads(stripped)
+    except json.JSONDecodeError:
+        scrubbed = _BEARER_HEADER_PATTERN.sub(r"\1<redacted>", stripped)
+        scrubbed = _ACCESS_TOKEN_PROSE_PATTERN.sub(r"\1<redacted>", scrubbed)
+        scrubbed = _SECRET_ASSIGNMENT_PATTERN.sub(r"\1<redacted>", scrubbed)
+        return _TOKEN_VALUE_PATTERN.sub("<redacted>", scrubbed)
+    return json.dumps(_scrub_json(structured))
 
 
 def _format_subprocess_result(
@@ -137,11 +170,11 @@ def _format_subprocess_result(
     """Format a CompletedProcess for the debug log without leaking tokens.
 
     On success, stdout is suppressed (it often contains the access token).
-    On failure, stdout/stderr are included truncated."""
-    stderr = (result.stderr or "").strip()[:500]
+    On failure, scrubbed stdout/stderr are included truncated."""
+    stderr = _scrub_subprocess_output(result.stderr or "")[:500]
     if result.returncode == 0:
         return f"rc=0 stderr={stderr!r}"
-    stdout = (result.stdout or "").strip()[:500]
+    stdout = _scrub_subprocess_output(result.stdout or "")[:500]
     return f"rc={result.returncode} stdout={stdout!r} stderr={stderr!r}"
 
 
@@ -207,7 +240,7 @@ def _log_auth_diagnostics() -> None:
         _debug(
             "databricks auth profiles",
             f"rc={profiles_result.returncode} "
-            f"stderr={(profiles_result.stderr or '').strip()[:300]!r}",
+            f"stderr={_scrub_subprocess_output(profiles_result.stderr or '')[:300]!r}",
         )
         if profiles_result.returncode == 0 and profiles_result.stdout:
             try:
@@ -897,11 +930,33 @@ def _profile_args(profile: str | None) -> list[str]:
     return ["--profile", profile] if profile else []
 
 
-def has_valid_databricks_auth(workspace: str, profile: str | None = None) -> bool:
-    # Honor the CI short-circuit (see ``get_databricks_token``): if a
-    # pre-fetched bearer is available, treat auth as valid and skip the
-    # `databricks auth token` shell-out (which only knows user-OAuth).
-    if os.environ.get("DATABRICKS_BEARER", "").strip():
+def _bearer_is_allowed(
+    workspace: str,
+    profile: str | None,
+    bearer: str,
+    *,
+    allow_env_bearer: bool = False,
+) -> bool:
+    if not bearer:
+        return False
+    if _SCOPED_BEARER is not None:
+        return _SCOPED_BEARER == (workspace.rstrip("/"), profile, bearer)
+    return allow_env_bearer
+
+
+def has_valid_databricks_auth(
+    workspace: str,
+    profile: str | None = None,
+    *,
+    allow_env_bearer: bool = True,
+) -> bool:
+    bearer = os.environ.get("DATABRICKS_BEARER", "").strip()
+    if _bearer_is_allowed(
+        workspace,
+        profile,
+        bearer,
+        allow_env_bearer=allow_env_bearer,
+    ):
         return True
     _log_auth_diagnostics()
     # Mirror run_databricks_login: when ~/.databrickscfg has multiple
@@ -1048,24 +1103,42 @@ def resolve_pat_token(profile: str | None) -> str | None:
     return None
 
 
-def ensure_pat_bearer(profile: str | None, pat: str | None = None) -> bool:
+def _install_scoped_bearer(
+    workspace: str | None,
+    profile: str | None,
+    token: str,
+) -> None:
+    """Install a PAT and bind its process-local use to the resolved profile."""
+    global _SCOPED_BEARER
+    os.environ["DATABRICKS_BEARER"] = token
+    _SCOPED_BEARER = (workspace.rstrip("/"), profile, token) if workspace else None
+
+
+def ensure_pat_bearer(
+    profile: str | None,
+    pat: str | None = None,
+    *,
+    workspace: str | None = None,
+) -> bool:
     """Ensure ``DATABRICKS_BEARER`` holds a usable token for a ``--use-pat`` profile.
 
-    If a non-empty bearer is already in the environment it wins (the CI escape
-    hatch). Otherwise the profile's static PAT is exported — callers that have
-    already resolved it (e.g. ``configure_shared_state``) pass it via ``pat`` to
-    skip a redundant ``~/.databrickscfg`` read; everyone else lets this resolve
-    it. An exported-but-*empty* ``DATABRICKS_BEARER`` is treated as absent —
+    A PAT supplied explicitly by a scoped caller wins and replaces ambient state.
+    Otherwise a non-empty bearer already in the environment is retained as the
+    legacy CI escape hatch; if absent, this resolves the profile's static PAT.
+    An exported-but-*empty* ``DATABRICKS_BEARER`` is treated as absent —
     matching ``get_databricks_token``'s own ``.strip()`` check — so a stray
     ``export DATABRICKS_BEARER=`` does not shadow the PAT and silently force the
     OAuth path (which fails for PAT-only profiles).
 
     Returns ``True`` iff a usable bearer is now present in the environment."""
+    if pat:
+        _install_scoped_bearer(workspace, profile, pat)
+        return True
     if os.environ.get("DATABRICKS_BEARER", "").strip():
         return True
-    pat = pat or resolve_pat_token(profile)
+    pat = resolve_pat_token(profile)
     if pat:
-        os.environ["DATABRICKS_BEARER"] = pat
+        _install_scoped_bearer(workspace, profile, pat)
         return True
     return False
 
@@ -1074,13 +1147,22 @@ def apply_pat_environment(state: dict) -> None:
     """Export the configured profile's PAT as ``DATABRICKS_BEARER`` when the
     workspace was configured with ``--use-pat``.
 
-    Every token fetch in this process (and in launched agent subprocesses,
-    which inherit the environment) then takes the existing static-bearer
-    short-circuit instead of the OAuth-only `databricks auth token` path.
-    A non-empty bearer already present in the environment is left untouched."""
+    The configured profile identity outranks ambient state: its PAT replaces a
+    pre-existing bearer, and a missing/stale PAT clears that bearer so callers
+    fail closed instead of borrowing credentials from another workspace."""
+    global _SCOPED_BEARER
     if not state.get("use_pat"):
+        if _SCOPED_BEARER is not None and os.environ.get("DATABRICKS_BEARER") == _SCOPED_BEARER[2]:
+            os.environ.pop("DATABRICKS_BEARER", None)
+        _SCOPED_BEARER = None
         return
-    ensure_pat_bearer(state.get("profile"))
+    profile = state.get("profile")
+    pat = resolve_pat_token(profile)
+    if pat:
+        ensure_pat_bearer(profile, pat, workspace=state.get("workspace"))
+    else:
+        os.environ.pop("DATABRICKS_BEARER", None)
+        _SCOPED_BEARER = None
 
 
 def run_databricks_login(workspace: str, profile: str | None = None) -> None:
@@ -1111,7 +1193,11 @@ def run_databricks_login(workspace: str, profile: str | None = None) -> None:
 
 
 def ensure_databricks_auth(
-    workspace: str, profile: str | None = None, *, quiet: bool = False
+    workspace: str,
+    profile: str | None = None,
+    *,
+    quiet: bool = False,
+    allow_env_bearer: bool = True,
 ) -> None:
     """Check auth and login only if needed (used by launch path).
 
@@ -1120,7 +1206,11 @@ def ensure_databricks_auth(
     login that actually runs is never silent.
     """
     with spinner("Checking Databricks auth..."):
-        auth_is_valid = has_valid_databricks_auth(workspace, profile)
+        auth_is_valid = has_valid_databricks_auth(
+            workspace,
+            profile,
+            allow_env_bearer=allow_env_bearer,
+        )
     if auth_is_valid:
         if not quiet:
             print_success(f"Databricks auth already available for {workspace}")
@@ -1133,15 +1223,18 @@ def get_databricks_token(
     profile: str | None = None,
     *,
     force_refresh: bool = False,
+    allow_env_bearer: bool = True,
 ) -> str:
-    # ``DATABRICKS_BEARER`` is the CI escape hatch: when set, skip the
-    # `databricks auth token` subprocess entirely and return the pre-fetched
-    # bearer directly. Used by the e2e job, where the protected runner has
-    # no `databricks auth login` cache and `databricks auth token` only knows
-    # how to read user-OAuth caches (not M2M client_credentials). Mirrors the
-    # same short-circuit baked into ``build_auth_shell_command``.
+    # ``DATABRICKS_BEARER`` is accepted only when the caller explicitly permits
+    # the CI/M2M escape hatch, or when ucode installed this exact token for this
+    # exact PAT profile. Arbitrary ambient state cannot override identity.
     bearer = os.environ.get("DATABRICKS_BEARER", "").strip()
-    if bearer:
+    if _bearer_is_allowed(
+        workspace,
+        profile,
+        bearer,
+        allow_env_bearer=allow_env_bearer,
+    ):
         _debug("get_databricks_token", "using DATABRICKS_BEARER env var")
         return bearer
 
@@ -1500,7 +1593,7 @@ _MODEL_SERVICE_PARENT_SCHEMA = "schemas/system.ai"
 
 # Supported OSS chat families, matched by name substring. Add an entry to
 # support a new family.
-_OSS_MODEL_FAMILIES = ("kimi-", "glm-", "deepseek-")
+_OSS_MODEL_FAMILIES = ("gpt-oss-", "kimi-", "glm-", "deepseek-")
 
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
@@ -1520,12 +1613,12 @@ def classify_model_family(model_id: str) -> str | None:
     for family in ANTHROPIC_FAMILIES:
         if f"claude-{family}-" in model_id:
             return family
+    if any(oss in model_id for oss in _OSS_MODEL_FAMILIES):
+        return "oss"
     if "gpt-" in model_id:
         return "codex"
     if "gemini-" in model_id:
         return "gemini"
-    if any(oss in model_id for oss in _OSS_MODEL_FAMILIES):
-        return "oss"
     return None
 
 
@@ -1833,7 +1926,10 @@ def discover_model_services(
     # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
     _prefer_opus_4_8(claude_models, ids)
 
-    codex_models = sorted([m for m in ids if "gpt-" in m], key=model_version_sort_key)
+    codex_models = sorted(
+        [m for m in ids if "gpt-" in m and not any(family in m for family in _OSS_MODEL_FAMILIES)],
+        key=model_version_sort_key,
+    )
     gemini_models = sorted([m for m in ids if "gemini-" in m], key=model_version_sort_key)
 
     oss_models = [m for m in ids if any(family in m for family in _OSS_MODEL_FAMILIES)]

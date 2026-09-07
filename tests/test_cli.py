@@ -18,6 +18,7 @@ import pytest
 from typer.testing import CliRunner
 
 import ucode.databricks as db_mod
+from ucode.agents import hermes as hermes_agent
 from ucode.cli import app
 from ucode.databricks import GatewayProbe
 
@@ -114,6 +115,7 @@ class TestHelp:
         flat = re.sub(r"[│╭╮╯╰─\s]+", " ", output)
         assert "--agents" in output
         assert "comma-separated list of agents" in flat
+        assert "copilot, pi, hermes" in flat
         assert "--workspaces" in output
 
 
@@ -321,6 +323,466 @@ class TestUpgrade:
             from ucode.cli import _installed_cli_distribution
 
             assert _installed_cli_distribution() == "ucode"
+
+
+class TestConfigureHermes:
+    def test_receipt_file_keeps_interactive_output_visible(self, tmp_path):
+        receipt_path = tmp_path / "hermes-receipt.json"
+        result_payload = {
+            "status": "configured",
+            "agent": "hermes",
+            "hermes_home": str(tmp_path.resolve()),
+            "provider_ids": ["ucode-databricks-codex"],
+            "default_provider": "ucode-databricks-codex",
+            "default_model": "system.ai.gpt-5",
+            "mcp_servers_configured": [],
+            "warnings": [],
+        }
+
+        state = {
+            "workspace": "https://example.databricks.com",
+            "profile": "interactive",
+            "codex_models": ["system.ai.gpt-5"],
+        }
+
+        def configure(*_args, **_kwargs):
+            print("visible interactive setup")
+            return state
+
+        with (
+            patch(
+                "ucode.cli._prompt_for_configuration",
+                return_value=(state["workspace"], state["profile"]),
+            ),
+            patch("ucode.cli.configure_shared_state", side_effect=configure),
+            patch("ucode.cli.hermes_agent.apply_config_patch", return_value={"status": "applied"}),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--hermes-home",
+                    str(tmp_path),
+                    "--receipt-file",
+                    str(receipt_path),
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert "visible interactive setup" in result.output
+        assert "Hermes configured" in result.output
+        assert json.loads(receipt_path.read_text(encoding="utf-8")) == result_payload
+
+    def test_receipt_is_published_only_after_state_and_config_succeed(self, tmp_path):
+        receipt_path = tmp_path / "hermes-receipt.json"
+        state = {
+            "workspace": "https://example.databricks.com",
+            "profile": "team-prod",
+            "codex_models": ["system.ai.gpt-5"],
+        }
+        events = []
+
+        def save(value):
+            events.append(("save", value))
+
+        def apply(_patch, *, hermes_home):
+            assert events and events[0][0] == "save"
+            assert events[0][1]["managed_configs"]["hermes"]["hermes_home"] == str(
+                Path(hermes_home).resolve()
+            )
+            assert not receipt_path.exists()
+            events.append(("apply", hermes_home))
+
+        with (
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.save_state", side_effect=save),
+            patch("ucode.cli.hermes_agent.apply_config_patch", side_effect=apply),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--workspace",
+                    state["workspace"],
+                    "--profile",
+                    state["profile"],
+                    "--receipt-file",
+                    str(receipt_path),
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert [event[0] for event in events] == ["save", "apply"]
+        assert json.loads(receipt_path.read_text())["status"] == "configured"
+
+    def test_partial_hermes_apply_keeps_staged_ownership_without_receipt(self, tmp_path):
+        receipt_path = tmp_path / "hermes-receipt.json"
+        state = {
+            "workspace": "https://example.databricks.com",
+            "profile": "team-prod",
+            "codex_models": ["system.ai.gpt-5"],
+        }
+        saved = []
+
+        with (
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch("ucode.cli.save_state", side_effect=lambda value: saved.append(value)),
+            patch(
+                "ucode.cli.hermes_agent.apply_config_patch",
+                side_effect=hermes_agent.HermesConfigApplyError("apply may be partial"),
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--workspace",
+                    state["workspace"],
+                    "--profile",
+                    state["profile"],
+                    "--receipt-file",
+                    str(receipt_path),
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert len(saved) == 1
+        assert saved[0]["managed_configs"]["hermes"]["provider_fingerprints"]
+        assert not receipt_path.exists()
+
+    def test_failed_setup_removes_stale_receipt(self, tmp_path):
+        receipt_path = tmp_path / "hermes-receipt.json"
+        receipt_path.write_text('{"status":"configured"}', encoding="utf-8")
+        with patch(
+            "ucode.cli.configure_hermes_command",
+            side_effect=RuntimeError("setup failed"),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--receipt-file",
+                    str(receipt_path),
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert not receipt_path.exists()
+
+    def test_stale_receipt_removal_failure_is_controlled(self, tmp_path, monkeypatch):
+        receipt_path = tmp_path / "hermes-receipt.json"
+        receipt_path.write_text('{"status":"configured"}', encoding="utf-8")
+        original_unlink = Path.unlink
+
+        def fail_target(path, *args, **kwargs):
+            if path == receipt_path:
+                raise OSError("permission denied")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_target)
+        with patch("ucode.cli.configure_hermes_command") as configure:
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--receipt-file",
+                    str(receipt_path),
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert "Unable to prepare completion receipt" in result.output
+        assert "Traceback" not in result.output
+        configure.assert_not_called()
+
+    def test_unwritable_receipt_never_starts_hermes_transaction(self, tmp_path, monkeypatch):
+        receipt_path = tmp_path / "hermes-receipt.json"
+        state = {
+            "workspace": "https://example.databricks.com",
+            "profile": "team-prod",
+            "codex_models": ["system.ai.gpt-5"],
+        }
+        with (
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.tempfile.NamedTemporaryFile",
+                side_effect=OSError("disk full"),
+            ),
+            patch("ucode.cli.hermes_agent.apply_config_patch") as apply,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--workspace",
+                    state["workspace"],
+                    "--profile",
+                    state["profile"],
+                    "--receipt-file",
+                    str(receipt_path),
+                ],
+            )
+
+        assert result.exit_code != 0
+        apply.assert_not_called()
+
+    def test_fully_specified_configuration_is_noninteractive_and_json_only(self, tmp_path):
+        state = {
+            "workspace": "https://example.databricks.com",
+            "profile": "team-prod",
+            "codex_models": ["system.ai.gpt-5"],
+            "claude_models": {"opus": "system.ai.claude-opus-4-8"},
+            "oss_models": ["system.ai.gpt-oss-120b"],
+            "gemini_models": ["system.ai.gemini-2-5-pro"],
+        }
+        receipt = {"status": "applied", "set_count": 3, "unset_count": 0}
+        with (
+            patch("ucode.cli.configure_shared_state", return_value=state) as shared,
+            patch("ucode.cli.hermes_agent.apply_config_patch", return_value=receipt) as apply,
+            patch("ucode.cli._prompt_for_configuration") as prompt,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--workspace",
+                    state["workspace"],
+                    "--profile",
+                    state["profile"],
+                    "--model",
+                    "system.ai.gpt-5",
+                    "--hermes-home",
+                    str(tmp_path),
+                    "--output",
+                    "json",
+                ],
+            )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload == {
+            "status": "configured",
+            "agent": "hermes",
+            "hermes_home": str(tmp_path.resolve()),
+            "provider_ids": [
+                "ucode-databricks-codex",
+                "ucode-databricks-anthropic",
+                "ucode-databricks-gemini",
+            ],
+            "default_provider": "ucode-databricks-codex",
+            "default_model": "system.ai.gpt-5",
+            "mcp_servers_configured": [],
+            "warnings": [],
+        }
+        prompt.assert_not_called()
+        shared.assert_called_once_with(
+            state["workspace"],
+            profile="team-prod",
+            tools=["hermes"],
+            force_login=False,
+            allow_env_bearer=False,
+        )
+        assert apply.call_args.kwargs["hermes_home"] == tmp_path.resolve()
+
+    def test_receipt_reports_actual_non_codex_default_provider(self, tmp_path):
+        model = "system.ai.deepseek-v3-2"
+        state = {
+            "workspace": "https://example.databricks.com",
+            "profile": "team-prod",
+            "codex_models": ["system.ai.gpt-5"],
+            "oss_models": [model],
+        }
+        with (
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.hermes_agent.apply_config_patch",
+                return_value={"status": "applied"},
+            ) as apply,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--workspace",
+                    state["workspace"],
+                    "--profile",
+                    state["profile"],
+                    "--model",
+                    model,
+                    "--hermes-home",
+                    str(tmp_path),
+                    "--output",
+                    "json",
+                ],
+            )
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["default_provider"] == "ucode-databricks-oss"
+        assert payload["default_model"] == model
+        rendered_patch = apply.call_args.args[0]
+        assert payload["provider_ids"] == [
+            path.removeprefix("providers.")
+            for path in rendered_patch["set"]
+            if path.startswith("providers.")
+        ]
+
+    def test_rejects_unsupported_hermes_default_model(self, tmp_path):
+        model = "system.ai.gpt-oss-120b"
+        state = {
+            "workspace": "https://example.databricks.com",
+            "profile": "team-prod",
+            "codex_models": ["system.ai.gpt-5"],
+            "oss_models": [model],
+        }
+        with (
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.hermes_agent.apply_config_patch",
+                return_value={"status": "applied"},
+            ) as apply,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--workspace",
+                    state["workspace"],
+                    "--profile",
+                    state["profile"],
+                    "--model",
+                    model,
+                    "--hermes-home",
+                    str(tmp_path),
+                    "--output",
+                    "json",
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert "not supported by Hermes" in result.output
+        apply.assert_not_called()
+
+    def test_interactive_mode_reuses_workspace_prompt_and_never_launches(self, tmp_path):
+        state = {
+            "workspace": "https://example.databricks.com",
+            "profile": "interactive",
+            "codex_models": ["system.ai.gpt-5"],
+        }
+        with (
+            patch(
+                "ucode.cli._prompt_for_configuration",
+                return_value=(state["workspace"], state["profile"]),
+            ) as prompt,
+            patch("ucode.cli.configure_shared_state", return_value=state) as shared,
+            patch(
+                "ucode.cli.hermes_agent.apply_config_patch",
+                return_value={"status": "applied"},
+            ),
+            patch("ucode.cli.launch_agent") as launch,
+        ):
+            result = runner.invoke(app, ["configure", "hermes", "--hermes-home", str(tmp_path)])
+
+        assert result.exit_code == 0
+        prompt.assert_called_once_with("hermes")
+        shared.assert_called_once_with(
+            state["workspace"],
+            profile=state["profile"],
+            tools=["hermes"],
+            force_login=True,
+            allow_env_bearer=False,
+        )
+        launch.assert_not_called()
+
+    def test_explicit_setup_disables_ambient_bearer(self, tmp_path):
+        state = {
+            "workspace": "https://example.databricks.com",
+            "profile": "explicit-profile",
+            "codex_models": ["system.ai.gpt-5"],
+        }
+        with (
+            patch("ucode.cli.configure_shared_state", return_value=state) as shared,
+            patch(
+                "ucode.cli.hermes_agent.apply_config_patch",
+                return_value={"status": "applied"},
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--workspace",
+                    state["workspace"],
+                    "--profile",
+                    state["profile"],
+                    "--hermes-home",
+                    str(tmp_path),
+                ],
+                env={"DATABRICKS_BEARER": "sentinel-unscoped-bearer"},
+            )
+
+        assert result.exit_code == 0, result.output
+        shared.assert_called_once_with(
+            state["workspace"],
+            profile=state["profile"],
+            tools=["hermes"],
+            force_login=False,
+            allow_env_bearer=False,
+        )
+
+    def test_failed_transaction_has_no_success_receipt_or_secret_leak(self, tmp_path):
+        state = {
+            "workspace": "https://example.databricks.com",
+            "profile": "team-prod",
+            "codex_models": ["system.ai.gpt-5"],
+            "access_token": "sentinel-access-token",
+        }
+        with (
+            patch("ucode.cli.configure_shared_state", return_value=state),
+            patch(
+                "ucode.cli.hermes_agent.apply_config_patch",
+                side_effect=RuntimeError("Hermes configuration failed with exit code 2."),
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "hermes",
+                    "--workspace",
+                    state["workspace"],
+                    "--profile",
+                    state["profile"],
+                    "--hermes-home",
+                    str(tmp_path),
+                    "--output",
+                    "json",
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert "sentinel-access-token" not in result.output
+        assert '"status": "configured"' not in result.output
+
+    def test_cancellation_never_starts_a_hermes_transaction(self, tmp_path):
+        with (
+            patch("ucode.cli._prompt_for_configuration", side_effect=KeyboardInterrupt),
+            patch("ucode.cli.hermes_agent.apply_config_patch") as apply,
+        ):
+            result = runner.invoke(app, ["configure", "hermes", "--hermes-home", str(tmp_path)])
+
+        assert result.exit_code == 130
+        apply.assert_not_called()
 
 
 class TestVersion:
@@ -953,8 +1415,8 @@ class TestAuthTokenCommand:
 
     @pytest.fixture(autouse=True)
     def _isolated_bearer(self):
-        # The --use-pat path writes DATABRICKS_BEARER directly; restore it so
-        # writes by code under test don't leak into other tests.
+        # Keep ambient bearer scenarios isolated even though explicit PAT
+        # resolution no longer mutates DATABRICKS_BEARER.
         original = os.environ.pop("DATABRICKS_BEARER", None)
         yield
         if original is None:
@@ -972,7 +1434,9 @@ class TestAuthTokenCommand:
         # Nothing but the bare token (plus trailing newline) may reach stdout,
         # or the consuming agent will treat the noise as part of the token.
         assert result.stdout == "tok-123\n"
-        fetch.assert_called_once_with("https://ws", None, force_refresh=False)
+        fetch.assert_called_once_with(
+            "https://ws", None, force_refresh=False, allow_env_bearer=False
+        )
 
     def test_host_and_profile_override_state(self):
         with (
@@ -983,7 +1447,9 @@ class TestAuthTokenCommand:
                 app, ["auth-token", "--host", "https://override", "--profile", "prod"]
             )
         assert result.exit_code == 0
-        fetch.assert_called_once_with("https://override", "prod", force_refresh=False)
+        fetch.assert_called_once_with(
+            "https://override", "prod", force_refresh=False, allow_env_bearer=False
+        )
 
     def test_force_refresh_is_forwarded(self):
         with (
@@ -992,7 +1458,91 @@ class TestAuthTokenCommand:
         ):
             result = runner.invoke(app, ["auth-token", "--force-refresh"])
         assert result.exit_code == 0
-        fetch.assert_called_once_with("https://ws", None, force_refresh=True)
+        fetch.assert_called_once_with(
+            "https://ws", None, force_refresh=True, allow_env_bearer=False
+        )
+
+    def test_explicit_identity_does_not_inherit_saved_pat_mode(self):
+        with (
+            patch(
+                "ucode.cli.load_state",
+                return_value={
+                    "workspace": "https://saved",
+                    "profile": "saved-pat-profile",
+                    "use_pat": True,
+                },
+            ),
+            patch("ucode.cli.ensure_pat_bearer", return_value=True) as ensure_pat,
+            patch("ucode.cli.get_databricks_token", return_value="oauth-token") as fetch,
+        ):
+            result = runner.invoke(
+                app,
+                ["auth-token", "--host", "https://override", "--profile", "oauth-profile"],
+            )
+
+        assert result.exit_code == 0
+        assert result.stdout == "oauth-token\n"
+        ensure_pat.assert_not_called()
+        fetch.assert_called_once_with(
+            "https://override",
+            "oauth-profile",
+            force_refresh=False,
+            allow_env_bearer=False,
+        )
+
+    def test_explicit_host_does_not_inherit_saved_profile(self):
+        with (
+            patch(
+                "ucode.cli.load_state",
+                return_value={"workspace": "https://saved", "profile": "saved-profile"},
+            ),
+            patch("ucode.cli.get_databricks_token", return_value="token") as fetch,
+        ):
+            result = runner.invoke(app, ["auth-token", "--host", "https://override"])
+
+        assert result.exit_code == 0
+        fetch.assert_called_once_with(
+            "https://override", None, force_refresh=False, allow_env_bearer=False
+        )
+
+    def test_explicit_env_bearer_opt_in(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_BEARER", "ci-token")
+        with (
+            patch("ucode.cli.load_state", return_value={"workspace": "https://saved"}),
+            patch("ucode.cli.get_databricks_token", return_value="ci-token") as fetch,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "auth-token",
+                    "--host",
+                    "https://ci-workspace",
+                    "--allow-env-bearer",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert result.stdout == "ci-token\n"
+        fetch.assert_called_once_with(
+            "https://ci-workspace", None, force_refresh=False, allow_env_bearer=True
+        )
+
+    def test_saved_identity_env_bearer_opt_in(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_BEARER", "ci-token")
+        with (
+            patch(
+                "ucode.cli.load_state",
+                return_value={"workspace": "https://saved", "profile": "saved-profile"},
+            ),
+            patch("ucode.cli.get_databricks_token", return_value="ci-token") as fetch,
+        ):
+            result = runner.invoke(app, ["auth-token", "--allow-env-bearer"])
+
+        assert result.exit_code == 0
+        assert result.stdout == "ci-token\n"
+        fetch.assert_called_once_with(
+            "https://saved", "saved-profile", force_refresh=False, allow_env_bearer=True
+        )
 
     def test_errors_without_workspace(self):
         with patch("ucode.cli.load_state", return_value={}):
@@ -1006,42 +1556,40 @@ class TestAuthTokenCommand:
         assert "auth-token" not in _strip_ansi(result.output)
 
     def test_use_pat_emits_resolved_pat(self, monkeypatch):
-        # --use-pat reads the profile's static PAT, exports it as
-        # DATABRICKS_BEARER, and get_databricks_token returns it directly.
+        # An explicit PAT identity is resolved directly; it must not mutate the
+        # process-global bearer or fall through to OAuth token minting.
         monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
-        monkeypatch.setattr("ucode.databricks.resolve_pat_token", lambda p: "dapi-pat")
+        monkeypatch.setattr("ucode.cli.resolve_pat_token", lambda p: "dapi-pat")
         with (
             patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
-            patch(
-                "ucode.cli.get_databricks_token",
-                side_effect=lambda w, p, **_kwargs: os.environ.get("DATABRICKS_BEARER", ""),
-            ),
+            patch("ucode.cli.ensure_pat_bearer") as ensure_pat,
+            patch("ucode.cli.get_databricks_token") as fetch,
         ):
             result = runner.invoke(app, ["auth-token", "--use-pat", "--profile", "p"])
         assert result.exit_code == 0
         assert result.stdout == "dapi-pat\n"
+        assert "DATABRICKS_BEARER" not in os.environ
+        ensure_pat.assert_not_called()
+        fetch.assert_not_called()
 
     def test_use_pat_ignores_empty_bearer_env(self, monkeypatch):
-        # A stray empty DATABRICKS_BEARER must not shadow the PAT and force the
-        # OAuth path (the regression that motivated ensure_pat_bearer).
+        # Empty ambient state is irrelevant to an explicitly scoped PAT.
         monkeypatch.setenv("DATABRICKS_BEARER", "")
-        monkeypatch.setattr("ucode.databricks.resolve_pat_token", lambda p: "dapi-pat")
+        monkeypatch.setattr("ucode.cli.resolve_pat_token", lambda p: "dapi-pat")
         with (
             patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
-            patch(
-                "ucode.cli.get_databricks_token",
-                side_effect=lambda w, p, **_kwargs: os.environ.get("DATABRICKS_BEARER", ""),
-            ),
+            patch("ucode.cli.get_databricks_token") as fetch,
         ):
             result = runner.invoke(app, ["auth-token", "--use-pat", "--profile", "p"])
         assert result.exit_code == 0
         assert result.stdout == "dapi-pat\n"
+        fetch.assert_not_called()
 
     def test_use_pat_fails_closed_without_pat(self, monkeypatch):
         # --use-pat with no resolvable PAT must error, NOT fall through to OAuth
         # (which can't serve a PAT-only profile and yields a misleading message).
         monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
-        monkeypatch.setattr("ucode.databricks.resolve_pat_token", lambda p: None)
+        monkeypatch.setattr("ucode.cli.resolve_pat_token", lambda p: None)
         with (
             patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
             patch("ucode.cli.get_databricks_token", return_value="oauth-tok") as fetch,
@@ -1052,20 +1600,20 @@ class TestAuthTokenCommand:
         fetch.assert_not_called()
         assert result.stdout == ""
 
-    def test_use_pat_honors_non_empty_bearer_env(self, monkeypatch):
-        # A real pre-set bearer (CI escape hatch) wins over the profile PAT.
+    def test_explicit_pat_ignores_non_empty_bearer_env(self, monkeypatch):
+        # An ambient token for another workspace must not replace the PAT tied
+        # to the explicitly requested profile.
         monkeypatch.setenv("DATABRICKS_BEARER", "ci-bearer")
-        monkeypatch.setattr("ucode.databricks.resolve_pat_token", lambda p: "dapi-pat")
+        monkeypatch.setattr("ucode.cli.resolve_pat_token", lambda p: "dapi-pat")
         with (
             patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
-            patch(
-                "ucode.cli.get_databricks_token",
-                side_effect=lambda w, p, **_kwargs: os.environ.get("DATABRICKS_BEARER", ""),
-            ),
+            patch("ucode.cli.get_databricks_token") as fetch,
         ):
             result = runner.invoke(app, ["auth-token", "--use-pat", "--profile", "p"])
         assert result.exit_code == 0
-        assert result.stdout == "ci-bearer\n"
+        assert result.stdout == "dapi-pat\n"
+        assert os.environ["DATABRICKS_BEARER"] == "ci-bearer"
+        fetch.assert_not_called()
 
 
 class TestStatus:
@@ -1613,6 +2161,105 @@ class TestRevert:
         assert cleared == [True]
         assert "Claude Code MCP config: restored" in result.output
 
+    def test_hermes_cleanup_is_surgical_and_uses_recorded_home(self):
+        ownership = {
+            "keys": [],
+            "hermes_home": "/profiles/original",
+            "active_model": {
+                "provider": "ucode-databricks-codex",
+                "default": "system.ai.gpt-5",
+            },
+            "provider_fingerprints": {"ucode-databricks-codex": "a" * 64},
+        }
+        state = {
+            **MINIMAL_STATE,
+            "available_tools": ["hermes"],
+            "managed_configs": {"hermes": ownership},
+        }
+        with (
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.revert_mcp_configs", return_value={}),
+            patch("ucode.cli.restore_file", return_value=False) as restore,
+            patch("ucode.cli.hermes_agent.unconfigure", return_value={}) as unconfigure,
+            patch("ucode.cli.clear_state"),
+        ):
+            result = runner.invoke(app, ["revert"])
+
+        assert result.exit_code == 0, result.output
+        unconfigure.assert_called_once_with(
+            hermes_home="/profiles/original",
+            owned_model=ownership["active_model"],
+            owned_provider_fingerprints=ownership["provider_fingerprints"],
+        )
+        assert all(
+            call.args[0] != hermes_agent.SPEC["config_path"] for call in restore.call_args_list
+        )
+
+    def test_hermes_cleanup_failure_preserves_state_for_retry(self):
+        ownership = {
+            "keys": [],
+            "hermes_home": "/profiles/original",
+            "active_model": {
+                "provider": "ucode-databricks-codex",
+                "default": "system.ai.gpt-5",
+            },
+            "provider_fingerprints": {"ucode-databricks-codex": "a" * 64},
+        }
+        state = {
+            **MINIMAL_STATE,
+            "available_tools": ["hermes"],
+            "managed_configs": {"hermes": ownership},
+        }
+        with (
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.revert_mcp_configs", return_value={}),
+            patch("ucode.cli.restore_file", return_value=False),
+            patch("ucode.cli.hermes_agent.unconfigure", side_effect=RuntimeError("cleanup failed")),
+            patch("ucode.cli.clear_state") as clear,
+        ):
+            result = runner.invoke(app, ["revert"])
+
+        assert result.exit_code == 1
+        clear.assert_not_called()
+
+
+class TestRegisterManagedMcpServers:
+    def test_failed_last_server_removal_preserves_retry_state(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        previous = [{"name": "old", "clients": ["hermes"]}]
+        state = {
+            "workspace": "https://example.databricks.com",
+            "managed_mcp_servers": previous.copy(),
+        }
+        monkeypatch.setattr(
+            cli_mod,
+            "apply_managed_mcp_servers",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("remove failed")),
+        )
+        monkeypatch.setattr(cli_mod, "print_warning", lambda _message: None)
+
+        cli_mod._register_managed_mcp_servers({}, "hermes", state)
+
+        assert state["managed_mcp_servers"] == previous
+
+    def test_successful_last_server_removal_clears_owned_state(self, monkeypatch):
+        import ucode.cli as cli_mod
+
+        state = {
+            "workspace": "https://example.databricks.com",
+            "managed_mcp_servers": [{"name": "old", "clients": ["hermes"]}],
+        }
+        monkeypatch.setattr(
+            cli_mod,
+            "apply_managed_mcp_servers",
+            lambda *args, **kwargs: [],
+        )
+
+        cli_mod._register_managed_mcp_servers({}, "hermes", state)
+
+        assert state["managed_mcp_servers"] == []
+
 
 class TestDoctorCommand:
     def test_invokes_doctor(self):
@@ -1966,6 +2613,55 @@ class TestPassthroughArgs:
 
 
 class TestConfigureAgentFlag:
+    @pytest.mark.parametrize(
+        ("tools", "expected"),
+        [
+            (["hermes"], False),
+            (["hermes", "claude"], False),
+            (["claude"], True),
+            (None, True),
+        ],
+    )
+    def test_shared_workspace_auth_policy_fails_closed_for_explicit_hermes(self, tools, expected):
+        from ucode import cli as cli_mod
+
+        with patch("ucode.cli.configure_shared_state", return_value={}) as shared:
+            cli_mod._configure_shared_workspace_states(
+                [("https://sentinel.example", "sentinel-profile")],
+                tools,
+                force_login=False,
+            )
+
+        assert shared.call_args.kwargs["allow_env_bearer"] is expected
+
+    def test_agents_flag_routes_hermes_through_selected_tools(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.install_tool_binary"),
+            patch("ucode.cli.configure_workspace_command") as mock_cfg,
+        ):
+            result = runner.invoke(app, ["configure", "--agents", "hermes"])
+
+        assert result.exit_code == 0, result.output
+        mock_cfg.assert_called_once_with(
+            selected_tools=["hermes"],
+            prompt_optional_updates=True,
+        )
+
+    def test_hermes_does_not_offer_unvalidated_mps_picker(self):
+        from ucode import cli as cli_mod
+
+        state = {"workspace": "https://x.databricks.com"}
+        with (
+            patch("ucode.cli.get_databricks_token") as token,
+            patch("ucode.cli.prompt_for_selection") as prompt,
+        ):
+            result = cli_mod._maybe_select_provider_service("hermes", state)
+
+        assert result is state
+        token.assert_not_called()
+        prompt.assert_not_called()
+
     def test_no_flag_calls_configure_all(self):
         with (
             patch("ucode.cli.install_databricks_cli"),
@@ -2542,6 +3238,7 @@ class TestConfigureAgentsSelection:
             use_pat=False,
             fable_enabled=None,
             databricks_ai_tools_enabled=None,
+            allow_env_bearer=True,
         ):
             captured["workspace"] = workspace
             captured["profile"] = profile
@@ -2580,6 +3277,7 @@ class TestConfigureAgentsSelection:
             use_pat=False,
             fable_enabled=None,
             databricks_ai_tools_enabled=None,
+            allow_env_bearer=True,
         ):
             configured_shared.append(
                 (workspace, profile, tuple(tools) if tools is not None else None, force_login)
@@ -2844,11 +3542,13 @@ class TestConfigureSharedStateUsePat:
         monkeypatch.setattr(cli_mod, "save_state", lambda s: saved.append(dict(s)))
         monkeypatch.setattr(cli_mod, "run_databricks_login", lambda w, p: logins.append((w, p)))
         monkeypatch.setattr(
-            cli_mod, "ensure_databricks_auth", lambda w, p=None: ensures.append((w, p))
+            cli_mod,
+            "ensure_databricks_auth",
+            lambda w, p=None, **_kwargs: ensures.append((w, p)),
         )
         monkeypatch.setattr(cli_mod, "resolve_pat_token", lambda p: pat_token)
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
-        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
+        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p, **_kwargs: "token")
         monkeypatch.setattr(
             cli_mod, "probe_unity_gateway_capabilities", lambda w, t: MODEL_SERVICE_PROBE
         )
@@ -2882,6 +3582,57 @@ class TestConfigureSharedStateUsePat:
         output = _strip_ansi(capsys.readouterr().out)
         assert "Unity AI Gateway connected" in output
         assert "Model service:" not in output
+
+    @pytest.mark.parametrize("allow_env_bearer", [False, True])
+    def test_threads_ambient_bearer_policy_to_auth_and_discovery(
+        self, monkeypatch, allow_env_bearer
+    ):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="sentinel-pat")
+        auth_policies: list[bool] = []
+        token_policies: list[bool] = []
+        monkeypatch.setattr(
+            cli_mod,
+            "ensure_databricks_auth",
+            lambda _workspace, _profile=None, *, allow_env_bearer=True: auth_policies.append(
+                allow_env_bearer
+            ),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "get_databricks_token",
+            lambda _workspace, _profile=None, *, allow_env_bearer=True: (
+                token_policies.append(allow_env_bearer) or "sentinel-token"
+            ),
+        )
+
+        cli_mod.configure_shared_state(
+            self.WS,
+            profile="explicit-profile",
+            allow_env_bearer=allow_env_bearer,
+        )
+
+        assert auth_policies == [allow_env_bearer]
+        assert token_policies == [allow_env_bearer]
+
+    def test_legacy_caller_keeps_ambient_bearer_default(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="sentinel-pat")
+        policies: list[bool] = []
+        monkeypatch.setattr(
+            cli_mod,
+            "ensure_databricks_auth",
+            lambda _workspace, _profile=None, *, allow_env_bearer=True: policies.append(
+                allow_env_bearer
+            ),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "get_databricks_token",
+            lambda _workspace, _profile=None, *, allow_env_bearer=True: "sentinel-token",
+        )
+
+        cli_mod.configure_shared_state(self.WS, profile="legacy-profile")
+
+        assert policies == [True]
 
     @pytest.mark.parametrize(
         ("responses", "expected_model_service"),
@@ -3069,6 +3820,27 @@ class TestConfigureSharedStateUsePat:
 
         assert state["codex_models"] == ["system.ai.gpt-5-6-sol"]
         assert state["oss_models"] == ["system.ai.glm-5-2"]
+
+    def test_hermes_discovers_every_supported_model_family(self, monkeypatch):
+        cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
+        monkeypatch.setattr(
+            cli_mod,
+            "discover_model_services",
+            lambda w, t: (
+                {"opus": "system.ai.claude-opus-4-8"},
+                ["system.ai.gpt-5"],
+                ["system.ai.gemini-2-5-pro"],
+                ["system.ai.gpt-oss-120b"],
+                None,
+            ),
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, profile="DEFAULT", tools=["hermes"])
+
+        assert state["claude_models"] == {"opus": "system.ai.claude-opus-4-8"}
+        assert state["codex_models"] == ["system.ai.gpt-5"]
+        assert state["gemini_models"] == ["system.ai.gemini-2-5-pro"]
+        assert state["oss_models"] == ["system.ai.gpt-oss-120b"]
 
     def _stub_with_fable(self, monkeypatch):
         cli_mod, *_ = self._stub_deps(monkeypatch, pat_token="dapi-pat")
@@ -3270,9 +4042,9 @@ class TestConfigureSharedStateMcpCleanup:
 
         monkeypatch.setattr(cli_mod, "normalize_workspace_url", lambda w: w)
         monkeypatch.setattr(cli_mod, "run_databricks_login", lambda w, p: None)
-        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda w, p=None: None)
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda w, p=None, **kwargs: None)
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
-        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
+        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p, **kwargs: "token")
         monkeypatch.setattr(
             cli_mod, "probe_unity_gateway_capabilities", lambda w, t: MODEL_SERVICE_PROBE
         )
@@ -3331,10 +4103,10 @@ class TestConfigureSharedStateSkipDiscovery:
         import ucode.cli as cli_mod
 
         monkeypatch.setattr(cli_mod, "normalize_workspace_url", lambda w: w)
-        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda w, p=None: None)
+        monkeypatch.setattr(cli_mod, "ensure_databricks_auth", lambda w, p=None, **kwargs: None)
         monkeypatch.setattr(cli_mod, "run_databricks_login", lambda w, p: None)
         monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
-        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p: "token")
+        monkeypatch.setattr(cli_mod, "get_databricks_token", lambda w, p, **kwargs: "token")
         monkeypatch.setattr(
             cli_mod, "probe_unity_gateway_capabilities", lambda w, t: MODEL_SERVICE_PROBE
         )

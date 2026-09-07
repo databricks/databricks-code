@@ -300,6 +300,49 @@ class TestCursorMcpClient:
 
 
 class TestConfigureClientMcpServer:
+    def test_configures_hermes_with_proxy_argv(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            mcp.hermes,
+            "write_mcp_server_config",
+            lambda name, argv, **kwargs: calls.append((name, argv, kwargs)) or False,
+        )
+
+        assert (
+            mcp.configure_client_mcp_server(
+                "hermes", "github", GH_URL, WS, "p", hermes_home="/profile"
+            )
+            == []
+        )
+        assert calls == [
+            (
+                "github",
+                _proxy_argv(),
+                {"hermes_home": "/profile", "expected_fingerprint": None},
+            )
+        ]
+
+    def test_removes_only_named_hermes_server(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            mcp.hermes,
+            "remove_mcp_server_config",
+            lambda name, **kwargs: calls.append((name, kwargs)) or True,
+        )
+
+        assert mcp.remove_client_mcp_server(
+            "hermes",
+            "github",
+            hermes_home="/profile",
+            expected_fingerprint="abc",
+        ) == [mcp.MCP_USER_SCOPE]
+        assert calls == [
+            (
+                "github",
+                {"hermes_home": "/profile", "expected_fingerprint": "abc"},
+            )
+        ]
+
     def test_configures_copilot_with_proxy_argv(self, monkeypatch):
         calls: list[tuple[str, list[str]]] = []
 
@@ -686,6 +729,75 @@ class TestApplyMcpServerChanges:
 
         assert changed is True
         assert removed == [("claude", "gone")]
+
+    def test_hermes_add_records_token_free_fingerprint_and_home(self, monkeypatch):
+        configured = []
+        monkeypatch.setattr(
+            mcp,
+            "configure_client_mcp_server",
+            lambda *args, **kwargs: configured.append((args, kwargs)) or [],
+        )
+        working = [self._server("managed", ["hermes"])]
+
+        assert (
+            mcp.apply_mcp_server_changes(
+                [],
+                working,
+                ["hermes"],
+                WS,
+                "profile",
+                hermes_home="/profiles/original",
+            )
+            is True
+        )
+
+        ownership = working[0]["ownership"]["hermes"]
+        assert len(ownership["fingerprint"]) == 64
+        assert ownership["hermes_home"] == "/profiles/original"
+        serialized = json.dumps(working).lower()
+        assert "bearer" not in serialized
+        assert "token" not in serialized
+        assert configured[0][1]["hermes_home"] == "/profiles/original"
+
+    def test_hermes_update_does_not_reuse_fingerprint_from_another_home(self, monkeypatch):
+        configured = []
+        monkeypatch.setattr(
+            mcp,
+            "configure_client_mcp_server",
+            lambda *args, **kwargs: configured.append((args, kwargs)) or [],
+        )
+        original = self._server("managed", ["hermes"])
+        original["ownership"] = {"hermes": {"fingerprint": "a" * 64, "hermes_home": "/profiles/a"}}
+        working = [{**self._server("managed", ["hermes"]), "url": GH_URL + "/changed"}]
+
+        assert mcp.apply_mcp_server_changes(
+            [original],
+            working,
+            ["hermes"],
+            WS,
+            hermes_home="/profiles/b",
+        )
+
+        assert configured[0][1]["expected_fingerprint"] is None
+        assert working[0]["ownership"]["hermes"]["hermes_home"] == "/profiles/b"
+
+    def test_recorded_removal_uses_server_owned_home(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            mcp,
+            "remove_client_mcp_server",
+            lambda *args, **kwargs: calls.append((args, kwargs)) or ["user"],
+        )
+        server = self._server("managed", ["hermes"])
+        server["ownership"] = {"hermes": {"fingerprint": "b" * 64, "hermes_home": "/profiles/a"}}
+
+        assert mcp._remove_recorded_client_server(
+            "hermes", "managed", server, hermes_home="/profiles/b"
+        ) == ["user"]
+        assert calls[0][1] == {
+            "hermes_home": "/profiles/a",
+            "expected_fingerprint": "b" * 64,
+        }
 
     def test_no_ops_returns_false_without_spinner(self, monkeypatch):
         # Identical original/working, so nothing to do.
@@ -1255,7 +1367,7 @@ class TestConfigureMcpCommand:
         assert mcp.configure_mcp_command() == 0
 
         output = capsys.readouterr().out
-        assert "Dropping 1 stale MCP entry" in output
+        assert "Cleaning 1 stale MCP entry" in output
         assert "databricks-genie-foreign" in output
         # codex is listed on the stale entry but not installed -> skipped.
         assert cleanup_calls == [("claude", "databricks-genie-foreign")]
@@ -2700,6 +2812,40 @@ class TestPurgeCrossWorkspaceSkillsEntry:
         assert removed == [("claude", mcp.SKILLS_MCP_SERVER_NAME)]
         assert state["mcp_servers"] == []
 
+    def test_retains_foreign_hermes_ownership_when_safe_removal_does_not_match(self, monkeypatch):
+        foreign_entry = {
+            "name": "managed",
+            "url": "https://other.databricks.com/api/2.0/mcp/functions/a/b",
+            "clients": ["hermes"],
+            "ownership": {"hermes": {"fingerprint": "a" * 64, "hermes_home": "/profiles/a"}},
+        }
+        state = {"mcp_servers": [foreign_entry]}
+        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["hermes"])
+        monkeypatch.setattr(mcp, "load_full_state", lambda: {})
+        monkeypatch.setattr(mcp, "_remove_recorded_client_server", lambda *_a, **_kw: [])
+        monkeypatch.setattr(mcp, "save_state", lambda _state: None)
+
+        mcp.purge_cross_workspace_mcp_residue(state, WS)
+
+        assert state["mcp_servers"] == [foreign_entry]
+
+    def test_drops_foreign_hermes_ownership_after_verified_removal(self, monkeypatch):
+        foreign_entry = {
+            "name": "managed",
+            "url": "https://other.databricks.com/api/2.0/mcp/functions/a/b",
+            "clients": ["hermes"],
+            "ownership": {"hermes": {"fingerprint": "a" * 64, "hermes_home": "/profiles/a"}},
+        }
+        state = {"mcp_servers": [foreign_entry]}
+        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["hermes"])
+        monkeypatch.setattr(mcp, "load_full_state", lambda: {})
+        monkeypatch.setattr(mcp, "_remove_recorded_client_server", lambda *_a, **_kw: ["user"])
+        monkeypatch.setattr(mcp, "save_state", lambda _state: None)
+
+        mcp.purge_cross_workspace_mcp_residue(state, WS)
+
+        assert state["mcp_servers"] == []
+
 
 class TestManagedMcpServerEntry:
     def test_sql(self):
@@ -2845,6 +2991,30 @@ class TestApplyManagedMcpServers:
             self._managed({"name": "s", "type": "app"}), "claude", WS
         )
         assert registered == []
+
+    def test_last_managed_server_removal_runs_before_returning_empty(self, monkeypatch):
+        previous = {
+            "name": "old",
+            "url": "https://example/mcp",
+            "auth": "proxy",
+            "clients": ["hermes"],
+        }
+        seen = {}
+        monkeypatch.setattr(mcp, "load_state", lambda: {"managed_mcp_servers": [previous]})
+        monkeypatch.setattr(
+            mcp,
+            "apply_mcp_server_changes",
+            lambda original, working, clients, *args, **kwargs: seen.update(
+                original=original,
+                working=working,
+                clients=clients,
+            ),
+        )
+
+        registered = mcp.apply_managed_mcp_servers({}, "hermes", WS)
+
+        assert registered == []
+        assert seen == {"original": [previous], "working": [], "clients": ["hermes"]}
 
     def test_mcp_only_client_returns_empty(self, monkeypatch):
         # A tool that isn't an MCP client can't have servers registered against it.

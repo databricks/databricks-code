@@ -220,14 +220,15 @@ class TestJwtExp:
 def _install_fake_token(monkeypatch, exp_offsets, delay=0.0):
     """Patch get_databricks_token to hand out JWTs whose exp is now+offset, one
     per successive mint (last offset repeats). Records the force flag of each."""
-    state = {"i": 0, "forces": []}
+    state = {"i": 0, "forces": [], "allow_env_bearer": []}
 
-    def fake(_ws, _profile, force_refresh=False):
+    def fake(_ws, _profile, force_refresh=False, allow_env_bearer=False):
         if delay:
             time.sleep(delay)
         off = exp_offsets[min(state["i"], len(exp_offsets) - 1)]
         state["i"] += 1
         state["forces"].append(force_refresh)
+        state["allow_env_bearer"].append(allow_env_bearer)
         return _make_jwt(time.time() + off)
 
     monkeypatch.setattr(gateway_proxy, "get_databricks_token", fake)
@@ -235,6 +236,32 @@ def _install_fake_token(monkeypatch, exp_offsets, delay=0.0):
 
 
 class TestTokenCache:
+    def test_default_mint_explicitly_rejects_ambient_bearer(self, monkeypatch):
+        calls: list[bool] = []
+
+        def fake(_ws, _profile, *, force_refresh=False, allow_env_bearer):
+            calls.append(allow_env_bearer)
+            return _make_jwt(time.time() + 5000)
+
+        monkeypatch.setattr(gateway_proxy, "get_databricks_token", fake)
+
+        gateway_proxy.TokenCache("ws", "oauth-profile")
+
+        assert calls == [False]
+
+    def test_explicit_bearer_opt_in_reaches_token_mint(self, monkeypatch):
+        calls: list[bool] = []
+
+        def fake(_ws, _profile, *, force_refresh=False, allow_env_bearer=False):
+            calls.append(allow_env_bearer)
+            return _make_jwt(time.time() + 5000)
+
+        monkeypatch.setattr(gateway_proxy, "get_databricks_token", fake)
+
+        gateway_proxy.TokenCache("ws", "pat-profile", allow_env_bearer=True)
+
+        assert calls == [True]
+
     def test_initial_mint_preserves_default_nonforce_refresh(self, monkeypatch):
         state = _install_fake_token(monkeypatch, [5000])
         gateway_proxy.TokenCache("ws", None)
@@ -438,6 +465,33 @@ class TestRetryOn401:
 
 
 class TestStartProxyPortFallback:
+    def test_forwards_explicit_bearer_opt_in_to_cache(self, monkeypatch):
+        captured: dict[str, object] = {}
+
+        class _StubCache:
+            def run_refresher(self):
+                return None
+
+        def fake_cache(workspace, profile, **kwargs):
+            captured.update(workspace=workspace, profile=profile, **kwargs)
+            return _StubCache()
+
+        monkeypatch.setattr(gateway_proxy, "TokenCache", fake_cache)
+
+        server, _cache, client = gateway_proxy.start_proxy(
+            "https://x.staging.cloud.databricks.com",
+            "pat-profile",
+            0,
+            token_header=gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
+            force_refresh_near_expiry=False,
+            allow_env_bearer=True,
+        )
+        try:
+            assert captured["allow_env_bearer"] is True
+        finally:
+            server.server_close()
+            client.close()
+
     def test_falls_back_to_free_port_when_cached_port_busy(self, monkeypatch):
         # A stale proxy from a killed session can still hold the cached port; the
         # bind must fall back to an OS-assigned free port rather than crash.

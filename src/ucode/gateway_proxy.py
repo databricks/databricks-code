@@ -120,10 +120,12 @@ class TokenCache:
         profile: str | None,
         *,
         force_refresh_near_expiry: bool = False,
+        allow_env_bearer: bool = False,
     ) -> None:
         self._workspace = workspace
         self._profile = profile
         self._force_refresh_near_expiry = force_refresh_near_expiry
+        self._allow_env_bearer = allow_env_bearer
         self._state_lock = threading.Lock()  # guards _token / _expiry (brief)
         self._refresh_lock = threading.Lock()  # single-flights the CLI refresh
         self._stop = threading.Event()
@@ -135,7 +137,20 @@ class TokenCache:
 
     def _refresh(self, *, force: bool) -> None:
         """Mint a token and record its expiry."""
-        token = get_databricks_token(self._workspace, self._profile, force_refresh=force)
+        if self._allow_env_bearer:
+            token = get_databricks_token(
+                self._workspace,
+                self._profile,
+                force_refresh=force,
+                allow_env_bearer=True,
+            )
+        else:
+            token = get_databricks_token(
+                self._workspace,
+                self._profile,
+                force_refresh=force,
+                allow_env_bearer=False,
+            )
         expiry = _jwt_exp(token) or (time.time() + _DEFAULT_TTL_S)
         with self._state_lock:
             self._token = token
@@ -374,6 +389,7 @@ def start_proxy(
     port: int,
     token_header: str,
     force_refresh_near_expiry: bool,
+    allow_env_bearer: bool = False,
 ) -> tuple[ThreadingHTTPServer, TokenCache, httpx.Client]:
     """Start the loopback refresh proxy + its background token refresher.
 
@@ -390,6 +406,7 @@ def start_proxy(
         workspace,
         profile,
         force_refresh_near_expiry=force_refresh_near_expiry,
+        allow_env_bearer=allow_env_bearer,
     )
     # One pooled, keep-alive client shared across handler threads: reuses TCP+TLS
     # to the gateway instead of a fresh handshake per request. Don't follow

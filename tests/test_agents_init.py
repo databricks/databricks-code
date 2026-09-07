@@ -13,6 +13,7 @@ from ucode.agents import (
     TOOL_SPECS,
     check_gateway_endpoint,
     configure_selected_tools,
+    configure_tool,
     default_model_for_tool,
     ensure_tool_binary_available,
     explicit_model_arg_value,
@@ -70,7 +71,15 @@ class TestProviderPermissionError:
 
 class TestToolSpecs:
     def test_all_tools_present(self):
-        assert set(TOOL_SPECS) == {"codex", "claude", "gemini", "opencode", "copilot", "pi"}
+        assert set(TOOL_SPECS) == {
+            "codex",
+            "claude",
+            "gemini",
+            "opencode",
+            "copilot",
+            "pi",
+            "hermes",
+        }
 
     def test_each_spec_has_required_keys(self):
         required = {"binary", "package", "display", "config_path", "backup_path"}
@@ -177,6 +186,7 @@ class TestNormalizeTool:
             ("opencode", "opencode"),
             ("copilot", "copilot"),
             ("pi", "pi"),
+            ("hermes", "hermes"),
             ("CODEX", "codex"),
             ("  Claude  ", "claude"),
         ],
@@ -185,8 +195,9 @@ class TestNormalizeTool:
         assert normalize_tool(alias) == expected
 
     def test_unknown_raises(self):
-        with pytest.raises(RuntimeError, match="Unsupported"):
+        with pytest.raises(RuntimeError, match="Unsupported") as excinfo:
             normalize_tool("unknown-agent")
+        assert "hermes" in str(excinfo.value)
 
 
 class TestCheckGatewayEndpoint:
@@ -199,6 +210,19 @@ class TestCheckGatewayEndpoint:
 
     def test_codex_available(self):
         assert check_gateway_endpoint({"codex_models": ["model-a"]}, "codex") is True
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("codex_models", ["model-a"]),
+            ("claude_models", {"sonnet": "model-a"}),
+            ("gemini_models", ["model-a"]),
+            ("oss_models", ["model-a"]),
+        ],
+    )
+    def test_hermes_available_for_every_supported_family(self, key, value):
+        assert check_gateway_endpoint({key: value}, "hermes") is True
+        assert check_gateway_endpoint({}, "hermes") is False
 
     def test_gemini_available(self):
         assert check_gateway_endpoint({"gemini_models": ["gemini-2"]}, "gemini") is True
@@ -495,6 +519,22 @@ class TestResolveGeminiProviderModel:
 
 
 class TestInstallToolBinary:
+    def test_missing_hermes_never_attempts_npm_install(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda _: None)
+        monkeypatch.setattr(
+            "ucode.agents.subprocess.run", lambda *args, **kwargs: calls.append(args)
+        )
+
+        assert install_tool_binary("hermes", strict=False) is False
+        assert calls == []
+
+    def test_missing_hermes_has_external_install_guidance(self, monkeypatch):
+        monkeypatch.setattr("ucode.agents.shutil.which", lambda _: None)
+
+        with pytest.raises(RuntimeError, match="official installer"):
+            install_tool_binary("hermes", strict=True)
+
     def test_non_strict_returns_false_when_npm_missing(self, monkeypatch):
         monkeypatch.setattr("ucode.agents.shutil.which", lambda _: None)
 
@@ -665,6 +705,32 @@ class TestConfigureSelectedTools:
         configure_selected_tools({}, ["codex", "claude"])
 
         assert batches == [["Codex", "Claude Code"]]
+
+    def test_hermes_dispatches_only_to_hermes_writer(self, monkeypatch):
+        state = {
+            "workspace": "https://x.databricks.com",
+            "codex_models": ["system.ai.gpt-5"],
+        }
+        calls: list[str] = []
+        for name in ("codex", "claude", "gemini", "opencode", "copilot", "pi", "hermes"):
+            module = getattr(agents_mod, name)
+            monkeypatch.setattr(
+                module,
+                "write_tool_config",
+                lambda *args, _name=name, **kwargs: calls.append(_name) or state,
+            )
+
+        result = configure_tool("hermes", state, "system.ai.gpt-5")
+
+        assert result is state
+        assert calls == ["hermes"]
+
+    def test_hermes_missing_model_error_is_hermes_specific(self):
+        with pytest.raises(
+            RuntimeError,
+            match="A Hermes model must be selected before configuration",
+        ):
+            configure_tool("hermes", {"workspace": "https://x.databricks.com"})
 
     def test_merges_with_existing_available_tools(self, monkeypatch):
         """Configuring a new tool should not drop previously-configured tools

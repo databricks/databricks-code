@@ -42,7 +42,7 @@ import anyio
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.stdio import stdio_server
 
-from ucode.databricks import ensure_pat_bearer, get_databricks_token
+from ucode.databricks import ensure_pat_bearer, get_databricks_token, resolve_pat_token
 
 # Exit code used when the proxy cannot continue. MCP clients surface a non-zero
 # exit far more usefully than a timeout, so bail out instead of hanging.
@@ -111,7 +111,12 @@ def _fail_fast(message: str) -> None:
     raise SystemExit(AUTH_FAILURE_EXIT_CODE)
 
 
-def _build_token_auth(workspace: str, profile: str | None):
+def _build_token_auth(
+    workspace: str,
+    profile: str | None,
+    *,
+    allow_env_bearer: bool = False,
+):
     """Build an httpx ``Auth`` that injects a fresh bearer on every request.
 
     The base class comes from whichever httpx the SDK uses (see ``_httpx``), so
@@ -122,15 +127,26 @@ def _build_token_auth(workspace: str, profile: str | None):
 
     class _DatabricksTokenAuth(httpx.Auth):
         def auth_flow(self, request):
-            # get_databricks_token honors the DATABRICKS_BEARER short-circuit and
-            # PAT profiles internally; --use-pat is surfaced via the env ucode set.
+            # Only an explicit --use-pat path may consume the bearer exported by
+            # ensure_pat_bearer; OAuth profiles mint against their scoped identity.
             # A RuntimeError here means auth is dead (expired refresh token,
             # logged-out profile). Raising it from inside auth_flow would tear
             # through the transport's task group and stall the process until the
             # client times out, so translate it into a terminal ProxyAuthError the
             # caller reports cleanly.
             try:
-                token = get_databricks_token(workspace, profile)
+                if allow_env_bearer:
+                    token = get_databricks_token(
+                        workspace,
+                        profile,
+                        allow_env_bearer=True,
+                    )
+                else:
+                    token = get_databricks_token(
+                        workspace,
+                        profile,
+                        allow_env_bearer=False,
+                    )
             except RuntimeError as exc:
                 raise ProxyAuthError(str(exc)) from exc
             request.headers["Authorization"] = f"Bearer {token}"
@@ -166,9 +182,18 @@ async def _pump_upstream[T](
     raise ProxyTransportError("upstream MCP transport closed unexpectedly")
 
 
-async def _run(url: str, workspace: str, profile: str | None) -> None:
+async def _run(
+    url: str,
+    workspace: str,
+    profile: str | None,
+    allow_env_bearer: bool = False,
+) -> None:
     httpx = _httpx()
-    auth = _build_token_auth(workspace, profile)
+    auth = _build_token_auth(
+        workspace,
+        profile,
+        allow_env_bearer=allow_env_bearer,
+    )
     # 2.x-native shape: hand the transport a pre-built AsyncClient carrying our
     # per-request auth. Works on mcp 1.28+ and 2.x; `streamable_http_client`
     # yields a (read, write) pair in both.
@@ -194,7 +219,12 @@ async def _run(url: str, workspace: str, profile: str | None) -> None:
                     tg.cancel_scope.cancel()
 
 
-def _preflight_token(workspace: str, profile: str | None) -> None:
+def _preflight_token(
+    workspace: str,
+    profile: str | None,
+    *,
+    allow_env_bearer: bool = False,
+) -> None:
     """Verify a Databricks token can be minted before opening the bridge.
 
     Raises ``RuntimeError`` (with the CLI's own message) when auth is dead. This
@@ -202,7 +232,18 @@ def _preflight_token(workspace: str, profile: str | None) -> None:
     with subprocess timeouts, so it returns or fails on its own — the point here
     is only to *locate* the failure before the transport starts, where it can be
     reported instead of stalling the session."""
-    get_databricks_token(workspace, profile)
+    if allow_env_bearer:
+        get_databricks_token(
+            workspace,
+            profile,
+            allow_env_bearer=True,
+        )
+    else:
+        get_databricks_token(
+            workspace,
+            profile,
+            allow_env_bearer=False,
+        )
 
 
 def _unwrap_proxy_error(exc: BaseException) -> ProxyAuthError | ProxyTransportError | None:
@@ -230,23 +271,35 @@ def serve(url: str, workspace: str, profile: str | None = None, *, use_pat: bool
     token`` only reads OAuth caches, so a PAT profile's token must be exported as
     ``DATABRICKS_BEARER`` first (``ensure_pat_bearer``) — then every per-request
     mint takes that short-circuit. OAuth needs no such step."""
-    if use_pat and not ensure_pat_bearer(profile):
-        _fail_fast(
-            "--use-pat is set but no personal access token was found for profile "
-            f"'{profile or '<none>'}' in ~/.databrickscfg (expected auth_type = pat). "
-            "Set DATABRICKS_BEARER, or reconfigure the profile."
-        )
+    if use_pat:
+        pat = resolve_pat_token(profile)
+        if not pat or not ensure_pat_bearer(profile, pat, workspace=workspace):
+            _fail_fast(
+                "--use-pat is set but no personal access token was found for profile "
+                f"'{profile or '<none>'}' in ~/.databrickscfg (expected auth_type = pat). "
+                "Reconfigure the profile."
+            )
 
     # Pre-flight the token before opening the bridge. Without this, the first
     # token failure surfaces from inside the transport's task group, where it can
     # stall the process instead of erroring out.
     try:
-        _preflight_token(workspace, profile)
+        if use_pat:
+            _preflight_token(
+                workspace,
+                profile,
+                allow_env_bearer=True,
+            )
+        else:
+            _preflight_token(workspace, profile)
     except RuntimeError as exc:
         _fail_fast(str(exc))
 
     try:
-        anyio.run(_run, url, workspace, profile)
+        if use_pat:
+            anyio.run(_run, url, workspace, profile, True)
+        else:
+            anyio.run(_run, url, workspace, profile)
     except BaseException as exc:  # noqa: BLE001 - re-raised unless it's a known proxy failure
         # Errors raised inside the transport arrive wrapped by its task group.
         # Report expected auth/transport failures without hiding programming bugs.

@@ -106,6 +106,40 @@ def set_current_workspace(workspace: str | None) -> None:
         raise RuntimeError(f"Failed to write state file: {STATE_PATH}") from exc
 
 
+def _hermes_ownership_metadata(entry: dict) -> dict:
+    """Return validated, non-secret Hermes cleanup ownership metadata."""
+    hermes_home = entry.get("hermes_home")
+    active_model = entry.get("active_model")
+    if not isinstance(hermes_home, str) or not hermes_home:
+        return {}
+    if not isinstance(active_model, dict):
+        return {}
+    provider = active_model.get("provider")
+    model = active_model.get("default")
+    if not isinstance(provider, str) or not provider:
+        return {}
+    if not isinstance(model, str) or not model:
+        return {}
+    result = {
+        "hermes_home": hermes_home,
+        "active_model": {"provider": provider, "default": model},
+    }
+    raw_fingerprints = entry.get("provider_fingerprints")
+    if isinstance(raw_fingerprints, dict):
+        fingerprints = {
+            provider_id: fingerprint
+            for provider_id, fingerprint in raw_fingerprints.items()
+            if isinstance(provider_id, str)
+            and provider_id.startswith("ucode-databricks-")
+            and isinstance(fingerprint, str)
+            and len(fingerprint) == 64
+            and all(char in "0123456789abcdef" for char in fingerprint)
+        }
+        if fingerprints:
+            result["provider_fingerprints"] = fingerprints
+    return result
+
+
 def hydrate_state(state: dict) -> dict:
     """Normalize a workspace state entry and add derived harness config.
 
@@ -125,6 +159,8 @@ def hydrate_state(state: dict) -> dict:
         if isinstance(entry, dict):
             keys = entry.get("keys") if isinstance(entry.get("keys"), list) else []
             normalized[tool] = {"keys": keys}
+            if tool == "hermes":
+                normalized[tool].update(_hermes_ownership_metadata(entry))
         elif entry:
             normalized[tool] = {"keys": []}
     hydrated["managed_configs"] = normalized
@@ -236,10 +272,19 @@ def clear_state() -> None:
         raise RuntimeError(f"Failed to clear state file: {STATE_PATH}") from exc
 
 
-def mark_tool_managed(state: dict, tool: str, managed_keys: list) -> dict:
+def mark_tool_managed(
+    state: dict,
+    tool: str,
+    managed_keys: list,
+    *,
+    metadata: dict | None = None,
+) -> dict:
     """Record which config keys ucode manages for ``tool``."""
     managed_configs = dict(state.get("managed_configs") or {})
-    managed_configs[tool] = {"keys": list(managed_keys)}
+    entry = {"keys": list(managed_keys)}
+    if tool == "hermes" and isinstance(metadata, dict):
+        entry.update(_hermes_ownership_metadata(metadata))
+    managed_configs[tool] = entry
     state["managed_configs"] = managed_configs
     state["last_tool"] = tool
     return state
