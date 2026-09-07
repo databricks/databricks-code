@@ -313,15 +313,21 @@ class TestInterposerSession:
     def test_does_not_schedule_notification_when_model_is_already_selected(self):
         sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
         frame = self._turn_start("gpt-5.5")
-        assert sess.on_tui_frame(frame) == codex_interposer.TuiFrameResult(frame, needs_settings_update=False)
+        assert sess.on_tui_frame(frame) == codex_interposer.TuiFrameResult(
+            frame, needs_settings_update=False
+        )
         assert sess.on_engine_frame(self._turn_started("turn-1")) == []
         later_selection = self._turn_start("gpt-5.6")
-        assert sess.on_tui_frame(later_selection) == codex_interposer.TuiFrameResult(later_selection, needs_settings_update=False)
+        assert sess.on_tui_frame(later_selection) == codex_interposer.TuiFrameResult(
+            later_selection, needs_settings_update=False
+        )
 
     def test_non_turn_frames_pass_through(self):
         sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
         frame = json.dumps({"method": "initialize", "id": 1, "params": {}})
-        assert sess.on_tui_frame(frame) == codex_interposer.TuiFrameResult(frame, needs_settings_update=False)
+        assert sess.on_tui_frame(frame) == codex_interposer.TuiFrameResult(
+            frame, needs_settings_update=False
+        )
 
     def _turn_started(self, turn_id: str, thread_id: str = "t1") -> str:
         return json.dumps(
@@ -366,7 +372,9 @@ class TestInterposerSession:
         sess.on_tui_frame(self._turn_start("luna"))
         assert sess.on_engine_frame(self._turn_started("turn-1"))
         second_turn = self._turn_start("luna")
-        assert sess.on_tui_frame(second_turn) == codex_interposer.TuiFrameResult(second_turn, needs_settings_update=False)
+        assert sess.on_tui_frame(second_turn) == codex_interposer.TuiFrameResult(
+            second_turn, needs_settings_update=False
+        )
         assert sess.on_engine_frame(self._turn_started("turn-2")) == []
 
     def test_routes_first_prompt_and_uses_returned_model_and_rationale(self):
@@ -461,7 +469,9 @@ class TestInterposerSession:
         )
         frame = self._turn_start("gpt-start")
 
-        assert sess.on_tui_frame(frame) == codex_interposer.TuiFrameResult(frame, needs_settings_update=False)
+        assert sess.on_tui_frame(frame) == codex_interposer.TuiFrameResult(
+            frame, needs_settings_update=False
+        )
 
     def test_rewrites_nested_collaboration_mode_model(self):
         """The app-server re-derives the thread model from
@@ -481,22 +491,24 @@ class TestInterposerSession:
             ),
             switch_message_fn=v2._switch_message,
         )
-        frame = json.dumps({
-            "method": codex_interposer.TURN_START,
-            "id": 1,
-            "params": {
-                "threadId": "t1",
-                "input": [{"type": "text", "text": "hello"}],
-                "model": "gpt-6-astra",
-                "collaborationMode": {
-                    "mode": "default",
-                    "settings": {
-                        "model": "gpt-6-astra",
-                        "reasoning_effort": "high",
+        frame = json.dumps(
+            {
+                "method": codex_interposer.TURN_START,
+                "id": 1,
+                "params": {
+                    "threadId": "t1",
+                    "input": [{"type": "text", "text": "hello"}],
+                    "model": "gpt-6-astra",
+                    "collaborationMode": {
+                        "mode": "default",
+                        "settings": {
+                            "model": "gpt-6-astra",
+                            "reasoning_effort": "high",
+                        },
                     },
                 },
-            },
-        })
+            }
+        )
         result = sess.on_tui_frame(frame)
         parsed = json.loads(result.frame)
         assert parsed["params"]["model"] == "gpt-5.6-luna"

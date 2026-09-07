@@ -247,16 +247,20 @@ async def _handle_tui(
                     result = await asyncio.to_thread(sess.on_tui_frame, frame)
                     if result.needs_settings_update and sess.thread_id:
                         update_id = f"ucode-route-{uuid.uuid4().hex}"
-                        update_req = json.dumps({
-                            "id": update_id,
-                            "method": SETTINGS_UPDATE,
-                            "params": {
-                                "threadId": sess.thread_id,
-                                "model": sess.target,
-                            },
-                        })
+                        update_req = json.dumps(
+                            {
+                                "id": update_id,
+                                "method": SETTINGS_UPDATE,
+                                "params": {
+                                    "threadId": sess.thread_id,
+                                    "model": sess.target,
+                                },
+                            }
+                        )
                         sess.settings_update_id = update_id
-                        log(f"[ROUTE] sending {SETTINGS_UPDATE} model={sess.target!r} to app-server")
+                        log(
+                            f"[ROUTE] sending {SETTINGS_UPDATE} model={sess.target!r} to app-server"
+                        )
                         await upstream.send(update_req)
                         try:
                             await asyncio.wait_for(sess.settings_update_event.wait(), timeout=10)
