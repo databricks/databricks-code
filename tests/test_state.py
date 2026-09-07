@@ -246,6 +246,45 @@ class TestHydrateState:
         assert "codex" not in result["managed_configs"]
         assert "claude" not in result["managed_configs"]
 
+    def test_preserves_valid_hermes_ownership_metadata(self):
+        state = {
+            "managed_configs": {
+                "hermes": {
+                    "keys": [],
+                    "hermes_home": "/profiles/team",
+                    "active_model": {
+                        "provider": "ucode-databricks-codex",
+                        "default": "system.ai.gpt-5",
+                    },
+                    "provider_fingerprints": {
+                        "ucode-databricks-codex": "a" * 64,
+                    },
+                },
+                "codex": {"keys": [["model"]], "hermes_home": "/ignored"},
+            }
+        }
+
+        result = hydrate_state(state)
+
+        assert result["managed_configs"]["hermes"] == state["managed_configs"]["hermes"]
+        assert result["managed_configs"]["codex"] == {"keys": [["model"]]}
+
+    def test_drops_invalid_hermes_ownership_metadata(self):
+        result = hydrate_state(
+            {
+                "managed_configs": {
+                    "hermes": {
+                        "keys": [],
+                        "hermes_home": "",
+                        "active_model": {"provider": "", "default": 7},
+                        "provider_fingerprints": {"not-owned": "bad"},
+                    }
+                }
+            }
+        )
+
+        assert result["managed_configs"]["hermes"] == {"keys": []}
+
 
 class TestBuildAgentState:
     def test_returns_empty_without_workspace(self):
@@ -293,3 +332,16 @@ class TestMarkToolManaged:
     def test_records_only_keys(self):
         result = mark_tool_managed({}, "codex", [["model"]])
         assert result["managed_configs"]["codex"] == {"keys": [["model"]]}
+
+    def test_records_hermes_ownership_metadata(self):
+        metadata = {
+            "hermes_home": "/profiles/team",
+            "active_model": {
+                "provider": "ucode-databricks-codex",
+                "default": "system.ai.gpt-5",
+            },
+        }
+
+        result = mark_tool_managed({}, "hermes", [], metadata=metadata)
+
+        assert result["managed_configs"]["hermes"] == {"keys": [], **metadata}

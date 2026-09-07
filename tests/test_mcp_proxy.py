@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -59,8 +60,26 @@ def test_proxy_imports_the_streamable_http_client_shared_by_both_majors():
 
 
 class TestDatabricksTokenAuth:
+    def test_default_auth_explicitly_rejects_ambient_bearer(self, monkeypatch):
+        calls: list[bool] = []
+
+        def fake(_ws, _profile, *, allow_env_bearer):
+            calls.append(allow_env_bearer)
+            return "tok-123"
+
+        monkeypatch.setattr(mcp_proxy, "get_databricks_token", fake)
+        auth = mcp_proxy._build_token_auth(WS, "oauth-profile")
+
+        list(auth.auth_flow(httpx.Request("POST", URL)))
+
+        assert calls == [False]
+
     def test_injects_bearer_from_minted_token(self, monkeypatch):
-        monkeypatch.setattr(mcp_proxy, "get_databricks_token", lambda ws, profile: "tok-123")
+        monkeypatch.setattr(
+            mcp_proxy,
+            "get_databricks_token",
+            lambda ws, profile, *, allow_env_bearer: "tok-123",
+        )
         auth = mcp_proxy._build_token_auth(WS, "uc-dogfood")
 
         request = httpx.Request("POST", URL)
@@ -78,23 +97,29 @@ class TestDatabricksTokenAuth:
         assert isinstance(auth, mcp_proxy._httpx().Auth)
 
     def test_calls_get_token_with_workspace_and_profile(self, monkeypatch):
-        calls: list[tuple[str, str | None]] = []
+        calls: list[tuple[str, str | None, bool]] = []
         monkeypatch.setattr(
             mcp_proxy,
             "get_databricks_token",
-            lambda ws, profile: calls.append((ws, profile)) or "t",
+            lambda ws, profile, *, allow_env_bearer: (
+                calls.append((ws, profile, allow_env_bearer)) or "t"
+            ),
         )
-        auth = mcp_proxy._build_token_auth(WS, "myprofile")
+        auth = mcp_proxy._build_token_auth(WS, "myprofile", allow_env_bearer=True)
 
         list(auth.auth_flow(httpx.Request("POST", URL)))
 
-        assert calls == [(WS, "myprofile")]
+        assert calls == [(WS, "myprofile", True)]
 
     def test_mints_a_fresh_token_per_request(self, monkeypatch):
         # Each request re-invokes get_databricks_token, so a rotated token is
         # picked up mid-session without the proxy tracking expiry itself.
         tokens = iter(["first", "second"])
-        monkeypatch.setattr(mcp_proxy, "get_databricks_token", lambda ws, profile: next(tokens))
+        monkeypatch.setattr(
+            mcp_proxy,
+            "get_databricks_token",
+            lambda ws, profile, *, allow_env_bearer: next(tokens),
+        )
         auth = mcp_proxy._build_token_auth(WS, None)
 
         r1 = httpx.Request("POST", URL)
@@ -106,7 +131,11 @@ class TestDatabricksTokenAuth:
         assert r2.headers["Authorization"] == "Bearer second"
 
     def test_auth_flow_yields_the_same_request(self, monkeypatch):
-        monkeypatch.setattr(mcp_proxy, "get_databricks_token", lambda ws, profile: "t")
+        monkeypatch.setattr(
+            mcp_proxy,
+            "get_databricks_token",
+            lambda ws, profile, *, allow_env_bearer: "t",
+        )
         auth = mcp_proxy._build_token_auth(WS, None)
 
         request = httpx.Request("POST", URL)
@@ -118,7 +147,7 @@ class TestDatabricksTokenAuth:
         # A raw RuntimeError escaping auth_flow tears through the transport's task
         # group and stalls the proxy until the client's startup timeout.
         # Translating it keeps the failure reportable by `serve`.
-        def boom(ws, profile):
+        def boom(ws, profile, *, allow_env_bearer):
             raise RuntimeError("no access token; run `databricks auth login`")
 
         monkeypatch.setattr(mcp_proxy, "get_databricks_token", boom)
@@ -230,7 +259,7 @@ def test_run_uses_mcp_http_defaults(monkeypatch):
         yield
 
     monkeypatch.setattr(httpx_module, "AsyncClient", CapturingClient)
-    monkeypatch.setattr(mcp_proxy, "_build_token_auth", lambda *args: object())
+    monkeypatch.setattr(mcp_proxy, "_build_token_auth", lambda *args, **kwargs: object())
     monkeypatch.setattr(mcp_proxy, "streamable_http_client", stop_bridge)
 
     with pytest.raises(StopBridge):
@@ -241,6 +270,19 @@ def test_run_uses_mcp_http_defaults(monkeypatch):
 
 
 class TestServe:
+    def test_default_preflight_explicitly_rejects_ambient_bearer(self, monkeypatch):
+        calls: list[bool] = []
+
+        def fake(_ws, _profile, *, allow_env_bearer):
+            calls.append(allow_env_bearer)
+            return "tok-123"
+
+        monkeypatch.setattr(mcp_proxy, "get_databricks_token", fake)
+
+        mcp_proxy._preflight_token(WS, "oauth-profile")
+
+        assert calls == [False]
+
     def test_runs_the_bridge_with_parsed_args(self, monkeypatch):
         captured: dict = {}
 
@@ -272,16 +314,57 @@ class TestServe:
         # short-circuit returns it. `databricks auth token` can't read a PAT itself.
         order: list[str] = []
         monkeypatch.setattr(
-            mcp_proxy, "ensure_pat_bearer", lambda profile: order.append(f"pat:{profile}") or True
+            mcp_proxy,
+            "resolve_pat_token",
+            lambda profile: order.append(f"resolve:{profile}") or "profile-pat",
         )
         monkeypatch.setattr(
-            mcp_proxy, "_preflight_token", lambda ws, profile: order.append("preflight")
+            mcp_proxy,
+            "ensure_pat_bearer",
+            lambda profile, pat, *, workspace: (
+                order.append(f"pat:{workspace}:{profile}:{pat}") or True
+            ),
         )
-        monkeypatch.setattr(mcp_proxy.anyio, "run", lambda func, *args: order.append("bridge"))
+        monkeypatch.setattr(
+            mcp_proxy,
+            "_preflight_token",
+            lambda ws, profile, *, allow_env_bearer: order.append(f"preflight:{allow_env_bearer}"),
+        )
+        monkeypatch.setattr(
+            mcp_proxy.anyio,
+            "run",
+            lambda func, *args: order.append(f"bridge:{args[-1]}"),
+        )
 
         mcp_proxy.serve(URL, WS, "patprof", use_pat=True)
 
-        assert order == ["pat:patprof", "preflight", "bridge"]
+        assert order == [
+            "resolve:patprof",
+            f"pat:{WS}:patprof:profile-pat",
+            "preflight:True",
+            "bridge:True",
+        ]
+
+    def test_use_pat_profile_replaces_conflicting_ambient_bearer(self, monkeypatch):
+        observed: dict[str, str] = {}
+        monkeypatch.setenv("DATABRICKS_BEARER", "other-workspace-token")
+        monkeypatch.setattr(
+            mcp_proxy,
+            "resolve_pat_token",
+            lambda profile: "profile-pat",
+            raising=False,
+        )
+
+        def preflight(_ws, _profile, *, allow_env_bearer):
+            observed["bearer"] = os.environ["DATABRICKS_BEARER"]
+            observed["allowed"] = str(allow_env_bearer)
+
+        monkeypatch.setattr(mcp_proxy, "_preflight_token", preflight)
+        monkeypatch.setattr(mcp_proxy.anyio, "run", lambda *_args: None)
+
+        mcp_proxy.serve(URL, WS, "patprof", use_pat=True)
+
+        assert observed == {"bearer": "profile-pat", "allowed": "True"}
 
     def test_use_pat_without_a_resolvable_pat_exits_before_serving(self, monkeypatch, capsys):
         started: list[str] = []
@@ -395,11 +478,15 @@ class TestServe:
 
 class TestPreflightToken:
     def test_passes_through_when_a_token_is_available(self, monkeypatch):
-        monkeypatch.setattr(mcp_proxy, "get_databricks_token", lambda ws, profile: "tok")
+        monkeypatch.setattr(
+            mcp_proxy,
+            "get_databricks_token",
+            lambda ws, profile, *, allow_env_bearer: "tok",
+        )
         mcp_proxy._preflight_token(WS, "p")  # no exception
 
     def test_surfaces_the_cli_error_message(self, monkeypatch):
-        def boom(ws, profile):
+        def boom(ws, profile, *, allow_env_bearer):
             raise RuntimeError("profile is stale; run `databricks auth logout`")
 
         monkeypatch.setattr(mcp_proxy, "get_databricks_token", boom)
@@ -414,7 +501,7 @@ class TestPreflightToken:
         monkeypatch.setattr(
             mcp_proxy,
             "get_databricks_token",
-            lambda ws, profile: calls.append((ws, profile)) or "tok",
+            lambda ws, profile, *, allow_env_bearer: calls.append((ws, profile)) or "tok",
         )
 
         mcp_proxy._preflight_token(WS, "myprofile")

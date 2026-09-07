@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import os
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib import metadata
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -35,6 +39,7 @@ from ucode.agents import (
 )
 from ucode.agents import claude as claude_agent
 from ucode.agents import codex as codex_agent
+from ucode.agents import hermes as hermes_agent
 from ucode.agents import (
     launch as launch_agent,
 )
@@ -520,6 +525,7 @@ def configure_shared_state(
     skip_preflight: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    allow_env_bearer: bool = True,
 ) -> dict:
     """Log into Databricks, verify AI Gateway, fetch model lists, persist state.
 
@@ -622,16 +628,23 @@ def configure_shared_state(
                 f"entry under [{profile}], or re-run without --use-pat to use OAuth."
             )
         # Export the PAT for this process and launched agent subprocesses so
-        # every token fetch takes the static-bearer path. ensure_pat_bearer
-        # keeps a non-empty pre-set bearer (CI escape hatch) but treats an
-        # empty one as absent, so it never shadows the PAT. Pass the validated
-        # token to avoid re-reading ~/.databrickscfg.
-        ensure_pat_bearer(profile, pat)
-        ensure_databricks_auth(workspace, profile)
+        # explicit PAT-enabled token fetches can take the static-bearer path.
+        # Pass the validated token so this scoped identity replaces ambient
+        # state and avoids re-reading ~/.databrickscfg.
+        ensure_pat_bearer(profile, pat, workspace=workspace)
+        ensure_databricks_auth(
+            workspace,
+            profile,
+            allow_env_bearer=allow_env_bearer,
+        )
     elif force_login:
         run_databricks_login(workspace, profile)
     else:
-        ensure_databricks_auth(workspace, profile)
+        ensure_databricks_auth(
+            workspace,
+            profile,
+            allow_env_bearer=allow_env_bearer,
+        )
     # After login the profile exists in ~/.databrickscfg, so a host->profile
     # lookup is reliable even when it returned nothing above.
     if profile is None:
@@ -639,7 +652,11 @@ def configure_shared_state(
         if profile:
             state["profile"] = profile
     with spinner("Verifying Unity AI Gateway..."):
-        token = get_databricks_token(workspace, profile)
+        token = get_databricks_token(
+            workspace,
+            profile,
+            allow_env_bearer=allow_env_bearer,
+        )
         model_service_probe = probe_unity_gateway_capabilities(workspace, token)
     if model_service_probe.resource_available:
         print_success("Unity AI Gateway connected")
@@ -647,13 +664,22 @@ def configure_shared_state(
         print_warning(f"Model service: {model_service_probe.detail}")
 
     want_claude = (
-        fetch_all or "claude" in tools or "opencode" in tools or "copilot" in tools or "pi" in tools
+        fetch_all
+        or "claude" in tools
+        or "hermes" in tools
+        or "opencode" in tools
+        or "copilot" in tools
+        or "pi" in tools
     )
-    want_gemini = fetch_all or "gemini" in tools or "opencode" in tools or "pi" in tools
-    want_codex = fetch_all or "codex" in tools or "copilot" in tools or "pi" in tools
+    want_gemini = (
+        fetch_all or "gemini" in tools or "hermes" in tools or "opencode" in tools or "pi" in tools
+    )
+    want_codex = (
+        fetch_all or "codex" in tools or "hermes" in tools or "copilot" in tools or "pi" in tools
+    )
     # Codex smart routing can select OSS models such as GLM, so a Codex-only
     # configure must persist that discovered family too.
-    want_oss = fetch_all or "opencode" in tools or "codex" in tools
+    want_oss = fetch_all or "hermes" in tools or "opencode" in tools or "codex" in tools
 
     claude_reason: str | None = None
     gemini_reason: str | None = None
@@ -756,6 +782,7 @@ def _configure_shared_workspace_states(
 ) -> list[dict]:
     if not workspaces:
         raise RuntimeError("At least one workspace must be provided.")
+    allow_env_bearer = tools is None or "hermes" not in tools
     states: list[dict] = []
     for workspace, profile in workspaces:
         states.append(
@@ -767,6 +794,7 @@ def _configure_shared_workspace_states(
                 use_pat=use_pat,
                 fable_enabled=fable_enabled,
                 databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+                allow_env_bearer=allow_env_bearer,
             )
         )
     return states
@@ -1119,12 +1147,35 @@ def revert() -> int:
     claude_managed_result = claude_agent.revert_managed_settings()
     codex_managed_result = codex_agent.revert_managed_config()
 
+    hermes_managed = managed_configs.get("hermes")
+    hermes_configured = "hermes" in (state.get("available_tools") or [])
+    hermes_cleaned = False
+    if hermes_managed or hermes_configured:
+        if not isinstance(hermes_managed, dict):
+            raise RuntimeError("Hermes cleanup ownership is missing; refusing unsafe cleanup.")
+        hermes_home = hermes_managed.get("hermes_home")
+        active_model = hermes_managed.get("active_model")
+        provider_fingerprints = hermes_managed.get("provider_fingerprints")
+        if not isinstance(hermes_home, str) or not isinstance(active_model, dict):
+            raise RuntimeError("Hermes ownership metadata is incomplete; refusing unsafe cleanup.")
+        if not isinstance(provider_fingerprints, dict) or not provider_fingerprints:
+            raise RuntimeError("Hermes provider ownership is incomplete; refusing unsafe cleanup.")
+        hermes_agent.unconfigure(
+            hermes_home=hermes_home,
+            owned_model=active_model,
+            owned_provider_fingerprints=provider_fingerprints,
+        )
+        hermes_cleaned = True
+
     results: dict[str, bool] = {
         tool: restore_file(
             spec["config_path"], spec["backup_path"], bool(managed_configs.get(tool))
         )
         for tool, spec in TOOL_SPECS.items()
+        if tool != "hermes"
     }
+    if "hermes" in TOOL_SPECS:
+        results["hermes"] = hermes_cleaned
     pi_settings_restored = restore_file(
         PI_SETTINGS_PATH, PI_SETTINGS_BACKUP_PATH, bool(managed_configs.get("pi"))
     )
@@ -1491,28 +1542,40 @@ def auth_token_cmd(
         bool,
         typer.Option("--force-refresh", help="Force the Databricks CLI to mint a new token."),
     ] = False,
+    allow_env_bearer: Annotated[
+        bool,
+        typer.Option(
+            "--allow-env-bearer",
+            help="Allow DATABRICKS_BEARER for this explicit identity (CI/M2M only).",
+            hidden=True,
+        ),
+    ] = False,
 ) -> None:
     """Print a Databricks bearer token to stdout, then exit.
 
     This is the cross-platform helper invoked by Claude Code's `apiKeyHelper`
     and Codex's auth command on every token refresh. It is not meant for
-    interactive use. All token logic (DATABRICKS_BEARER short-circuit, PAT
-    profiles, OAuth refresh) lives in `get_databricks_token`, so the same
-    binary works on macOS, Linux, and Windows without any POSIX shell."""
+    interactive use. Explicit PAT profiles are resolved directly; OAuth and an
+    explicitly allowed DATABRICKS_BEARER are handled by `get_databricks_token`,
+    so the same binary works on macOS, Linux, and Windows without a POSIX shell."""
     import sys
 
+    explicit_identity = host is not None or profile is not None
     state = load_state()
     workspace = host or state.get("workspace")
     if not workspace:
         print_err("No workspace configured. Run `ug configure` first.")
         raise typer.Exit(1)
-    profile = profile or state.get("profile")
-    if use_pat or state.get("use_pat"):
+    if profile is None and host is None:
+        profile = state.get("profile")
+    effective_use_pat = use_pat or (not explicit_identity and bool(state.get("use_pat")))
+    if effective_use_pat:
         # --use-pat explicitly means "serve the profile's static PAT". Fail
         # closed if it can't be read rather than falling through to OAuth —
         # `auth token` cannot serve a PAT-only profile, so that path would
         # surface a misleading stale-login error instead of the real cause.
-        if not ensure_pat_bearer(profile):
+        token = resolve_pat_token(profile)
+        if not token:
             print_err(
                 f"--use-pat: no personal access token available for profile "
                 f"'{profile or '<none>'}'. Add a `token = <PAT>` entry under "
@@ -1520,11 +1583,17 @@ def auth_token_cmd(
                 "`ug configure` without --use-pat to use OAuth."
             )
             raise typer.Exit(1)
-    try:
-        token = get_databricks_token(workspace, profile, force_refresh=force_refresh)
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
+    else:
+        try:
+            token = get_databricks_token(
+                workspace,
+                profile,
+                force_refresh=force_refresh,
+                allow_env_bearer=allow_env_bearer,
+            )
+        except RuntimeError as exc:
+            print_err(str(exc))
+            raise typer.Exit(1) from None
     # Write the bare token (with trailing newline) to stdout — nothing else may
     # land on stdout or the consuming agent will treat it as part of the token.
     sys.stdout.write(token + "\n")
@@ -2713,7 +2782,7 @@ def configure(
         str | None,
         typer.Option(
             "--agent",
-            help="Configure only the named agent (e.g. claude, codex, gemini, opencode, copilot, pi).",
+            help="Configure only the named agent (e.g. claude, codex, gemini, opencode, copilot, pi, hermes).",
         ),
     ] = None,
     agents: Annotated[
@@ -3031,6 +3100,209 @@ def configure(
         # managed config) is followed by `print_err(str(exc))` printing the exit code — a bare,
         # meaningless "ERROR 0".
         raise
+    except RuntimeError as exc:
+        print_err(str(exc))
+        raise typer.Exit(1) from None
+    except KeyboardInterrupt:
+        print_err("Interrupted.")
+        raise typer.Exit(130) from None
+
+
+def _prepare_hermes_receipt(receipt_file: Path, receipt: dict) -> Path:
+    """Durably stage a receipt without publishing its success marker."""
+    staged_path: Path | None = None
+    try:
+        receipt_file.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=receipt_file.parent,
+            prefix=f".{receipt_file.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            staged_path = Path(handle.name)
+            handle.write(json.dumps(receipt, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return staged_path
+    except OSError as exc:
+        if staged_path is not None:
+            try:
+                staged_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise RuntimeError("Could not prepare the Hermes configuration receipt.") from exc
+
+
+def _discard_staged_receipt(staged_path: Path | None) -> None:
+    if staged_path is None:
+        return
+    try:
+        staged_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def configure_hermes_command(
+    *,
+    workspace: str | None = None,
+    profile: str | None = None,
+    model: str | None = None,
+    hermes_home: str | Path | None = None,
+    receipt_file: Path | None = None,
+) -> dict:
+    """Configure Hermes through its public config commands and return a safe receipt."""
+    if profile and not workspace:
+        raise RuntimeError("--profile requires --workspace.")
+    interactive = workspace is None
+    if workspace is None:
+        workspace, prompted_profile = _prompt_for_configuration("hermes")
+        profile = profile or prompted_profile
+
+    state = configure_shared_state(
+        workspace,
+        profile=profile,
+        tools=["hermes"],
+        force_login=interactive,
+        allow_env_bearer=False,
+    )
+    selected = model or hermes_agent.default_model(state)
+    if not selected:
+        raise RuntimeError("No supported models are available for Hermes.")
+    claude_models = state.get("claude_models")
+    available = [
+        *(state.get("codex_models") or []),
+        *(claude_models.values() if isinstance(claude_models, dict) else []),
+        *(state.get("oss_models") or []),
+        *(state.get("gemini_models") or []),
+    ]
+    if model is not None and model not in available:
+        raise RuntimeError(
+            f"Hermes model '{model}' is not available on workspace {state['workspace']}."
+        )
+
+    target = (
+        Path(hermes_home or os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+        .expanduser()
+        .resolve()
+    )
+    patch = hermes_agent.render_config_patch(
+        hermes_agent.state_scoped_to_home(state, target),
+        model=selected,
+    )
+    provider_ids = [
+        path.removeprefix("providers.") for path in patch["set"] if path.startswith("providers.")
+    ]
+    receipt = {
+        "status": "configured",
+        "agent": "hermes",
+        "hermes_home": str(target),
+        "provider_ids": provider_ids,
+        "default_provider": patch["set"]["model.provider"],
+        "default_model": selected,
+        "mcp_servers_configured": [],
+        "warnings": [],
+    }
+    staged_receipt = _prepare_hermes_receipt(receipt_file, receipt) if receipt_file else None
+    previous_state = copy.deepcopy(state)
+    pending_state = hermes_agent.record_config_ownership(copy.deepcopy(state), patch, target)
+    pending_state["available_tools"] = sorted(
+        set(pending_state.get("available_tools") or []) | {"hermes"}
+    )
+    try:
+        save_state(pending_state)
+    except Exception:
+        _discard_staged_receipt(staged_receipt)
+        raise
+    try:
+        hermes_agent.apply_config_patch(patch, hermes_home=target)
+    except Exception as exc:
+        if not isinstance(exc, hermes_agent.HermesConfigApplyError):
+            try:
+                save_state(previous_state)
+            except Exception:
+                pass
+        _discard_staged_receipt(staged_receipt)
+        raise
+    if receipt_file is not None and staged_receipt is not None:
+        try:
+            os.replace(staged_receipt, receipt_file)
+        except OSError as exc:
+            _discard_staged_receipt(staged_receipt)
+            raise RuntimeError("Could not publish the Hermes configuration receipt.") from exc
+    return receipt
+
+
+@configure_app.command("hermes")
+def configure_hermes(
+    workspace: Annotated[
+        str | None,
+        typer.Option("--workspace", help="Databricks workspace URL (skips the workspace prompt)."),
+    ] = None,
+    profile: Annotated[
+        str | None,
+        typer.Option("--profile", help="Exact Databricks CLI profile to use with --workspace."),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="Exact discovered Responses model to make the default."),
+    ] = None,
+    hermes_home: Annotated[
+        Path | None,
+        typer.Option(
+            "--hermes-home",
+            help="Exact Hermes home to configure (defaults to HERMES_HOME or ~/.hermes).",
+        ),
+    ] = None,
+    output: Annotated[
+        str,
+        typer.Option("--output", help="Completion output: text (default) or json."),
+    ] = "text",
+    receipt_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--receipt-file",
+            help="Write the non-secret completion receipt to this file while keeping normal UI output.",
+        ),
+    ] = None,
+) -> None:
+    """Configure Hermes for Databricks Model Serving without launching it."""
+    if output not in {"text", "json"}:
+        print_err("--output must be one of: text, json.")
+        raise typer.Exit(2)
+    if receipt_file is not None and output == "json":
+        print_err("--receipt-file cannot be combined with --output json.")
+        raise typer.Exit(2)
+    if receipt_file is not None:
+        try:
+            receipt_file.unlink(missing_ok=True)
+        except OSError:
+            print_err("Unable to prepare completion receipt.")
+            raise typer.Exit(1) from None
+    try:
+        if output == "json":
+            # Discovery/auth helpers use the normal Rich UI. Suppress those progress
+            # messages so stdout remains a single machine-readable document.
+            with console.capture():
+                result = configure_hermes_command(
+                    workspace=workspace,
+                    profile=profile,
+                    model=model,
+                    hermes_home=hermes_home,
+                )
+            typer.echo(json.dumps(result, sort_keys=True))
+        else:
+            result = configure_hermes_command(
+                workspace=workspace,
+                profile=profile,
+                model=model,
+                hermes_home=hermes_home,
+                receipt_file=receipt_file,
+            )
+            print_success(
+                f"Hermes configured for Databricks Model Serving ({result['default_model']})"
+            )
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

@@ -133,7 +133,7 @@ def _counting_token(value: str = "dbx-swap-token"):
     the mint count deterministic (one on init, one per forced retry-refresh)."""
     calls: list[bool] = []
 
-    def fn(_workspace, _profile, force_refresh=False):
+    def fn(_workspace, _profile, force_refresh=False, **_kwargs):
         calls.append(force_refresh)
         return value
 

@@ -74,7 +74,36 @@ To configure specific tools without the picker, pass a comma-separated list:
 ug configure --agents claude,codex
 ```
 
-Available agent names are `codex`, `claude`, `gemini`, `opencode`, `copilot`, and `pi`. `cursor` is also accepted (MCP-only — it registers Databricks MCP servers but configures no models).
+Available agent names are `codex`, `claude`, `gemini`, `opencode`, `copilot`, `pi`, and `hermes`. `cursor` is also accepted (MCP-only — it registers Databricks MCP servers but configures no models).
+
+### Hermes Agent
+
+Hermes exposes **Databricks Model Serving** in its native provider picker and
+delegates Databricks-specific setup to ucode. Configure it directly without
+launching a session with:
+
+```bash
+ucode configure hermes
+```
+
+For automation, pin the workspace, Databricks CLI profile, model, and isolated
+Hermes home explicitly:
+
+```bash
+ucode configure hermes \
+  --workspace https://my-workspace.databricks.com \
+  --profile DEFAULT \
+  --model system.ai.my-model \
+  --hermes-home /path/to/hermes-home \
+  --output json
+```
+
+Generated providers use refreshable Databricks CLI credentials; ucode never
+writes an OAuth token or PAT into Hermes configuration. Normal use remains
+`hermes` and its `/model` picker—no ucode wrapper process is required.
+
+Current support includes Responses/Codex, Anthropic Messages, native Gemini,
+OpenAI-compatible OSS models, and managed MCP servers.
 
 Naming agents explicitly is treated as a request for all of them: if any one isn't available on the workspace, the run fails without configuring the others. Add `--skip-unavailable` to configure the available subset instead and skip the rest with a warning:
 

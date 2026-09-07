@@ -1046,7 +1046,14 @@ class TestClaudeLaunch:
             def wait(self):
                 return 0
 
-        def start_proxy(workspace, profile, port, token_header, force_refresh_near_expiry):
+        def start_proxy(
+            workspace,
+            profile,
+            port,
+            token_header,
+            force_refresh_near_expiry,
+            allow_env_bearer=False,
+        ):
             calls.append(
                 (
                     "proxy",
@@ -1055,6 +1062,7 @@ class TestClaudeLaunch:
                     port,
                     token_header,
                     force_refresh_near_expiry,
+                    allow_env_bearer,
                 )
             )
             return Server(), Cache(), Client()
@@ -1082,6 +1090,7 @@ class TestClaudeLaunch:
             "test",
             12345,
             claude.gateway_proxy.AI_GATEWAY_TOKEN_HEADER,
+            False,
             False,
         )
         assert calls[-3:] == [("stop",), ("shutdown",), ("close",)]

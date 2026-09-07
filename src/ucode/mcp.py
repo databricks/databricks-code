@@ -10,6 +10,7 @@ import subprocess
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -26,7 +27,7 @@ from questionary.prompts.common import InquirerControl
 from questionary.question import Question
 from questionary.styles import merge_styles_default
 
-from ucode.agents import copilot, cursor, gemini, opencode
+from ucode.agents import copilot, cursor, gemini, hermes, opencode
 from ucode.config_io import restore_file
 from ucode.databricks import (
     apply_pat_environment,
@@ -97,6 +98,11 @@ MCP_CLIENTS = {
         "binary": "cursor-agent",
         "display": "Cursor",
         "list_command": "cursor-agent mcp list",
+    },
+    "hermes": {
+        "binary": "hermes",
+        "display": "Hermes",
+        "list_command": "hermes mcp list",
     },
 }
 SKILLS_MCP_KIND = "skills"
@@ -300,6 +306,8 @@ def configure_client_mcp_server(
     *,
     use_pat: bool = False,
     always_load: bool = False,
+    hermes_home: str | None = None,
+    expected_fingerprint: str | None = None,
 ) -> list[str]:
     # Every client registers the same `ucode mcp-proxy ...` stdio command; the
     # proxy forwards to `url` and refreshes the Databricks token itself. Only the
@@ -330,10 +338,24 @@ def configure_client_mcp_server(
     if client == "cursor":
         removed = cursor.write_mcp_server_config(name, argv)
         return [MCP_USER_SCOPE] if removed else []
+    if client == "hermes":
+        removed = hermes.write_mcp_server_config(
+            name,
+            argv,
+            hermes_home=hermes_home,
+            expected_fingerprint=expected_fingerprint,
+        )
+        return [MCP_USER_SCOPE] if removed else []
     raise RuntimeError(f"Unsupported MCP client '{client}'.")
 
 
-def remove_client_mcp_server(client: str, name: str) -> list[str]:
+def remove_client_mcp_server(
+    client: str,
+    name: str,
+    *,
+    hermes_home: str | None = None,
+    expected_fingerprint: str | None = None,
+) -> list[str]:
     if client == "claude":
         return [scope for scope in MCP_CLEANUP_SCOPES if remove_claude_mcp_server(name, scope)]
     if client == "codex":
@@ -346,7 +368,40 @@ def remove_client_mcp_server(client: str, name: str) -> list[str]:
         return [MCP_USER_SCOPE] if copilot.remove_mcp_server_config(name) else []
     if client == "cursor":
         return [MCP_USER_SCOPE] if cursor.remove_mcp_server_config(name) else []
+    if client == "hermes":
+        removed = hermes.remove_mcp_server_config(
+            name,
+            hermes_home=hermes_home,
+            expected_fingerprint=expected_fingerprint,
+        )
+        return [MCP_USER_SCOPE] if removed else []
     raise RuntimeError(f"Unsupported MCP client '{client}'.")
+
+
+def _remove_recorded_client_server(
+    client: str,
+    name: str,
+    server: dict,
+    *,
+    hermes_home: str | None,
+) -> list[str]:
+    if client != "hermes":
+        return remove_client_mcp_server(client, name)
+    raw_ownership = server.get("ownership")
+    ownership: dict = raw_ownership if isinstance(raw_ownership, dict) else {}
+    hermes_ownership = ownership.get("hermes")
+    if not isinstance(hermes_ownership, dict):
+        return []
+    owned_home = hermes_ownership.get("hermes_home")
+    owned_fingerprint = hermes_ownership.get("fingerprint")
+    if not isinstance(owned_home, str) or not isinstance(owned_fingerprint, str):
+        return []
+    return remove_client_mcp_server(
+        client,
+        name,
+        hermes_home=owned_home,
+        expected_fingerprint=owned_fingerprint,
+    )
 
 
 def revert_mcp_configs(state: dict) -> dict[str, bool]:
@@ -363,7 +418,12 @@ def revert_mcp_configs(state: dict) -> dict[str, bool]:
         for client in server.get("clients") or []:
             if client not in MCP_CLIENTS:
                 continue
-            removed_scopes = remove_client_mcp_server(client, name)
+            removed_scopes = _remove_recorded_client_server(
+                client,
+                name,
+                server,
+                hermes_home=_recorded_hermes_home(state),
+            )
             results[client] = bool(removed_scopes) or results.get(client, False)
 
     # OpenCode MCP entries live in the normal OpenCode config and are restored
@@ -377,6 +437,17 @@ def revert_mcp_configs(state: dict) -> dict[str, bool]:
         ),
     ) or results.get("copilot", False)
     return results
+
+
+def _recorded_hermes_home(state: dict) -> str | None:
+    managed = state.get("managed_configs")
+    if not isinstance(managed, dict):
+        return None
+    hermes_managed = managed.get("hermes")
+    if not isinstance(hermes_managed, dict):
+        return None
+    value = hermes_managed.get("hermes_home")
+    return value if isinstance(value, str) and value else None
 
 
 def _coerce_bool(value: object) -> bool | None:
@@ -1133,7 +1204,7 @@ def apply_managed_mcp_servers(
         return []
     entries = managed.get("mcp_servers")
     if not isinstance(entries, list):
-        return []
+        entries = []
     working: list[dict] = []
     seen: set[str] = set()
     skipped: list[str] = []
@@ -1158,8 +1229,6 @@ def apply_managed_mcp_servers(
             "Skipping managed MCP server(s) ucode can't yet auto-register from the workspace "
             f"config: {', '.join(skipped)}. Add them with `ucode configure mcp`."
         )
-    if not working:
-        return []
     # Diff against the managed servers ucode registered on a prior launch so a removed entry is
     # unregistered and an unchanged one is a no-op. Only this tool's managed servers are considered.
     state = load_state()
@@ -1168,7 +1237,17 @@ def apply_managed_mcp_servers(
         for server in (state.get("managed_mcp_servers") or [])
         if isinstance(server, dict) and tool in (server.get("clients") or [])
     ]
-    apply_mcp_server_changes(previous, working, [tool], workspace, profile, use_pat=use_pat)
+    if not working and not previous:
+        return []
+    apply_mcp_server_changes(
+        previous,
+        working,
+        [tool],
+        workspace,
+        profile,
+        use_pat=use_pat,
+        hermes_home=_recorded_hermes_home(state),
+    )
     return working
 
 
@@ -1219,7 +1298,13 @@ def apply_managed_skills(
     original = list(state.get("mcp_servers") or [])
     working = _resolve_skills_mcp_servers(workspace, [tool], new_locations, original)
     changed = apply_mcp_server_changes(
-        original, working, [tool], workspace, profile, use_pat=use_pat
+        original,
+        working,
+        [tool],
+        workspace,
+        profile,
+        use_pat=use_pat,
+        hermes_home=_recorded_hermes_home(state),
     )
     if not (changed or original != working or prev_managed != desired):
         return []
@@ -1458,7 +1543,25 @@ def apply_mcp_server_changes(
     profile: str | None = None,
     *,
     use_pat: bool = False,
+    hermes_home: str | None = None,
 ) -> bool:
+    target_hermes_home = str(
+        Path(hermes_home or os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+        .expanduser()
+        .resolve()
+    )
+    if "hermes" in clients:
+        for server in working_servers:
+            url = server.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            argv = build_mcp_proxy_argv(url, workspace, profile, use_pat=use_pat)
+            ownership = dict(server.get("ownership") or {})
+            ownership["hermes"] = {
+                "fingerprint": hermes.mcp_server_fingerprint(hermes.mcp_value_for_argv(argv)),
+                "hermes_home": target_hermes_home,
+            }
+            server["ownership"] = ownership
     original_by_name = _servers_by_name(original_servers)
     working_by_name = _servers_by_name(working_servers)
 
@@ -1475,7 +1578,12 @@ def apply_mcp_server_changes(
         if name not in working_by_name:
             for client in _mcp_server_clients(server):
                 work.setdefault(client, []).append(
-                    lambda c=client, n=name: remove_client_mcp_server(c, n)
+                    lambda c=client, n=name, s=server: _remove_recorded_client_server(
+                        c,
+                        n,
+                        s,
+                        hermes_home=hermes_home,
+                    )
                 )
             changed = True
 
@@ -1489,10 +1597,31 @@ def apply_mcp_server_changes(
         # alwaysLoad (Claude-only) keeps the skills registry's utility tools
         # discoverable without an explicit mention; other clients ignore it.
         always_load = server.get("kind") == SKILLS_MCP_KIND
+        original_ownership = original.get("ownership") if isinstance(original, dict) else None
+        original_hermes = (
+            original_ownership.get("hermes") if isinstance(original_ownership, dict) else None
+        )
+        expected_hermes_fingerprint = None
+        if (
+            isinstance(original_hermes, dict)
+            and original_hermes.get("hermes_home") == target_hermes_home
+            and isinstance(original_hermes.get("fingerprint"), str)
+        ):
+            expected_hermes_fingerprint = original_hermes["fingerprint"]
         for client in clients:
             work[client].append(
-                lambda c=client, n=name, u=url, al=always_load: configure_client_mcp_server(
-                    c, n, u, workspace, profile, use_pat=use_pat, always_load=al
+                lambda c=client, n=name, u=url, al=always_load, expected=expected_hermes_fingerprint: (
+                    configure_client_mcp_server(
+                        c,
+                        n,
+                        u,
+                        workspace,
+                        profile,
+                        use_pat=use_pat,
+                        always_load=al,
+                        hermes_home=target_hermes_home,
+                        expected_fingerprint=expected if c == "hermes" else None,
+                    )
                 )
             )
         changed = True
@@ -1550,23 +1679,39 @@ def purge_cross_workspace_mcp_residue(state: dict, workspace: str) -> None:
         )
         noun = "entry" if len(foreign_mcp_servers) == 1 else "entries"
         print_warning(
-            f"Dropping {len(foreign_mcp_servers)} stale MCP {noun} "
+            f"Cleaning {len(foreign_mcp_servers)} stale MCP {noun} "
             f"not bound to this workspace: {foreign_names}."
         )
+        retained_foreign: list[dict] = []
         for server in foreign_mcp_servers:
             name = _server_name(server)
             if not name:
+                retained_foreign.append(server)
                 continue
+            fully_removed = True
             for client in server.get("clients") or []:
                 if client not in installed or client not in MCP_CLIENTS:
+                    if client == "hermes":
+                        fully_removed = False
                     continue
                 try:
-                    remove_client_mcp_server(client, name)
+                    removed_scopes = _remove_recorded_client_server(
+                        client,
+                        name,
+                        server,
+                        hermes_home=_recorded_hermes_home(state),
+                    )
                 except RuntimeError as exc:
+                    fully_removed = False
                     print_warning(
                         f"Failed to remove `{name}` from {MCP_CLIENTS[client]['display']}: {exc}"
                     )
-        state["mcp_servers"] = current_mcp_servers
+                    continue
+                if client == "hermes" and not removed_scopes:
+                    fully_removed = False
+            if not fully_removed:
+                retained_foreign.append(server)
+        state["mcp_servers"] = [*current_mcp_servers, *retained_foreign]
         save_state(state)
 
     other_ws_mcps = _mcp_entries_only_in_other_workspaces(workspace)
@@ -1869,6 +2014,7 @@ def configure_mcp_command(
             workspace,
             profile,
             use_pat=bool(state.get("use_pat")),
+            hermes_home=_recorded_hermes_home(state),
         )
         if changed or original_mcp_servers_for_location != working_mcp_servers:
             state["mcp_servers"] = working_mcp_servers
@@ -1966,6 +2112,7 @@ def configure_mcp_command(
         workspace,
         profile,
         use_pat=bool(state.get("use_pat")),
+        hermes_home=_recorded_hermes_home(state),
     )
     if changed or original_mcp_servers != working_mcp_servers:
         state["mcp_servers"] = working_mcp_servers
@@ -2074,7 +2221,13 @@ def remove_mcp_command(agents: set[str] | None = None) -> int:
         if targets:
             removal_view.append({**server, "clients": targets})
     changed = apply_mcp_server_changes(
-        removal_view, [], clients, workspace, profile, use_pat=bool(state.get("use_pat"))
+        removal_view,
+        [],
+        clients,
+        workspace,
+        profile,
+        use_pat=bool(state.get("use_pat")),
+        hermes_home=_recorded_hermes_home(state),
     )
 
     # Update saved state: drop a fully-removed server, or keep it with the named
@@ -2178,7 +2331,14 @@ def _update_skills_mcp(
     """Rebuild the single skills connection for ``locations`` and persist it."""
     original = list(state.get("mcp_servers") or [])
     working = _resolve_skills_mcp_servers(workspace, clients, locations, original)
-    changed = apply_mcp_server_changes(original, working, clients, workspace, profile)
+    changed = apply_mcp_server_changes(
+        original,
+        working,
+        clients,
+        workspace,
+        profile,
+        hermes_home=_recorded_hermes_home(state),
+    )
     if changed or original != working:
         state["mcp_servers"] = working
         save_state(state)
