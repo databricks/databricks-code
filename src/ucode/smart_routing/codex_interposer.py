@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from websockets.asyncio.client import connect
@@ -26,42 +26,6 @@ RouteDecisionFn = Callable[[str], tuple[routing.RoutingDecision | None, str | No
 SwitchMessageFn = Callable[[str, str], str]
 TokenProvider = Callable[[], str]
 
-def _frame_summary(raw: str) -> str:
-    """Return a compact one-line summary of a JSON-RPC frame for logging."""
-    try:
-        msg = json.loads(raw)
-    except ValueError:
-        return raw[:80]
-    if not isinstance(msg, dict):
-        return raw[:80]
-    method = msg.get("method") or "?"
-    parts: list[str] = [f"method={method}"]
-    if "id" in msg:
-        parts.append(f"id={msg['id']}")
-    params = msg.get("params")
-    if isinstance(params, dict):
-        model = params.get("model")
-        if isinstance(model, str):
-            parts.append(f"model={model}")
-        tid = params.get("threadId")
-        if isinstance(tid, str):
-            parts.append(f"threadId={tid}")
-        turn = params.get("turn")
-        if isinstance(turn, dict) and isinstance(turn.get("id"), str):
-            parts.append(f"turnId={turn['id']}")
-        ts = params.get("threadSettings")
-        if isinstance(ts, dict) and isinstance(ts.get("model"), str):
-            parts.append(f"threadSettings.model={ts['model']}")
-    result = msg.get("result")
-    if isinstance(result, dict):
-        thread = result.get("thread")
-        if isinstance(thread, dict):
-            if isinstance(thread.get("id"), str):
-                parts.append(f"result.thread.id={thread['id']}")
-            if isinstance(thread.get("model"), str):
-                parts.append(f"result.thread.model={thread['model']}")
-    return " ".join(parts)
-
 
 def _prompt_from_turn(params: dict) -> str | None:
     """Extract the plaintext portions of a Codex ``turn/start`` input."""
@@ -79,6 +43,12 @@ def _prompt_from_turn(params: dict) -> str | None:
             parts.append(item["text"])
     prompt = "\n".join(part for part in parts if part.strip())
     return prompt or None
+
+
+@dataclass
+class TuiFrameResult:
+    frame: str
+    needs_settings_update: bool = False
 
 
 class _Session:
@@ -105,36 +75,29 @@ class _Session:
         self.injected = False
         self.settings_update_id: str | None = None
 
-    def on_tui_frame(self, raw: str) -> tuple[str, bool]:
-        """Process a TUI-to-app frame. Returns (frame, needs_settings_update).
-
-        When routing selects a different model, the caller must send
-        ``thread/settings/update`` to the app-server (and wait for its
-        confirmation) before forwarding the returned frame.
-        """
+    def on_tui_frame(self, raw: str) -> TuiFrameResult:
         try:
             msg = json.loads(raw)
         except ValueError:
-            return raw, False
+            return TuiFrameResult(raw)
         if not isinstance(msg, dict):
-            return raw, False
+            return TuiFrameResult(raw)
         params = msg.get("params")
         if msg.get("method") == TURN_START and isinstance(params, dict):
             if isinstance(params.get("threadId"), str):
                 self.thread_id = params["threadId"]
-            # Route only the first turn; later /model selections belong to the user.
             if self.first_turn_seen:
-                return raw, False
+                return TuiFrameResult(raw)
             self.first_turn_seen = True
             if self.route_decision is not None:
                 prompt = _prompt_from_turn(params)
                 if prompt is None:
                     self.log("[ROUTE] first turn had no plaintext prompt; keeping current model")
-                    return raw, False
+                    return TuiFrameResult(raw)
                 decision, reason = self.route_decision(prompt)
                 if decision is None:
                     self.log(f"[ROUTE] selection failed; keeping current model: {reason}")
-                    return raw, False
+                    return TuiFrameResult(raw)
                 decision = replace(decision, model=codex_routing.codex_model_id(decision.model))
                 self.target = decision.model
                 if self.switch_message_fn is not None:
@@ -144,21 +107,15 @@ class _Session:
             old = params.get("model")
             if self.target is not None and old != self.target:
                 params["model"] = self.target
-                # Also rewrite the nested collaborationMode.settings.model —
-                # the app-server uses it to re-derive the thread model on
-                # every turn/start, overwriting any thread/settings/update
-                # we sent beforehand.
                 collab = params.get("collaborationMode")
                 if isinstance(collab, dict):
                     settings = collab.get("settings")
-                    if isinstance(settings, dict) and isinstance(
-                        settings.get("model"), str
-                    ):
+                    if isinstance(settings, dict) and isinstance(settings.get("model"), str):
                         settings["model"] = self.target
                 self.switch_pending = True
                 self.log(f"[REWRITE] model {old!r} -> {self.target!r}")
-                return json.dumps(msg), True
-        return raw, False
+                return TuiFrameResult(json.dumps(msg), needs_settings_update=True)
+        return TuiFrameResult(raw)
 
     def on_engine_frame(self, raw: str) -> list[dict]:
         try:
@@ -177,8 +134,6 @@ class _Session:
             ts = src.get("threadSettings")
             if isinstance(ts, dict):
                 self.settings = ts
-        # When the app-server confirms our thread/settings/update request,
-        # record it so the tui_to_app loop can stop waiting.
         if (
             self.settings_update_id is not None
             and isinstance(msg.get("id"), str)
@@ -218,7 +173,6 @@ class _Session:
                     "memoryCitation": None,
                 }
                 self.log(f"[INJECT] agentMessage note (started+completed): {self.switch_message!r}")
-                # Codex renders the message only when it receives both lifecycle events.
                 injected.append(
                     {
                         "method": ITEM_STARTED,
@@ -288,20 +242,8 @@ async def _handle_tui(
         async def tui_to_app():
             async for frame in tui:
                 if isinstance(frame, str):
-                    log(f"[TUI->APP] {_frame_summary(frame)}")
-                    # Route selection is a blocking HTTP call. Keep it off the
-                    # WebSocket event loop while holding this first frame until
-                    # its selected model has been written into ``turn/start``.
-                    frame, needs_settings_update = await asyncio.to_thread(
-                        sess.on_tui_frame, frame
-                    )
-                    # When routing picks a different model, send
-                    # thread/settings/update to the app-server BEFORE
-                    # forwarding turn/start.  The app-server pins the model
-                    # at thread creation time and ignores the per-turn
-                    # ``model`` field, so we must update the thread model
-                    # at the app-server level before the turn begins.
-                    if needs_settings_update and sess.thread_id:
+                    result = await asyncio.to_thread(sess.on_tui_frame, frame)
+                    if result.needs_settings_update and sess.thread_id:
                         update_id = f"ucode-route-{uuid.uuid4().hex}"
                         update_req = json.dumps({
                             "id": update_id,
@@ -314,9 +256,6 @@ async def _handle_tui(
                         sess.settings_update_id = update_id
                         log(f"[ROUTE] sending {SETTINGS_UPDATE} model={sess.target!r} to app-server")
                         await upstream.send(update_req)
-                        # Wait for the app-server to confirm the update.
-                        # The response arrives on the app_to_tui loop and
-                        # clears settings_update_id in on_engine_frame.
                         deadline = asyncio.get_event_loop().time() + 10
                         while sess.settings_update_id is not None:
                             remaining = deadline - asyncio.get_event_loop().time()
@@ -326,16 +265,15 @@ async def _handle_tui(
                             await asyncio.sleep(0.05)
                         if sess.settings_update_id is None:
                             log("[ROUTE] settings/update confirmed by app-server")
-                await upstream.send(frame)
+                    await upstream.send(result.frame)
+                else:
+                    await upstream.send(frame)
 
         async def app_to_tui():
             async for frame in upstream:
-                if isinstance(frame, str):
-                    log(f"[APP->TUI] {_frame_summary(frame)}")
                 await tui.send(frame)
                 if isinstance(frame, str):
                     for inj in sess.on_engine_frame(frame):
-                        log(f"[TUI<-INJ] {_frame_summary(json.dumps(inj))}")
                         await tui.send(json.dumps(inj))
 
         a = asyncio.create_task(tui_to_app())
