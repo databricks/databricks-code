@@ -48,7 +48,7 @@ def _prompt_from_turn(params: dict) -> str | None:
 @dataclass
 class TuiFrameResult:
     frame: str
-    needs_settings_update: bool = False
+    needs_settings_update: bool
 
 
 class _Session:
@@ -74,30 +74,31 @@ class _Session:
         self.notice_pending = False
         self.injected = False
         self.settings_update_id: str | None = None
+        self.settings_update_event: asyncio.Event = asyncio.Event()
 
     def on_tui_frame(self, raw: str) -> TuiFrameResult:
         try:
             msg = json.loads(raw)
         except ValueError:
-            return TuiFrameResult(raw)
+            return TuiFrameResult(raw, needs_settings_update=False)
         if not isinstance(msg, dict):
-            return TuiFrameResult(raw)
+            return TuiFrameResult(raw, needs_settings_update=False)
         params = msg.get("params")
         if msg.get("method") == TURN_START and isinstance(params, dict):
             if isinstance(params.get("threadId"), str):
                 self.thread_id = params["threadId"]
             if self.first_turn_seen:
-                return TuiFrameResult(raw)
+                return TuiFrameResult(raw, needs_settings_update=False)
             self.first_turn_seen = True
             if self.route_decision is not None:
                 prompt = _prompt_from_turn(params)
                 if prompt is None:
                     self.log("[ROUTE] first turn had no plaintext prompt; keeping current model")
-                    return TuiFrameResult(raw)
+                    return TuiFrameResult(raw, needs_settings_update=False)
                 decision, reason = self.route_decision(prompt)
                 if decision is None:
                     self.log(f"[ROUTE] selection failed; keeping current model: {reason}")
-                    return TuiFrameResult(raw)
+                    return TuiFrameResult(raw, needs_settings_update=False)
                 decision = replace(decision, model=codex_routing.codex_model_id(decision.model))
                 self.target = decision.model
                 if self.switch_message_fn is not None:
@@ -115,7 +116,7 @@ class _Session:
                 self.switch_pending = True
                 self.log(f"[REWRITE] model {old!r} -> {self.target!r}")
                 return TuiFrameResult(json.dumps(msg), needs_settings_update=True)
-        return TuiFrameResult(raw)
+        return TuiFrameResult(raw, needs_settings_update=False)
 
     def on_engine_frame(self, raw: str) -> list[dict]:
         try:
@@ -140,6 +141,7 @@ class _Session:
             and msg["id"] == self.settings_update_id
         ):
             self.settings_update_id = None
+            self.settings_update_event.set()
         if (
             msg.get("method") == TURN_STARTED
             and not self.injected
@@ -256,15 +258,11 @@ async def _handle_tui(
                         sess.settings_update_id = update_id
                         log(f"[ROUTE] sending {SETTINGS_UPDATE} model={sess.target!r} to app-server")
                         await upstream.send(update_req)
-                        deadline = asyncio.get_event_loop().time() + 10
-                        while sess.settings_update_id is not None:
-                            remaining = deadline - asyncio.get_event_loop().time()
-                            if remaining <= 0:
-                                log("[ROUTE] settings/update timed out; forwarding turn/start anyway")
-                                break
-                            await asyncio.sleep(0.05)
-                        if sess.settings_update_id is None:
+                        try:
+                            await asyncio.wait_for(sess.settings_update_event.wait(), timeout=10)
                             log("[ROUTE] settings/update confirmed by app-server")
+                        except TimeoutError:
+                            log("[ROUTE] settings/update timed out; forwarding turn/start anyway")
                     await upstream.send(result.frame)
                 else:
                     await upstream.send(frame)
