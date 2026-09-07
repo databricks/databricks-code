@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -13,6 +16,22 @@ import pytest
 from ucode.agents import claude
 from ucode.databricks import AnthropicModelCatalog
 from ucode.smart_routing import claude_hooks, claude_pty, routing, v2
+
+
+@contextlib.contextmanager
+def _short_socket_dir():
+    """Yield a short directory for AF_UNIX sockets.
+
+    pytest's tmp_path lives under /private/var/folders on macOS, whose length
+    alone can exceed the kernel's ~104-char AF_UNIX path limit and make bind
+    fail with "AF_UNIX path too long". Production sockets live under ~/.ucode
+    (short), so bind here to mirror production.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="ucode-pty-"))
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 class TestDirectModelCommand:
@@ -60,38 +79,39 @@ class TestFirstPromptHook:
         assert "Selected Model : GLM 5.3 Flash" in result["reason"]
         assert "anthropic-aigw-77df06ea" not in result["reason"]
 
-    def test_blocks_once_then_allows_replay(self, tmp_path):
-        socket_path = tmp_path / "first.sock"
-        blocked: list[tuple[str, str]] = []
-        stop = threading.Event()
-        claude_pty.serve_first_prompt_socket(
-            socket_path,
-            lambda _prompt: claude_pty.FirstPromptRoute(
-                model="sonnet", display_model="sonnet", rationale="Selected for a narrow task."
-            ),
-            lambda prompt, model: blocked.append((prompt, model)),
-            stop,
-        )
-        try:
-            deadline = time.monotonic() + 5
-            while not socket_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            first = claude_pty.request_first_prompt_route(
-                socket_path, {"session_id": "s1", "prompt": "fix the parser"}
+    def test_blocks_once_then_allows_replay(self):
+        with _short_socket_dir() as sock_dir:
+            socket_path = sock_dir / "first.sock"
+            blocked: list[tuple[str, str]] = []
+            stop = threading.Event()
+            claude_pty.serve_first_prompt_socket(
+                socket_path,
+                lambda _prompt: claude_pty.FirstPromptRoute(
+                    model="sonnet", display_model="sonnet", rationale="Selected for a narrow task."
+                ),
+                lambda prompt, model: blocked.append((prompt, model)),
+                stop,
             )
-            replay = claude_pty.request_first_prompt_route(
-                socket_path, {"session_id": "s1", "prompt": "fix the parser"}
-            )
-            assert first == {
-                "action": "block",
-                "model": "sonnet",
-                "display_model": "sonnet",
-                "rationale": "Selected for a narrow task.",
-            }
-            assert replay == {"action": "allow"}
-            assert blocked == [("fix the parser", "sonnet")]
-        finally:
-            stop.set()
+            try:
+                deadline = time.monotonic() + 5
+                while not socket_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                first = claude_pty.request_first_prompt_route(
+                    socket_path, {"session_id": "s1", "prompt": "fix the parser"}
+                )
+                replay = claude_pty.request_first_prompt_route(
+                    socket_path, {"session_id": "s1", "prompt": "fix the parser"}
+                )
+                assert first == {
+                    "action": "block",
+                    "model": "sonnet",
+                    "display_model": "sonnet",
+                    "rationale": "Selected for a narrow task.",
+                }
+                assert replay == {"action": "allow"}
+                assert blocked == [("fix the parser", "sonnet")]
+            finally:
+                stop.set()
 
     def test_first_prompt_hook_is_per_launch(self):
         settings = {"hooks": {"PreToolUse": [{"hooks": [{"command": "user-policy"}]}]}}
@@ -490,9 +510,10 @@ class TestPtyFlow:
         fake_claude = tmp_path / "fake_claude.py"
         capture = tmp_path / "capture.json"
         restored = tmp_path / "restored"
-        socket_path = tmp_path / "first.sock"
-        fake_claude.write_text(
-            """
+        with _short_socket_dir() as sock_dir:
+            socket_path = sock_dir / "first.sock"
+            fake_claude.write_text(
+                """
 import json
 import os
 import socket
@@ -531,27 +552,58 @@ capture_path.write_text(json.dumps({
     "restored_before_replay": restored_path.exists(),
 }))
 """.lstrip()
-        )
-        result = claude_pty.run_claude_pty(
-            [
-                sys.executable,
-                str(fake_claude),
-                str(socket_path),
-                str(capture),
-                str(restored),
-            ],
-            route_prompt=lambda _prompt: claude_pty.FirstPromptRoute(
-                model="system.ai.claude-sonnet-5",
-                display_model="system.ai.claude-sonnet-5",
-                rationale="",
-            ),
-            socket_path=socket_path,
-            restore_model_setting=lambda: restored.write_text("restored"),
-        )
+            )
+            result = claude_pty.run_claude_pty(
+                [
+                    sys.executable,
+                    str(fake_claude),
+                    str(socket_path),
+                    str(capture),
+                    str(restored),
+                ],
+                route_prompt=lambda _prompt: claude_pty.FirstPromptRoute(
+                    model="system.ai.claude-sonnet-5",
+                    display_model="system.ai.claude-sonnet-5",
+                    rationale="",
+                ),
+                socket_path=socket_path,
+                restore_model_setting=lambda: restored.write_text("restored"),
+            )
 
-        assert result == 0
-        assert json.loads(capture.read_text()) == {
-            "command": "/model system.ai.claude-sonnet-5\r",
-            "replayed": "\x1b[200~fix\nthe parser\x1b[201~\r",
-            "restored_before_replay": True,
-        }
+            assert result == 0
+            assert json.loads(capture.read_text()) == {
+                "command": "/model system.ai.claude-sonnet-5\r",
+                "replayed": "\x1b[200~fix\nthe parser\x1b[201~\r",
+                "restored_before_replay": True,
+            }
+
+    def test_bind_failure_names_the_reason(self, tmp_path):
+        # A socket path beyond the kernel's AF_UNIX limit can never bind; the
+        # serving thread must carry the failure out so the launch error names
+        # it instead of reporting a bare missing socket.
+        socket_path = tmp_path / ("x" * 160 + ".sock")
+        stop = threading.Event()
+        thread = claude_pty.serve_first_prompt_socket(
+            socket_path,
+            lambda _prompt: claude_pty.FirstPromptRoute(
+                model="sonnet", display_model="sonnet", rationale=""
+            ),
+            lambda _prompt, _model: None,
+            stop,
+        )
+        try:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+            assert isinstance(thread.bind_error, OSError)
+            with pytest.raises(RuntimeError) as exc_info:
+                claude_pty.run_claude_pty(
+                    ["claude"],
+                    route_prompt=lambda _prompt: claude_pty.FirstPromptRoute(
+                        model="sonnet", display_model="sonnet", rationale=""
+                    ),
+                    socket_path=socket_path,
+                )
+            assert "Claude was not launched" in str(exc_info.value)
+            assert str(thread.bind_error) in str(exc_info.value)
+        finally:
+            stop.set()

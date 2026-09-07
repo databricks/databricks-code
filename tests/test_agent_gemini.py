@@ -83,6 +83,15 @@ class TestBuildRuntimeEnv:
         assert env["GEMINI_API_KEY"] == "mytoken"
         assert env["GEMINI_API_KEY_AUTH_MECHANISM"] == "bearer"
 
+    def test_carries_custom_headers_override(self, monkeypatch):
+        # The launch env must hand the harness the documented override even on
+        # generations that ignore the User-Agent key (see render_env_overlay):
+        # the provider routing header in the same value is load-bearing.
+        monkeypatch.setattr(gemini, "ucode_version", lambda: "0.1.0")
+        monkeypatch.setattr(gemini, "agent_version", lambda binary: "0.40.0")
+        env = gemini.build_runtime_env(WS, "gemini-2", "tok")
+        assert env["GEMINI_CLI_CUSTOM_HEADERS"].startswith("User-Agent:ucode/0.1.0 gemini/0.40.0")
+
     def test_sets_base_url(self):
         env = gemini.build_runtime_env(WS, "gemini-2", "tok")
         assert env["GOOGLE_GEMINI_BASE_URL"] == f"{WS}/ai-gateway/gemini"

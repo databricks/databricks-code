@@ -124,9 +124,13 @@ def render_env_overlay(
     workspace: str, model: str, token: str, *, provider: str | None = None
 ) -> dict[str, str]:
     # Gemini CLI parses GEMINI_CLI_CUSTOM_HEADERS as comma-separated
-    # `Key:Value` pairs and spreads them after the SDK's default User-Agent,
-    # so a key named `User-Agent` overrides the default. Resolved via
-    # upstream issue google-gemini/gemini-cli#10088.
+    # `Key:Value` pairs and merges them into the request headers (upstream
+    # google-gemini/gemini-cli#10088) — this is also how the
+    # Databricks-Model-Provider-Service routing header travels. A custom
+    # `User-Agent` only wins on harness builds with the fixed merge order
+    # (default first, custom spread after); older builds overwrite it with
+    # their default `GeminiCLI/...` UA. Gateway spend attribution still
+    # matches those requests on the `gemini` substring (see usage.py).
     custom_headers = f"User-Agent:ucode/{ucode_version()} gemini/{agent_version('gemini')}"
     if provider:
         # A Model Provider Service routes by this header; the request still names
