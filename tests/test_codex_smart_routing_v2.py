@@ -306,21 +306,22 @@ class TestInterposerSession:
 
     def test_switches_first_turn(self):
         sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
-        output = sess.on_tui_frame(self._turn_start("system.ai.gpt-5-6-luna"))
+        output, needs_update = sess.on_tui_frame(self._turn_start("system.ai.gpt-5-6-luna"))
         assert json.loads(output)["params"]["model"] == "gpt-5.5"
+        assert needs_update
 
     def test_does_not_schedule_notification_when_model_is_already_selected(self):
         sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
         frame = self._turn_start("gpt-5.5")
-        assert sess.on_tui_frame(frame) == frame
+        assert sess.on_tui_frame(frame) == (frame, False)
         assert sess.on_engine_frame(self._turn_started("turn-1")) == []
         later_selection = self._turn_start("gpt-5.6")
-        assert sess.on_tui_frame(later_selection) == later_selection
+        assert sess.on_tui_frame(later_selection) == (later_selection, False)
 
     def test_non_turn_frames_pass_through(self):
         sess = codex_interposer._Session("gpt-5.5", log=lambda _m: None)
         frame = json.dumps({"method": "initialize", "id": 1, "params": {}})
-        assert sess.on_tui_frame(frame) == frame
+        assert sess.on_tui_frame(frame) == (frame, False)
 
     def _turn_started(self, turn_id: str, thread_id: str = "t1") -> str:
         return json.dumps(
@@ -365,7 +366,7 @@ class TestInterposerSession:
         sess.on_tui_frame(self._turn_start("luna"))
         assert sess.on_engine_frame(self._turn_started("turn-1"))
         second_turn = self._turn_start("luna")
-        assert sess.on_tui_frame(second_turn) == second_turn
+        assert sess.on_tui_frame(second_turn) == (second_turn, False)
         assert sess.on_engine_frame(self._turn_started("turn-2")) == []
 
     def test_routes_first_prompt_and_uses_returned_model_and_rationale(self):
@@ -390,10 +391,11 @@ class TestInterposerSession:
             switch_message_fn=v2.format_routing_notice,
         )
 
-        output = sess.on_tui_frame(self._turn_start("gpt-5.5", prompt="Fix issue #42"))
+        output, needs_update = sess.on_tui_frame(self._turn_start("gpt-5.5", prompt="Fix issue #42"))
 
         assert calls == ["Fix issue #42"]
         assert json.loads(output)["params"]["model"] == "claude-opus-4-8"
+        assert needs_update
         assert "Task classified as bugfix." in sess.switch_message
 
     def test_maps_selected_uc_gpt_model_and_shows_routing_notice(self):
@@ -415,7 +417,7 @@ class TestInterposerSession:
         )
         frame = self._turn_start("system.ai.gpt-5-6-luna")
 
-        output = sess.on_tui_frame(frame)
+        output, needs_update = sess.on_tui_frame(frame)
         assert json.loads(output)["params"]["model"] == "gpt-5.6-luna"
         injected = sess.on_engine_frame(self._turn_started("turn-1"))
 
@@ -445,9 +447,10 @@ class TestInterposerSession:
             switch_message_fn=v2._switch_message,
         )
 
-        output = sess.on_tui_frame(self._turn_start("system.ai.gpt-5-6-sol"))
+        output, needs_update = sess.on_tui_frame(self._turn_start("system.ai.gpt-5-6-sol"))
 
         assert json.loads(output)["params"]["model"] == "system.ai.glm-5-2"
+        assert needs_update
         assert "Selected Model : system.ai.glm-5-2" in sess.switch_message
 
     def test_router_failure_keeps_original_model(self):
@@ -458,7 +461,47 @@ class TestInterposerSession:
         )
         frame = self._turn_start("gpt-start")
 
-        assert sess.on_tui_frame(frame) == frame
+        assert sess.on_tui_frame(frame) == (frame, False)
+
+    def test_rewrites_nested_collaboration_mode_model(self):
+        """The app-server re-derives the thread model from
+        collaborationMode.settings.model on every turn/start, so the
+        interposer must rewrite that nested field too — not just the
+        top-level ``model`` field."""
+        sess = codex_interposer._Session(
+            None,
+            log=lambda _m: None,
+            route_decision=lambda _p: (
+                codex_interposer.routing.RoutingDecision(
+                    model="gpt-5.6-luna",
+                    raw_model="gpt-5-6-luna",
+                    rationale="trivial",
+                ),
+                None,
+            ),
+            switch_message_fn=v2._switch_message,
+        )
+        frame = json.dumps({
+            "method": codex_interposer.TURN_START,
+            "id": 1,
+            "params": {
+                "threadId": "t1",
+                "input": [{"type": "text", "text": "hello"}],
+                "model": "gpt-6-astra",
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {
+                        "model": "gpt-6-astra",
+                        "reasoning_effort": "high",
+                    },
+                },
+            },
+        })
+        output, needs_update = sess.on_tui_frame(frame)
+        result = json.loads(output)
+        assert result["params"]["model"] == "gpt-5.6-luna"
+        assert result["params"]["collaborationMode"]["settings"]["model"] == "gpt-5.6-luna"
+        assert needs_update
 
 
 def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
