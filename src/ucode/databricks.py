@@ -3432,5 +3432,6 @@ def build_shared_base_urls(workspace: str) -> dict[str, str | dict[str, str]]:
         "opencode": build_opencode_base_urls(workspace),
         "copilot": build_copilot_base_url(workspace),
         "pi": build_pi_base_urls(workspace),
+        "omp": build_pi_base_urls(workspace),
     }
     return urls

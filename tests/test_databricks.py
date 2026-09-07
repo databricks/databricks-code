@@ -137,6 +137,13 @@ class TestBuildSharedBaseUrls:
         assert "claude" in urls
         assert "gemini" in urls
         assert "opencode" in urls
+        assert "copilot" in urls
+        assert "pi" in urls
+        assert "omp" in urls
+
+    def test_omp_reuses_pi_gateway_paths(self):
+        urls = build_shared_base_urls(WS)
+        assert urls["omp"] == urls["pi"]
 
     def test_opencode_is_dict(self):
         urls = build_shared_base_urls(WS)
