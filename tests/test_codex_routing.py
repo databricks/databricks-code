@@ -230,6 +230,33 @@ def test_spawn_rewrite_uses_codex_model_id_for_uc_endpoint(monkeypatch):
     assert output["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-5.6-luna"
 
 
+def test_spawn_rewrite_preserves_custom_catalog_model_id(monkeypatch):
+    monkeypatch.setattr(
+        codex_routing,
+        "request_routing_decision",
+        lambda *args, **kwargs: (
+            codex_routing.RoutingDecision(
+                model="system.ai.gpt-5-5",
+                raw_model="gpt-5-5",
+            ),
+            None,
+        ),
+    )
+
+    output = codex_routing.route_pre_tool_use(
+        {
+            "tool_name": "collaborationspawn_agent",
+            "tool_input": {"task_name": "routing-smoke-test", "message": "encrypted"},
+        },
+        workspace=WS,
+        token="token",
+        available_models=["system.ai.gpt-5-5"],
+        preserve_model_ids=True,
+    )
+
+    assert output["hookSpecificOutput"]["updatedInput"]["model"] == "system.ai.gpt-5-5"
+
+
 def test_codex_model_id_maps_uc_gpt_models_to_codex_slugs():
     expected = {
         "system.ai.gpt-5-2": "gpt-5.2",

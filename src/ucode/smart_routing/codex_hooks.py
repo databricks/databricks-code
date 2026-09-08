@@ -53,23 +53,41 @@ def _routing_hook_groups(state: dict) -> dict[str, list[dict]]:
 
 
 def merge_pre_tool_use_hooks(
-    existing: list[dict], state: dict, *, available_models: list[str]
+    existing: list[dict],
+    state: dict,
+    *,
+    available_models: list[str],
+    preserve_model_ids: bool = False,
 ) -> list[dict]:
     """Add the ucode spawn hook to an existing Codex PreToolUse hook list."""
     doc = {"hooks": {"PreToolUse": copy.deepcopy(existing)}}
     hooks.sync_managed_hooks(
         doc,
         ROUTING_HOOK_COMMAND_MARKER,
-        {"PreToolUse": [_pre_tool_use_hook_group(state, available_models=available_models)]},
+        {
+            "PreToolUse": [
+                _pre_tool_use_hook_group(
+                    state,
+                    available_models=available_models,
+                    preserve_model_ids=preserve_model_ids,
+                )
+            ]
+        },
     )
     return doc["hooks"]["PreToolUse"]
 
 
-def _pre_tool_use_hook_group(state: dict, *, available_models: list[str] | None = None) -> dict:
+def _pre_tool_use_hook_group(
+    state: dict,
+    *,
+    available_models: list[str] | None = None,
+    preserve_model_ids: bool = False,
+) -> dict:
     route_argv = _routing_hook_argv(
         state,
         "route-subagent",
         available_models=available_models,
+        preserve_model_ids=preserve_model_ids,
     )
     return {
         "matcher": "Agent|.*spawn_agent$",
@@ -78,7 +96,11 @@ def _pre_tool_use_hook_group(state: dict, *, available_models: list[str] | None 
 
 
 def _routing_hook_argv(
-    state: dict, event: str, *, available_models: list[str] | None = None
+    state: dict,
+    event: str,
+    *,
+    available_models: list[str] | None = None,
+    preserve_model_ids: bool = False,
 ) -> list[str]:
     workspace = str(state.get("workspace") or "")
     argv = [
@@ -96,6 +118,8 @@ def _routing_hook_argv(
         argv += ["--profile", profile]
     if state.get("use_pat"):
         argv.append("--use-pat")
+    if preserve_model_ids:
+        argv.append("--preserve-model-ids")
     models = available_models if available_models is not None else routing_models(state)
     for model in models:
         if isinstance(model, str) and model:

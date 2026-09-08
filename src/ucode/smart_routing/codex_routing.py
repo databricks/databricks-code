@@ -84,6 +84,7 @@ def route_pre_tool_use(
     available_models: list[str],
     timeout: float = REQUEST_TIMEOUT_S,
     audit_decision: bool = False,
+    preserve_model_ids: bool = False,
 ) -> dict[str, Any] | None:
     """Route one Codex ``spawn_agent`` call and rewrite its model."""
     record = None
@@ -99,7 +100,7 @@ def route_pre_tool_use(
             workspace, token, task, available_models, timeout=timeout
         ),
         default_task_label="Codex subagent task",
-        model_id_mapper=codex_model_id,
+        model_id_mapper=(lambda model: model) if preserve_model_ids else codex_model_id,
         record_decision=record,
     )
 

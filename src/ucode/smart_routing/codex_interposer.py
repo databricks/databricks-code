@@ -60,6 +60,7 @@ class _Session:
         available_models: list[str] | None = None,
         route_decision: RouteDecisionFn | None = None,
         switch_message_fn: SwitchMessageFn | None = None,
+        preserve_model_ids: bool = False,
     ) -> None:
         self.target = target_model
         self.available_models = list(available_models or [])
@@ -67,6 +68,7 @@ class _Session:
         self.switch_message = switch_message
         self.route_decision = route_decision
         self.switch_message_fn = switch_message_fn
+        self.preserve_model_ids = preserve_model_ids
         self.thread_id: str | None = None
         self.settings: dict | None = None
         self.first_turn_seen = False
@@ -99,7 +101,8 @@ class _Session:
                 if decision is None:
                     self.log(f"[ROUTE] selection failed; keeping current model: {reason}")
                     return TuiFrameResult(raw, needs_settings_update=False)
-                decision = replace(decision, model=codex_routing.codex_model_id(decision.model))
+                if not self.preserve_model_ids:
+                    decision = replace(decision, model=codex_routing.codex_model_id(decision.model))
                 self.target = decision.model
                 if self.switch_message_fn is not None:
                     self.switch_message = self.switch_message_fn(decision.model, decision.rationale)
@@ -211,6 +214,7 @@ async def _handle_tui(
     workspace: str | None = None,
     token_provider: TokenProvider | None = None,
     switch_message_fn: SwitchMessageFn | None = None,
+    preserve_model_ids: bool = False,
 ) -> None:
     path = getattr(getattr(tui, "request", None), "path", "/") or "/"
     uri = upstream_uri.rstrip("/") + path
@@ -238,6 +242,7 @@ async def _handle_tui(
         available_models,
         route_decision,
         switch_message_fn,
+        preserve_model_ids,
     )
     async with connect(uri, max_size=None) as upstream:
 
@@ -300,6 +305,7 @@ async def _serve(
     workspace: str | None = None,
     token_provider: TokenProvider | None = None,
     switch_message_fn: SwitchMessageFn | None = None,
+    preserve_model_ids: bool = False,
 ):
     async def handler(tui):
         try:
@@ -313,6 +319,7 @@ async def _serve(
                 workspace,
                 token_provider,
                 switch_message_fn,
+                preserve_model_ids,
             )
         except Exception as exc:  # noqa: BLE001
             log(f"[ERR] session: {exc!r}")
@@ -333,6 +340,7 @@ def start_interposer_thread(
     token_provider: TokenProvider | None = None,
     switch_message_fn: SwitchMessageFn | None = None,
     switch_message: str | None = None,
+    preserve_model_ids: bool = False,
     log_path: Path | None = None,
     ready_timeout: float = 10.0,
 ) -> tuple[int, Callable[[], None]]:
@@ -365,6 +373,7 @@ def start_interposer_thread(
                     workspace,
                     token_provider,
                     switch_message_fn,
+                    preserve_model_ids,
                 )
             )
             holder["port"] = holder["server"].sockets[0].getsockname()[1]

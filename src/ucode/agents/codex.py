@@ -41,7 +41,6 @@ from ucode.managed_files import (
 from ucode.smart_routing import v2 as smart_routing_v2
 from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
-    routing_models,
     sync_smart_routing_hooks,
 )
 from ucode.smart_routing.codex_routing import codex_model_id
@@ -528,17 +527,18 @@ def _launch_smart_routing(state: dict, tool_args: list[str]) -> None:
         )
 
     managed_model = default_model(state)
-    models = routing_models(state)
-    start_model = (
-        managed_model
-        or (codex_model_id(models[0]) if models else None)
-        or APP_SERVER_SMART_ROUTING_STARTING_MODEL
-    )
+    routing_options = smart_routing_v2.codex_routing_options(state)
+    models = routing_options.models
+    first_model = None
+    if models:
+        first_model = models[0] if routing_options.preserve_model_ids else codex_model_id(models[0])
+    start_model = managed_model or first_model or APP_SERVER_SMART_ROUTING_STARTING_MODEL
     smart_routing_v2.launch_codex(
         state,
         tool_args,
         binary=binary,
         start_model=start_model,
+        routing_options=routing_options,
         render_overlay=render_overlay,
     )
 

@@ -1436,6 +1436,7 @@ def codex_router_hook_cmd(
     profile: Annotated[str | None, typer.Option("--profile")] = None,
     use_pat: Annotated[bool, typer.Option("--use-pat")] = False,
     model: Annotated[list[str] | None, typer.Option("--model")] = None,
+    preserve_model_ids: Annotated[bool, typer.Option("--preserve-model-ids")] = False,
 ) -> None:
     """Run a Codex smart-routing lifecycle hook."""
     import json
@@ -1502,6 +1503,7 @@ def codex_router_hook_cmd(
         token=token,
         available_models=model or [],
         audit_decision=True,
+        preserve_model_ids=preserve_model_ids,
     )
     if output is not None:
         sys.stdout.write(json.dumps(output))
