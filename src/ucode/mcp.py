@@ -988,11 +988,10 @@ def build_mcp_picker_choices(
     choices: list[questionary.Choice | questionary.Separator] = []
     displayed_names: set[str] = set()
 
-    if "databricks-sql" in known_names:
-        choices.append(known_choice("databricks-sql", "Databricks SQL"))
-    else:
-        choices.append(_add_choice(SQL_MCP_VALUE, "Databricks SQL"))
-    displayed_names.add("databricks-sql")
+    # Databricks SQL is intentionally NOT offered as an up-front add-choice — we don't promote
+    # it. If it's exposed as a `system.ai` MCP service it shows like any other service, and an
+    # already-configured `databricks-sql` still appears (removable) via the known-server fallback
+    # at the end. The `managed:sql` selection value is still resolvable for managed configs.
 
     for name in available_mcp_service_names or []:
         # Picker shows the dotted UC name; state/agents store the dashed form

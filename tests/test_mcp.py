@@ -340,10 +340,8 @@ class TestMcpPicker:
         assert "External connections" not in choice_text
         assert "Databricks managed services" not in choice_text
         assert "Custom servers" not in choice_text
-        assert choice_text == [
-            "Databricks SQL",
-            "Connection: github-mcp",
-        ]
+        assert choice_text == ["Connection: github-mcp"]
+        assert "Databricks SQL" not in choice_text
         assert "Built-in AI tools" not in choice_text
         assert checkbox_calls[0]["kwargs"]["instruction"] == (
             "(space to toggle, ctrl-a all, enter to save, type to filter)"
@@ -367,13 +365,14 @@ class TestMcpPicker:
         )
         choices_by_title = {choice.title: choice for choice in choices}
         assert choices_by_title["Connection: github-mcp"].checked is True
-        assert choices_by_title["Databricks SQL"].checked is False
+        # Databricks SQL is not promoted as an up-front picker entry.
+        assert "Databricks SQL" not in choices_by_title
 
     def test_additive_picker_shows_configured_servers_as_disabled(self):
         """In `ucode mcp add` mode an already-configured server can't be removed, so
         it's shown as a non-toggleable note rather than a pre-checked box."""
         choices = mcp.build_mcp_picker_choices(
-            ["github-mcp"],
+            ["github-mcp", "slack-mcp"],
             [],
             [],
             [{"name": "github-mcp", "url": f"{WS}/api/2.0/mcp/external/github-mcp"}],
@@ -384,7 +383,7 @@ class TestMcpPicker:
         assert configured.disabled == "already configured"
         assert configured.checked is False
         # A not-yet-configured server stays an addable, toggleable choice.
-        assert choices_by_title["Databricks SQL"].disabled is None
+        assert choices_by_title["Connection: slack-mcp"].disabled is None
 
     def test_removal_picker_lists_configured_servers_with_their_clients(self, monkeypatch):
         checkbox_calls: list[dict] = []
@@ -413,10 +412,10 @@ class TestMcpPicker:
         assert [c.value for c in choices] == ["system-ai-github"]
         assert all(c.checked is False for c in choices)
 
-    def test_picker_keeps_databricks_sql_when_nothing_discovered(self):
-        choices = mcp.build_mcp_picker_choices([], [], [], [])
-        assert [choice.title for choice in choices] == ["Databricks SQL"]
-        assert choices[0].value == f"{mcp.MCP_ADD_PREFIX}managed:sql"
+    def test_picker_is_empty_when_nothing_discovered_or_configured(self):
+        # Databricks SQL is no longer a hardcoded fallback entry, so with nothing to
+        # show the picker is empty (the caller prints the "nothing selected" hint).
+        assert mcp.build_mcp_picker_choices([], [], [], []) == []
 
     def test_discovers_genie_spaces_as_mcp_servers(self):
         assert mcp.genie_mcp_servers(
