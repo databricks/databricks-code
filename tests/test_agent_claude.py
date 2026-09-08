@@ -39,17 +39,12 @@ class TestMinimumVersion:
         monkeypatch.setattr(claude, "agent_version", lambda _binary: version)
 
         assert claude.minimum_version_error() is None
-        assert claude.required_update_message() is None
 
     def test_older_version_requires_update(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() == (
-            "Smart routing requires Claude Code 2.1.248 or newer. "
-            "Your current version is Claude Code 2.1.247."
-        )
-        assert claude.required_update_message() == (
             "Smart routing requires Claude Code 2.1.248 or newer. "
             "Your current version is Claude Code 2.1.247."
         )
@@ -63,7 +58,6 @@ class TestMinimumVersion:
             "Your current version is Claude Code 2.1.247."
         )
         assert claude.minimum_version_error() == expected
-        assert claude.required_update_message() == expected
 
     def test_smart_routing_message_wins_when_both_features_are_enabled(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
@@ -77,7 +71,6 @@ class TestMinimumVersion:
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "unknown")
 
         assert claude.minimum_version_error() is None
-        assert claude.required_update_message() is None
 
     def test_older_version_is_not_validated_without_discovery_features(self, monkeypatch):
         monkeypatch.delenv(v2.ENV_VAR, raising=False)
@@ -85,7 +78,6 @@ class TestMinimumVersion:
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() is None
-        assert claude.required_update_message() is None
 
 
 class TestRenderOverlay:
