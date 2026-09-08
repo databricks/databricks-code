@@ -250,6 +250,26 @@ class TestTracingMlflowCheck:
         assert check.suggestion is not None
 
 
+class TestUcodeCheck:
+    def test_upgrade_uses_renamed_repository(self):
+        with (
+            patch.object(doctor_mod.shutil, "which", return_value="/usr/bin/uv"),
+            patch.object(doctor_mod.subprocess, "run") as run,
+        ):
+            assert doctor_mod._upgrade_ucode()
+
+        run.assert_called_once_with(
+            [
+                "uv",
+                "tool",
+                "install",
+                "--reinstall",
+                "git+https://github.com/databricks/unity-gateway",
+            ],
+            check=True,
+        )
+
+
 class TestDoctorFlow:
     def _only(self, checks: list[Check]):
         """Run doctor() with a fixed set of checks and a stubbed prompter."""
