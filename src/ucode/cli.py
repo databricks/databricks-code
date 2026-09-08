@@ -74,6 +74,7 @@ from ucode.managed_budget import (
 )
 from ucode.managed_config import (
     MANAGED_CONFIG_ENV_VAR,
+    ManagedConfigResult,
     get_model_recommendation,
     load_managed_state,
     managed_agent_config_enabled,
@@ -1802,15 +1803,16 @@ def _reject_disabled_agent(managed: dict | None, tool: str) -> None:
         )
 
 
-def _fetch_managed_config(state: dict) -> tuple[dict | None, bool]:
-    """The workspace's managed config for this launch, or ``(None, _)`` when there is none.
+def _fetch_managed_config(state: dict) -> ManagedConfigResult:
+    """The workspace's managed config for this launch, or a manifest-less result when there is none.
 
-    Returns ``(None, False)`` when managed configs are switched off — either the feature is disabled
-    or the launch passed ``--skip-managed-config`` (which clears the enabling env var for the process).
+    Returns a feature-disabled-free result when managed configs are switched off — either the feature
+    is disabled or the launch passed ``--skip-managed-config`` (which clears the enabling env var for
+    the process).
     """
 
     if not managed_agent_config_enabled():
-        return None, False
+        return ManagedConfigResult(None, False)
     with spinner("Loading..."):
         return refresh_managed_config(state)
 
@@ -2493,7 +2495,7 @@ def _launch_managed_default(
     if not current:
         raise RuntimeError("No workspace configured. Run `ug configure` first.")
     apply_pat_environment(state)
-    # --dry-run avoids the fetch but still applies the last saved config.
+    coding_agent_config_feature_disabled = False
     if dry_run:
         managed = load_managed_state(current)
     else:
