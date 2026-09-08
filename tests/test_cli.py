@@ -435,6 +435,23 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         mock_set.assert_not_called()
 
+    def test_claude_oauth_client_id_reaches_configure(self):
+        patches = _patch_launch("claude")
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patch("ucode.cli.configure_shared_state", return_value=MINIMAL_STATE) as mock_shared,
+            patches[4],
+            patches[5],
+            patches[6],
+            patches[7],
+            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
+        ):
+            result = runner.invoke(app, ["claude", "--oauth-client-id", "custom-app-id"])
+        assert result.exit_code == 0, result.output
+        assert mock_shared.call_args.kwargs["oauth_client_id"] == "custom-app-id"
+
     def test_codex_enable_smart_routing_is_consumed_by_ucode(self):
         enabled_during_launch = []
         with patch(
@@ -1944,6 +1961,40 @@ class TestCachedConfigPredicate:
                 is False
             )
 
+    def test_rejects_an_oauth_client_id_that_differs_from_the_cached_one(self, tmp_path):
+        import ucode.cli as cli_mod
+
+        state = {**MINIMAL_STATE, "oauth_client_id": "configured-app"}
+        settings_path = tmp_path / "ucode-settings.json"
+        settings_path.write_text("{}", encoding="utf-8")
+        with (
+            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
+            patch("ucode.cli.claude_agent.CLAUDE_SETTINGS_PATH", settings_path),
+            patch("ucode.cli.claude_agent.managed_settings_are_current", return_value=True),
+            patch(
+                "ucode.cli.claude_agent.gateway_model_discovery_setting_is_absent",
+                return_value=True,
+            ),
+        ):
+            assert (
+                cli_mod._can_launch_from_cached_config(
+                    "claude", state, **self._kwargs(oauth_client_id="other-app")
+                )
+                is False
+            )
+            assert (
+                cli_mod._can_launch_from_cached_config(
+                    "claude", state, **self._kwargs(oauth_client_id="configured-app")
+                )
+                is True
+            )
+            assert (
+                cli_mod._can_launch_from_cached_config(
+                    "claude", state, **self._kwargs(oauth_client_id="")
+                )
+                is False
+            )
+
 
 class TestPassthroughArgs:
     @pytest.mark.parametrize(
@@ -3284,6 +3335,107 @@ class TestConfigureSkipValidate:
         # `ucode configure` (single-agent) still installs AI Tools — it's the
         # configure path, unlike launch which auto-configures without installing.
         assert installed == [["claude"]]
+
+
+class TestConfigureSharedStateOauthClientId:
+    WS = "https://example.databricks.com"
+    CLIENT_ID = "0844d280-b84d-45f2-b675-5d2c8fdc3825"
+
+    @staticmethod
+    def _stub_deps(monkeypatch, *, existing_state=None):
+        import ucode.cli as cli_mod
+
+        calls: dict[str, list] = {"ensure": [], "login": [], "token": []}
+        saved: list[dict] = []
+        monkeypatch.setattr(cli_mod, "load_state", lambda: dict(existing_state or {}))
+        monkeypatch.setattr(cli_mod, "save_state", lambda s: saved.append(dict(s)))
+        monkeypatch.setattr(
+            cli_mod,
+            "ensure_databricks_auth",
+            lambda w, p=None, **kwargs: calls["ensure"].append(kwargs.get("oauth_client_id")),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "run_databricks_login",
+            lambda w, p=None, **kwargs: calls["login"].append(kwargs.get("oauth_client_id")),
+        )
+        monkeypatch.setattr(
+            cli_mod,
+            "get_databricks_token",
+            lambda w, p=None, **kwargs: (
+                calls["token"].append(kwargs.get("oauth_client_id")) or "token"
+            ),
+        )
+        monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda w: None)
+        monkeypatch.setattr(
+            cli_mod, "probe_unity_gateway_capabilities", lambda w, t: MODEL_SERVICE_PROBE
+        )
+        monkeypatch.setattr(cli_mod, "discover_model_services", lambda w, t: ({}, [], [], [], None))
+        monkeypatch.setattr(cli_mod, "discover_claude_models", lambda w, t: ({}, None))
+        monkeypatch.setattr(cli_mod, "discover_gemini_models", lambda w, t: ([], None))
+        monkeypatch.setattr(cli_mod, "discover_codex_models", lambda w, t: ([], None))
+        monkeypatch.setattr(cli_mod, "build_shared_base_urls", lambda w: {})
+        return cli_mod, calls, saved
+
+    def test_persists_and_reaches_the_auth_check_and_the_token_mint(self, monkeypatch):
+        cli_mod, calls, _saved = self._stub_deps(monkeypatch)
+
+        state = cli_mod.configure_shared_state(self.WS, oauth_client_id=self.CLIENT_ID)
+
+        assert state["oauth_client_id"] == self.CLIENT_ID
+        assert calls["ensure"] == [self.CLIENT_ID]
+        assert calls["token"] == [self.CLIENT_ID]
+
+    def test_force_login_signs_into_the_app_being_configured(self, monkeypatch):
+        cli_mod, calls, _saved = self._stub_deps(monkeypatch)
+
+        cli_mod.configure_shared_state(self.WS, force_login=True, oauth_client_id=self.CLIENT_ID)
+
+        assert calls["login"] == [self.CLIENT_ID]
+        assert calls["ensure"] == []
+
+    def test_launch_inherits_the_persisted_client_id(self, monkeypatch):
+        cli_mod, calls, _saved = self._stub_deps(
+            monkeypatch,
+            existing_state={"workspace": self.WS, "oauth_client_id": self.CLIENT_ID},
+        )
+
+        state = cli_mod.configure_shared_state(self.WS)
+
+        assert state["oauth_client_id"] == self.CLIENT_ID
+        assert calls["ensure"] == [self.CLIENT_ID]
+
+    def test_empty_string_clears_the_persisted_client_id(self, monkeypatch):
+        cli_mod, calls, _saved = self._stub_deps(
+            monkeypatch,
+            existing_state={"workspace": self.WS, "oauth_client_id": self.CLIENT_ID},
+        )
+
+        state = cli_mod.configure_shared_state(self.WS, oauth_client_id="")
+
+        assert "oauth_client_id" not in state
+        assert calls["ensure"] == [None]
+
+    def test_not_inherited_across_workspaces(self, monkeypatch):
+        cli_mod, _calls, _saved = self._stub_deps(
+            monkeypatch,
+            existing_state={"workspace": "https://other.databricks.com", "oauth_client_id": "old"},
+        )
+
+        state = cli_mod.configure_shared_state(self.WS)
+
+        assert "oauth_client_id" not in state
+
+    def test_skip_preflight_still_persists_it(self, monkeypatch):
+        cli_mod, calls, saved = self._stub_deps(monkeypatch)
+
+        state = cli_mod.configure_shared_state(
+            self.WS, skip_preflight=True, oauth_client_id=self.CLIENT_ID
+        )
+
+        assert state["oauth_client_id"] == self.CLIENT_ID
+        assert saved[-1]["oauth_client_id"] == self.CLIENT_ID
+        assert calls["ensure"] == [] and calls["login"] == []
 
 
 class TestConfigureSharedStateMcpCleanup:
