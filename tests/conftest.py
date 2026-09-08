@@ -27,6 +27,7 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     import ucode.config_io as config_io_mod
     import ucode.databricks as databricks_mod
     import ucode.managed_files as managed_files_mod
+    import ucode.oauth as oauth_mod
     import ucode.state as state_mod
     from ucode.agents import codex as codex_mod
 
@@ -34,6 +35,9 @@ def _isolate_ucode_state(tmp_path, monkeypatch):
     state_dir.mkdir()
     monkeypatch.setattr(state_mod, "STATE_PATH", state_dir / "state.json")
     monkeypatch.setattr(config_io_mod, "APP_DIR", state_dir)
+    # Resolved from APP_DIR at import time, so patching APP_DIR alone would still
+    # leave a real refresh token in the developer's ~/.ucode.
+    monkeypatch.setattr(oauth_mod, "TOKEN_CACHE_PATH", state_dir / "oauth-tokens.json")
     backup_dir = state_dir / "managed-backups"
     monkeypatch.setattr(managed_files_mod, "MANAGED_BACKUP_DIR", backup_dir)
     monkeypatch.setattr(
