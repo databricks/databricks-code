@@ -17,6 +17,11 @@ WS = "https://example.databricks.com"
 SHARED_EXPERIMENT_ID = "111"
 
 
+@pytest.fixture(autouse=True)
+def _avoid_real_managed_settings(monkeypatch):
+    monkeypatch.setattr(claude, "_managed_settings_path", lambda: None)
+
+
 def _enabled_state(profile: str | None = None) -> dict:
     return {
         "workspace": WS,
@@ -82,6 +87,7 @@ class TestTracingEnv:
             "MLFLOW_TRACKING_URI": "databricks://p",
             "MLFLOW_EXPERIMENT_ID": "111",
             "MLFLOW_TRACING_SQL_WAREHOUSE_ID": "wh123",
+            "MLFLOW_ENABLE_ASYNC_TRACE_LOGGING": "false",
         }
 
     def test_empty_for_non_claude_agents(self):

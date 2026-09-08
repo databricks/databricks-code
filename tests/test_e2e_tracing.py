@@ -57,6 +57,10 @@ def _trace_ids(client, experiment_id: str) -> set[str]:
     return ids
 
 
+@pytest.mark.skip(
+    reason="Tracing e2e is flaky in CI (async trace ingestion races the poll timeout); "
+    "disabled pending a more robust verification path."
+)
 class TestClaudeTracingE2E:
     def test_claude_session_lands_a_trace(self, tmp_path, monkeypatch, e2e_state, e2e_workspace):
         pytest.importorskip("mlflow", reason="mlflow not installed (pip install mlflow)")

@@ -6,26 +6,37 @@ Reads from `system.ai_gateway.usage` via a Databricks SQL warehouse.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
-from typing import cast
+from decimal import Decimal, InvalidOperation
+from typing import NamedTuple, cast
 
 from ucode.databricks import (
+    SqlWarehouse,
     apply_pat_environment,
-    discover_sql_warehouse_http_path,
+    discover_sql_warehouses,
     ensure_databricks_auth,
+    fetch_external_model_prices,
     get_databricks_token,
+    resolve_current_budget_spend,
     run_usage_query,
 )
 from ucode.state import load_state
 from ucode.ui import (
     console,
-    format_duration,
+    format_cost_usd,
+    format_meter,
     format_token_count,
+    format_usd,
     heading,
     label,
+    muted,
     print_heading,
     print_note,
+    print_warning,
+    prompt_for_selection,
+    prompt_yes_no_default,
     render_box_table,
     spinner,
     value,
@@ -33,6 +44,141 @@ from ucode.ui import (
 
 USAGE_BREAKDOWN_DAYS = 7
 USAGE_SUMMARY_DAYS = 30
+
+QUERY_MESSAGE = "Querying system.ai_gateway.usage..."
+STARTUP_MESSAGE = "Starting up warehouse..."
+PRICES_MESSAGE = "Fetching model prices..."
+# `REQUESTED` is an explicit --warehouse-id, whose state we never looked up.
+WARM_WAREHOUSE_STATES = ("RUNNING", "REQUESTED")
+
+MILLION = Decimal(1_000_000)
+
+# Region/provider prefixes the price catalog puts on some model ids (e.g. `eu/gpt-5.6-sol`,
+# `us.anthropic.claude-opus-4-8`). They're stripped before matching so a regional id and its base id
+# collide onto the same price key.
+_PRICE_STRIP_PREFIXES = (
+    "eu/",
+    "us/",
+    "global/",
+    "apac.",
+    "au.",
+    "us.",
+    "eu.",
+    "anthropic.",
+    "databricks-",
+    "ap-northeast-1/",
+    "ap-northeast-2/",
+    "ap-southeast-1/",
+    "ap-southeast-2/",
+    "ap-south-1/",
+    "ca-central-1/",
+    "sa-east-1/",
+)
+
+
+class ModelPrice(NamedTuple):
+    """USD rates per million tokens. Any field may be None when the catalog omits it."""
+
+    input: Decimal | None
+    output: Decimal | None
+    cache_read: Decimal | None
+
+
+def _price_decimal(raw: object) -> Decimal | None:
+    if not isinstance(raw, (int, float, str)) or not str(raw).strip():
+        return None
+    try:
+        return Decimal(str(raw).strip())
+    except InvalidOperation:
+        return None
+
+
+def normalize_price_key(model_name: str) -> str:
+    """Separator-insensitive key that collapses a model's spellings for price matching.
+
+    Usage `gpt-5-6-sol` / catalog `gpt-5.6-sol` / `us.anthropic.claude-opus-4-8` all reduce to one
+    key by stripping region/provider prefixes and version/date suffixes, then all non-alphanumerics.
+    """
+    name = (model_name or "").strip().lower()
+    # Loop so stacked prefixes collapse too, e.g. `us.` then `anthropic.`.
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _PRICE_STRIP_PREFIXES:
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                changed = True
+                break
+    name = name.split("@", 1)[0]
+    name = re.sub(r"-v\d+(:\d+)?$", "", name)  # Bedrock version suffix, e.g. `-v1:0`
+    name = re.sub(r"-20\d{6}$", "", name)  # date stamp, e.g. `-20251001`
+    return re.sub(r"[^a-z0-9]+", "", name)
+
+
+def _is_bare_model_name(model_name: str) -> bool:
+    """True when a catalog id carries no region/provider prefix (its base price)."""
+    lowered = model_name.strip().lower()
+    return not any(lowered.startswith(prefix) for prefix in _PRICE_STRIP_PREFIXES)
+
+
+def build_price_lookup(raw_models: list[dict]) -> dict[str, ModelPrice]:
+    """Map normalized price keys to `ModelPrice` from the raw catalog listing.
+
+    When several catalog ids collapse to one key (a regional id and its base), the priced, un-prefixed
+    entry wins so we bill at the base rate rather than a regional markup.
+    """
+    lookup: dict[str, ModelPrice] = {}
+    scores: dict[str, tuple[bool, bool]] = {}
+    for entry in raw_models:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("model_name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        key = normalize_price_key(name)
+        if not key:
+            continue
+        pricing = entry.get("base_pricing")
+        pricing = pricing if isinstance(pricing, Mapping) else {}
+        price = ModelPrice(
+            input=_price_decimal(pricing.get("input_per_million_tokens")),
+            output=_price_decimal(pricing.get("output_per_million_tokens")),
+            cache_read=_price_decimal(pricing.get("cache_read_per_million_tokens")),
+        )
+        score = (price.input is not None, _is_bare_model_name(name))
+        if key not in scores or score > scores[key]:
+            scores[key] = score
+            lookup[key] = price
+    return lookup
+
+
+def estimate_model_cost(
+    price: ModelPrice | None,
+    input_tokens: int,
+    cached_tokens: int,
+    output_tokens: int,
+) -> Decimal | None:
+    """Estimate USD cost for one model's token usage, or None when it can't be priced.
+
+    Cached tokens are a subset of input tokens billed at the (cheaper) cache-read rate, so the
+    uncached remainder is priced at the input rate. Returns None when the catalog has no input rate
+    or when no token breakdown is available (input/output/cached all zero), so the caller shows tokens
+    without a dollar figure rather than a misleading $0.
+    """
+    if price is None or price.input is None:
+        return None
+    if input_tokens <= 0 and output_tokens <= 0 and cached_tokens <= 0:
+        return None
+    cached = min(max(cached_tokens, 0), max(input_tokens, 0))
+    uncached = max(input_tokens, 0) - cached
+    cache_rate = price.cache_read if price.cache_read is not None else price.input
+    output_rate = price.output if price.output is not None else Decimal(0)
+    total = (
+        Decimal(uncached) * price.input
+        + Decimal(cached) * cache_rate
+        + Decimal(max(output_tokens, 0)) * output_rate
+    )
+    return total / MILLION
 
 
 def build_usage_report_query() -> str:
@@ -51,7 +197,10 @@ SELECT
   request_id,
   event_time,
   destination_model,
-  COALESCE(total_tokens, 0) AS total_tokens_used
+  COALESCE(total_tokens, 0) AS total_tokens_used,
+  COALESCE(input_tokens, 0) AS input_tokens_used,
+  COALESCE(token_details.cache_read_input_tokens, 0) AS cached_tokens_used,
+  COALESCE(output_tokens, 0) AS output_tokens_used
 FROM system.ai_gateway.usage
 WHERE event_time >= current_timestamp() - interval {USAGE_SUMMARY_DAYS} days
   AND requester = current_user()
@@ -68,9 +217,7 @@ daily_usage AS (
     tool,
     usage_day,
     SUM(total_tokens_used) AS total_tokens_used,
-    COUNT(DISTINCT request_id) AS sessions,
-    MIN(event_time) AS first_event_time,
-    MAX(event_time) AS last_event_time
+    COUNT(DISTINCT request_id) AS sessions
   FROM usage_events
   GROUP BY 1, 2, 3
 ),
@@ -80,9 +227,12 @@ model_usage AS (
     tool,
     usage_day,
     destination_model,
-    SUM(total_tokens_used) AS model_tokens_used
+    COUNT(DISTINCT request_id) AS model_requests,
+    SUM(total_tokens_used) AS model_tokens_used,
+    SUM(input_tokens_used) AS model_input_used,
+    SUM(cached_tokens_used) AS model_cached_used,
+    SUM(output_tokens_used) AS model_output_used
   FROM usage_events
-  WHERE destination_model IS NOT NULL AND destination_model != ''
   GROUP BY 1, 2, 3, 4
 ),
 model_rollup AS (
@@ -90,11 +240,17 @@ model_rollup AS (
     requester_name,
     tool,
     usage_day,
-    CONCAT_WS(', ', SORT_ARRAY(COLLECT_SET(destination_model))) AS models,
     TO_JSON(
       SORT_ARRAY(
         COLLECT_LIST(
-          NAMED_STRUCT('model', destination_model, 'tokens', model_tokens_used)
+          NAMED_STRUCT(
+            'model', destination_model,
+            'requests', model_requests,
+            'tokens', model_tokens_used,
+            'input', model_input_used,
+            'cached', model_cached_used,
+            'output', model_output_used
+          )
         )
       )
     ) AS model_tokens
@@ -107,9 +263,6 @@ SELECT
   daily_usage.usage_day,
   daily_usage.total_tokens_used,
   daily_usage.sessions,
-  daily_usage.first_event_time,
-  daily_usage.last_event_time,
-  COALESCE(model_rollup.models, '') AS models,
   COALESCE(model_rollup.model_tokens, '[]') AS model_tokens
 FROM daily_usage
 LEFT JOIN model_rollup
@@ -156,18 +309,6 @@ def coerce_date(value_obj: object) -> date | None:
     return None
 
 
-def coerce_datetime(value_obj: object) -> datetime | None:
-    if isinstance(value_obj, datetime):
-        return value_obj
-    if isinstance(value_obj, str):
-        candidate = value_obj.replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(candidate)
-        except ValueError:
-            return None
-    return None
-
-
 def simplify_model_name(tool: str, model_name: str) -> str:
     normalized = (model_name or "").strip()
     if not normalized:
@@ -207,91 +348,136 @@ def summarize_models(tool: str, raw_models: object) -> str:
     return ", ".join(parts) if parts else "-"
 
 
-def _coerce_model_token_item(tool: str, item: object) -> tuple[str, int] | None:
+class ModelUsage(NamedTuple):
+    """One model's usage for a day/window.
+
+    `key` is a separator-insensitive identity used to merge spellings of the same model (id form vs.
+    display form vs. regional variant); `name` is the display name derived from `raw_names` (the raw
+    `destination_model` ids). `input` includes cached tokens (`cached` is its cache-read subset).
+    """
+
+    name: str
+    key: str
+    requests: int
+    total: int
+    input: int
+    cached: int
+    output: int
+    raw_names: tuple[str, ...]
+
+
+UNKNOWN_MODEL = "<unknown>"
+_MODEL_DATABRICKS_PREFIX = "databricks-"
+
+
+def model_identity_key(name: str) -> str:
+    """Identity used to merge spellings of the same model, falling back to the lowercased name."""
+    return normalize_price_key(name) or name.strip().lower() or UNKNOWN_MODEL
+
+
+def canonical_model_name(raw_names: tuple[str, ...]) -> str:
+    """Display name for a merged model: prefer the lowercase, space-free id spelling over a display
+    label (e.g. `claude-opus-4-8` over `Claude Opus 4.8`), keeping the family prefix and dropping
+    only `databricks-`."""
+    cleaned: list[str] = []
+    for raw in raw_names:
+        name = raw.strip()
+        if name.lower().startswith(_MODEL_DATABRICKS_PREFIX):
+            name = name[len(_MODEL_DATABRICKS_PREFIX) :]
+        if name:
+            cleaned.append(name)
+    if not cleaned:
+        return UNKNOWN_MODEL
+    id_forms = [name for name in cleaned if " " not in name and name == name.lower()]
+    return sorted(id_forms or cleaned, key=lambda name: (len(name), name))[0]
+
+
+def _coerce_int(raw: object) -> int:
+    try:
+        return int(cast(int | float | str, raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_model_usage_item(item: object) -> ModelUsage | None:
     if not isinstance(item, Mapping):
         return None
     item_mapping = cast(Mapping[str, object], item)
 
     raw_model = item_mapping.get("model")
-    if not isinstance(raw_model, str) or not raw_model.strip():
-        return None
-
-    raw_tokens = item_mapping.get("tokens")
-    try:
-        token_total = int(cast(int | float | str, raw_tokens or 0))
-    except (TypeError, ValueError):
-        token_total = 0
-
-    model_name = simplify_model_name(tool, raw_model)
-    if model_name == "-":
-        return None
-    return model_name, token_total
-
-
-def extract_model_token_breakdown(
-    tool: str,
-    raw_model_tokens: object,
-    raw_models: object = None,
-    total_tokens: int = 0,
-) -> list[tuple[str, int]]:
-    items: object
-    if isinstance(raw_model_tokens, str) and raw_model_tokens.strip():
-        try:
-            items = json.loads(raw_model_tokens)
-        except json.JSONDecodeError:
-            items = []
+    if isinstance(raw_model, str) and raw_model.strip():
+        raw_names: tuple[str, ...] = (raw_model.strip(),)
+        key = model_identity_key(raw_model)
+        name = canonical_model_name(raw_names)
     else:
-        items = raw_model_tokens
+        # Requests the gateway logged without a destination model still count toward the total.
+        raw_names = ()
+        key = UNKNOWN_MODEL
+        name = UNKNOWN_MODEL
+    return ModelUsage(
+        name=name,
+        key=key,
+        requests=_coerce_int(item_mapping.get("requests")),
+        total=_coerce_int(item_mapping.get("tokens")),
+        input=_coerce_int(item_mapping.get("input")),
+        cached=_coerce_int(item_mapping.get("cached")),
+        output=_coerce_int(item_mapping.get("output")),
+        raw_names=raw_names,
+    )
 
-    model_tokens: dict[str, int] = {}
+
+def extract_model_usage(raw_model_tokens: object) -> list[ModelUsage]:
+    """Per-model usage from a row's `model_tokens` JSON, merged by identity, highest tokens first."""
+    try:
+        items = (
+            json.loads(raw_model_tokens) if isinstance(raw_model_tokens, str) else raw_model_tokens
+        )
+    except json.JSONDecodeError:
+        items = []
+
+    merged: dict[str, ModelUsage] = {}
     if isinstance(items, list):
         for item in items:
-            coerced = _coerce_model_token_item(tool, item)
-            if not coerced:
-                continue
-            model_name, token_total = coerced
-            model_tokens[model_name] = model_tokens.get(model_name, 0) + token_total
-
-    if model_tokens:
-        return sorted(model_tokens.items(), key=lambda item: (-item[1], item[0].lower()))
-
-    models = extract_model_names(tool, raw_models)
-    if len(models) == 1 and total_tokens:
-        return [(models[0], total_tokens)]
-    return [(model_name, 0) for model_name in models]
+            coerced = _coerce_model_usage_item(item)
+            if coerced:
+                _merge_model_usage(merged, coerced)
+    return sorted(merged.values(), key=lambda u: (-u.total, u.name.lower()))
 
 
-def summarize_model_tokens(
-    tool: str,
-    raw_model_tokens: object,
-    raw_models: object,
-    total_tokens: int,
-) -> str:
-    model_tokens = extract_model_token_breakdown(
-        tool,
-        raw_model_tokens,
-        raw_models,
-        total_tokens,
-    )
-    if not model_tokens:
-        return "-"
-    return ", ".join(
-        f"{model_name} ({format_token_count(token_total)})" if token_total else model_name
-        for model_name, token_total in model_tokens
+def _merge_model_usage(merged: dict[str, ModelUsage], usage: ModelUsage) -> None:
+    """Accumulate `usage` into `merged` by identity key; the display name is recomputed from the
+    unioned raw names so a model's id and display spellings fold into one row across days."""
+    existing = merged.get(usage.key)
+    if existing is None:
+        merged[usage.key] = usage
+        return
+    raw_names = tuple(dict.fromkeys(existing.raw_names + usage.raw_names))
+    merged[usage.key] = existing._replace(
+        name=canonical_model_name(raw_names) if raw_names else existing.name,
+        requests=existing.requests + usage.requests,
+        total=existing.total + usage.total,
+        input=existing.input + usage.input,
+        cached=existing.cached + usage.cached,
+        output=existing.output + usage.output,
+        raw_names=raw_names,
     )
 
 
-def empty_tool_day(tool: str, usage_day: date) -> dict[str, object]:
-    return {
-        "tool": tool,
-        "usage_day": usage_day,
-        "total_tokens_used": 0,
-        "sessions": 0,
-        "first_event_time": None,
-        "last_event_time": None,
-        "models": "-",
-        "model_tokens": "[]",
-    }
+def model_usage_cost(
+    usage: ModelUsage,
+    price_lookup: dict[str, ModelPrice] | None,
+) -> Decimal | None:
+    """Estimated USD cost for one model's usage, or None when it can't be priced."""
+    if not price_lookup:
+        return None
+    for raw_name in usage.raw_names:
+        price = price_lookup.get(normalize_price_key(raw_name))
+        if price is None:
+            continue
+        cost = estimate_model_cost(price, usage.input, usage.cached, usage.output)
+        if cost is not None:
+            return cost
+    return None
 
 
 def has_tool_usage_last_week(records: list[dict[str, object]], tool: str) -> bool:
@@ -310,44 +496,77 @@ def has_tool_usage_last_week(records: list[dict[str, object]], tool: str) -> boo
     return False
 
 
-def build_tool_breakdown_rows(records: list[dict[str, object]], tool: str) -> list[list[str]]:
+class ToolUsageTotals(NamedTuple):
+    """Tool-level rollup for the week: total requests, tokens, and cost (None when unpriceable)."""
+
+    requests: int
+    tokens: int
+    cost: Decimal | None
+
+
+TOOL_MODEL_TABLE_HEADERS = [
+    "Model",
+    "Requests",
+    "Input (incl. cache)",
+    "Output",
+    "Est. Cost (USD)",
+]
+
+
+def aggregate_tool_model_usage(records: list[dict[str, object]], tool: str) -> list[ModelUsage]:
+    """Per-model usage for `tool` over the last 7 days, merged across days, highest tokens first."""
     today = date.today()
-    rows_by_day: dict[date, dict[str, object]] = {}
+    week_start = today - timedelta(days=USAGE_BREAKDOWN_DAYS - 1)
+    merged: dict[str, ModelUsage] = {}
     for record in records:
         if record.get("tool") != tool:
             continue
         usage_day = coerce_date(record.get("usage_day"))
-        if usage_day:
-            rows_by_day[usage_day] = record
+        if not usage_day or usage_day < week_start:
+            continue
+        for model_usage in extract_model_usage(record.get("model_tokens")):
+            _merge_model_usage(merged, model_usage)
+    return sorted(merged.values(), key=lambda u: (-u.total, u.name.lower()))
 
-    rendered_rows: list[list[str]] = []
-    for day_offset in range(USAGE_BREAKDOWN_DAYS):
-        usage_day = today - timedelta(days=day_offset)
-        record = rows_by_day.get(usage_day) or empty_tool_day(tool, usage_day)
-        first_event_time = coerce_datetime(record.get("first_event_time"))
-        last_event_time = coerce_datetime(record.get("last_event_time"))
-        duration = None
-        if first_event_time and last_event_time:
-            duration = last_event_time - first_event_time
-        token_total = int(cast(int, record.get("total_tokens_used") or 0))
-        session_total = int(cast(int, record.get("sessions") or 0))
-        rendered_rows.append(
+
+def build_tool_model_rows(
+    records: list[dict[str, object]],
+    tool: str,
+    price_lookup: dict[str, ModelPrice] | None = None,
+) -> tuple[list[list[str]], ToolUsageTotals]:
+    """Per-model table rows + tool totals for the week.
+
+    Columns match `TOOL_MODEL_TABLE_HEADERS`: model, requests, input (incl. cache), output, cost.
+    Cost is a dash for models the price catalog doesn't cover; the totals' cost is None when nothing
+    in the tool could be priced.
+    """
+    rows: list[list[str]] = []
+    total_requests = 0
+    total_tokens = 0
+    total_cost = Decimal(0)
+    any_priced = False
+    for usage in aggregate_tool_model_usage(records, tool):
+        cost = model_usage_cost(usage, price_lookup)
+        rows.append(
             [
-                usage_day.strftime("%m-%d"),
-                usage_day.strftime("%a"),
-                format_token_count(token_total) if token_total else "-",
-                str(session_total) if session_total else "-",
-                format_duration(duration),
-                summarize_model_tokens(
-                    tool,
-                    record.get("model_tokens"),
-                    record.get("models"),
-                    token_total,
-                ),
+                usage.name,
+                f"{usage.requests:,}",
+                format_token_count(usage.input),
+                format_token_count(usage.output),
+                format_cost_usd(cost) if cost is not None else "-",
             ]
         )
-
-    return rendered_rows
+        total_requests += usage.requests
+        total_tokens += usage.input + usage.output
+        if cost is not None:
+            total_cost += cost
+            any_priced = True
+    totals = ToolUsageTotals(
+        requests=total_requests,
+        tokens=total_tokens,
+        cost=total_cost if any_priced else None,
+    )
+    return rows, totals
 
 
 def find_requester_name(
@@ -370,10 +589,28 @@ def find_requester_name(
     return "current user"
 
 
+def render_budget_lines(budget_spend: tuple[Decimal, Decimal] | None) -> list[str]:
+    """Spend-against-threshold lines, or nothing when unavailable."""
+    if budget_spend is None:
+        return []
+    spend, threshold = budget_spend
+    # No whole to be a fraction of; dividing would raise.
+    if threshold <= 0:
+        return [f"{label('Budget spend:')} {value(format_usd(spend))}"]
+    fraction = float(spend / threshold)
+    summary = f"{format_usd(spend)} of {format_usd(threshold)} ({fraction:.0%})"
+    return [
+        f"{label('Budget spend:')} {value(summary)}",
+        muted(format_meter(fraction)),
+    ]
+
+
 def render_usage_summary(
     records: list[dict[str, object]],
     requester_name: str,
     tool_displays: dict[str, str],
+    budget_spend: tuple[Decimal, Decimal] | None = None,
+    price_lookup: dict[str, ModelPrice] | None = None,
 ) -> str:
     today = date.today()
     week_start = today - timedelta(days=USAGE_BREAKDOWN_DAYS - 1)
@@ -383,7 +620,7 @@ def render_usage_summary(
     weekly_total = 0
     monthly_total = 0
     active_tools_last_week: list[str] = []
-    weekly_model_tokens: dict[str, int] = {}
+    weekly_model_usage: dict[str, ModelUsage] = {}
     for record in records:
         usage_day = coerce_date(record.get("usage_day"))
         if not usage_day:
@@ -401,43 +638,143 @@ def render_usage_summary(
             ):
                 active_tools_last_week.append(tool)
             if isinstance(tool, str):
-                for model_name, model_token_total in extract_model_token_breakdown(
-                    tool,
-                    record.get("model_tokens"),
-                    record.get("models"),
-                    token_total,
-                ):
-                    weekly_model_tokens[model_name] = (
-                        weekly_model_tokens.get(model_name, 0) + model_token_total
-                    )
+                for model_usage in extract_model_usage(record.get("model_tokens")):
+                    _merge_model_usage(weekly_model_usage, model_usage)
         if usage_day == today:
             daily_total += token_total
 
+    today_text = format_token_count(daily_total)
+    weekly_text = format_token_count(weekly_total)
+    monthly_text = format_token_count(monthly_total)
+    token_table = render_box_table(
+        ["Today", "Last 7 days", "Last 30 days"],
+        [[f"{today_text} tokens", f"{weekly_text} tokens", f"{monthly_text} tokens"]],
+    )
+    for token_text in {today_text, weekly_text, monthly_text}:
+        plain_value = f"{token_text} tokens"
+        token_table = token_table.replace(plain_value, value(plain_value))
     lines = [
         heading(f"Usage Summary for {requester_name}"),
         "",
-        "[bold green]✓[/bold green] Databricks AI Gateway usage",
-        f"{label('Today:')} {value(format_token_count(daily_total) + ' tokens')}",
-        f"{label('Last 7 days:')} {value(format_token_count(weekly_total) + ' tokens')}",
-        f"{label('Last 30 days:')} {value(format_token_count(monthly_total) + ' tokens')}",
+        "[bold green]✓[/bold green]  [bold]Databricks AI Gateway Token Usage[/bold]",
+        token_table,
     ]
     if active_tools_last_week:
-        tool_text = ", ".join(tool_displays[tool] for tool in active_tools_last_week)
-        lines.append(f"{label('Active tools:')} {value(tool_text)}")
-    if weekly_model_tokens:
+        tool_text = " · ".join(tool_displays[tool] for tool in active_tools_last_week)
+        lines.extend(["", f"   🤖  {label('Top Harnesses:')} {value(tool_text)}"])
+    if weekly_model_usage:
         top_models = sorted(
-            weekly_model_tokens.items(),
-            key=lambda item: (-item[1], item[0].lower()),
+            weekly_model_usage.values(),
+            key=lambda u: (-u.total, u.name.lower()),
         )[:3]
-        models_text = ", ".join(
-            f"{model_name} ({format_token_count(token_total)})"
-            for model_name, token_total in top_models
+        models_text = " · ".join(usage.name for usage in top_models)
+        lines.append(f"   ⭐  {label('Top Models:')} {value(models_text)}")
+        weekly_cost = sum(
+            (
+                model_usage_cost(usage, price_lookup) or Decimal(0)
+                for usage in weekly_model_usage.values()
+            ),
+            Decimal(0),
         )
-        lines.append(f"{label('Top models this week:')} {value(models_text)}")
+        if weekly_cost > 0:
+            lines.append(
+                f"   💰  {label('Estimated Cost for Last 7 Days:')} "
+                f"{value(format_cost_usd(weekly_cost))}"
+            )
+    lines.extend(render_budget_lines(budget_spend))
     return "\n".join(lines)
 
 
-def usage() -> int:
+def run_query_on_first_working_warehouse(
+    workspace: str,
+    token: str,
+    candidates: list[SqlWarehouse],
+    query: str,
+) -> tuple[str, list[str], list[tuple]]:
+    """Run `query` on the first candidate that accepts the connection.
+
+    Returns the warehouse's http path alongside the result so later queries
+    reuse it. Raises the last error when every candidate fails.
+    """
+    last_error: RuntimeError | None = None
+    for warehouse in candidates:
+        print_note(f"Using SQL warehouse `{warehouse.label}` ({warehouse.state}).")
+        try:
+            # Inside the loop so the spinner stops before any warning prints.
+            columns, rows = _query_with_progress(workspace, token, warehouse, query)
+        except RuntimeError as exc:
+            last_error = exc
+            print_warning(f"SQL warehouse `{warehouse.label}` is unusable: {exc}")
+            continue
+        return warehouse.http_path, columns, rows
+    raise last_error or RuntimeError("No SQL warehouse could run the usage query.")
+
+
+def select_sql_warehouse(candidates: list[SqlWarehouse]) -> SqlWarehouse | None:
+    """Ask which discovered warehouse should run the detailed usage query."""
+    selected_path = prompt_for_selection(
+        "Select a SQL warehouse for the usage query:",
+        [
+            (warehouse.http_path, f"{warehouse.label} ({warehouse.state})")
+            for warehouse in candidates
+        ],
+    )
+    return next(
+        (warehouse for warehouse in candidates if warehouse.http_path == selected_path),
+        None,
+    )
+
+
+def select_and_run_usage_query(
+    workspace: str,
+    token: str,
+    candidates: list[SqlWarehouse],
+    query: str,
+) -> tuple[str, list[str], list[tuple]] | None:
+    """Let the user choose warehouses until one runs the query or they cancel.
+
+    A failed warehouse is removed before the picker is shown again so the user cannot
+    accidentally retry the same unusable option forever. Returns ``None`` when the picker
+    is cancelled and raises the final warehouse error when no candidates remain.
+    """
+    remaining = list(candidates)
+    last_error: RuntimeError | None = None
+    while remaining:
+        selected = select_sql_warehouse(remaining)
+        if selected is None:
+            return None
+        try:
+            return run_query_on_first_working_warehouse(workspace, token, [selected], query)
+        except RuntimeError as exc:
+            last_error = exc
+            remaining = [
+                warehouse for warehouse in remaining if warehouse.http_path != selected.http_path
+            ]
+    raise last_error or RuntimeError("No SQL warehouse could run the usage query.")
+
+
+def _query_with_progress(
+    workspace: str,
+    token: str,
+    warehouse: SqlWarehouse,
+    query: str,
+) -> tuple[list[str], list[tuple]]:
+    """Run the query, reporting a cold start until the connection opens.
+
+    A warehouse that isn't already up costs minutes to start, so the spinner
+    says that until `run_usage_query` reports it connected.
+    """
+    connected = warehouse.state in WARM_WAREHOUSE_STATES
+
+    def mark_connected() -> None:
+        nonlocal connected
+        connected = True
+
+    with spinner(lambda: QUERY_MESSAGE if connected else STARTUP_MESSAGE):
+        return run_usage_query(workspace, warehouse.http_path, token, query, mark_connected)
+
+
+def usage(warehouse_id: str | None = None) -> int:
     # Late import to avoid circular import (agents → state, but usage uses TOOL_SPECS for displays).
     from ucode.agents import TOOL_SPECS
 
@@ -452,28 +789,63 @@ def usage() -> int:
     with spinner("Retrieving Databricks access token..."):
         token = get_databricks_token(workspace, profile)
 
-    with spinner("Discovering SQL warehouse..."):
-        resolved_http_path = discover_sql_warehouse_http_path(workspace, token, quiet=False)
+    # Budget spend comes from AI Gateway directly, so show the useful at-a-glance result before
+    # asking whether to start (and potentially wait for) a SQL warehouse for the detailed report.
+    with spinner("Checking budget spend..."):
+        budget_spend, _ = resolve_current_budget_spend(workspace, token)
+    budget_lines = render_budget_lines(budget_spend)
+    if budget_lines:
+        console.print("\n".join([heading("Usage Budget"), "", *budget_lines]))
+    else:
+        print_note("Budget spend and threshold are unavailable.")
 
-    with spinner("Querying system.ai_gateway.usage..."):
-        columns, rows = run_usage_query(
-            workspace,
-            resolved_http_path,
-            token,
-            build_usage_report_query(),
+    if not prompt_yes_no_default(
+        "Show token usage and estimated cost details? This queries a SQL warehouse.",
+        default=False,
+    ):
+        return 0
+
+    with spinner("Discovering SQL warehouse..."):
+        candidates = discover_sql_warehouses(workspace, token, warehouse_id=warehouse_id)
+    if warehouse_id is None:
+        query_result = select_and_run_usage_query(
+            workspace, token, candidates, build_usage_report_query()
+        )
+        if query_result is None:
+            print_note("Usage details cancelled.")
+            return 0
+        resolved_http_path, columns, rows = query_result
+    else:
+        resolved_http_path, columns, rows = run_query_on_first_working_warehouse(
+            workspace, token, candidates, build_usage_report_query()
         )
     records = parse_usage_rows(columns, rows)
     requester_name = find_requester_name(workspace, resolved_http_path, token, records)
+
+    # Per-model dollar cost is estimated from tokens × catalog prices; omit cost rather than fail
+    # when the price catalog is unreachable.
+    with spinner(PRICES_MESSAGE):
+        raw_prices, _ = fetch_external_model_prices(workspace, token)
+    price_lookup = build_price_lookup(raw_prices)
 
     tool_displays = {tool: spec["display"] for tool, spec in TOOL_SPECS.items()}
     configured_tools = configured_usage_tools(state, tool_displays)
     configured_tool_displays = {tool: tool_displays[tool] for tool in configured_tools}
     records = filter_records_for_tools(records, configured_tools)
 
-    console.print(render_usage_summary(records, requester_name, configured_tool_displays))
+    console.print(
+        render_usage_summary(
+            records,
+            requester_name,
+            configured_tool_displays,
+            price_lookup=price_lookup,
+        )
+    )
 
-    table_headers = ["Date", "Day", "Tokens", "Sessions", "Duration", "Models"]
-    table_widths = [8, 5, 10, 8, 8, 24]
+    table_widths = [24, 10, 20, 10, 12]
+    today = date.today()
+    week_start = today - timedelta(days=USAGE_BREAKDOWN_DAYS - 1)
+    date_range = f"{week_start:%b %d}–{today:%b %d, %Y}"
 
     if not configured_tools:
         print_note("No coding agents configured. Run `ucode configure` to set up agents.")
@@ -485,11 +857,11 @@ def usage() -> int:
         if not has_tool_usage_last_week(records, tool):
             print_note(f"No usage for {display} in the last {USAGE_BREAKDOWN_DAYS} days.")
             continue
-        console.print(
-            render_box_table(
-                table_headers,
-                build_tool_breakdown_rows(records, tool),
-                max_widths=table_widths,
-            )
-        )
+        rows, totals = build_tool_model_rows(records, tool, price_lookup)
+        console.print(muted(date_range))
+        console.print(f"{label('Requests:')} {value(f'{totals.requests:,}')}")
+        console.print(f"{label('Total tokens:')} {value(f'{totals.tokens:,}')}")
+        if totals.cost is not None:
+            console.print(f"{label('Est. Cost (USD):')} {value(format_cost_usd(totals.cost))}")
+        console.print(render_box_table(TOOL_MODEL_TABLE_HEADERS, rows, max_widths=table_widths))
     return 0

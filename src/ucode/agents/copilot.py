@@ -20,7 +20,6 @@ import subprocess
 import threading
 from pathlib import Path
 
-from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -36,6 +35,8 @@ from ucode.databricks import (
     get_databricks_token,
 )
 from ucode.state import mark_tool_managed, save_state
+
+from .args import LaunchOptions
 
 COPILOT_CONFIG_DIR = Path.home() / ".copilot"
 COPILOT_ENV_PATH = COPILOT_CONFIG_DIR / "ucode.env"
@@ -66,12 +67,17 @@ LEGACY_ENV_KEYS = [
 ]
 
 
-def is_update_available() -> tuple[str, str] | None:
-    return available_npm_package_update(SPEC["package"])
-
-
 def default_model(state: dict) -> str | None:
-    """Prefer Claude sonnet, then opus/haiku, then codex."""
+    """Prefer Claude sonnet, then opus/haiku, then codex.
+
+    A managed config's ``copilot_default_model`` and ``copilot_models`` both win outright: the former is
+    the admin's chosen session start, the latter their allowlist. Workspace-wide discovery falls back.
+    """
+    if isinstance(state.get("copilot_default_model"), str):
+        return state.get("copilot_default_model")
+    copilot_models = state.get("copilot_models") or []
+    if isinstance(copilot_models, list) and copilot_models:
+        return copilot_models[0]
     claude_models = state.get("claude_models") or {}
     for family in ("sonnet", "opus", "haiku"):
         if claude_models.get(family):
@@ -99,25 +105,27 @@ def build_runtime_env(workspace: str, model: str, token: str) -> dict[str, str]:
     return env
 
 
-def build_mcp_server_entry(url: str) -> dict:
+def build_mcp_server_entry(argv: list[str]) -> dict:
+    # A `local` MCP server runs a stdio command; `command`/`args` split the
+    # argv. ucode registers the `ucode mcp-proxy ...` bridge here so Copilot
+    # never speaks HTTP+bearer directly — the proxy handles token refresh. The
+    # OAUTH_TOKEN env Copilot still injects at launch is for MODEL auth, not MCP.
     return {
-        "type": "http",
-        "url": url,
-        "headers": {
-            "Authorization": "Bearer ${OAUTH_TOKEN}",
-        },
+        "type": "local",
+        "command": argv[0],
+        "args": list(argv[1:]),
         "tools": ["*"],
     }
 
 
-def write_mcp_server_config(name: str, url: str) -> bool:
+def write_mcp_server_config(name: str, argv: list[str]) -> bool:
     backup_existing_file(COPILOT_MCP_CONFIG_PATH, COPILOT_MCP_BACKUP_PATH)
     existing = read_json_safe(COPILOT_MCP_CONFIG_PATH)
     mcp_servers = existing.get("mcpServers")
     if not isinstance(mcp_servers, dict):
         mcp_servers = {}
     removed = name in mcp_servers
-    mcp_servers[name] = build_mcp_server_entry(url)
+    mcp_servers[name] = build_mcp_server_entry(argv)
     existing["mcpServers"] = mcp_servers
     write_json_file(COPILOT_MCP_CONFIG_PATH, existing)
     return removed
@@ -173,7 +181,7 @@ def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
             continue
 
 
-def launch(state: dict, tool_args: list[str]) -> None:
+def launch(state: dict, tool_args: list[str], *, options: LaunchOptions) -> None:
     model, token = _refresh_token_once(state)
     env = build_runtime_env(state["workspace"], model, token)
 

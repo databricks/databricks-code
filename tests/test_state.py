@@ -12,11 +12,13 @@ from ucode.state import (
     STATE_VERSION,
     build_agent_state,
     clear_state,
+    get_provider_service,
     hydrate_state,
     load_full_state,
     load_state,
     mark_tool_managed,
     save_state,
+    set_provider_service,
 )
 
 FAKE_WS = "https://example.databricks.com"
@@ -107,6 +109,23 @@ class TestSaveLoadRoundTrip:
         assert loaded["workspace"] == FAKE_WS
         assert loaded["claude_models"]["sonnet"] == "databricks-claude-sonnet-4"
 
+    def test_persists_codex_launcher_default_in_agent_state(self):
+        save_state(
+            {
+                "workspace": FAKE_WS,
+                "codex_models": [
+                    "system.ai.gpt-5",
+                    "system.ai.gpt-5-1",
+                    "system.ai.gpt-5-6-luna",
+                ],
+            }
+        )
+
+        persisted = load_full_state()["workspaces"][FAKE_WS]
+        assert persisted["codex_models"][0] == "system.ai.gpt-5"
+        assert "model" not in persisted["agents"]["codex"]
+        assert persisted["agents"]["pi"]["model"] == "system.ai.gpt-5"
+
     def test_save_respects_dry_run(self):
         import ucode.config_io as config_io_mod
 
@@ -137,6 +156,32 @@ class TestClearState:
 
     def test_clear_when_no_state_is_noop(self):
         clear_state()  # should not raise
+
+
+class TestProviderService:
+    def test_get_returns_none_when_unset(self):
+        assert get_provider_service({}, "claude") is None
+        assert get_provider_service({"provider_services": {}}, "claude") is None
+
+    def test_set_and_get_roundtrip(self):
+        state = set_provider_service({}, "claude", "main.a.anthropic")
+        assert state["provider_services"]["claude"] == "main.a.anthropic"
+        assert get_provider_service(state, "claude") == "main.a.anthropic"
+        assert get_provider_service(state, "codex") is None
+
+    def test_set_none_clears_entry_and_key(self):
+        state = set_provider_service({}, "claude", "main.a.anthropic")
+        state = set_provider_service(state, "claude", None)
+        assert get_provider_service(state, "claude") is None
+        # Drop the empty container entirely rather than leaving {}.
+        assert "provider_services" not in state
+
+    def test_clearing_one_tool_keeps_the_other(self):
+        state = set_provider_service({}, "claude", "main.a.anthropic")
+        state = set_provider_service(state, "codex", "main.a.openai")
+        state = set_provider_service(state, "claude", None)
+        assert get_provider_service(state, "claude") is None
+        assert get_provider_service(state, "codex") == "main.a.openai"
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +218,15 @@ class TestHydrateState:
 
         assert result["agents"]["claude"]["model"] == "claude-opus"
         assert result["agents"]["claude"]["base_url"] == FAKE_URLS["claude"]
-        assert result["agents"]["claude"]["auth_command"].startswith("if [ -n")
-        assert result["agents"]["codex"]["model"] == "gpt-5"
+        # Cross-platform helper, not the old POSIX `if [ -n ... ]` pipeline (#116).
+        assert "auth-token" in result["agents"]["claude"]["auth_command"]
+        assert "if [ -n" not in result["agents"]["claude"]["auth_command"]
+        assert "model" not in result["agents"]["codex"]
         assert result["agents"]["codex"]["base_url"] == FAKE_URLS["codex"]
-        assert (
-            result["agents"]["codex"]["auth"]["args"][1]
-            == result["agents"]["codex"]["auth_command"]
-        )
+        # Codex runs the helper as argv (command + args), never via `sh -c`.
+        codex_auth = result["agents"]["codex"]["auth"]
+        assert codex_auth["command"] != "sh"
+        assert codex_auth["args"][0] == "auth-token"
         assert result["agents"]["pi"]["model"] == "claude-opus"
         assert result["agents"]["pi"]["base_urls"] == FAKE_URLS["pi"]
 
@@ -214,8 +261,11 @@ class TestBuildAgentState:
                 "base_urls": FAKE_URLS,
             }
         )
+        # --use-pat threads through to the `ucode auth-token --use-pat` helper,
+        # which resolves the static PAT internally on every platform.
         for agent in ("claude", "codex", "pi"):
-            assert "auth describe --profile DEFAULT --sensitive" in (result[agent]["auth_command"])
+            assert "--use-pat" in result[agent]["auth_command"]
+            assert "--profile DEFAULT" in result[agent]["auth_command"]
 
 
 # ---------------------------------------------------------------------------
@@ -239,3 +289,7 @@ class TestMarkToolManaged:
         result = mark_tool_managed(state, "codex", [["profile"]])
         assert "gemini" in result["managed_configs"]
         assert "codex" in result["managed_configs"]
+
+    def test_records_only_keys(self):
+        result = mark_tool_managed({}, "codex", [["model"]])
+        assert result["managed_configs"]["codex"] == {"keys": [["model"]]}

@@ -10,10 +10,13 @@ installed or no models are available.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -22,15 +25,32 @@ import pytest
 from ucode.databricks import (
     build_shared_base_urls,
     build_tool_base_url,
-    discover_sql_warehouse_http_path,
-    ensure_ai_gateway_v2,
+    discover_model_services,
+    discover_sql_warehouses,
     fetch_ai_gateway_claude_models,
     fetch_codex_models,
     fetch_gemini_models,
     has_valid_databricks_auth,
+    is_model_provider_feature_unavailable,
+    list_model_provider_services,
+    list_tool_provider_services,
+    probe_unity_gateway_capabilities,
+    service_usable_for_tool,
     workspace_hostname,
 )
 from ucode.ui import normalize_workspace_url
+
+# ---------------------------------------------------------------------------
+# CI provider-launch pinning
+# ---------------------------------------------------------------------------
+# The claude and codex provider-launch tests each route through one fixed,
+# non-relayed MPS that exposes only its cheapest model, so the inference is
+# deterministic and ~a cent per run rather than depending on whichever service
+# happened to list first. Hardcoded on purpose.
+CI_ANTHROPIC_MPS = "main.ucode.ci_e2e_anthropic_nonrelay_mps"  # api-key Anthropic (for claude)
+CI_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+CI_OPENAI_MPS = "main.ucode.ci_openai_mps"  # api-key OpenAI (for codex)
+CI_OPENAI_MODEL = "gpt-5-nano"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,6 +78,17 @@ def _run_agent(
         env=env,
         stdin=subprocess.DEVNULL,
     )
+
+
+def _codex_home_outside_tmp() -> Path:
+    """Create a fresh CODEX_HOME under the user's home dir, registered for cleanup at exit.
+
+    pytest's ``tmp_path`` lives under ``/tmp``; codex (>=0.134) refuses to create its helper
+    binaries when ``CODEX_HOME`` is under a temporary dir, so launching codex from ``tmp_path``
+    fails before doing anything. Rooting CODEX_HOME under ``$HOME`` sidesteps that guard."""
+    home = Path(tempfile.mkdtemp(prefix=".ucode-e2e-codex-", dir=Path.home()))
+    atexit.register(shutil.rmtree, home, ignore_errors=True)
+    return home
 
 
 def _run_gemini_gateway_smoke(workspace: str, model: str, token: str) -> str:
@@ -113,13 +144,13 @@ class TestDatabricksAuth:
 
 
 # ---------------------------------------------------------------------------
-# AI Gateway v2 probe
+# AI Gateway probe
 # ---------------------------------------------------------------------------
 
 
-class TestAiGatewayV2:
-    def test_ensure_ai_gateway_v2_does_not_raise(self, e2e_workspace, e2e_token):
-        ensure_ai_gateway_v2(e2e_workspace, e2e_token)
+class TestAiGateway:
+    def test_probe_unity_gateway_capabilities_does_not_raise(self, e2e_workspace, e2e_token):
+        probe_unity_gateway_capabilities(e2e_workspace, e2e_token)
 
     def test_workspace_hostname_resolves(self, e2e_workspace):
         hostname = workspace_hostname(e2e_workspace)
@@ -144,6 +175,40 @@ class TestModelDiscovery:
     def test_fetch_codex_models_returns_list(self, e2e_workspace, e2e_token):
         models = fetch_codex_models(e2e_workspace, e2e_token)
         assert isinstance(models, list)
+
+
+# ---------------------------------------------------------------------------
+# Model Provider Services discovery
+# ---------------------------------------------------------------------------
+
+
+class TestModelProviderServicesDiscovery:
+    def test_list_returns_services_or_skips_when_feature_off(self, e2e_workspace, e2e_token):
+        services, reason = list_model_provider_services(e2e_workspace, e2e_token)
+        if is_model_provider_feature_unavailable(reason):
+            pytest.skip("Model Provider Service feature not enabled on this workspace")
+        assert reason is None, f"listing failed: {reason}"
+        assert isinstance(services, list)
+        for svc in services:
+            assert set(svc) >= {"name", "provider_type", "targets", "allow_all_targets"}
+            # Names are stripped of the `model-provider-services/` API prefix.
+            assert svc["name"] and "/" not in svc["name"]
+
+    def test_tool_filter_matches_provider_type(self, e2e_workspace, e2e_token):
+        services, reason = list_model_provider_services(e2e_workspace, e2e_token)
+        if is_model_provider_feature_unavailable(reason):
+            pytest.skip("Model Provider Service feature not enabled on this workspace")
+        assert reason is None
+        claude_names, _ = list_tool_provider_services("claude", e2e_workspace, e2e_token)
+        codex_names, _ = list_tool_provider_services("codex", e2e_workspace, e2e_token)
+        # claude routes through Anthropic and Bedrock services (Bedrock only when
+        # it exposes Claude models); codex through OpenAI.
+        assert set(claude_names) == {
+            s["name"] for s in services if service_usable_for_tool("claude", s)
+        }
+        assert set(codex_names) == {
+            s["name"] for s in services if service_usable_for_tool("codex", s)
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -195,10 +260,11 @@ class TestStateRoundTrip:
 class TestSqlWarehouseDiscovery:
     def test_discovers_http_path(self, e2e_workspace, e2e_token):
         try:
-            http_path = discover_sql_warehouse_http_path(e2e_workspace, e2e_token, quiet=True)
+            candidates = discover_sql_warehouses(e2e_workspace, e2e_token)
         except RuntimeError as exc:
             pytest.skip(f"No SQL warehouse available: {exc}")
-        assert http_path.startswith("/sql/1.0/warehouses/")
+        assert candidates
+        assert all(w.http_path.startswith("/sql/1.0/warehouses/") for w in candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +329,8 @@ class TestConfigureSubset:
         # selection plumbing, not the agent binaries themselves.
         monkeypatch.setattr(cli_mod, "install_tool_binary", lambda tool, **kwargs: True)
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
+        # Answer the provider picker; "databricks" keeps the Databricks path.
+        monkeypatch.setattr(cli_mod, "prompt_for_selection", lambda prompt, options: "databricks")
 
         rc = cli_mod.configure_workspace_command()
         assert rc == 0
@@ -294,6 +362,8 @@ class TestConfigureSubset:
         )
         monkeypatch.setattr(cli_mod, "install_tool_binary", lambda tool, **kwargs: True)
         monkeypatch.setattr(cli_mod, "validate_all_tools", lambda state: None)
+        # Answer the provider picker; "databricks" keeps the Databricks path.
+        monkeypatch.setattr(cli_mod, "prompt_for_selection", lambda prompt, options: "databricks")
 
         # First run: pick codex.
         monkeypatch.setattr(cli_mod, "prompt_for_tools", lambda available: ["codex"])
@@ -352,6 +422,33 @@ class TestConfigureSubset:
 # Tests are skipped when the binary is not installed or no models are available.
 # ---------------------------------------------------------------------------
 
+# Model exclusions live here so a temporary outage can be scoped consistently
+# across every harness that exercises the affected model.
+E2E_MODEL_SKIP_HARNESSES: dict[str, frozenset[str]] = {
+    # Codex nano is unreliably slow and exceeds the E2E timeout.
+    "gpt-5-4-nano": frozenset({"codex"}),
+    # The CI OpenAI project cannot serve this snapshot in its geography.
+    "gpt-5-3-codex": frozenset({"codex", "pi"}),
+    # Bedrock Grok rejects request/tool shapes from these harnesses.
+    "grok": frozenset({"codex", "copilot", "pi"}),
+    # These Gemini endpoints hang OpenCode well past its E2E timeout.
+    "databricks-gemini-3-1-flash-lite": frozenset({"opencode"}),
+    # Codex-tuned and newer GPT endpoints do not support Copilot's MLflow chat route.
+    "-codex": frozenset({"copilot"}),
+    "gpt-5-5": frozenset({"copilot"}),
+    "gpt-5-6": frozenset({"copilot"}),
+    # Astra currently fails through these paths in prod-aws-us-east-1.
+    "astra": frozenset({"copilot", "pi", "web_search"}),
+}
+
+
+def _model_is_skipped(model: str, harness: str) -> bool:
+    normalized = model.lower()
+    return any(
+        fragment in normalized and harness in harnesses
+        for fragment, harnesses in E2E_MODEL_SKIP_HARNESSES.items()
+    )
+
 
 def _require_binary(binary: str):
     if not shutil.which(binary):
@@ -361,22 +458,20 @@ def _require_binary(binary: str):
 class TestCodexLaunch:
     """Run codex against every available codex model."""
 
-    # Substrings of model IDs that are known-incompatible with the codex CLI on
-    # Databricks today. Each entry should have a comment explaining why.
-    CODEX_INCOMPATIBLE_MODEL_FRAGMENTS = (
-        # nano endpoint is unreliably slow and times out past the 60s budget.
-        "gpt-5-4-nano",
-    )
-
     def _codex_models(self, e2e_state: dict) -> list[str]:
         models = [
             model
             for model in (e2e_state.get("codex_models") or [])
-            if not any(frag in model for frag in self.CODEX_INCOMPATIBLE_MODEL_FRAGMENTS)
+            if not _model_is_skipped(model, "codex")
         ]
         if not models:
             pytest.skip("No Codex models available on this workspace")
         return models
+
+    def test_astra_is_not_skipped(self):
+        assert self._codex_models({"codex_models": ["databricks-gpt-6-astra"]}) == [
+            "databricks-gpt-6-astra"
+        ]
 
     def test_launch_codex_per_model(self, tmp_path, monkeypatch, e2e_state, e2e_workspace):
         """Parametrized inline — iterates over all codex models and asserts each works."""
@@ -387,7 +482,7 @@ class TestCodexLaunch:
         models = self._codex_models(e2e_state)
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        config_dir = tmp_path / "codex_home" / ".codex"
+        config_dir = _codex_home_outside_tmp() / ".codex"
         config_dir.mkdir(parents=True)
         config_path = config_dir / "ucode.config.toml"
         backup_path = tmp_path / "codex-config.backup.toml"
@@ -414,9 +509,12 @@ class TestCodexLaunch:
                 continue
 
             if result.returncode != 0 or not (result.stdout or result.stderr).strip():
+                # Keep a generous tail of stderr. codex-cli logs a non-fatal model-listing error
+                # first and the actual cause last, so a short prefix reports the wrong problem —
+                # at 200 chars the geography failure above read as a `/v1/models` routing error.
                 failures.append(
                     f"model={model} rc={result.returncode} "
-                    f"stdout={result.stdout[:200]!r} stderr={result.stderr[:200]!r}"
+                    f"stdout={result.stdout[-500:]!r} stderr={result.stderr[-1500:]!r}"
                 )
 
         assert not failures, "Codex launch failures:\n" + "\n".join(failures)
@@ -461,7 +559,6 @@ class TestClaudeLaunch:
                 "ANTHROPIC_MODEL": model_id,
                 "ANTHROPIC_BASE_URL": base_url,
                 "ANTHROPIC_API_KEY": e2e_token,
-                "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
             }
             cmd = claude.validate_cmd("claude")
             result = _run_agent(cmd, env=env, timeout=90)
@@ -473,6 +570,117 @@ class TestClaudeLaunch:
                 )
 
         assert not failures, "Claude launch failures:\n" + "\n".join(failures)
+
+
+class TestModelProviderLaunch:
+    """Launch claude/codex routed through a real Model Provider Service.
+
+    Both are pinned to fixed CI MPSes (CI_ANTHROPIC_MPS / CI_OPENAI_MPS), each
+    exposing only its cheapest model, so a real request flows through the MPS
+    gateway deterministically. Skips when the MPS is absent or the caller lacks
+    permission on the backing connection.
+    """
+
+    @staticmethod
+    def _skip_if_provider_unusable(combined: str, provider: str) -> None:
+        # Environmental provider-account conditions, not ucode bugs: the test only proves routing
+        # reaches the provider, so skip (rather than fail) when the account lacks a grant on the
+        # connection or has run out of credits — state outside the code under test.
+        if "USE CONNECTION" in combined or "EXECUTE" in combined:
+            pytest.skip(f"no permission on provider {provider}: {combined[:200]}")
+        if "Credit balance is too low" in combined:
+            pytest.skip(f"provider {provider} account is out of credits: {combined[:200]}")
+
+    def test_launch_claude_through_provider(
+        self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
+    ):
+        import ucode.config_io as config_io_mod
+        from ucode.agents import claude, resolve_provider_models
+
+        _require_binary("claude")
+        # Pinned to a fixed CI MPS so the inference is deterministic and cheap. Skip (don't fail)
+        # when it's absent, so e2e runs against other workspaces still work.
+        provider = CI_ANTHROPIC_MPS
+        state = {**e2e_state, "workspace": e2e_workspace}
+        # Resolve the provider's models as the launch path does. This Anthropic MPS declares a
+        # single Haiku target, so provider_models pins that family and route_root_model (below)
+        # makes Claude Code launch on exactly it — its built-in default tier isn't in the allowlist.
+        provider_models, error, _relayed = resolve_provider_models("claude", state, provider)
+        if error is not None:
+            pytest.skip(f"CI Anthropic MPS {provider} unavailable on this workspace: {error}")
+
+        config_dir = tmp_path / "claude_config"
+        config_dir.mkdir()
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        monkeypatch.setattr(claude, "CLAUDE_SETTINGS_PATH", config_dir / "settings.json")
+        monkeypatch.setattr(claude, "CLAUDE_BACKUP_PATH", tmp_path / "claude-settings.backup.json")
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr("ucode.state.save_state", lambda s: None)
+            claude.write_tool_config(
+                state,
+                None,
+                provider=provider,
+                provider_models=provider_models,
+                route_root_model=CI_ANTHROPIC_MODEL,
+            )
+
+        env = {
+            **os.environ,
+            "CLAUDE_CONFIG_DIR": str(config_dir),
+            "ANTHROPIC_BASE_URL": build_tool_base_url("claude", e2e_workspace),
+            "ANTHROPIC_API_KEY": e2e_token,
+        }
+        result = _run_agent(claude.validate_cmd("claude"), env=env, timeout=90)
+        combined = (result.stdout + result.stderr).strip()
+        self._skip_if_provider_unusable(combined, provider)
+        assert result.returncode == 0 and combined, (
+            f"provider={provider} rc={result.returncode} "
+            f"stdout={result.stdout[:300]!r} stderr={result.stderr[:300]!r}"
+        )
+
+    def test_launch_codex_through_provider(
+        self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
+    ):
+        import ucode.config_io as config_io_mod
+        from ucode.agents import codex, resolve_provider_models
+
+        _require_binary("codex")
+        # Pinned to the fixed CI OpenAI MPS (Nano-only) — the codex counterpart to the claude pin
+        # (codex speaks the OpenAI API, so it can't use the Anthropic MPS). Skip when it's absent.
+        provider = CI_OPENAI_MPS
+        state = {**e2e_state, "workspace": e2e_workspace, "codex_default_model": CI_OPENAI_MODEL}
+        _, error, _ = resolve_provider_models("codex", state, provider)
+        if error is not None:
+            pytest.skip(f"CI OpenAI MPS {provider} unavailable on this workspace: {error}")
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        config_dir = _codex_home_outside_tmp() / ".codex"
+        config_dir.mkdir(parents=True)
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_dir / "ucode.config.toml")
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "codex-config.backup.toml")
+
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setattr("ucode.state.save_state", lambda s: None)
+            # codex.write_tool_config pins the model from state["codex_default_model"] (set above),
+            # so it lands as gpt-5-nano — the only model this MPS allows.
+            codex.write_tool_config(state, None, provider=provider)
+
+        timeout_seconds = int(os.environ.get("UCODE_E2E_AGENT_TIMEOUT", "60"))
+        try:
+            result = _run_agent(
+                codex.validate_cmd("codex"),
+                env={**os.environ, "CODEX_HOME": str(config_dir)},
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"provider={provider} timed out after {timeout_seconds}s")
+        combined = (result.stdout + result.stderr).strip()
+        self._skip_if_provider_unusable(combined, provider)
+        assert result.returncode == 0 and combined, (
+            f"provider={provider} rc={result.returncode} "
+            f"stdout={result.stdout[:300]!r} stderr={result.stderr[:300]!r}"
+        )
 
 
 class TestGeminiLaunch:
@@ -561,13 +769,7 @@ class TestGeminiFreshInstall:
 
 
 class TestOpencodeLaunch:
-    """Run opencode against every available opencode model (anthropic + gemini)."""
-
-    # Models that hang opencode well past 180s on the staging gateway with
-    # no stderr beyond the initial `> build · <model>` line, while every
-    # other configured model returns in ~3s. Backend-side latency we can't
-    # influence from this repo; skip rather than block CI.
-    SKIP_MODELS: frozenset[str] = frozenset({"databricks-gemini-3-1-flash-lite"})
+    """Run OpenCode against the available native and OSS model providers."""
 
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
         """Return [(provider, model_id), ...] for all opencode models."""
@@ -575,7 +777,7 @@ class TestOpencodeLaunch:
         out: list[tuple[str, str]] = []
         for provider, models in opencode_models.items():
             for model in models or []:
-                if model in self.SKIP_MODELS:
+                if _model_is_skipped(model, "opencode"):
                     continue
                 out.append((provider, model))
         return out
@@ -655,25 +857,108 @@ class TestOpencodeLaunch:
 
         assert not failures, "OpenCode launch failures:\n" + "\n".join(failures)
 
+    def test_launch_deepseek_v4_pro(
+        self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
+    ):
+        """Discover and invoke the live versioned DeepSeek V4 Pro model."""
+        import ucode.config_io as config_io_mod
+        from ucode.agents import opencode
+
+        _require_binary("opencode")
+        _, _, _, oss_models, reason = discover_model_services(e2e_workspace, e2e_token)
+        assert reason is None, reason
+        model = next((m for m in oss_models if "deepseek-v4-pro" in m), None)
+        if model is None:
+            pytest.skip("DeepSeek V4 Pro is not available on this workspace")
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        xdg = tmp_path / "opencode-xdg"
+        monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
+        monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", xdg / "opencode" / "opencode.json")
+        monkeypatch.setattr(
+            opencode, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-config.backup.json"
+        )
+        monkeypatch.setattr("ucode.state.save_state", lambda state: None)
+        monkeypatch.setattr(
+            "ucode.agents.opencode.get_databricks_token",
+            lambda workspace, profile=None, **kwargs: e2e_token,
+        )
+
+        state = {
+            **e2e_state,
+            "workspace": e2e_workspace,
+            "oss_models": oss_models,
+            "opencode_models": {
+                **(e2e_state.get("opencode_models") or {}),
+                "oss": oss_models,
+            },
+        }
+        opencode.write_tool_config(state, model, token=e2e_token)
+
+        result = _run_agent(
+            opencode.validate_cmd("opencode"),
+            env=opencode.build_runtime_env(e2e_token),
+            timeout=180,
+        )
+        combined = (result.stdout + result.stderr).strip()
+        assert result.returncode == 0 and combined, (
+            f"DeepSeek model={model} rc={result.returncode} "
+            f"stdout={result.stdout[:300]!r} stderr={result.stderr[:500]!r}"
+        )
+
+    def test_recovers_from_rejected_initial_token(
+        self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
+    ):
+        """Exercise the real OpenCode plugin's 401 refresh-and-retry path."""
+        import ucode.config_io as config_io_mod
+        from ucode.agents import opencode
+
+        _require_binary("opencode")
+        models = self._all_models(e2e_state)
+        if not models:
+            pytest.skip("No OpenCode models available on this workspace")
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        xdg = tmp_path / "opencode-xdg"
+        monkeypatch.setattr(opencode, "OPENCODE_XDG_CONFIG_HOME", xdg)
+        monkeypatch.setattr(opencode, "OPENCODE_CONFIG_PATH", xdg / "opencode" / "opencode.json")
+        monkeypatch.setattr(
+            opencode, "OPENCODE_BACKUP_PATH", tmp_path / "opencode-config.backup.json"
+        )
+        monkeypatch.setattr("ucode.state.save_state", lambda s: None)
+
+        _, model = models[0]
+        rejected_token = "ucode-intentionally-rejected-token"
+        opencode.write_tool_config(
+            {**e2e_state, "workspace": e2e_workspace},
+            model,
+            token=rejected_token,
+        )
+
+        env = opencode.build_runtime_env(rejected_token)
+        # CI authenticates this way; the helper subprocess inherits it and
+        # returns the known-good token after OpenCode's first request gets 401.
+        env["DATABRICKS_BEARER"] = e2e_token
+        result = _run_agent(
+            opencode.validate_cmd("opencode"),
+            env=env,
+            timeout=180,
+        )
+        combined = (result.stdout + result.stderr).strip()
+        assert result.returncode == 0 and combined, (
+            "OpenCode did not recover after its initial token was rejected: "
+            f"rc={result.returncode} stdout={result.stdout[:300]!r} "
+            f"stderr={result.stderr[:500]!r}"
+        )
+
 
 class TestCopilotLaunch:
     """Run copilot against every Claude/codex model via the MLflow chat-completions gateway.
 
     Gemini is excluded by design — Databricks' Gemini translator rejects the
-    `stream_options` field Copilot CLI sends. Some codex variants are also
-    incompatible upstream and are listed in COPILOT_INCOMPATIBLE_MODEL_FRAGMENTS.
+    `stream_options` field Copilot CLI sends. Other incompatible models are
+    scoped to Copilot in E2E_MODEL_SKIP_HARNESSES.
     """
-
-    # Substrings of model IDs that are known-incompatible with Copilot CLI on
-    # Databricks today. Each entry should have a comment explaining why.
-    COPILOT_INCOMPATIBLE_MODEL_FRAGMENTS = (
-        # Codex-tuned endpoints expose only openai/v1/responses and
-        # cursor/v1/chat/completions, not mlflow/v1/chat/completions.
-        "-codex",
-        # gpt-5.5 rejects function tools + reasoning_effort on /chat/completions
-        # ("Please use /v1/responses instead").
-        "gpt-5-5",
-    )
 
     def _all_models(self, e2e_state: dict) -> list[tuple[str, str]]:
         """Return [(family, model_id), ...] for every model copilot can talk to."""
@@ -682,10 +967,14 @@ class TestCopilotLaunch:
         for family, model_id in _launchable_model_items(claude_models):
             out.append((f"claude-{family}", model_id))
         for model in e2e_state.get("codex_models") or []:
-            if any(frag in model for frag in self.COPILOT_INCOMPATIBLE_MODEL_FRAGMENTS):
+            if _model_is_skipped(model, "copilot"):
                 continue
             out.append(("codex", model))
         return out
+
+    def test_astra_is_skipped(self):
+        state = {"codex_models": ["databricks-gpt-6-astra", "databricks-gpt-5-4"]}
+        assert self._all_models(state) == [("codex", "databricks-gpt-5-4")]
 
     def test_launch_copilot_per_model(
         self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token
@@ -742,10 +1031,15 @@ class TestPiLaunch:
         for family, model_id in _launchable_model_items(claude_models):
             out.append((f"claude-{family}", model_id))
         for model in e2e_state.get("codex_models") or []:
-            out.append(("codex", model))
+            if not _model_is_skipped(model, "pi"):
+                out.append(("codex", model))
         for model in e2e_state.get("gemini_models") or []:
             out.append(("gemini", model))
         return out
+
+    def test_astra_is_skipped(self):
+        state = {"codex_models": ["databricks-gpt-6-astra", "databricks-gpt-5-4"]}
+        assert self._all_models(state) == [("codex", "databricks-gpt-5-4")]
 
     def test_launch_pi_per_model(self, tmp_path, monkeypatch, e2e_state, e2e_workspace, e2e_token):
         import ucode.config_io as config_io_mod
@@ -757,14 +1051,17 @@ class TestPiLaunch:
             pytest.skip("No Pi-compatible models available on this workspace")
 
         monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
-        # Pi reads models.json below HOME/.pi/agent. Point both pi's runtime
-        # HOME and our writer at the same isolated tmp home.
+        # Point PI_CODING_AGENT_DIR and ucode's config writer at the same
+        # isolated directory without changing the process HOME.
         pi_home = tmp_path / "pi-home"
         pi_dir = pi_home / ".pi" / "agent"
         config_path = pi_dir / "models.json"
         backup_path = tmp_path / "pi-models.backup.json"
         monkeypatch.setattr(pi, "PI_UCODE_HOME", pi_home)
+        monkeypatch.setattr(pi, "PI_CONFIG_DIR", pi_dir)
         monkeypatch.setattr(pi, "PI_CONFIG_PATH", config_path)
+        monkeypatch.setattr(pi, "PI_SETTINGS_PATH", pi_dir / "settings.json")
+        monkeypatch.setattr(pi, "PI_SETTINGS_BACKUP_PATH", tmp_path / "pi-settings.backup.json")
         monkeypatch.setattr(pi, "PI_BACKUP_PATH", backup_path)
 
         failures = []
@@ -812,10 +1109,19 @@ class TestPiLaunch:
 
 
 def _first_codex_model(e2e_state: dict) -> str:
-    models = e2e_state.get("codex_models") or []
+    models = [
+        model
+        for model in (e2e_state.get("codex_models") or [])
+        if not _model_is_skipped(model, "web_search")
+    ]
     if not models:
         pytest.skip("No Responses-API (codex) models available on this workspace")
     return models[0]
+
+
+def test_web_search_skips_astra():
+    state = {"codex_models": ["databricks-gpt-6-astra", "databricks-gpt-5-4"]}
+    assert _first_codex_model(state) == "databricks-gpt-5-4"
 
 
 class TestWebSearchResponsesApi:

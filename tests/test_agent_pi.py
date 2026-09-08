@@ -240,9 +240,13 @@ class TestBuildRuntimeEnv:
         env = pi.build_runtime_env("tok")
         assert env["OAUTH_TOKEN"] == "tok"
 
-    def test_sets_ucode_home(self):
+    def test_sets_private_agent_dir_without_replacing_home(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/real-user-home")
+
         env = pi.build_runtime_env("tok")
-        assert env["HOME"] == str(pi.PI_UCODE_HOME)
+
+        assert env["PI_CODING_AGENT_DIR"] == str(pi.PI_CONFIG_DIR)
+        assert env["HOME"] == "/real-user-home"
 
 
 class TestPiValidateCmd:
@@ -413,3 +417,61 @@ class TestValidateAllToolsPiRollback:
         agents_mod.validate_all_tools({"available_tools": ["pi"], "managed_configs": {"pi": True}})
 
         assert not settings_file.exists()
+
+
+class TestManagedModels:
+    """A managed config's models arrive as `pi_models` and must not come from the shared keys."""
+
+    def test_managed_models_win_over_the_shared_discovery_lists(self):
+        state = {
+            "pi_models": ["system.ai.claude-opus-4-8"],
+            "claude_models": {"opus": "shared-should-not-win"},
+        }
+        assert pi.default_model(state) == "system.ai.claude-opus-4-8"
+
+    def test_falls_back_to_the_shared_lists_without_a_managed_config(self):
+        assert pi.default_model({"claude_models": {"opus": "discovered"}}) == "discovered"
+
+    def test_managed_models_split_into_pis_per_provider_inputs(self):
+        # Pi builds one provider block per family, so a flat list has to be classified back out.
+        state = {
+            "pi_models": [
+                "system.ai.claude-opus-4-8",
+                "system.ai.gpt-5",
+                "system.ai.gemini-3-flash",
+            ]
+        }
+        assert pi._managed_model_families(state) == (
+            {"opus": "system.ai.claude-opus-4-8"},
+            ["system.ai.gpt-5"],
+            ["system.ai.gemini-3-flash"],
+        )
+
+    def test_no_split_without_managed_models(self):
+        assert pi._managed_model_families({"claude_models": {"opus": "x"}}) is None
+
+    def test_none_when_no_managed_model_is_servable(self):
+        # Pi has no OSS provider, so an oss-only list yields no families. Returning an all-empty
+        # tuple would be truthy and suppress the fallback, writing a config with zero providers.
+        assert pi._managed_model_families({"pi_models": ["system.ai.kimi-k2-7-code"]}) is None
+
+    def test_partially_servable_list_still_splits(self):
+        families = pi._managed_model_families(
+            {"pi_models": ["system.ai.kimi-k2-7-code", "system.ai.claude-opus-4-8"]}
+        )
+        assert families == ({"opus": "system.ai.claude-opus-4-8"}, [], [])
+
+
+class TestManagedDefaultModel:
+    """A managed config's `pi_default_model` takes priority over the allowlist."""
+
+    def test_pi_default_model_wins_over_allowlist(self):
+        state = {
+            "pi_default_model": "admin-chosen-default",
+            "pi_models": ["system.ai.claude-opus-4-8", "system.ai.gpt-5"],
+        }
+        assert pi.default_model(state) == "admin-chosen-default"
+
+    def test_falls_back_to_pi_models_without_default(self):
+        state = {"pi_models": ["system.ai.claude-opus-4-8"]}
+        assert pi.default_model(state) == "system.ai.claude-opus-4-8"

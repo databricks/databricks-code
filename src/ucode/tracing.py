@@ -133,6 +133,14 @@ def tracing_env(state: dict, tool: str) -> dict[str, str]:
     env = {
         "MLFLOW_TRACKING_URI": str(cfg["tracking_uri"]),
         "MLFLOW_EXPERIMENT_ID": str(entry["experiment_id"]),
+        # The trace is emitted by the `mlflow autolog claude stop-hook` Stop
+        # hook, which is always a short-lived one-shot process. With async
+        # trace logging (MLflow's default) the root `claude_code_conversation`
+        # span is queued and the hook's best-effort flush can lose it if the
+        # export hasn't drained before the process exits — observed on CI
+        # runners, where it leaves an orphaned `llm` span and no queryable
+        # trace. Force synchronous export so the span is written before exit.
+        "MLFLOW_ENABLE_ASYNC_TRACE_LOGGING": "false",
     }
     warehouse_id = cfg.get("sql_warehouse_id")
     if warehouse_id:

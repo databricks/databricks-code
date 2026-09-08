@@ -1,4 +1,4 @@
-"""Pi coding agent: writes ~/.pi/agent/models.json with Databricks-backed providers.
+"""Pi coding agent: writes a ucode-private models.json with Databricks-backed providers.
 
 Pi (https://pi.dev) is a multi-provider coding agent. We register three
 providers in its `models.json`, each speaking the API dialect best suited to
@@ -32,7 +32,6 @@ import signal
 import subprocess
 import threading
 
-from ucode.agent_updates import available_npm_package_update
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -42,12 +41,16 @@ from ucode.config_io import (
     write_json_file,
 )
 from ucode.databricks import (
+    ANTHROPIC_FAMILIES,
     TOKEN_REFRESH_INTERVAL_SECONDS,
     build_pi_base_urls,
+    classify_model_family,
     get_databricks_token,
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
+
+from .args import LaunchOptions
 
 PI_UCODE_HOME = APP_DIR / "pi-home"
 PI_CONFIG_DIR = PI_UCODE_HOME / ".pi" / "agent"
@@ -77,10 +80,6 @@ PROVIDER_KEYS: list[list[str]] = [["providers", name] for name in PROVIDER_NAMES
 LEGACY_PROVIDER_NAMES = ("databricks-anthropic", "databricks-codex", "databricks-oss")
 
 
-def is_update_available() -> tuple[str, str] | None:
-    return available_npm_package_update(SPEC["package"])
-
-
 def _resolve_model_selector(
     model: str,
     claude_models: dict[str, str],
@@ -108,7 +107,7 @@ def render_overlay(
     codex_models: list[str],
     gemini_models: list[str],
 ) -> tuple[dict, list[list[str]]]:
-    """Return (overlay, managed_key_paths) for ~/.pi/agent/models.json."""
+    """Return (overlay, managed_key_paths) for Pi's private agent config."""
     providers: dict = {}
     keys: list[list[str]] = [["model"]]
     # Pi expands header values that match an env var name. Our UA contains
@@ -171,13 +170,19 @@ def write_tool_config(
             state["workspace"], state.get("profile"), force_refresh=force_refresh
         )
     pi_base_urls = state.get("base_urls", {}).get("pi") or build_pi_base_urls(state["workspace"])
+    managed_families = _managed_model_families(state)
+    claude_models, codex_models, gemini_models = managed_families or (
+        state.get("claude_models") or {},
+        state.get("codex_models") or [],
+        state.get("gemini_models") or [],
+    )
     overlay, managed_keys = render_overlay(
         model,
         token,
         pi_base_urls,
-        state.get("claude_models") or {},
-        state.get("codex_models") or [],
-        state.get("gemini_models") or [],
+        claude_models,
+        codex_models,
+        gemini_models,
     )
     existing = read_json_safe(PI_CONFIG_PATH)
     providers = existing.get("providers")
@@ -205,8 +210,45 @@ def _write_settings(model_selector: str) -> None:
     write_json_file(PI_SETTINGS_PATH, merged)
 
 
+def _managed_model_families(state: dict) -> tuple[dict[str, str], list[str], list[str]] | None:
+    """Split a managed config's ``pi_models`` into the per-family inputs Pi's providers need.
+
+    Pi builds one provider block per family, so a flat list has to be classified back out. Returns
+    None when the managed models yield no family Pi can serve, leaving the workspace-wide discovery
+    lists in play rather than writing a config with no usable provider.
+    """
+    managed = state.get("pi_models")
+    if not isinstance(managed, list) or not managed:
+        return None
+    claude: dict[str, str] = {}
+    codex: list[str] = []
+    gemini: list[str] = []
+    for model in managed:
+        if not isinstance(model, str) or not model.strip():
+            continue
+        family = classify_model_family(model)
+        if family in ANTHROPIC_FAMILIES:
+            claude.setdefault(family, model)
+        elif family == "codex":
+            codex.append(model)
+        elif family == "gemini":
+            gemini.append(model)
+    if not (claude or codex or gemini):
+        return None
+    return claude, codex, gemini
+
+
 def default_model(state: dict) -> str | None:
-    """Prefer Claude opus → sonnet → haiku; fall back to codex, gemini."""
+    """Prefer Claude opus → sonnet → haiku; fall back to codex, gemini.
+
+    A managed config's ``pi_default_model`` and ``pi_models`` both win outright: the former is
+    the admin's chosen session start, the latter their allowlist. Workspace-wide discovery falls back.
+    """
+    if isinstance(state.get("pi_default_model"), str):
+        return state.get("pi_default_model")
+    managed = state.get("pi_models")
+    if isinstance(managed, list) and managed:
+        return managed[0]
     claude_models = state.get("claude_models") or {}
     for family in ("opus", "sonnet", "haiku"):
         if claude_models.get(family):
@@ -237,11 +279,11 @@ def _refresh_forever(state: dict, stop_event: threading.Event) -> None:
 def build_runtime_env(token: str) -> dict[str, str]:
     env = os.environ.copy()
     env["OAUTH_TOKEN"] = token
-    env["HOME"] = str(PI_UCODE_HOME)
+    env["PI_CODING_AGENT_DIR"] = str(PI_CONFIG_DIR)
     return env
 
 
-def launch(state: dict, tool_args: list[str]) -> None:
+def launch(state: dict, tool_args: list[str], *, options: LaunchOptions) -> None:
     token = _refresh_token_once(state)
     env = build_runtime_env(token)
 

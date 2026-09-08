@@ -23,14 +23,15 @@ from ucode.state import load_state
 
 
 def _has_uc_models(workspace: str, token: str) -> bool:
-    claude, codex, gemini, _reason = discover_model_services(workspace, token)
-    return bool(claude or codex or gemini)
+    claude, codex, gemini, oss, _reason = discover_model_services(workspace, token)
+    return bool(claude or codex or gemini or oss)
 
 
 def _all_resolved_model_ids(state: dict) -> list[str]:
     ids: list[str] = list((state.get("claude_models") or {}).values())
     ids += state.get("codex_models") or []
     ids += state.get("gemini_models") or []
+    ids += state.get("oss_models") or []
     return ids
 
 
@@ -42,14 +43,19 @@ def _all_resolved_model_ids(state: dict) -> list[str]:
 
 class TestDiscoverModelServicesE2E:
     def test_returns_only_system_ai_models(self, e2e_workspace, e2e_token):
-        claude, codex, gemini, reason = discover_model_services(e2e_workspace, e2e_token)
-        if not (claude or codex or gemini):
+        claude, codex, gemini, oss, reason = discover_model_services(e2e_workspace, e2e_token)
+        if not (claude or codex or gemini or oss):
             pytest.skip(f"No system.ai.* model services on workspace: {reason}")
         non_system = sorted(
             {
                 m
                 for m in _all_resolved_model_ids(
-                    {"claude_models": claude, "codex_models": codex, "gemini_models": gemini}
+                    {
+                        "claude_models": claude,
+                        "codex_models": codex,
+                        "gemini_models": gemini,
+                        "oss_models": oss,
+                    }
                 )
                 if not m.startswith("system.ai.")
             }
@@ -64,6 +70,22 @@ class TestListMcpServicesE2E:
             pytest.skip(f"No system.ai.* MCP services on workspace: {reason}")
         non_system = sorted({n for n in names if not n.startswith("system.ai.")})
         assert not non_system, f"Non-system.ai entries leaked through: {non_system[:5]}"
+
+    def test_custom_parent_filters_server_side(self, e2e_workspace, e2e_token):
+        names, _ = list_mcp_services(e2e_workspace, e2e_token, parent="main.default")
+        if not names:
+            pytest.skip("No mcp-services in main.default on this workspace.")
+        outside = sorted({n for n in names if not n.startswith("main.default.")})
+        assert not outside, f"Server returned entries outside main.default: {outside[:5]}"
+
+    def test_invalid_parent_returns_http_404(self, e2e_workspace, e2e_token):
+        names, reason = list_mcp_services(
+            e2e_workspace, e2e_token, parent="nope_catalog.nope_schema"
+        )
+        assert names == []
+        assert reason and reason.startswith("HTTP 404"), (
+            f"Expected HTTP 404 for bogus location, got: {reason}"
+        )
 
 
 # ---------------------------------------------------------------------------
