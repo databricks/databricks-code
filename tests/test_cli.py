@@ -514,6 +514,30 @@ class TestSubcommandRouting:
 
         assert options.launch_smart_routing is expected
 
+    @pytest.mark.parametrize(
+        ("tool_args", "expected"),
+        [
+            (["--session-id"], True),
+            (["--session-id", "--verbose"], True),
+            (["--session-id", "session-123"], True),
+            (["update"], False),
+            (["update", "--session-id"], False),
+            (["--model", "fixed"], False),
+            (["--session-id", "session-123", "--model", "fixed"], False),
+        ],
+    )
+    def test_claude_options_allow_smart_routing_except_model(self, tool_args, expected):
+        options = cli_mod._launch_options(
+            "claude",
+            tool_args,
+            smart_routing_enabled=True,
+            explicit_prompt=False,
+            model=None,
+            provider=None,
+        )
+
+        assert options.launch_smart_routing is expected
+
     def test_codex_refresh_is_consumed_by_ucode(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
             result = runner.invoke(app, ["codex", "--refresh"])
@@ -844,6 +868,7 @@ class TestClaudeModelFlag:
 
         assert result.exit_code == 0, result.output
         assert mock_launch.call_args.args[1]["_claude_launch_model"] == "system.ai.glm-5-2"
+        assert mock_launch.call_args.kwargs["options"].launch_smart_routing is False
 
     @staticmethod
     def _provider_launch(monkeypatch, argv, provider_models, relayed=False):

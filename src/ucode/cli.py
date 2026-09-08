@@ -41,6 +41,7 @@ from ucode.agents import codex as codex_agent
 from ucode.agents import (
     launch as launch_agent,
 )
+from ucode.agents.args import has_explicit_model_arg
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
 from ucode.config_io import is_dry_run, restore_file, set_dry_run
@@ -1824,6 +1825,20 @@ def _download_managed_skills(managed: dict, state: dict) -> None:
         print_note(f"Downloaded workspace skill(s) to disk: {', '.join(written)}")
 
 
+def _should_launch_smart_routing(
+    tool: str,
+    tool_args: list[str],
+    *,
+    explicit_prompt: bool,
+    model: str | None,
+) -> bool:
+    if model is not None or has_explicit_model_arg(tool_args):
+        return False
+    if not tool_args or explicit_prompt:
+        return True
+    return tool == "claude" and tool_args[0].startswith("-")
+
+
 def _launch_options(
     tool: str,
     tool_args: list[str],
@@ -1833,7 +1848,6 @@ def _launch_options(
     model: str | None,
     provider: str | None,
 ) -> LaunchOptions:
-    has_model_override = model is not None or explicit_model_arg_value(tool_args) is not None
     return LaunchOptions(
         claude_launch_model=model if tool == "claude" and provider is None else None,
         launch_smart_routing=(
@@ -1841,12 +1855,15 @@ def _launch_options(
             smart_routing_enabled
             # Only Claude Code and Codex currently support smart routing.
             and tool in CAN_USE_CACHED_CONFIG_AGENTS
-            # An explicit model selection must bypass smart routing.
-            and not has_model_override
             # Smart routing does not currently support Model Provider Services.
             and provider is None
-            # Route a bare agent launch or a prompt explicitly passed after `--`.
-            and (not tool_args or explicit_prompt)
+            # Route a supported interactive launch shape.
+            and _should_launch_smart_routing(
+                tool,
+                tool_args,
+                explicit_prompt=explicit_prompt,
+                model=model,
+            )
         ),
     )
 
