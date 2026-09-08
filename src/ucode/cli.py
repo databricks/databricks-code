@@ -41,6 +41,7 @@ from ucode.agents import codex as codex_agent
 from ucode.agents import (
     launch as launch_agent,
 )
+from ucode.agents.args import has_explicit_model_arg
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
 from ucode.config_io import is_dry_run, restore_file, set_dry_run
@@ -1856,6 +1857,25 @@ def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
     _download_managed_skills(managed, state)
 
 
+def _claude_launch_supports_smart_routing(
+    tool_args: list[str], *, explicit_prompt: bool, model: str | None
+) -> bool:
+    """Return whether this Claude invocation can route its first prompt.
+
+    A model selected through ucode or Claude's own ``--model`` option always wins over
+    smart routing. Bare launches and prompts passed after ucode's ``--`` separator are
+    routable. Otherwise, a leading option such as ``--session-id <id>`` still starts a
+    session, while a leading positional argument such as ``update`` is a Claude command.
+
+    Values belonging to arbitrary Claude options cannot be identified without duplicating
+    Claude's option parser, so the first forwarded argument determines whether the invocation
+    begins with an option or a command.
+    """
+    if model is not None or has_explicit_model_arg(tool_args):
+        return False
+    return not tool_args or explicit_prompt or tool_args[0].startswith("-")
+
+
 def _launch_options(
     tool: str,
     tool_args: list[str],
@@ -1867,11 +1887,11 @@ def _launch_options(
 ) -> LaunchOptions:
     has_model_override = model is not None or explicit_model_arg_value(tool_args) is not None
     supports_prompt_routing = (
-        not tool_args
-        or explicit_prompt
-        # Claude options such as --session-id still start an interactive session whose
-        # first prompt can be routed. A leading positional argument is a Claude command.
-        or (tool == "claude" and tool_args[0].startswith("-"))
+        _claude_launch_supports_smart_routing(
+            tool_args, explicit_prompt=explicit_prompt, model=model
+        )
+        if tool == "claude"
+        else not has_model_override and (not tool_args or explicit_prompt)
     )
     return LaunchOptions(
         claude_launch_model=model if tool == "claude" and provider is None else None,
@@ -1880,8 +1900,6 @@ def _launch_options(
             smart_routing_enabled
             # Only Claude Code and Codex currently support smart routing.
             and tool in CAN_USE_CACHED_CONFIG_AGENTS
-            # An explicit model selection must bypass smart routing.
-            and not has_model_override
             # Smart routing does not currently support Model Provider Services.
             and provider is None
             # Route a supported interactive launch shape.
