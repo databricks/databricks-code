@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 from typer.testing import CliRunner
 
+import ucode.cli as cli_mod
 import ucode.databricks as db_mod
 from ucode.cli import app
 from ucode.databricks import GatewayProbe
@@ -464,6 +465,55 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert captured == [("1", ["fix the parser"])]
 
+    @pytest.mark.parametrize(
+        ("args", "forwarded", "has_separator"),
+        [
+            (["codex", "--", "fix the parser"], ["fix the parser"], True),
+            (["codex", "--"], [], True),
+            (["claude", "--", "doctor"], ["doctor"], True),
+            (
+                ["codex", "--model", "gpt-5.6-sol", "--", "fix the parser"],
+                ["--model", "gpt-5.6-sol", "fix the parser"],
+                False,
+            ),
+        ],
+    )
+    def test_agent_records_prompt_separator(self, args, forwarded, has_separator):
+        with patch("ucode.cli._launch_tool") as mock_launch:
+            result = runner.invoke(app, args)
+
+        assert result.exit_code == 0, result.output
+        ctx = mock_launch.call_args.args[1]
+        assert ctx.args == forwarded
+        assert cli_mod._has_explicit_prompt(ctx) is has_separator
+
+    @pytest.mark.parametrize("tool", ["codex", "claude"])
+    @pytest.mark.parametrize(
+        ("tool_args", "explicit_prompt", "model", "provider", "expected"),
+        [
+            ([], False, None, None, True),
+            (["fix this"], True, None, None, True),
+            (["fix this"], False, None, None, False),
+            (["update"], False, None, None, False),
+            (["--model", "fixed"], False, None, None, False),
+            ([], False, "fixed", None, False),
+            ([], False, None, "catalog.schema.service", False),
+        ],
+    )
+    def test_codex_and_claude_share_smart_routing_policy(
+        self, tool, tool_args, explicit_prompt, model, provider, expected
+    ):
+        options = cli_mod._launch_options(
+            tool,
+            tool_args,
+            smart_routing_enabled=True,
+            explicit_prompt=explicit_prompt,
+            model=model,
+            provider=provider,
+        )
+
+        assert options.launch_smart_routing is expected
+
     def test_codex_refresh_is_consumed_by_ucode(self):
         with patch("ucode.cli._launch_tool") as mock_launch:
             result = runner.invoke(app, ["codex", "--refresh"])
@@ -584,6 +634,7 @@ class TestSubcommandRouting:
         assert result.exit_code == 0, result.output
         assert mock_configure.call_args.kwargs["route_root_model"] is None
         assert "_claude_launch_model" not in mock_launch.call_args.args[1]
+        assert mock_launch.call_args.kwargs["options"].launch_smart_routing is True
 
     def test_claude_v2_first_prompt_hook_is_disabled_without_flag(self, monkeypatch):
         monkeypatch.delenv("ENABLE_SMART_ROUTING_V2", raising=False)
@@ -757,7 +808,7 @@ class TestClaudeModelFlag:
         assert "Model: system.ai.claude-opus-4-8" not in output
         assert mock_launch.call_args.args[2] == forwarded_args
 
-    def test_model_threads_to_claude_as_custom_model(self, monkeypatch):
+    def test_model_is_launch_scoped_for_claude(self, monkeypatch):
         monkeypatch.delenv("ENABLE_SMART_ROUTING_V2", raising=False)
         with (
             patch("ucode.cli.ensure_bootstrap_dependencies"),
@@ -771,11 +822,13 @@ class TestClaudeModelFlag:
         ):
             result = runner.invoke(app, ["claude", "--model", "cat.schema.claude-opus-5"])
         assert result.exit_code == 0, result.output
-        # Claude routes --model as custom_model (pinned into the family aliases by render_overlay),
-        # NOT as ANTHROPIC_MODEL — Claude Code validates that value and rejects a raw id.
-        assert mock_configure.call_args.kwargs["custom_model"] == "cat.schema.claude-opus-5"
+        # The model is passed through invocation-scoped LaunchOptions, not persisted in settings.
+        assert mock_configure.call_args.kwargs["custom_model"] is None
         assert mock_configure.call_args.kwargs["route_root_model"] is None
-        assert "_claude_launch_model" not in mock_launch.call_args.args[1]
+        assert (
+            mock_launch.call_args.kwargs["options"].claude_launch_model
+            == "cat.schema.claude-opus-5"
+        )
 
     def test_v2_model_sets_transient_launch_override(self, monkeypatch):
         monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")

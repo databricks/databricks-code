@@ -11,6 +11,7 @@ import ucode.agents as agents_mod
 from ucode.agents import (
     DEFAULT_TOOL,
     TOOL_SPECS,
+    LaunchOptions,
     check_gateway_endpoint,
     configure_selected_tools,
     default_model_for_tool,
@@ -94,6 +95,20 @@ class TestToolSpecs:
         )
 
         assert agents_mod.tool_update_available("opencode") == ("1.18.15", "1.18.16")
+
+
+def test_launch_dispatches_invocation_options(monkeypatch):
+    calls = []
+    options = LaunchOptions(launch_smart_routing=True)
+    monkeypatch.setattr(
+        agents_mod.codex,
+        "launch",
+        lambda state, tool_args, *, options: calls.append((state, tool_args, options)),
+    )
+
+    agents_mod.launch("codex", {"workspace": "ws"}, ["prompt"], options=options)
+
+    assert calls == [({"workspace": "ws"}, ["prompt"], options)]
 
 
 class TestInstallAiToolsForAgents:

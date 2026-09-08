@@ -41,6 +41,7 @@ from ucode.ui import (
 )
 
 from . import claude, codex, copilot, gemini, opencode, pi
+from .args import LaunchOptions as LaunchOptions
 from .args import explicit_model_arg_value as explicit_model_arg_value
 
 _MODULES = {
@@ -432,8 +433,7 @@ def configure_tool(
     elif tool == "claude":
         # A Model Provider Service routes by header and pins no Databricks
         # model, so the usual "model required" guard doesn't apply to claude.
-        # `custom_model` (from `ucode claude --model`) likewise supplies the model.
-        if not model and not provider and not custom_model:
+        if not model and not provider:
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         result = claude.write_tool_config(
             state,
@@ -464,8 +464,14 @@ def configure_tool(
     return result
 
 
-def launch(tool: str, state: dict, tool_args: list[str]) -> None:
-    _MODULES[tool].launch(state, tool_args)
+def launch(
+    tool: str,
+    state: dict,
+    tool_args: list[str],
+    *,
+    options: LaunchOptions,
+) -> None:
+    _MODULES[tool].launch(state, tool_args, options=options)
 
 
 def check_gateway_endpoint(state: dict, tool: str) -> bool:
