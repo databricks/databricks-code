@@ -1549,6 +1549,26 @@ class TestSkillsRemoveCommand:
         remove.assert_called_once_with(agents={"claude", "codex"})
 
 
+class TestConfigureSkillsDeprecation:
+    def test_warns_and_keeps_legacy_dispatch(self):
+        with patch("ucode.cli.configure_skills_mcp_command") as configure:
+            result = runner.invoke(app, ["configure", "skills", "--location", "a.b", "--mcp"])
+
+        assert result.exit_code == 0, result.output
+        assert "deprecated" in _strip_ansi(result.output).lower()
+        configure.assert_called_once_with(["a.b"])
+
+    def test_bare_command_explains_that_utility_setup_remains_supported(self):
+        with patch("ucode.cli.configure_skills_mcp_command") as configure:
+            result = runner.invoke(app, ["configure", "skills"])
+
+        output = _strip_ansi(result.output).lower()
+        assert result.exit_code == 0, result.output
+        assert "utility-tools-only setup" in output
+        assert "remains supported" in output
+        configure.assert_called_once_with([])
+
+
 class TestManagedSkillsOnLaunch:
     """Managed skills are delivered by download only: the launch path downloads them and never
     registers them on the skills MCP connection (only a developer's own `skill add --mcp` schemas
