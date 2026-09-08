@@ -50,7 +50,7 @@ from ucode.ui import (
 # warns when its own token and one of these are both set, so we surface them.
 _CLAUDE_TOKEN_ENV_VARS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
 
-UCODE_GIT_URL = "git+https://github.com/databricks/ucode"
+UCODE_GIT_URL = "git+https://github.com/databricks/unity-gateway"
 
 # status -> (glyph, status_badge kind). "info" is a healthy line that still
 # carries an optional suggestion (e.g. the ucode self-upgrade).

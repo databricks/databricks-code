@@ -3485,7 +3485,7 @@ def upgrade_cmd() -> None:
     """Upgrade ug to the latest version from GitHub."""
     legacy_distribution = "ucode"
     current_distribution = "unity-gateway"
-    git_url = "git+https://github.com/databricks/ucode"
+    git_url = "git+https://github.com/databricks/unity-gateway"
     installed_distribution = _installed_cli_distribution()
     upgrade_requirement = f"{installed_distribution} @ {git_url}"
     migrated = False
@@ -3562,7 +3562,7 @@ def _installed_cli_distribution() -> str:
             continue
         return distribution_name
     # Source checkouts and unusual installers may expose neither distribution.
-    # The repository is still named ucode when this bridge ships, so use the
+    # The distribution remains named ucode until the Phase 3 cutover, so use the
     # non-destructive legacy upgrade path and let uv report an actionable error.
     return "ucode"
 
