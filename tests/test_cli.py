@@ -2689,21 +2689,18 @@ class TestConfigureSharedStateUsePat:
         ("responses", "expected_model_service"),
         [
             (
-                [({}, None), ({"endpoints": []}, None)],
+                [({}, None)],
                 "reachable, no accessible model services returned; check USE CATALOG on system, "
                 "and USE SCHEMA and EXECUTE on system.ai",
             ),
             (
-                [
-                    (None, "HTTP 403 Forbidden"),
-                    ({"endpoints": [{"name": "databricks-gpt-5"}]}, None),
-                ],
-                "HTTP 403 Forbidden",
+                [({"next_page_token": "more"}, None)] * db_mod._MODEL_SERVICE_PROBE_MAX_PAGES,
+                "reachable",
             ),
         ],
         ids=[
-            "model-service-empty-legacy-empty",
-            "model-service-forbidden-legacy-resource",
+            "model-service-empty",
+            "model-service-inconclusive",
         ],
     )
     def test_prints_warning_when_model_service_not_detected(
@@ -2733,28 +2730,18 @@ class TestConfigureSharedStateUsePat:
         ("responses", "error_match"),
         [
             (
-                [
-                    ({}, None),
-                    (
-                        None,
-                        "HTTP 404 Not Found: AI Gateway V2 is not available for CSP-enabled "
-                        "workspaces",
-                    ),
-                ],
-                "no accessible model services",
+                [(None, "HTTP 404 Not Found: model service unavailable")],
+                "not enabled",
             ),
             (
-                [
-                    (None, "HTTP 404 Not Found: V3 unavailable"),
-                    (None, "HTTP 404 Not Found: V2 unavailable"),
-                ],
-                "neither model services",
+                [(None, "HTTP 403 Forbidden: Missing Unity Catalog grants")],
+                "model service access could not be verified",
             ),
             ([(None, "HTTP 401 Unauthorized")], "rejected the access token"),
         ],
         ids=[
-            "model-service-empty-legacy-unavailable",
-            "neither-path-reachable",
+            "model-service-unavailable",
+            "model-service-forbidden",
             "invalid-token",
         ],
     )
