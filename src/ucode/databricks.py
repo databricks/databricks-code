@@ -195,9 +195,10 @@ def _log_auth_diagnostics() -> None:
         _debug(f"databrickscfg ({cfg_path})", f"read error: {exc}")
 
 
+@functools.cache
 def _make_ssl_context() -> ssl.SSLContext:
     """Return an SSL context that trusts the system CA bundle plus any custom CA
-    pointed to by REQUESTS_CA_BUNDLE or CURL_CA_BUNDLE.
+    pointed to by REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, or SSL_CERT_FILE.
 
     Enterprise environments often inject a self-signed certificate via an SSL
     inspection proxy. curl picks it up from the system store automatically;
@@ -210,9 +211,10 @@ def _make_ssl_context() -> ssl.SSLContext:
         if ca_bundle and Path(ca_bundle).is_file():
             try:
                 ctx.load_verify_locations(cafile=ca_bundle)
-            except ssl.SSLError:
-                pass
-            break
+            except OSError:
+                continue
+            else:
+                break
     return ctx
 
 

@@ -1202,6 +1202,42 @@ class TestHttpGetJsonReason:
         assert reason == "HTTP 404 Not Found"
 
 
+class TestMakeSslContext:
+    @pytest.fixture(autouse=True)
+    def clear_cache(self):
+        db_mod._make_ssl_context.cache_clear()
+        yield
+        db_mod._make_ssl_context.cache_clear()
+
+    def test_context_is_cached(self, monkeypatch):
+        from unittest.mock import Mock
+
+        context = Mock()
+        create_default_context = Mock(return_value=context)
+        monkeypatch.setattr(db_mod.ssl, "create_default_context", create_default_context)
+
+        assert db_mod._make_ssl_context() is context
+        assert db_mod._make_ssl_context() is context
+        create_default_context.assert_called_once_with()
+
+    @pytest.mark.parametrize("load_error", [OSError("permission denied"), db_mod.ssl.SSLError()])
+    def test_failed_bundle_falls_back_to_next_one(self, monkeypatch, load_error):
+        from unittest.mock import Mock
+
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/first.pem")
+        monkeypatch.setenv("CURL_CA_BUNDLE", "/second.pem")
+        monkeypatch.setattr(db_mod.Path, "is_file", lambda self: True)
+        context = Mock()
+        context.load_verify_locations.side_effect = [load_error, None]
+        monkeypatch.setattr(db_mod.ssl, "create_default_context", Mock(return_value=context))
+
+        assert db_mod._make_ssl_context() is context
+        assert context.load_verify_locations.call_args_list == [
+            ((), {"cafile": "/first.pem"}),
+            ((), {"cafile": "/second.pem"}),
+        ]
+
+
 class TestParseDatabricksCliVersion:
     def test_parses_standard_format(self):
         assert _parse_databricks_cli_version("Databricks CLI v0.299.2") == (0, 299, 2)
