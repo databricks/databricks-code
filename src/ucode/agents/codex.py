@@ -526,8 +526,7 @@ def _launch_smart_routing(state: dict, tool_args: list[str]) -> None:
         )
 
     managed_model = default_model(state)
-    routing_options = smart_routing_v2.codex_routing_options(state)
-    models = smart_routing_v2.codex_models_for_routing(routing_options)
+    models, catalog_path = smart_routing_v2.configured_codex_models(state)
     first_model = models[0] if models else None
     start_model = managed_model or first_model or APP_SERVER_SMART_ROUTING_STARTING_MODEL
     smart_routing_v2.launch_codex(
@@ -535,7 +534,8 @@ def _launch_smart_routing(state: dict, tool_args: list[str]) -> None:
         tool_args,
         binary=binary,
         start_model=start_model,
-        routing_options=routing_options,
+        available_models=models,
+        catalog_path=catalog_path,
         render_overlay=render_overlay,
     )
 

@@ -12,7 +12,6 @@ import time
 import urllib.request
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, TextIO
 
@@ -57,12 +56,6 @@ CLAUDE_ROUTED_AGENT_PROMPT = (
 # needed because Anthropic omits models from its catalog unless the model id contains "anthropic"
 # or "claude".
 _ANTHROPIC_AIGW_MODEL_RE = re.compile(r"^anthropic-aigw-[0-9a-fA-F]{8}-(.+)$")
-
-
-@dataclass(frozen=True)
-class CodexRoutingOptions:
-    models: list[str]
-    catalog_path: Path | None = None
 
 
 def enabled() -> bool:
@@ -423,18 +416,16 @@ def launch_claude(
 
 def _model_catalog() -> tuple[Path, list[str]] | None:
     """Read the first configured Codex model catalog using Codex config precedence."""
-    try:
-        from ucode.agents import codex
+    from ucode.agents import codex
 
-        paths = [codex._managed_config_path(), codex.CODEX_CONFIG_PATH, _codex_home_config_path()]
-    except (ImportError, OSError):
-        return None
-
-    seen_paths: set[Path] = set()
-    for config_path in paths:
-        if config_path is None or config_path in seen_paths:
+    config_paths = (
+        codex._managed_config_path(),
+        codex.CODEX_CONFIG_PATH,
+        _codex_home_config_path(),
+    )
+    for config_path in dict.fromkeys(config_paths):
+        if config_path is None:
             continue
-        seen_paths.add(config_path)
         configured_path = read_toml_safe(config_path).get("model_catalog_json")
         if not isinstance(configured_path, str) or not configured_path.strip():
             continue
@@ -457,20 +448,13 @@ def _model_catalog() -> tuple[Path, list[str]] | None:
     return None
 
 
-def codex_routing_options(state: dict) -> CodexRoutingOptions:
-    """Use a configured catalog exclusively, or the existing persisted model list."""
+def configured_codex_models(state: dict) -> tuple[list[str], Path | None]:
+    """Return catalog models when configured, otherwise the existing routing models."""
     catalog = _model_catalog()
     if catalog is not None:
         catalog_path, models = catalog
-        return CodexRoutingOptions(models, catalog_path=catalog_path)
-    return CodexRoutingOptions(routing_models(state))
-
-
-def codex_models_for_routing(options: CodexRoutingOptions) -> list[str]:
-    """Return the model IDs Codex should receive for the selected model source."""
-    if options.catalog_path is not None:
-        return options.models
-    return [codex_routing.codex_model_id(model) for model in options.models]
+        return models, catalog_path
+    return [codex_routing.codex_model_id(model) for model in routing_models(state)], None
 
 
 def _codex_home_config_path() -> Path:
@@ -497,7 +481,8 @@ def launch_codex(
     *,
     binary: str,
     start_model: str | None,
-    routing_options: CodexRoutingOptions,
+    available_models: list[str],
+    catalog_path: Path | None,
     render_overlay: Callable[..., dict],
 ) -> NoReturn:
     workspace = state.get("workspace")
@@ -512,7 +497,6 @@ def launch_codex(
 
     profile = state.get("profile")
     os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, profile)
-    available_models = codex_models_for_routing(routing_options)
     if not available_models:
         print_note(
             "Smart routing model metadata is unavailable; starting Codex on gpt-5.6-luna "
@@ -524,8 +508,8 @@ def launch_codex(
         state.get("profile"),
         use_pat=bool(state.get("use_pat")),
     )
-    if routing_options.catalog_path is not None:
-        overlay["model_catalog_json"] = str(routing_options.catalog_path)
+    if catalog_path is not None:
+        overlay["model_catalog_json"] = str(catalog_path)
     overlay["hooks"] = {
         "PreToolUse": _v2_pre_tool_use_hooks(state, available_models),
     }

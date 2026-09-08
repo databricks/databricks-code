@@ -57,12 +57,10 @@ class TestCodexModelCatalog:
         managed.write_text(f'model_catalog_json = "{managed_catalog}"\n', encoding="utf-8")
         profile.write_text(f'model_catalog_json = "{profile_catalog}"\n', encoding="utf-8")
 
-        options = v2.codex_routing_options({"codex_models": ["cached-model"]})
+        models, catalog_path = v2.configured_codex_models({"codex_models": ["cached-model"]})
 
-        assert options == v2.CodexRoutingOptions(
-            ["system.ai.gpt-5-5", "system.ai.glm-5-3"],
-            catalog_path=managed_catalog,
-        )
+        assert models == ["system.ai.gpt-5-5", "system.ai.glm-5-3"]
+        assert catalog_path == managed_catalog
 
     def test_falls_back_to_profile_catalog(self, tmp_path, monkeypatch):
         managed, profile, _user = self._configure_paths(tmp_path, monkeypatch)
@@ -71,10 +69,10 @@ class TestCodexModelCatalog:
         managed.write_text('model_provider = "managed"\n', encoding="utf-8")
         profile.write_text(f'model_catalog_json = "{catalog}"\n', encoding="utf-8")
 
-        options = v2.codex_routing_options({})
+        models, catalog_path = v2.configured_codex_models({})
 
-        assert options.models == ["system.ai.gpt-5-6-sol"]
-        assert options.catalog_path == catalog
+        assert models == ["system.ai.gpt-5-6-sol"]
+        assert catalog_path == catalog
 
     def test_falls_back_to_user_catalog(self, tmp_path, monkeypatch):
         managed, profile, user = self._configure_paths(tmp_path, monkeypatch)
@@ -84,10 +82,10 @@ class TestCodexModelCatalog:
         profile.write_text('model_provider = "profile"\n', encoding="utf-8")
         user.write_text(f'model_catalog_json = "{catalog}"\n', encoding="utf-8")
 
-        options = v2.codex_routing_options({})
+        models, catalog_path = v2.configured_codex_models({})
 
-        assert options.models == ["system.ai.glm-5-3"]
-        assert options.catalog_path == catalog
+        assert models == ["system.ai.glm-5-3"]
+        assert catalog_path == catalog
 
     def test_falls_back_to_cached_workspace_models(self, tmp_path, monkeypatch):
         self._configure_paths(tmp_path, monkeypatch)
@@ -96,8 +94,9 @@ class TestCodexModelCatalog:
             "oss_models": ["system.ai.glm-5-2"],
         }
 
-        assert v2.codex_routing_options(state) == v2.CodexRoutingOptions(
-            ["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"]
+        assert v2.configured_codex_models(state) == (
+            ["gpt-5.6-sol", "system.ai.glm-5-2"],
+            None,
         )
 
     def test_configured_empty_catalog_does_not_fall_back_to_cached_models(
@@ -108,9 +107,10 @@ class TestCodexModelCatalog:
         self._write_catalog(catalog, [])
         managed.write_text(f'model_catalog_json = "{catalog}"\n', encoding="utf-8")
 
-        options = v2.codex_routing_options({"codex_models": ["cached-model"]})
+        models, catalog_path = v2.configured_codex_models({"codex_models": ["cached-model"]})
 
-        assert options == v2.CodexRoutingOptions([], catalog_path=catalog)
+        assert models == []
+        assert catalog_path == catalog
 
     def test_configured_unreadable_catalog_does_not_fall_back_to_cached_models(
         self, tmp_path, monkeypatch
@@ -119,21 +119,10 @@ class TestCodexModelCatalog:
         catalog = tmp_path / "missing-models.json"
         managed.write_text(f'model_catalog_json = "{catalog}"\n', encoding="utf-8")
 
-        options = v2.codex_routing_options({"codex_models": ["cached-model"]})
+        models, catalog_path = v2.configured_codex_models({"codex_models": ["cached-model"]})
 
-        assert options == v2.CodexRoutingOptions([], catalog_path=catalog)
-
-    def test_models_for_routing_preserves_catalog_slugs_and_maps_cached_models(self):
-        catalog_options = v2.CodexRoutingOptions(
-            ["system.ai.gpt-5-5"], catalog_path=Path("/catalog.json")
-        )
-        cached_options = v2.CodexRoutingOptions(["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"])
-
-        assert v2.codex_models_for_routing(catalog_options) == ["system.ai.gpt-5-5"]
-        assert v2.codex_models_for_routing(cached_options) == [
-            "gpt-5.6-sol",
-            "system.ai.glm-5-2",
-        ]
+        assert models == []
+        assert catalog_path == catalog
 
 
 class TestLaunchCodex:
@@ -155,14 +144,12 @@ class TestLaunchCodex:
     )
     def test_codex_smart_routing_launch_dispatches_to_v2(self, monkeypatch, tool_args, options):
         calls = []
-        routing_options = v2.CodexRoutingOptions(
-            ["system.ai.gpt-5-5"],
-            catalog_path=Path("/catalog.json"),
-        )
+        models = ["system.ai.gpt-5-5"]
+        catalog_path = Path("/catalog.json")
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(codex, "default_model", lambda state: None)
         monkeypatch.setattr(codex, "clear_model_preferences", lambda state: False)
-        monkeypatch.setattr(v2, "codex_routing_options", lambda state: routing_options)
+        monkeypatch.setattr(v2, "configured_codex_models", lambda state: (models, catalog_path))
 
         def launch_v2(state, tool_args, **kwargs):
             calls.append((state, tool_args, kwargs))
@@ -182,7 +169,8 @@ class TestLaunchCodex:
                 {
                     "binary": "codex",
                     "start_model": "system.ai.gpt-5-5",
-                    "routing_options": routing_options,
+                    "available_models": models,
+                    "catalog_path": catalog_path,
                     "render_overlay": codex.render_overlay,
                 },
             )
@@ -227,8 +215,8 @@ class TestLaunchCodex:
         monkeypatch.setattr(codex, "default_model", lambda state: None)
         monkeypatch.setattr(
             v2,
-            "codex_routing_options",
-            lambda state: v2.CodexRoutingOptions(["system.ai.gpt-5-6-luna"]),
+            "configured_codex_models",
+            lambda state: (["gpt-5.6-luna"], None),
         )
 
         def launch_v2(state, tool_args, **kwargs):
@@ -302,10 +290,8 @@ class TestLaunchCodex:
                 ["--search"],
                 binary="codex",
                 start_model="gpt-start",
-                routing_options=v2.CodexRoutingOptions(
-                    ["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"],
-                    catalog_path=Path("/catalog.json"),
-                ),
+                available_models=["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"],
+                catalog_path=Path("/catalog.json"),
                 render_overlay=codex.render_overlay,
             )
 
@@ -440,7 +426,8 @@ class TestLaunchCodex:
                 [],
                 binary="codex",
                 start_model="gpt-5.6-luna",
-                routing_options=v2.CodexRoutingOptions([]),
+                available_models=[],
+                catalog_path=None,
                 render_overlay=codex.render_overlay,
             )
 
