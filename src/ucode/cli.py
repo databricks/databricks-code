@@ -13,9 +13,12 @@ from typing import Annotated
 
 import typer
 from rich.panel import Panel
+from typer._click import Context as ClickContext
+from typer.core import TyperCommand
 
 from ucode.agents import (
     TOOL_SPECS,
+    LaunchOptions,
     check_gateway_endpoint,
     configure_selected_tools,
     configure_single_tool,
@@ -1983,6 +1986,7 @@ def _can_launch_from_cached_config(
     model: str | None,
     explicit_provider: str | None,
     workspace_url: str | None,
+    smart_routing_enabled: bool | None = None,
 ) -> bool:
     """Return whether a normal Claude/Codex launch can use its cached config."""
     if tool not in CAN_USE_CACHED_CONFIG_AGENTS:
@@ -1991,7 +1995,11 @@ def _can_launch_from_cached_config(
     if refresh or model or explicit_provider is not None:
         return False
 
-    if tool == "codex" and smart_routing_v2.enabled():
+    if smart_routing_enabled is None:
+        smart_routing_enabled = smart_routing_v2.enabled()
+
+    # TODO(lilly): replace with codex/v1/models or custom catalog
+    if tool == "codex" and smart_routing_enabled:
         if not state.get("codex_models") or not state.get("oss_models"):
             return False
 
@@ -2016,6 +2024,33 @@ def _can_launch_from_cached_config(
     return codex_agent.has_ucode_config() and codex_agent.managed_config_is_current(state)
 
 
+def _launch_options(
+    tool: str,
+    tool_args: list[str],
+    *,
+    smart_routing_enabled: bool,
+    explicit_prompt: bool,
+    model: str | None,
+    provider: str | None,
+) -> LaunchOptions:
+    has_model_override = model is not None or explicit_model_arg_value(tool_args) is not None
+    return LaunchOptions(
+        claude_launch_model=model if tool == "claude" and provider is None else None,
+        launch_smart_routing=(
+            # Smart routing is enabled globally.
+            smart_routing_enabled
+            # Only Claude Code and Codex currently support smart routing.
+            and tool in CAN_USE_CACHED_CONFIG_AGENTS
+            # An explicit model selection must bypass smart routing.
+            and not has_model_override
+            # Smart routing does not currently support Model Provider Services.
+            and provider is None
+            # Route a bare agent launch or a prompt explicitly passed after `--`.
+            and (not tool_args or explicit_prompt)
+        ),
+    )
+
+
 def _launch_tool(
     tool_name: str,
     ctx: typer.Context,
@@ -2029,6 +2064,8 @@ def _launch_tool(
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        explicit_prompt = _has_explicit_prompt(ctx)
+        smart_routing_enabled = smart_routing_v2.enabled()
         # Launchers such as isaac put their harness arguments after `--`, so the harness's own
         # `--model` lands in ctx.args instead of a ucode option. It still determines the effective
         # launch model and should therefore win in the launch summary.
@@ -2062,6 +2099,14 @@ def _launch_tool(
         # back to whatever `ug configure` saved for this tool.
         provider = provider or get_provider_service(state, tool)
         state = _migrate_legacy_smart_routing(state)
+        launch_options = _launch_options(
+            tool,
+            ctx.args,
+            smart_routing_enabled=smart_routing_enabled,
+            explicit_prompt=explicit_prompt,
+            model=model,
+            provider=provider,
+        )
         if _can_launch_from_cached_config(
             tool,
             state,
@@ -2069,12 +2114,13 @@ def _launch_tool(
             model=model,
             explicit_provider=explicit_provider,
             workspace_url=workspace_url,
+            smart_routing_enabled=launch_options.launch_smart_routing,
         ):
             print_section(_launch_title(tool))
             if forwarded_model:
                 print_kv("Model", forwarded_model)
             print_success(f"Starting {TOOL_SPECS[tool]['display']}")
-            launch_agent(tool, state, ctx.args)
+            launch_agent(tool, state, ctx.args, options=launch_options)
             return
         # Fetched before `configure_shared_state` because it decides whether this agent may launch
         # at all and whether the model discovery below can be skipped.
@@ -2131,7 +2177,7 @@ def _launch_tool(
                 provider = managed_provider
         # Checked after the managed config settles `provider`: an admin-set provider must trip this
         # guard too, or routing would be persisted as on while a provider is active.
-        if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_v2.enabled() and provider:
+        if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_enabled and provider:
             raise RuntimeError(
                 f"{TOOL_SPECS[tool]['display']} smart routing cannot be enabled with "
                 "--provider. Launch without a Model Provider Service and try again."
@@ -2209,9 +2255,7 @@ def _launch_tool(
                     resolved_model = managed_model
             # An explicit `--model` is the user's own choice and outranks everything above (managed
             # default, smart-routing pick). Non-claude agents take it as the resolved model, which
-            # their CLIs pass to the gateway verbatim. Claude is special (see custom_model below):
-            # Claude Code validates ANTHROPIC_MODEL client-side and rejects a raw Databricks id, so
-            # the id can't ride `resolved_model` — it is threaded separately as `custom_model`.
+            # Codex keeps an explicit --model in ctx.args and passes it to its CLI verbatim.
             if model and tool != "claude":
                 resolved_model = model
         state = configure_tool(
@@ -2222,10 +2266,8 @@ def _launch_tool(
             provider_models=provider_models,
             relayed=relayed,
             route_root_model=route_root_model,
-            # Under a provider, --model is honored via route_root_model (above), not custom_model —
-            # the latter pins a raw id into every family alias, which would clobber the service's
-            # per-family target pins.
-            custom_model=model if (tool == "claude" and not provider) else None,
+            # Claude's explicit model is launch-scoped and is passed through LaunchOptions below.
+            custom_model=None,
             coding_agent_config_defaults=coding_agent_config_defaults,
         )
         # Relayed = a Claude subscription: forward --model to Claude Code's own flag, like `-- --model X`.
@@ -2254,7 +2296,7 @@ def _launch_tool(
             print_kv("Model", route_root_model)
         elif resolved_model:
             print_kv("Model", resolved_model)
-        if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_v2.enabled() and not provider:
+        if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_enabled and not provider:
             print_kv("Smart routing", "enabled")
             print_note(
                 f"{TOOL_SPECS[tool]['display']} may require one-time hook review. Open "
@@ -2284,8 +2326,16 @@ def _launch_tool(
                     state["_claude_launch_model"] = launch_model
             if provider:
                 state["_claude_launch_provider"] = provider
+        launch_options = _launch_options(
+            tool,
+            ctx.args,
+            smart_routing_enabled=smart_routing_enabled,
+            explicit_prompt=explicit_prompt,
+            model=model or (route_root_model if tool == "claude" else None),
+            provider=provider,
+        )
         print_success(f"Starting {TOOL_SPECS[tool]['display']}")
-        launch_agent(tool, state, ctx.args)
+        launch_agent(tool, state, ctx.args, options=launch_options)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
@@ -2349,6 +2399,30 @@ WorkspaceOption = Annotated[
         "if not already configured.",
     ),
 ]
+
+
+_PROMPT_SUFFIX_KEY = "ucode_explicit_prompt_suffix"
+
+
+class _PromptAwareCommand(TyperCommand):
+    """Record an agent's ``--`` prompt separator before Click removes it."""
+
+    def parse_args(self, ctx: ClickContext, args: list[str]) -> list[str]:
+        try:
+            separator = args.index("--")
+        except ValueError:
+            pass
+        else:
+            ctx.meta[_PROMPT_SUFFIX_KEY] = tuple(args[separator + 1 :])
+        return super().parse_args(ctx, args)
+
+
+def _has_explicit_prompt(ctx: typer.Context) -> bool:
+    suffix = ctx.meta.get(_PROMPT_SUFFIX_KEY)
+    if not isinstance(suffix, tuple):
+        return False
+    suffix_args = list(suffix)
+    return ctx.args == suffix_args and len(suffix_args) <= 1
 
 
 @app.callback(invoke_without_command=True)
@@ -2469,7 +2543,11 @@ def _print_no_managed_config_guidance(workspace: str, profile: str | None) -> No
         print_note("Run `ug setup` to configure one for your workspace, then `ug publish`.")
 
 
-@app.command("codex", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+@app.command(
+    "codex",
+    cls=_PromptAwareCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 def codex_cmd(
     ctx: typer.Context,
     provider: Annotated[
@@ -2527,7 +2605,11 @@ def codex_cmd(
         )
 
 
-@app.command("claude", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+@app.command(
+    "claude",
+    cls=_PromptAwareCommand,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
 def claude_cmd(
     ctx: typer.Context,
     provider: Annotated[
@@ -3403,7 +3485,7 @@ def upgrade_cmd() -> None:
     """Upgrade ug to the latest version from GitHub."""
     legacy_distribution = "ucode"
     current_distribution = "unity-gateway"
-    git_url = "git+https://github.com/databricks/ucode"
+    git_url = "git+https://github.com/databricks/unity-gateway"
     installed_distribution = _installed_cli_distribution()
     upgrade_requirement = f"{installed_distribution} @ {git_url}"
     migrated = False
@@ -3480,7 +3562,7 @@ def _installed_cli_distribution() -> str:
             continue
         return distribution_name
     # Source checkouts and unusual installers may expose neither distribution.
-    # The repository is still named ucode when this bridge ships, so use the
+    # The distribution remains named ucode until the Phase 3 cutover, so use the
     # non-destructive legacy upgrade path and let uv report an actionable error.
     return "ucode"
 

@@ -14,7 +14,7 @@ GitHub Copilot CLI, and Pi through Databricks.
 ## Installation
 
 ```bash
-uv tool install git+https://github.com/databricks/ucode
+uv tool install git+https://github.com/databricks/unity-gateway
 ```
 
 Check your version with `ug --version`. Between releases this looks like
@@ -433,8 +433,8 @@ Contributions are welcome.
 ### Getting started
 
 ```bash
-git clone https://github.com/databricks/ucode
-cd ucode
+git clone https://github.com/databricks/unity-gateway
+cd unity-gateway
 uv sync
 ```
 
