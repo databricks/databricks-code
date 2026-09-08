@@ -1391,6 +1391,17 @@ class TestBuildAuthTokenArgv:
     def test_no_use_pat_flag_by_default(self):
         assert "--use-pat" not in build_auth_token_argv(WS)
 
+    def test_oauth_client_id_is_pinned_in_the_argv(self):
+        argv = build_auth_token_argv(WS, oauth_client_id="custom-app-id")
+        assert argv[argv.index("--oauth-client-id") + 1] == "custom-app-id"
+
+    def test_no_oauth_client_id_flag_by_default(self):
+        assert "--oauth-client-id" not in build_auth_token_argv(WS)
+
+    def test_oauth_client_id_passed_as_a_separate_argv_element(self):
+        argv = build_auth_token_argv(WS, oauth_client_id="weird id; rm -rf /")
+        assert "weird id; rm -rf /" in argv
+
 
 class TestBuildAuthShellCommand:
     def test_contains_workspace(self):
@@ -1422,6 +1433,167 @@ class TestBuildAuthShellCommand:
         cmd = build_auth_shell_command(WS, profile="DEFAULT", use_pat=True)
         assert "--use-pat" in cmd
         assert "--profile DEFAULT" in cmd
+
+    def test_oauth_client_id_emits_flag(self):
+        cmd = build_auth_shell_command(WS, oauth_client_id="custom-app-id")
+        assert "--oauth-client-id custom-app-id" in cmd
+
+    def test_no_oauth_client_id_flag_by_default(self):
+        assert "--oauth-client-id" not in build_auth_shell_command(WS)
+
+
+class TestResolveOauthClientId:
+    def _write_state(self, workspaces: dict, current: str | None = None) -> None:
+        import ucode.state as state_mod
+
+        state_mod.STATE_PATH.write_text(
+            json.dumps(
+                {
+                    "state_version": state_mod.STATE_VERSION,
+                    "current_workspace": current,
+                    "workspaces": workspaces,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_none_when_nothing_is_configured(self):
+        assert db_mod.resolve_oauth_client_id(WS) is None
+
+    def test_explicit_argument_wins(self):
+        self._write_state({WS: {"oauth_client_id": "from-state"}}, current=WS)
+        assert db_mod.resolve_oauth_client_id(WS, "from-flag") == "from-flag"
+
+    def test_falls_back_to_saved_workspace_state(self):
+        self._write_state({WS: {"oauth_client_id": "from-state"}}, current=WS)
+        assert db_mod.resolve_oauth_client_id(WS) == "from-state"
+
+    def test_resolved_by_host_not_by_current_workspace(self):
+        other = "https://other.databricks.com"
+        self._write_state(
+            {
+                other: {"oauth_client_id": "other-app"},
+                WS: {"oauth_client_id": "wanted-app"},
+            },
+            current=other,
+        )
+        assert db_mod.resolve_oauth_client_id(WS) == "wanted-app"
+
+    def test_trailing_slash_host_matches_the_saved_entry(self):
+        self._write_state({WS: {"oauth_client_id": "from-state"}}, current=WS)
+        assert db_mod.resolve_oauth_client_id(WS + "/") == "from-state"
+
+    def test_blank_values_are_ignored(self):
+        self._write_state({WS: {"oauth_client_id": ""}}, current=WS)
+        assert db_mod.resolve_oauth_client_id(WS, "  ") is None
+
+    def test_values_are_trimmed(self):
+        assert db_mod.resolve_oauth_client_id(WS, "  padded-app  ") == "padded-app"
+
+
+class TestGetDatabricksTokenCustomOauthApp:
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_BEARER", raising=False)
+
+    def _hostile_cli(self, tmp_path, monkeypatch):
+        log = tmp_path / "cli-was-called"
+        fake = tmp_path / "databricks"
+        fake.write_text(f"#!/bin/sh\ntouch {log}\necho tokenless\n")
+        fake.chmod(0o755)
+        monkeypatch.setattr(
+            "os.environ", {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+        )
+        return log
+
+    def test_explicit_client_id_mints_from_the_custom_app(self, tmp_path, monkeypatch):
+        log = self._hostile_cli(tmp_path, monkeypatch)
+        calls: list[tuple] = []
+        monkeypatch.setattr(
+            "ucode.oauth.get_token",
+            lambda host, client_id, **kwargs: (
+                calls.append((host, client_id, kwargs)) or "custom-token"
+            ),
+        )
+
+        token = get_databricks_token(WS, oauth_client_id="custom-app-id")
+
+        assert token == "custom-token"
+        assert calls == [(WS, "custom-app-id", {"force_refresh": False})]
+        assert not log.exists()
+
+    def test_saved_client_id_applies_without_the_flag(self, tmp_path, monkeypatch):
+        import ucode.state as state_mod
+
+        state_mod.STATE_PATH.write_text(
+            json.dumps(
+                {
+                    "state_version": state_mod.STATE_VERSION,
+                    "current_workspace": WS,
+                    "workspaces": {WS: {"oauth_client_id": "saved-app-id"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        log = self._hostile_cli(tmp_path, monkeypatch)
+        monkeypatch.setattr("ucode.oauth.get_token", lambda host, client_id, **_kw: client_id)
+
+        assert get_databricks_token(WS) == "saved-app-id"
+        assert not log.exists()
+
+    def test_force_refresh_is_forwarded(self, tmp_path, monkeypatch):
+        self._hostile_cli(tmp_path, monkeypatch)
+        captured: dict = {}
+        monkeypatch.setattr(
+            "ucode.oauth.get_token",
+            lambda host, client_id, **kwargs: captured.update(kwargs) or "t",
+        )
+
+        get_databricks_token(WS, oauth_client_id="custom-app-id", force_refresh=True)
+
+        assert captured == {"force_refresh": True}
+
+    def test_bearer_env_still_short_circuits_the_custom_app(self, tmp_path, monkeypatch):
+        self._hostile_cli(tmp_path, monkeypatch)
+        monkeypatch.setattr("os.environ", {**os.environ, "DATABRICKS_BEARER": "injected"})
+        monkeypatch.setattr(
+            "ucode.oauth.get_token",
+            lambda *a, **kw: pytest.fail("custom OAuth ran despite DATABRICKS_BEARER"),
+        )
+
+        assert get_databricks_token(WS, oauth_client_id="custom-app-id") == "injected"
+
+    def test_has_valid_auth_reports_true_when_the_custom_app_has_a_session(
+        self, tmp_path, monkeypatch
+    ):
+        log = self._hostile_cli(tmp_path, monkeypatch)
+        monkeypatch.setattr("ucode.oauth.get_token", lambda *a, **kw: "tok")
+
+        assert db_mod.has_valid_databricks_auth(WS, oauth_client_id="custom-app-id") is True
+        assert not log.exists()
+
+    def test_has_valid_auth_reports_false_when_not_signed_in(self, tmp_path, monkeypatch):
+        self._hostile_cli(tmp_path, monkeypatch)
+
+        def not_signed_in(*_args, **_kwargs):
+            raise RuntimeError("Not signed in")
+
+        monkeypatch.setattr("ucode.oauth.get_token", not_signed_in)
+
+        assert db_mod.has_valid_databricks_auth(WS, oauth_client_id="custom-app-id") is False
+
+    def test_login_takes_the_pkce_flow(self, tmp_path, monkeypatch):
+        log = self._hostile_cli(tmp_path, monkeypatch)
+        calls: list[tuple] = []
+        monkeypatch.setattr(
+            "ucode.oauth.login",
+            lambda host, client_id, **kwargs: calls.append((host, client_id, kwargs)),
+        )
+
+        db_mod.run_databricks_login(WS, oauth_client_id="custom-app-id")
+
+        assert calls == [(WS, "custom-app-id", {})]
+        assert not log.exists()
 
 
 class TestEnsurePatBearer:
