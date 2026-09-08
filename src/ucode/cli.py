@@ -1866,6 +1866,13 @@ def _launch_options(
     provider: str | None,
 ) -> LaunchOptions:
     has_model_override = model is not None or explicit_model_arg_value(tool_args) is not None
+    supports_prompt_routing = (
+        not tool_args
+        or explicit_prompt
+        # Claude options such as --session-id still start an interactive session whose
+        # first prompt can be routed. A leading positional argument is a Claude command.
+        or (tool == "claude" and tool_args[0].startswith("-"))
+    )
     return LaunchOptions(
         claude_launch_model=model if tool == "claude" and provider is None else None,
         launch_smart_routing=(
@@ -1877,8 +1884,8 @@ def _launch_options(
             and not has_model_override
             # Smart routing does not currently support Model Provider Services.
             and provider is None
-            # Route a bare agent launch or a prompt explicitly passed after `--`.
-            and (not tool_args or explicit_prompt)
+            # Route a supported interactive launch shape.
+            and supports_prompt_routing
         ),
     )
 
