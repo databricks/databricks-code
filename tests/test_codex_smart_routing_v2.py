@@ -97,8 +97,43 @@ class TestCodexModelCatalog:
         }
 
         assert v2.codex_routing_options(state) == v2.CodexRoutingOptions(
-            ["gpt-5.6-sol", "system.ai.glm-5-2"]
+            ["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"]
         )
+
+    def test_configured_empty_catalog_does_not_fall_back_to_cached_models(
+        self, tmp_path, monkeypatch
+    ):
+        managed, _profile, _user = self._configure_paths(tmp_path, monkeypatch)
+        catalog = tmp_path / "empty-models.json"
+        self._write_catalog(catalog, [])
+        managed.write_text(f'model_catalog_json = "{catalog}"\n', encoding="utf-8")
+
+        options = v2.codex_routing_options({"codex_models": ["cached-model"]})
+
+        assert options == v2.CodexRoutingOptions([], catalog_path=catalog)
+
+    def test_configured_unreadable_catalog_does_not_fall_back_to_cached_models(
+        self, tmp_path, monkeypatch
+    ):
+        managed, _profile, _user = self._configure_paths(tmp_path, monkeypatch)
+        catalog = tmp_path / "missing-models.json"
+        managed.write_text(f'model_catalog_json = "{catalog}"\n', encoding="utf-8")
+
+        options = v2.codex_routing_options({"codex_models": ["cached-model"]})
+
+        assert options == v2.CodexRoutingOptions([], catalog_path=catalog)
+
+    def test_models_for_routing_preserves_catalog_slugs_and_maps_cached_models(self):
+        catalog_options = v2.CodexRoutingOptions(
+            ["system.ai.gpt-5-5"], catalog_path=Path("/catalog.json")
+        )
+        cached_options = v2.CodexRoutingOptions(["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"])
+
+        assert v2.codex_models_for_routing(catalog_options) == ["system.ai.gpt-5-5"]
+        assert v2.codex_models_for_routing(cached_options) == [
+            "gpt-5.6-sol",
+            "system.ai.glm-5-2",
+        ]
 
 
 class TestLaunchCodex:
@@ -193,7 +228,7 @@ class TestLaunchCodex:
         monkeypatch.setattr(
             v2,
             "codex_routing_options",
-            lambda state: v2.CodexRoutingOptions(["gpt-5.6-luna"]),
+            lambda state: v2.CodexRoutingOptions(["system.ai.gpt-5-6-luna"]),
         )
 
         def launch_v2(state, tool_args, **kwargs):

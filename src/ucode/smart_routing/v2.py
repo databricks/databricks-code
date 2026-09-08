@@ -441,7 +441,7 @@ def _model_catalog() -> tuple[Path, list[str]] | None:
         catalog_path = Path(configured_path).expanduser()
         rows = read_json_safe(catalog_path).get("models")
         if not isinstance(rows, list):
-            continue
+            return catalog_path, []
         models: list[str] = []
         seen_models: set[str] = set()
         for row in rows:
@@ -453,20 +453,24 @@ def _model_catalog() -> tuple[Path, list[str]] | None:
                 continue
             seen_models.add(model)
             models.append(model)
-        if models:
-            return catalog_path, models
+        return catalog_path, models
     return None
 
 
 def codex_routing_options(state: dict) -> CodexRoutingOptions:
-    """Prefer custom-catalog models, then fall back to persisted workspace models."""
+    """Use a configured catalog exclusively, or the existing persisted model list."""
     catalog = _model_catalog()
     if catalog is not None:
         catalog_path, models = catalog
         return CodexRoutingOptions(models, catalog_path=catalog_path)
-    return CodexRoutingOptions(
-        [codex_routing.codex_model_id(model) for model in routing_models(state)]
-    )
+    return CodexRoutingOptions(routing_models(state))
+
+
+def codex_models_for_routing(options: CodexRoutingOptions) -> list[str]:
+    """Return the model IDs Codex should receive for the selected model source."""
+    if options.catalog_path is not None:
+        return options.models
+    return [codex_routing.codex_model_id(model) for model in options.models]
 
 
 def _codex_home_config_path() -> Path:
@@ -508,7 +512,7 @@ def launch_codex(
 
     profile = state.get("profile")
     os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, profile)
-    available_models = routing_options.models
+    available_models = codex_models_for_routing(routing_options)
     if not available_models:
         print_note(
             "Smart routing model metadata is unavailable; starting Codex on gpt-5.6-luna "
