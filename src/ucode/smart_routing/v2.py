@@ -25,7 +25,7 @@ from ucode.databricks import (
     list_anthropic_model_catalog,
     list_anthropic_models,
 )
-from ucode.smart_routing import claude_routing, codex_interposer, routing
+from ucode.smart_routing import claude_routing, codex_interposer, codex_routing, routing
 from ucode.smart_routing.claude_hooks import (
     FIRST_PROMPT_SOCKET_ENV,
     sync_first_prompt_hook,
@@ -62,7 +62,6 @@ _ANTHROPIC_AIGW_MODEL_RE = re.compile(r"^anthropic-aigw-[0-9a-fA-F]{8}-(.+)$")
 @dataclass(frozen=True)
 class CodexRoutingOptions:
     models: list[str]
-    preserve_model_ids: bool = False
     catalog_path: Path | None = None
 
 
@@ -464,8 +463,10 @@ def codex_routing_options(state: dict) -> CodexRoutingOptions:
     catalog = _model_catalog()
     if catalog is not None:
         catalog_path, models = catalog
-        return CodexRoutingOptions(models, preserve_model_ids=True, catalog_path=catalog_path)
-    return CodexRoutingOptions(routing_models(state))
+        return CodexRoutingOptions(models, catalog_path=catalog_path)
+    return CodexRoutingOptions(
+        [codex_routing.codex_model_id(model) for model in routing_models(state)]
+    )
 
 
 def _codex_home_config_path() -> Path:
@@ -475,9 +476,7 @@ def _codex_home_config_path() -> Path:
     return Path.home() / ".codex" / "config.toml"
 
 
-def _v2_pre_tool_use_hooks(
-    state: dict, available_models: list[str], *, preserve_model_ids: bool = False
-) -> list[dict]:
+def _v2_pre_tool_use_hooks(state: dict, available_models: list[str]) -> list[dict]:
     doc = read_toml_safe(_codex_home_config_path())
     configured_hooks = doc.get("hooks")
     existing = configured_hooks.get("PreToolUse") if isinstance(configured_hooks, dict) else None
@@ -485,7 +484,6 @@ def _v2_pre_tool_use_hooks(
         existing if isinstance(existing, list) else [],
         state,
         available_models=available_models,
-        preserve_model_ids=preserve_model_ids,
     )
 
 
@@ -525,11 +523,7 @@ def launch_codex(
     if routing_options.catalog_path is not None:
         overlay["model_catalog_json"] = str(routing_options.catalog_path)
     overlay["hooks"] = {
-        "PreToolUse": _v2_pre_tool_use_hooks(
-            state,
-            available_models,
-            preserve_model_ids=routing_options.preserve_model_ids,
-        ),
+        "PreToolUse": _v2_pre_tool_use_hooks(state, available_models),
     }
     config_args = codex_config_args(overlay)
     app_port = _free_port()
@@ -557,7 +551,6 @@ def launch_codex(
             workspace=workspace,
             token_provider=lambda: get_databricks_token(workspace, profile),
             switch_message_fn=format_routing_notice,
-            preserve_model_ids=routing_options.preserve_model_ids,
             log_path=CODEX_INTERPOSER_LOG,
         )
         tui_url = _loopback_websocket_url(tui_port)

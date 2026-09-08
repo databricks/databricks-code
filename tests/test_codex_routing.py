@@ -167,7 +167,7 @@ def test_spawn_rewrite_preserves_original_input(monkeypatch):
         "request_routing_decision",
         lambda *args, **kwargs: (
             codex_routing.RoutingDecision(
-                model="databricks-gpt-5-5",
+                model="gpt-5.5",
                 raw_model="gpt-5-6-sol",
                 rationale="Review needs deeper reasoning.",
             ),
@@ -179,7 +179,7 @@ def test_spawn_rewrite_preserves_original_input(monkeypatch):
         payload,
         workspace=WS,
         token="token",
-        available_models=["databricks-gpt-5-5"],
+        available_models=["gpt-5.5"],
     )
 
     hook = output["hookSpecificOutput"]
@@ -201,13 +201,13 @@ def test_spawn_rewrite_preserves_original_input(monkeypatch):
     assert hook["permissionDecisionReason"] == expected_message
 
 
-def test_spawn_rewrite_uses_codex_model_id_for_uc_endpoint(monkeypatch):
+def test_spawn_rewrite_uses_selected_codex_model_id(monkeypatch):
     monkeypatch.setattr(
         codex_routing,
         "request_routing_decision",
         lambda *args, **kwargs: (
             codex_routing.RoutingDecision(
-                model="system.ai.gpt-5-6-luna",
+                model="gpt-5.6-luna",
                 raw_model="gpt-5-6-luna",
             ),
             None,
@@ -221,7 +221,7 @@ def test_spawn_rewrite_uses_codex_model_id_for_uc_endpoint(monkeypatch):
         },
         workspace=WS,
         token="token",
-        available_models=["system.ai.gpt-5-6-luna"],
+        available_models=["gpt-5.6-luna"],
     )
 
     assert output["systemMessage"] == codex_routing.routing.format_subagent_message(
@@ -251,7 +251,6 @@ def test_spawn_rewrite_preserves_custom_catalog_model_id(monkeypatch):
         workspace=WS,
         token="token",
         available_models=["system.ai.gpt-5-5"],
-        preserve_model_ids=True,
     )
 
     assert output["hookSpecificOutput"]["updatedInput"]["model"] == "system.ai.gpt-5-5"
@@ -400,7 +399,7 @@ def test_decision_is_reconciled_with_actual_subagent_model(tmp_path, monkeypatch
         "request_routing_decision",
         lambda *args, **kwargs: (
             codex_routing.RoutingDecision(
-                model="system.ai.gpt-5-6-luna",
+                model="gpt-5.6-luna",
                 raw_model="gpt-5-6-luna",
             ),
             None,
@@ -415,7 +414,7 @@ def test_decision_is_reconciled_with_actual_subagent_model(tmp_path, monkeypatch
         },
         workspace=WS,
         token="token",
-        available_models=["system.ai.gpt-5-6-luna", "system.ai.gpt-5-6-sol"],
+        available_models=["gpt-5.6-luna", "gpt-5.6-sol"],
         audit_decision=True,
     )
     record = codex_routing.record_subagent_start(

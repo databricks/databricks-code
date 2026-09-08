@@ -43,7 +43,6 @@ from ucode.smart_routing.codex_hooks import (
     remove_smart_routing_hooks,
     sync_smart_routing_hooks,
 )
-from ucode.smart_routing.codex_routing import codex_model_id
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.ui import print_warning_err
@@ -529,9 +528,7 @@ def _launch_smart_routing(state: dict, tool_args: list[str]) -> None:
     managed_model = default_model(state)
     routing_options = smart_routing_v2.codex_routing_options(state)
     models = routing_options.models
-    first_model = None
-    if models:
-        first_model = models[0] if routing_options.preserve_model_ids else codex_model_id(models[0])
+    first_model = models[0] if models else None
     start_model = managed_model or first_model or APP_SERVER_SMART_ROUTING_STARTING_MODEL
     smart_routing_v2.launch_codex(
         state,

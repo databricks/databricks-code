@@ -61,7 +61,6 @@ class TestCodexModelCatalog:
 
         assert options == v2.CodexRoutingOptions(
             ["system.ai.gpt-5-5", "system.ai.glm-5-3"],
-            preserve_model_ids=True,
             catalog_path=managed_catalog,
         )
 
@@ -76,7 +75,6 @@ class TestCodexModelCatalog:
 
         assert options.models == ["system.ai.gpt-5-6-sol"]
         assert options.catalog_path == catalog
-        assert options.preserve_model_ids is True
 
     def test_falls_back_to_user_catalog(self, tmp_path, monkeypatch):
         managed, profile, user = self._configure_paths(tmp_path, monkeypatch)
@@ -90,7 +88,6 @@ class TestCodexModelCatalog:
 
         assert options.models == ["system.ai.glm-5-3"]
         assert options.catalog_path == catalog
-        assert options.preserve_model_ids is True
 
     def test_falls_back_to_cached_workspace_models(self, tmp_path, monkeypatch):
         self._configure_paths(tmp_path, monkeypatch)
@@ -100,7 +97,7 @@ class TestCodexModelCatalog:
         }
 
         assert v2.codex_routing_options(state) == v2.CodexRoutingOptions(
-            ["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"]
+            ["gpt-5.6-sol", "system.ai.glm-5-2"]
         )
 
 
@@ -125,7 +122,6 @@ class TestLaunchCodex:
         calls = []
         routing_options = v2.CodexRoutingOptions(
             ["system.ai.gpt-5-5"],
-            preserve_model_ids=True,
             catalog_path=Path("/catalog.json"),
         )
         monkeypatch.setenv(v2.ENV_VAR, "1")
@@ -197,7 +193,7 @@ class TestLaunchCodex:
         monkeypatch.setattr(
             v2,
             "codex_routing_options",
-            lambda state: v2.CodexRoutingOptions(["system.ai.gpt-5-6-luna"]),
+            lambda state: v2.CodexRoutingOptions(["gpt-5.6-luna"]),
         )
 
         def launch_v2(state, tool_args, **kwargs):
@@ -273,7 +269,6 @@ class TestLaunchCodex:
                 start_model="gpt-start",
                 routing_options=v2.CodexRoutingOptions(
                     ["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"],
-                    preserve_model_ids=True,
                     catalog_path=Path("/catalog.json"),
                 ),
                 render_overlay=codex.render_overlay,
@@ -301,7 +296,6 @@ class TestLaunchCodex:
         assert "codex-router-hook route-subagent" in hook_override
         assert f"--host {WS}" in hook_override
         assert "--profile myprof" in hook_override
-        assert "--preserve-model-ids" in hook_override
         assert "--model system.ai.gpt-5-6-sol" in hook_override
         assert "--model system.ai.glm-5-2" in hook_override
         assert processes[0].argv[12:] == [
@@ -328,7 +322,6 @@ class TestLaunchCodex:
         assert interposer_args["kwargs"]["token_provider"]() == "token-2"
         assert token_calls == [(WS, "myprof"), (WS, "myprof")]
         assert interposer_args["kwargs"]["switch_message_fn"] is v2.format_routing_notice
-        assert interposer_args["kwargs"]["preserve_model_ids"] is True
         assert stopped == [True]
         assert processes[0].terminated is True
 
@@ -551,11 +544,11 @@ class TestInterposerSession:
         assert result.needs_settings_update
         assert "Task classified as bugfix." in sess.switch_message
 
-    def test_maps_selected_uc_gpt_model_and_shows_routing_notice(self):
+    def test_uses_selected_codex_model_and_shows_routing_notice(self):
         def select(_prompt):
             return (
                 codex_interposer.routing.RoutingDecision(
-                    model="system.ai.gpt-5-6-luna",
+                    model="gpt-5.6-luna",
                     raw_model="gpt-5-6-luna",
                     rationale="Trivial task.",
                 ),
@@ -592,7 +585,6 @@ class TestInterposerSession:
                 ),
                 None,
             ),
-            preserve_model_ids=True,
         )
 
         result = sess.on_tui_frame(self._turn_start("system.ai.glm-5-3"))

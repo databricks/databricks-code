@@ -674,7 +674,6 @@ class TestSubcommandRouting:
                     "my-profile",
                     "--model",
                     "system.ai.gpt-5-6-sol",
-                    "--preserve-model-ids",
                 ],
                 input='{"tool_name":"collaboration.spawn_agent","tool_input":{"message":"fix it"}}',
                 env={"ENABLE_SMART_ROUTING_V2": "1", **token_env},
@@ -682,7 +681,6 @@ class TestSubcommandRouting:
 
         assert result.exit_code == 0, result.output
         assert json.loads(result.output) == routed
-        assert mock_route.call_args.kwargs["preserve_model_ids"] is True
         return mock_token, mock_route
 
     def test_codex_subagent_hook_reuses_fresh_oauth_token(self, monkeypatch):
