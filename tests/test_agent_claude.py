@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from ucode.agents import claude
+from ucode.agents import LaunchOptions, claude
 from ucode.smart_routing import claude_routing, v2
 from ucode.state import MANAGED_OVERLAY_KEY
 
@@ -39,17 +39,12 @@ class TestMinimumVersion:
         monkeypatch.setattr(claude, "agent_version", lambda _binary: version)
 
         assert claude.minimum_version_error() is None
-        assert claude.required_update_message() is None
 
     def test_older_version_requires_update(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() == (
-            "Smart routing requires Claude Code 2.1.248 or newer. "
-            "Your current version is Claude Code 2.1.247."
-        )
-        assert claude.required_update_message() == (
             "Smart routing requires Claude Code 2.1.248 or newer. "
             "Your current version is Claude Code 2.1.247."
         )
@@ -63,7 +58,6 @@ class TestMinimumVersion:
             "Your current version is Claude Code 2.1.247."
         )
         assert claude.minimum_version_error() == expected
-        assert claude.required_update_message() == expected
 
     def test_smart_routing_message_wins_when_both_features_are_enabled(self, monkeypatch):
         monkeypatch.setenv(v2.ENV_VAR, "1")
@@ -77,7 +71,6 @@ class TestMinimumVersion:
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "unknown")
 
         assert claude.minimum_version_error() is None
-        assert claude.required_update_message() is None
 
     def test_older_version_is_not_validated_without_discovery_features(self, monkeypatch):
         monkeypatch.delenv(v2.ENV_VAR, raising=False)
@@ -85,7 +78,6 @@ class TestMinimumVersion:
         monkeypatch.setattr(claude, "agent_version", lambda _binary: "2.1.247")
 
         assert claude.minimum_version_error() is None
-        assert claude.required_update_message() is None
 
 
 class TestRenderOverlay:
@@ -142,10 +134,8 @@ class TestRenderOverlay:
         )
         assert overlay["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "system.ai.claude-haiku-4-6"
 
-    def test_custom_model_pins_all_family_aliases(self):
-        # `ucode claude --model` pins the id into every family alias so it takes effect whichever
-        # slot Claude Code resolves — and NOT into ANTHROPIC_MODEL, which Claude Code validates and
-        # rejects for a raw Databricks id. It overrides the discovered-model aliases.
+    def test_custom_model_does_not_persist_model_selection(self):
+        # Explicit model selection is launch-scoped and must not be written to settings.
         overlay, _ = claude.render_overlay(
             WS,
             "s4",
@@ -153,22 +143,23 @@ class TestRenderOverlay:
             custom_model="main.aarushi.claude-opus-5",
         )
         env = overlay["env"]
-        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "main.aarushi.claude-opus-5"
-        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "main.aarushi.claude-opus-5"
-        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "main.aarushi.claude-opus-5"
         assert "ANTHROPIC_MODEL" not in env
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-8[1m]"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.sonnet"
+        assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in env
         # No [1m] suffix is appended to the custom id — it's passed through verbatim.
-        assert "[1m]" not in env["ANTHROPIC_DEFAULT_OPUS_MODEL"]
+        assert "main.aarushi.claude-opus-5" not in env.values()
 
-    def test_custom_model_pins_fable_alias_only_when_fable_enabled(self):
+    def test_custom_model_does_not_persist_fable_selection(self):
         without = claude.render_overlay(WS, "s4", claude_models={}, custom_model="main.x.m")[0][
             "env"
         ]
-        assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in without
+        assert "ANTHROPIC_MODEL" not in without
         with_fable = claude.render_overlay(
             WS, "s4", claude_models={}, custom_model="main.x.m", fable_enabled=True
         )[0]["env"]
-        assert with_fable["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "main.x.m"
+        assert "ANTHROPIC_MODEL" not in with_fable
+        assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in with_fable
 
     def test_sets_anthropic_base_url(self):
         overlay, _ = claude.render_overlay(WS, "s4")
@@ -1092,6 +1083,7 @@ class TestClaudeLaunch:
                     "relayed_proxy_port": 12345,
                 },
                 ["--debug"],
+                options=LaunchOptions(),
             )
 
         assert exc.value.code == 0
@@ -1113,7 +1105,11 @@ class TestClaudeLaunch:
             RuntimeError,
             match="Smart routing in Claude Code is currently not supported on Windows",
         ):
-            claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+            claude.launch(
+                {"workspace": WS, "profile": "test"},
+                ["--debug"],
+                options=LaunchOptions(launch_smart_routing=True),
+            )
 
     def test_default_launch_keeps_existing_auth_path(self, monkeypatch):
         calls: list[list[str]] = []
@@ -1123,63 +1119,25 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"], options=LaunchOptions())
 
         assert os.environ["OAUTH_TOKEN"] == "token"
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
 
-    def test_v2_launch_override_bypasses_first_prompt_routing(self, monkeypatch):
+    def test_launch_model_is_only_set_for_current_process(self, monkeypatch):
         calls: list[list[str]] = []
-        monkeypatch.setenv(v2.ENV_VAR, "1")
-        monkeypatch.setattr(v2, "launch_claude", Mock())
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
         monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
         claude.launch(
-            {"workspace": WS, "_claude_launch_model": "system.ai.glm-5-2"},
-            ["--debug"],
+            {"workspace": WS, "profile": "test"},
+            [],
+            options=LaunchOptions(claude_launch_model="cat.schema.model"),
         )
 
-        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
-        v2.launch_claude.assert_not_called()
-
-    @pytest.mark.parametrize(
-        "tool_args",
-        [
-            ["-m", "opus"],
-            ["--model=opus"],
-        ],
-    )
-    def test_v2_explicit_claude_model_bypasses_first_prompt_routing(self, monkeypatch, tool_args):
-        calls: list[list[str]] = []
-        monkeypatch.setenv(v2.ENV_VAR, "1")
-        monkeypatch.setattr(v2, "launch_claude", Mock())
-        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
-        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
-
-        claude.launch({"workspace": WS}, tool_args)
-
-        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]]
-        v2.launch_claude.assert_not_called()
-
-    @pytest.mark.parametrize(
-        "provider_state",
-        [
-            {"provider_services": {"claude": "main.default.anthropic"}},
-            {"_claude_launch_provider": "main.default.anthropic"},
-        ],
-    )
-    def test_v2_provider_launch_bypasses_first_prompt_routing(self, monkeypatch, provider_state):
-        calls: list[list[str]] = []
-        monkeypatch.setenv(v2.ENV_VAR, "1")
-        monkeypatch.setattr(v2, "launch_claude", Mock())
-        monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
-        monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
-
-        claude.launch({"workspace": WS, **provider_state}, ["--debug"])
-
-        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), "--debug"]]
-        v2.launch_claude.assert_not_called()
+        assert os.environ["ANTHROPIC_MODEL"] == "cat.schema.model"
+        assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH)]]
 
     @pytest.mark.parametrize(
         "tool_args",
@@ -1195,7 +1153,7 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        claude.launch({"workspace": WS}, tool_args)
+        claude.launch({"workspace": WS}, tool_args, options=LaunchOptions())
 
         assert calls == [["claude", "--settings", str(claude.CLAUDE_SETTINGS_PATH), *tool_args]]
         v2.launch_claude.assert_not_called()
@@ -1207,7 +1165,11 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "_original_launch_model", lambda _state: None)
         monkeypatch.setattr(v2, "launch_claude", launch_v2)
 
-        claude.launch({"workspace": WS}, tool_args)
+        claude.launch(
+            {"workspace": WS},
+            tool_args,
+            options=LaunchOptions(launch_smart_routing=True),
+        )
 
         launch_v2.assert_called_once_with(
             {"workspace": WS},
@@ -1220,12 +1182,6 @@ class TestClaudeLaunch:
             model_name=claude._maybe_add_1m_suffix,
         )
 
-    def test_v2_does_not_treat_option_value_as_positional_argument(self):
-        assert claude._uses_interactive_tui(["--name", "doctor"]) is True
-
-    def test_v2_treats_optional_option_value_as_interactive(self):
-        assert claude._uses_interactive_tui(["--resume", "session-id"]) is True
-
     def test_gateway_discovery_uses_direct_gateway(self, monkeypatch):
         calls: list[list[str]] = []
         monkeypatch.delenv(v2.ENV_VAR, raising=False)
@@ -1234,7 +1190,7 @@ class TestClaudeLaunch:
         monkeypatch.setattr(claude, "get_databricks_token", lambda *_args: "token")
         monkeypatch.setattr(claude, "exec_or_spawn", lambda argv: calls.append(argv))
 
-        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"])
+        claude.launch({"workspace": WS, "profile": "test"}, ["--debug"], options=LaunchOptions())
 
         assert os.environ["OAUTH_TOKEN"] == "token"
         assert os.environ["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"

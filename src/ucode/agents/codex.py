@@ -5,9 +5,6 @@ from __future__ import annotations
 import copy
 import os
 import re
-import subprocess
-import sys
-import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -51,6 +48,8 @@ from ucode.smart_routing.codex_routing import codex_model_id
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
 from ucode.ui import print_warning_err
+
+from .args import LaunchOptions
 
 CODEX_CONFIG_DIR = Path.home() / ".codex"
 CODEX_PROFILE_NAME = "ucode"
@@ -98,12 +97,18 @@ def _parse_version(value: str) -> tuple[int, int, int] | None:
     return int(major), int(minor), int(patch)
 
 
-def _installed_version_status() -> tuple[str, bool] | None:
+def minimum_version_error() -> str | None:
+    """Return the active smart-routing version blocker, if any."""
+    if not smart_routing_v2.enabled():
+        return None
     version = agent_version(SPEC["binary"])
     parsed = _parse_version(version)
-    if parsed is None:
+    if parsed is None or parsed >= MINIMUM_ROUTING_CODEX_VERSION:
         return None
-    return version, parsed < MINIMUM_CODEX_VERSION
+    return (
+        "Codex smart routing requires Codex "
+        f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version}."
+    )
 
 
 def _use_legacy_layout() -> bool:
@@ -483,96 +488,59 @@ def clear_model_preferences(state: dict) -> bool:
     return changed
 
 
-# codex rejects the global --profile on subcommands that don't accept it
-# (app-server, mcp-server, ...) with a CLI *parse-time* error — before it touches
-# auth, the gateway, or the network — so the rejection exits almost instantly.
-# We use that to decide when to retry without --profile (see launch()). This
-# window is well above codex's ~0.15s cold-start floor and far below the seconds
-# any real session needs to connect and then fail, so it never catches a genuine
-# failure. Its exit code (1) is indistinguishable from an ordinary failure, so
-# elapsed time is the signal we key on rather than stderr text.
-_PROFILE_REJECTED_MAX_SECONDS = 3.0
-
-
-def launch(state: dict, tool_args: list[str]) -> None:
+def launch(
+    state: dict,
+    tool_args: list[str],
+    *,
+    options: LaunchOptions,
+) -> None:
+    if options.launch_smart_routing:
+        _launch_smart_routing(state, tool_args)
+        return
     clear_model_preferences(state)
     binary = SPEC["binary"]
     workspace = state.get("workspace")
-    if smart_routing_v2.enabled():
-        version_text = agent_version(binary)
-        parsed_version = _parse_version(version_text)
-        if parsed_version is not None and parsed_version < MINIMUM_ROUTING_CODEX_VERSION:
-            raise RuntimeError(
-                "Codex smart routing requires Codex "
-                f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version_text}."
-            )
-
-        def _app_server_start_model() -> str:
-            managed_model = default_model(state)
-            if managed_model:
-                return managed_model
-            models = routing_models(state)
-            if models:
-                return codex_model_id(models[0])
-            return APP_SERVER_SMART_ROUTING_STARTING_MODEL
-
-        smart_routing_v2.launch_codex(
-            state,
-            tool_args,
-            binary=binary,
-            start_model=_app_server_start_model(),
-            render_overlay=render_overlay,
-        )
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
-    if tool_args[:1] == ["app"]:
-        # `codex app` rejects --profile. Pass the ucode profile as --config
-        # overrides instead, preserving its Databricks provider and auth
-        # settings without changing the user's base config.toml.
-        profile_doc = read_toml_safe(CODEX_CONFIG_PATH)
-        if not profile_doc:
-            raise RuntimeError(
-                f"Cannot launch Codex app with the ucode profile because {CODEX_CONFIG_PATH} "
-                "is missing or empty. Run `ucode configure --agents codex` first."
-            )
-        config_args = codex_config_args(profile_doc)
-        exec_or_spawn([binary, "app", *config_args, *tool_args[1:]])
-        return  # unreachable in production (exec replaces the process)
-    # Run codex with --profile first — the TUI and runtime subcommands
-    # (exec/resume/mcp/...) keep ucode's Databricks routing, including any added
-    # by future codex versions. codex rejects the global --profile on
-    # server-family subcommands (app-server, mcp-server, ...), which are
-    # caller-configured anyway (e.g. omnigent runs `codex app-server` with its
-    # own CODEX_HOME); on that rejection we relaunch without --profile.
-    #
-    # The retry is gated on the attempt failing *fast*: the rejection is a
-    # parse-time error (~0.15s), whereas a session that actually starts can only
-    # fail after a network round-trip (seconds). Without that gate a genuinely
-    # failing `codex exec` would be silently re-run without --profile — i.e. on
-    # the user's own OpenAI login instead of the Databricks gateway (ucode writes
-    # a *named-profile* file, so no --profile means no ucode routing). stdio is
-    # inherited (no capture), so Ctrl-C reaches codex directly and the resulting
-    # KeyboardInterrupt propagates past the retry check — quitting an interactive
-    # session is never mistaken for a --profile rejection.
-    started = time.monotonic()
-    returncode = subprocess.run([binary, "--profile", CODEX_PROFILE_NAME, *tool_args]).returncode
-    if returncode != 0 and time.monotonic() - started < _PROFILE_REJECTED_MAX_SECONDS:
-        # Fast failure: most likely codex rejected --profile on this subcommand.
-        # Relaunch without it, handing over the terminal. (A fast failure for
-        # any other reason — e.g. a bad flag — just re-fails the same way here,
-        # with no ucode routing to lose since the subcommand had none.)
-        #
-        # Warn on *stderr*: this path is reached by `codex app-server`, whose
-        # stdout is a JSON-RPC stream its caller parses. Emit before handing off,
-        # since execvp replaces this process.
-        print_warning_err(
-            "ucode's `--profile` isn't accepted here (error above). Retrying "
-            f"without it: Codex will resolve {LEGACY_CODEX_CONFIG_PATH} and any OS-managed "
-            "settings instead of the ucode profile."
+    # Layer ucode's named profile as ordinary config overrides. Unlike
+    # `--profile`, `--config` is accepted by runtime, utility, and server
+    # commands, so every invocation keeps the same Databricks settings without
+    # classifying Codex subcommands or probing and retrying the real command.
+    profile_doc = read_toml_safe(CODEX_CONFIG_PATH)
+    if not profile_doc:
+        raise RuntimeError(
+            f"Cannot launch Codex with the ucode profile because {CODEX_CONFIG_PATH} "
+            "is missing or empty. Run `ucode configure --agents codex` first."
         )
-        exec_or_spawn([binary, *tool_args])
-        return  # unreachable in production (exec replaces the process)
-    sys.exit(returncode)
+    exec_or_spawn([binary, *codex_config_args(profile_doc), *tool_args])
+
+
+def _launch_smart_routing(state: dict, tool_args: list[str]) -> None:
+    """Launch the Codex TUI through the smart-routing interposer."""
+    clear_model_preferences(state)
+    binary = SPEC["binary"]
+    version_text = agent_version(binary)
+    parsed_version = _parse_version(version_text)
+    if parsed_version is not None and parsed_version < MINIMUM_ROUTING_CODEX_VERSION:
+        raise RuntimeError(
+            "Codex smart routing requires Codex "
+            f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version_text}."
+        )
+
+    managed_model = default_model(state)
+    models = routing_models(state)
+    start_model = (
+        managed_model
+        or (codex_model_id(models[0]) if models else None)
+        or APP_SERVER_SMART_ROUTING_STARTING_MODEL
+    )
+    smart_routing_v2.launch_codex(
+        state,
+        tool_args,
+        binary=binary,
+        start_model=start_model,
+        render_overlay=render_overlay,
+    )
 
 
 def disable_smart_routing(state: dict) -> bool:
