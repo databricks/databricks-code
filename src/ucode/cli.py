@@ -1832,17 +1832,6 @@ def _should_launch_smart_routing(
     explicit_prompt: bool,
     model: str | None,
 ) -> bool:
-    """Return whether this agent invocation can route its first prompt.
-
-    A selected model always wins over smart routing. Bare launches and prompts passed
-    after ucode's ``--`` separator are routable. Claude also supports leading options
-    such as ``--session-id <id>``; a leading positional argument such as ``update`` is
-    a command and cannot route a first prompt.
-
-    Values belonging to arbitrary Claude options cannot be identified without duplicating
-    Claude's option parser, so the first forwarded argument determines whether the invocation
-    begins with an option or a command.
-    """
     if model is not None or has_explicit_model_arg(tool_args):
         return False
     if not tool_args or explicit_prompt:
