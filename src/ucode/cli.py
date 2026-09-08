@@ -2990,10 +2990,12 @@ def configure(
             # The workspaces were just configured, so enable tracing for them
             # directly instead of re-prompting. Fall back to the workspace that
             # `configure_workspace_command` made current (the interactive pick).
-            tracing_workspaces = workspace_entries
+            tracing_workspaces: list[tuple[str, str | None]] | None = workspace_entries
             if tracing_workspaces is None:
                 current = load_full_state().get("current_workspace")
-                tracing_workspaces = [(current, None)] if current else None
+                tracing_workspaces = (
+                    [(current, None)] if isinstance(current, str) and current else None
+                )
             if tracing_workspaces:
                 configure_tracing_command(workspaces=tracing_workspaces)
         if mcp is not None:

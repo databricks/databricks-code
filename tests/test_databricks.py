@@ -195,6 +195,21 @@ class TestDiscoverClaudeModels:
             {"max_retries": 2},
         )
 
+    def test_lists_anthropic_display_names_with_model_ids(self, monkeypatch):
+        payload = {
+            "data": [
+                {"id": "system.ai.glm-5-3-flash", "display_name": "GLM 5.3 Flash"},
+                {"id": "opaque-model-id"},
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda *_args, **_kwargs: (payload, None))
+
+        catalog = db_mod.list_anthropic_model_catalog(WS, "token")
+
+        assert catalog.model_ids == ["system.ai.glm-5-3-flash", "opaque-model-id"]
+        assert catalog.model_id_to_display_name == {"system.ai.glm-5-3-flash": "GLM 5.3 Flash"}
+        assert catalog.error_msg is None
+
     def test_selects_opus_4_8_when_advertised(self, monkeypatch):
         payload = {
             "data": [
