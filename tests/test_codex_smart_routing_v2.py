@@ -600,7 +600,7 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
         "workspace": WS,
         "token": "same-oauth-token",
         "task": "Fix the parser",
-        "router_name": "task_v1",
+        "router_name": codex_routing.routing.ROUTER_NAME,
         "timeout": codex_routing.REQUEST_TIMEOUT_S,
         "route_options": [
             ("kimi-k3-neo", "codex"),
@@ -620,6 +620,6 @@ def test_routing_request_uses_models_prompt_and_same_token(monkeypatch):
             {"model": "glm-5-2", "harness": "codex"},
         ],
         "task": {"prompt": "Fix the parser"},
-        "route_selector": {"router_name": "task_v1"},
+        "route_selector": {"router_name": codex_routing.routing.ROUTER_NAME},
     }
     assert "same-oauth-token" not in logged[0]
