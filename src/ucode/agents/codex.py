@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
@@ -554,8 +555,11 @@ def launch(state: dict, tool_args: list[str]) -> None:
     # inherited (no capture), so Ctrl-C reaches codex directly and the resulting
     # KeyboardInterrupt propagates past the retry check — quitting an interactive
     # session is never mistaken for a --profile rejection.
+    resolved_binary = shutil.which(binary) or binary
+    if not resolved_binary:
+        raise RuntimeError(f"Unable to locate {binary} on PATH")
     started = time.monotonic()
-    returncode = subprocess.run([binary, "--profile", CODEX_PROFILE_NAME, *tool_args]).returncode
+    returncode = subprocess.run([resolved_binary, "--profile", CODEX_PROFILE_NAME, *tool_args]).returncode
     if returncode != 0 and time.monotonic() - started < _PROFILE_REJECTED_MAX_SECONDS:
         # Fast failure: most likely codex rejected --profile on this subcommand.
         # Relaunch without it, handing over the terminal. (A fast failure for
@@ -570,7 +574,7 @@ def launch(state: dict, tool_args: list[str]) -> None:
             f"without it: Codex will resolve {LEGACY_CODEX_CONFIG_PATH} and any OS-managed "
             "settings instead of the ucode profile."
         )
-        exec_or_spawn([binary, *tool_args])
+        exec_or_spawn([resolved_binary, *tool_args])
         return  # unreachable in production (exec replaces the process)
     sys.exit(returncode)
 
