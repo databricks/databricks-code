@@ -90,6 +90,14 @@ class TestHelp:
         for tool in TOOLS:
             assert tool in result.output
 
+    def test_managed_authoring_commands_are_removed(self):
+        # Authoring moved to the AI Gateway API/UI, so `ug setup` and `ug publish` no longer exist.
+        assert runner.invoke(app, ["setup"]).exit_code != 0
+        assert runner.invoke(app, ["setup", "mcps"]).exit_code != 0
+        assert runner.invoke(app, ["publish"]).exit_code != 0
+        # `ug export` (read-only) stays.
+        assert runner.invoke(app, ["export", "--help"]).exit_code == 0
+
     @pytest.mark.parametrize("prog_name", ["ug", "ucode"])
     def test_help_uses_invoked_name_and_names_ucode_as_an_alias(self, prog_name):
         result = runner.invoke(app, ["--help"], prog_name=prog_name)
@@ -3368,7 +3376,6 @@ class TestBareUcode:
         monkeypatch,
         *,
         managed,
-        is_admin=False,
         args=None,
         cached=None,
         coding_agent_config_feature_disabled=False,
@@ -3384,8 +3391,6 @@ class TestBareUcode:
             monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (managed, False))
 
         monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: cached)
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda *a, **k: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda *a, **k: is_admin)
         monkeypatch.setattr(
             "ucode.cli._launch_tool",
             lambda tool, ctx, **kw: launched.append((tool, kw)),
@@ -3436,21 +3441,20 @@ class TestBareUcode:
         assert "launching OpenCode" in result.output
         assert "as the default agent" not in result.output
 
-    def test_admin_without_a_config_is_pointed_at_setup(self, monkeypatch):
-        result, launched = self._run(monkeypatch, managed=None, is_admin=True)
+    def test_no_config_points_the_dev_at_configure(self, monkeypatch):
+        # With no managed config a developer can still set up locally, so the guidance points at
+        # `ug configure` (not the removed authoring commands).
+        result, launched = self._run(monkeypatch, managed=None)
         assert result.exit_code == 0, result.output
         assert launched == []
-        assert "ug setup" in result.output
-
-    def test_non_admin_without_a_config_is_told_to_ask(self, monkeypatch):
-        result, launched = self._run(monkeypatch, managed=None, is_admin=False)
-        assert result.exit_code == 0, result.output
-        assert launched == []
-        assert "Ask a workspace admin" in result.output
+        flat = " ".join(result.output.split())
+        assert "ug configure" in flat
+        assert "ug setup" not in flat
+        assert "ug publish" not in flat
 
     def test_feature_disabled_guides_without_managed_mention(self, monkeypatch):
         result, launched = self._run(
-            monkeypatch, managed=None, is_admin=True, coding_agent_config_feature_disabled=True
+            monkeypatch, managed=None, coding_agent_config_feature_disabled=True
         )
         assert result.exit_code == 0, result.output
         assert launched == []
@@ -3487,10 +3491,6 @@ class TestBareUcode:
             lambda state: pytest.fail("--dry-run must not fetch"),
         )
         monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
-        # The no-config guidance checks admin status; stub the token/admin calls so the test
-        # doesn't shell out to the `databricks` binary (absent in CI).
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda *a, **k: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda *a, **k: False)
         monkeypatch.setattr(
             "ucode.cli._launch_tool",
             lambda *a, **k: pytest.fail("nothing to launch without a config"),

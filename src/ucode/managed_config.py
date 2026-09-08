@@ -6,15 +6,13 @@ local file, ``~/.ucode/managed-state.json`` (0600), that both roles share:
 
 - fetching the raw manifest (via :func:`ucode.databricks.fetch_managed_coding_agent_configs`),
 - normalizing the proto-JSON into a stable internal dict keyed by ucode's own tool names,
-- persisting it via :func:`save_managed_state` / :func:`load_managed_state` — the admin-write side
-  (``managed_setup`` / ``managed_wizard``) authors the manifest here, and the launch path pulls the
-  published copy back into the same file, and
+- persisting it via :func:`save_managed_state` / :func:`load_managed_state`, which the launch path
+  uses to pull the published copy into the local file, and
 - re-reading it on each launch, falling back to the persisted copy when the read fails.
 
-There is deliberately one file, not a separate authored ``managed-settings.json``: the workspace is
-the source of truth, so an authored draft and the pulled copy are the same shape and coexist in
-``managed-state.json``. ``ucode setup`` authors the draft; ``ucode publish`` publishes it; a launch
-then pulls the published copy back into the same file.
+The workspace is the source of truth: an admin authors the ``CodingAgentConfig`` through the AI
+Gateway API or UI, and each launch pulls the published copy into ``managed-state.json``. ``ucode``
+only reads and applies it; it never authors or publishes.
 
 :func:`refresh_managed_config` is the launch path's entry point. It is called before model discovery,
 because the manifest decides whether that discovery is needed at all; the launch path then hands the

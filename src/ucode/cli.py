@@ -58,7 +58,6 @@ from ucode.databricks import (
     get_databricks_token,
     install_databricks_cli,
     is_model_provider_feature_unavailable,
-    is_workspace_admin,
     list_profile_entries,
     list_tool_provider_services,
     normalize_workspace_url,
@@ -89,15 +88,6 @@ from ucode.managed_resolve import (
     managed_unservable_models,
     recommended_agent,
     resolve_state,
-)
-from ucode.managed_wizard import (
-    publish_command,
-    setup_budget_policy_command,
-    setup_command,
-    setup_help_command,
-    setup_mcp_command,
-    setup_skills_command,
-    show_command,
 )
 from ucode.mcp import (
     MCP_CLIENTS,
@@ -1051,12 +1041,6 @@ mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ug.")
 skill_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(skill_app, name="skill", help="Databricks Skills for your coding tools.")
-setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
-app.add_typer(
-    setup_app,
-    name="setup",
-    help="Author the workspace's managed coding config (admins only). See `ug setup help`.",
-)
 
 
 def _version_callback(value: bool) -> None:
@@ -2284,7 +2268,7 @@ def _launch_managed_default(
         )
         return
     if not managed:
-        _print_no_managed_config_guidance(current, state.get("profile"))
+        _print_no_managed_config_guidance()
         return
     # The budget tier can move the org to a cheaper agent, so it outranks the config's
     # default_agent. Fetched here and handed to _launch_tool so it is read once per launch.
@@ -2308,22 +2292,12 @@ def _launch_managed_default(
     )
 
 
-def _print_no_managed_config_guidance(workspace: str, profile: str | None) -> None:
-    """Tell an admin how to publish a config, and everyone else who to ask."""
-    print_warning(
-        "No managed coding agent config was found for this workspace; using your local settings."
+def _print_no_managed_config_guidance() -> None:
+    """Point the developer at per-user configure when no managed config is published."""
+    print_note(
+        "No managed coding agent config is published for this workspace. Run `ug configure` to "
+        "set up your coding agents, then launch one with `ug <agent>` (for example `ug claude`)."
     )
-    try:
-        token = get_databricks_token(workspace, profile)
-    except RuntimeError:
-        return
-    with spinner("Checking your workspace permissions..."):
-        is_admin = is_workspace_admin(workspace, token)
-    if is_admin is False:
-        print_note("Ask a workspace admin to set one up with `ug setup`.")
-    else:
-        # None means the admin check itself failed; point at setup rather than a dead end.
-        print_note("Run `ug setup` to configure one for your workspace, then `ug publish`.")
 
 
 @app.command(
@@ -3007,162 +2981,6 @@ def configure_tracing(
         raise typer.Exit(130) from None
 
 
-@setup_app.callback(invoke_without_command=True)
-def setup(
-    ctx: typer.Context,
-    from_file: Annotated[
-        str | None,
-        typer.Option(
-            "--from-file",
-            help="Skip the interactive flow and load a hand-written managed config (JSON, in "
-            "ug's manifest shape) instead. Validated before it is saved.",
-        ),
-    ] = None,
-) -> None:
-    """Choose the agents and models for your workspace's managed config (admins only).
-
-    MCP servers, skills, and the tiered spend policy have their own commands — see `ug setup help`.
-    """
-    if ctx.invoked_subcommand is not None:
-        return
-    # `typer.Exit` subclasses RuntimeError, so it must be raised outside the try — inside, the
-    # `except RuntimeError` below would swallow it and report the exit code as an error message.
-    try:
-        install_databricks_cli()
-        code = setup_command(from_file=from_file)
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("mcps")
-def setup_mcp_cmd() -> None:
-    """Choose the MCP servers the managed config gives developers (admins only)."""
-    # Same `typer.Exit`/RuntimeError ordering trap as the `setup` callback above.
-    try:
-        install_databricks_cli()
-        code = setup_mcp_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("skills")
-def setup_skills_cmd(
-    location: Annotated[
-        str | None,
-        typer.Option(
-            "--location",
-            help="Skill schemas to publish as `<catalog>.<schema>` (comma-separated for several). "
-            "Skips the prompt.",
-        ),
-    ] = None,
-) -> None:
-    """Choose the skills the managed config gives developers (admins only)."""
-    try:
-        install_databricks_cli()
-        # None means "prompt"; an explicit `--location` is parsed to the list to publish.
-        locations = None if location is None else _parse_skill_locations(location)
-        code = setup_skills_command(locations)
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("spend-tiers")
-def setup_budget_policy_cmd() -> None:
-    """Route developers to cheaper agents as the workspace spends its budget (admins only)."""
-    try:
-        install_databricks_cli()
-        code = setup_budget_policy_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("help")
-def setup_help_cmd() -> None:
-    """Walk through the managed-config setup: every command, in order, and what's already done."""
-    # No auth and no CLI install: this reads the local draft only, so it works before `ucode
-    # configure` and on a machine without the Databricks CLI.
-    try:
-        code = setup_help_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@setup_app.command("show")
-def setup_show_cmd() -> None:
-    """Print the authored managed config and the payload `ug publish` would publish."""
-    try:
-        code = show_command()
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    if code:
-        raise typer.Exit(code)
-
-
-@app.command("publish")
-def publish_cmd(
-    file_path: Annotated[
-        str | None,
-        typer.Option(
-            "--file",
-            "-f",
-            help="Publish a config file exported with `ug export` instead of the locally "
-            "authored config. Its `workspace` must match the configured workspace.",
-        ),
-    ] = None,
-    yes: Annotated[
-        bool,
-        typer.Option("--yes", "-y", help="Publish without the confirmation prompt."),
-    ] = False,
-) -> None:
-    """Publish this workspace's managed coding config (workspace admins only).
-
-    Always validates the manifest before publishing (and shows what would change, then confirms), so
-    there is no separate dry-run: `ug setup` only ever writes a valid manifest, and a
-    hand-editing admin sees any error here before anything reaches the workspace.
-    """
-    # See the `setup` callback: `typer.Exit` subclasses RuntimeError, so it must be raised after
-    # the try block or the handler below would report a successful exit as an error.
-    try:
-        install_databricks_cli()
-        code = publish_command(file_path=file_path, yes=yes)
-    except RuntimeError as exc:
-        print_err(str(exc))
-        raise typer.Exit(1) from None
-    except KeyboardInterrupt:
-        print_err("Interrupted.")
-        raise typer.Exit(130) from None
-    if code:
-        raise typer.Exit(code)
-
-
 @app.command("export")
 def export_cmd(
     file_path: Annotated[
@@ -3177,11 +2995,10 @@ def export_cmd(
 ) -> None:
     """Export this workspace's managed coding-agent config as portable JSON.
 
-    Serializes the local managed config to the external `CodingAgentConfig` format that
-    `ug publish -f <path>` consumes, with credentials and server-owned fields (resource name,
-    workspace id, timestamps, user ids) excluded. Any user can run it; it makes no network calls
-    and mutates no workspace or local state. Without --file the JSON is printed to stdout;
-    diagnostics and errors go to stderr.
+    Serializes the local managed config to the external `CodingAgentConfig` proto-JSON format,
+    with credentials and server-owned fields (resource name, workspace id, timestamps, user ids)
+    excluded. Any user can run it; it makes no network calls and mutates no workspace or local
+    state. Without --file the JSON is printed to stdout; diagnostics and errors go to stderr.
     """
     from ucode.managed_export import export_command
 

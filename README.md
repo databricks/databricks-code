@@ -246,78 +246,6 @@ ucode skill add --location main.default --skills my-skill,other-skill
 ucode skill add --skills main.default.my-skill,main.default.other-skill
 ```
 
-### Managed config for a workspace (admins)
-
-Author the coding config your developers pick up automatically, instead of asking each of them to
-run `ug configure` by hand. Restricted to workspace admins. `ug setup help` prints the whole
-sequence; the short version is one command for the agents and models, then a command per optional
-section, then publish:
-
-```bash
-ug setup                 # agents and models (start here)
-ug setup mcps            # managed MCP servers
-ug setup skills          # managed skills
-ug setup spend-tiers     # spend-based routing
-ug publish                 # publish it to the workspace
-```
-
-`ug setup` walks through the agents to enable and which one bare `ug` launches, then per agent:
-Databricks-hosted models or an external Model Provider Service and the models to expose. Interactive
-Claude Code and Codex configuration installs gateway-critical values in the OS-managed settings
-scope so enterprise settings cannot silently override Unity Gateway. Non-interactive and CI runs use local
-files without invoking `sudo`, and stop with an actionable error if an existing managed value
-conflicts. Claude subscription relay is local-only because its loopback proxy exists only for that
-session.
-Claude Code is asked one model per family (opus/sonnet/haiku/fable), since it selects models by family
-alias; any family can be skipped.
-
-The optional sections each edit their own part of the same config, so you can add an MCP server or
-change a spend tier later without walking the whole flow. `ug setup skills --location
-main.default,other.schema` skips the prompt. `ug setup spend-tiers` sets a tiered spend policy
-that switches the default agent and model as the workspace burns through a budget. Each section
-command also offers to publish right away, so you can apply changes incrementally; answering the
-section prompts also runs the matching `ug configure` step, which does configure this machine.
-
-Everything is written to `~/.ucode/managed-state.json` — the one local managed-config file — which
-`ug publish` publishes. Re-running `ug setup` keeps the MCP servers, skills, tracing table, and
-tiered spend policy already authored, rather than clearing them; to drop one, edit the file and reload
-it with `ug setup --from-file`.
-
-```bash
-# Review the manifest and the exact payload `ug publish` would publish.
-ug setup show
-
-# Skip the prompts and load a hand-written config instead (validated before saving).
-ug setup --from-file ./managed-config.json
-```
-
-Once the manifest looks right, publish it:
-
-```bash
-# Validate, show a diff against what's live, and ask before publishing.
-ug publish
-
-# Publish without the confirmation prompt (for CI).
-ug publish --yes
-
-# Publish a config file exported with `ug export` instead of the locally authored one.
-ug publish -f ./managed-config.json
-ug publish --file ./managed-config.json --yes
-```
-
-`publish` updates the workspace's existing config in place rather than replacing it, so a failed
-publish leaves the current config intact. It shows a diff of exactly what changes against the
-published config before asking to confirm, and does nothing when the two already match. It is a
-whole-manifest write — every field ug authors is sent — but because `ug setup` carries the
-other sections forward, a re-run no longer silently drops them. Developers pick the new config up on
-their next ug run.
-
-With `-f`/`--file`, `publish` reads a config file produced by `ug export` and publishes it through
-the same validation, diff, and confirmation flow. The file's `workspace` must match the configured
-workspace (it can never redirect publication elsewhere) and its `spec_version` must be a supported
-integer; server-owned fields (resource name, workspace ids, timestamps, user ids) and unknown fields
-are rejected rather than silently dropped.
-
 ### Exporting the config
 
 Any user (not only admins) can print the workspace's managed config as portable JSON with `ug
@@ -325,8 +253,8 @@ export`. The output leads with the source `workspace` URL and a `spec_version` (
 version), followed by the canonical external config; credentials and server-assigned fields (the
 resource name, timestamps, user ids) are excluded. Without `--file` the JSON is written to stdout;
 with `--file`/`-f` the same bytes are written to a file (atomically, and the destination's parent
-directory must already exist) while stdout stays empty. The exported file is exactly what `ug
-publish -f <file>` consumes.
+directory must already exist) while stdout stays empty. The exported file is the portable
+`CodingAgentConfig` proto-JSON the AI Gateway API accepts.
 
 ```bash
 # Print the managed config as JSON.
@@ -383,16 +311,6 @@ The output looks like:
 | `ug skill add --location main.default --mcp` | Add schemas to the skills MCP scope, keeping any already configured (additive; never replaces) |
 | `ug skill add --location main.default` | Download a schema's skills to disk without removing existing downloads |
 | `ug skill add --skills main.default.my-skill` | Download a named subset of skills (bare names need `--location`; fully-qualified names stand alone) |
-| `ug setup` | Author the managed config's agents and models (workspace admins only) |
-| `ug setup mcps` | Add or change the managed config's MCP servers |
-| `ug setup skills [--location a.b,c.d]` | Add or change the managed config's skills |
-| `ug setup spend-tiers` | Set the managed config's tiered spend routing policy |
-| `ug setup help` | Walk through the whole setup sequence, marking what's already configured |
-| `ug setup show` | Print the authored config and the payload `ug publish` would publish |
-| `ug setup --from-file <file>` | Load a hand-written managed config instead of running the prompts |
-| `ug publish` | Publish the authored managed config to the workspace, after a diff and confirmation (admins only) |
-| `ug publish -f <file>` | Publish a config file exported with `ug export` instead of the locally authored one |
-| `ug publish --yes` | Publish without the confirmation prompt |
 
 Databricks AI Tools are installed only by `ug configure`, never by `ug <agent>` launches.
 Use `--enable-databricks-ai-tools` or `--disable-databricks-ai-tools` with `ug configure` to
@@ -413,7 +331,7 @@ control the installation.
 | `~/.copilot/.env` | GitHub Copilot CLI |
 | `~/.pi/agent/models.json` | Pi |
 | `~/.cursor/mcp.json` | Cursor Agent (MCP servers only) |
-| `~/.ucode/managed-state.json` | The managed config — authored by `ug setup` (admins) and refreshed from the workspace on launch |
+| `~/.ucode/managed-state.json` | The managed config (published by an admin through the AI Gateway) refreshed from the workspace on launch |
 | `~/.ucode/managed-backups/` | Baseline backups for OS-managed files changed by ug |
 
 Existing files are backed up before being overwritten. `ug revert` restores backups.

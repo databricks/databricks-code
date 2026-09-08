@@ -1,10 +1,9 @@
 """`ucode export`: serialize the workspace's managed coding-agent config to portable JSON.
 
-Reads the local managed config (the one file :mod:`ucode.managed_config` owns, authored by
-``ucode setup`` and refreshed by a launch), validates and serializes it through the same path
-``ucode publish`` uses, and writes the external proto-JSON ``CodingAgentConfig`` — prefixed with the
-source ``workspace`` and a ``spec_version`` envelope, the format ``ucode publish -f <path>`` consumes
-— to stdout or a file.
+Reads the local managed config (the one file :mod:`ucode.managed_config` owns, populated when a
+launch refreshes it from the workspace), validates and serializes it to the external proto-JSON
+``CodingAgentConfig`` (prefixed with the source ``workspace`` and a ``spec_version`` envelope) to
+stdout or a file.
 
 Deliberately read-only and offline: no auth, no admin check, no discovery, no publish, and no write
 except the explicitly requested ``--file`` output. That makes it role-agnostic (any developer can
@@ -40,8 +39,8 @@ def build_export_payload() -> dict:
     manifest = load_managed_state(workspace)
     if not manifest:
         raise RuntimeError(
-            "No managed coding-agent config found locally. Run `ug setup` to author one, or run "
-            "`ug` against a workspace that publishes one, then re-run `ug export`."
+            "No managed coding-agent config found locally. Run `ug` against a workspace that "
+            "publishes one, then re-run `ug export`."
         )
     errors = validate_manifest(manifest, None)
     if errors:
