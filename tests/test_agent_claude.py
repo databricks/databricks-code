@@ -236,6 +236,14 @@ class TestRenderOverlay:
         assert "apiKeyHelper" in overlay
         assert WS in overlay["apiKeyHelper"]
 
+    def test_api_key_helper_pins_a_custom_oauth_app(self):
+        overlay, _ = claude.render_overlay(WS, "s4", oauth_client_id="custom-app-id")
+        assert "--oauth-client-id custom-app-id" in overlay["apiKeyHelper"]
+
+    def test_api_key_helper_omits_the_flag_without_a_custom_app(self):
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert "--oauth-client-id" not in overlay["apiKeyHelper"]
+
     def test_relayed_omits_api_key_helper(self):
         # Claude Code's own subscription OAuth must own Authorization; an
         # apiKeyHelper would outrank it.
@@ -761,6 +769,15 @@ class TestWriteToolConfigManagedSettings:
         assert written["env"]["MY_OWN"] == "keep"
         assert written["env"]["ANTHROPIC_BASE_URL"]
         assert written["apiKeyHelper"]
+
+    def test_written_settings_pin_the_workspace_custom_oauth_app(self, monkeypatch):
+        private_writes: list = []
+        managed_writes: list = []
+        self._patch(monkeypatch, private_writes, managed_writes, {})
+        state = {"workspace": WS, "codex_models": [], "oauth_client_id": "custom-app-id"}
+        claude.write_tool_config(state, "databricks-claude-sonnet-4")
+        _, payload = private_writes[0]
+        assert "--oauth-client-id custom-app-id" in payload["apiKeyHelper"]
 
     def test_managed_file_strips_stale_gateway_model_discovery(self, monkeypatch):
         private_writes: list = []

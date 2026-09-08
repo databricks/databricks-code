@@ -42,6 +42,7 @@ from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
 from ucode.config_io import is_dry_run, restore_file, set_dry_run
 from ucode.databricks import (
+    OAUTH_CLIENT_ID_STATE_KEY,
     apply_pat_environment,
     build_shared_base_urls,
     discover_claude_models,
@@ -520,6 +521,7 @@ def configure_shared_state(
     skip_preflight: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    oauth_client_id: str | None = None,
 ) -> dict:
     """Log into Databricks, verify AI Gateway, fetch model lists, persist state.
 
@@ -543,12 +545,16 @@ def configure_shared_state(
     ``ANTHROPIC_DEFAULT_FABLE_MODEL`` pin (default off). ``None`` means "inherit":
     a launch re-run keeps whatever the workspace was configured with; ``True``/
     ``False`` come from an explicit ``configure --enable-fable``/``--disable-fable``.
+    ``oauth_client_id`` selects a custom app. ``None`` inherits the saved value;
+    an empty string clears it.
     """
     workspace = normalize_workspace_url(workspace)
     prior_state = load_state()
     previous_workspace = prior_state.get("workspace")
     if use_pat is None:
         use_pat = bool(prior_state.get("use_pat")) and previous_workspace == workspace
+    if oauth_client_id is None and previous_workspace == workspace:
+        oauth_client_id = prior_state.get(OAUTH_CLIENT_ID_STATE_KEY)
     if fable_enabled is None:
         fable_enabled = bool(prior_state.get("fable_enabled")) and previous_workspace == workspace
     if databricks_ai_tools_enabled is None:
@@ -582,6 +588,10 @@ def configure_shared_state(
         state["use_pat"] = True
     else:
         state.pop("use_pat", None)
+    if oauth_client_id:
+        state[OAUTH_CLIENT_ID_STATE_KEY] = oauth_client_id
+    else:
+        state.pop(OAUTH_CLIENT_ID_STATE_KEY, None)
     # Persist the Fable opt-in so launches keep pinning the family; an explicit
     # `configure --disable-fable` (fable_enabled=False) clears it.
     if fable_enabled:
@@ -609,6 +619,7 @@ def configure_shared_state(
 
     # ── Preflight (bypassed above under --skip-preflight): validate Databricks
     #    auth + the AI Gateway, then discover the available models. ──
+    auth_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
     if use_pat:
         if not profile:
             raise RuntimeError(
@@ -627,11 +638,11 @@ def configure_shared_state(
         # empty one as absent, so it never shadows the PAT. Pass the validated
         # token to avoid re-reading ~/.databrickscfg.
         ensure_pat_bearer(profile, pat)
-        ensure_databricks_auth(workspace, profile)
+        ensure_databricks_auth(workspace, profile, **auth_kwargs)
     elif force_login:
-        run_databricks_login(workspace, profile)
+        run_databricks_login(workspace, profile, **auth_kwargs)
     else:
-        ensure_databricks_auth(workspace, profile)
+        ensure_databricks_auth(workspace, profile, **auth_kwargs)
     # After login the profile exists in ~/.databrickscfg, so a host->profile
     # lookup is reliable even when it returned nothing above.
     if profile is None:
@@ -639,7 +650,7 @@ def configure_shared_state(
         if profile:
             state["profile"] = profile
     with spinner("Verifying Unity AI Gateway..."):
-        token = get_databricks_token(workspace, profile)
+        token = get_databricks_token(workspace, profile, **auth_kwargs)
         model_service_probe = probe_unity_gateway_capabilities(workspace, token)
     if model_service_probe.resource_available:
         print_success("Unity AI Gateway connected")
@@ -753,10 +764,12 @@ def _configure_shared_workspace_states(
     use_pat: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    oauth_client_id: str | None = None,
 ) -> list[dict]:
     if not workspaces:
         raise RuntimeError("At least one workspace must be provided.")
     states: list[dict] = []
+    oauth_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id is not None else {}
     for workspace, profile in workspaces:
         states.append(
             configure_shared_state(
@@ -767,6 +780,7 @@ def _configure_shared_workspace_states(
                 use_pat=use_pat,
                 fable_enabled=fable_enabled,
                 databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+                **oauth_kwargs,
             )
         )
     return states
@@ -849,6 +863,7 @@ def configure_workspace_command(
     skip_unavailable: bool = False,
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
+    oauth_client_id: str | None = None,
     offer_optional_setup: bool = False,
 ) -> int:
     if tool is not None and selected_tools is not None:
@@ -869,6 +884,7 @@ def configure_workspace_command(
             use_pat=use_pat,
             fable_enabled=fable_enabled,
             databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+            oauth_client_id=oauth_client_id,
         )
         state = states[0]
         state = configure_single_tool(tool, state)
@@ -908,6 +924,7 @@ def configure_workspace_command(
         use_pat=use_pat,
         fable_enabled=fable_enabled,
         databricks_ai_tools_enabled=databricks_ai_tools_enabled,
+        oauth_client_id=oauth_client_id,
     )
     state = states[0]
     save_state(state)
@@ -1726,14 +1743,16 @@ def claude_router_hook_cmd(
         sys.stdout.write(json.dumps(output))
 
 
-def _auto_configure_tool(tool: str) -> None:
+def _auto_configure_tool(tool: str, oauth_client_id: str | None = None) -> None:
     """First-time setup for a single tool — mirrors configure_workspace_command."""
     existing = load_state()
     workspace = existing.get("workspace")
     profile = existing.get("profile")
     if not workspace:
         workspace, profile = _prompt_for_configuration(tool)
-    state = configure_shared_state(workspace, profile=profile, tools=[tool])
+    state = configure_shared_state(
+        workspace, profile=profile, tools=[tool], oauth_client_id=oauth_client_id
+    )
 
     state = configure_single_tool(tool, state)
 
@@ -1994,12 +2013,19 @@ def _can_launch_from_cached_config(
     model: str | None,
     explicit_provider: str | None,
     workspace_url: str | None,
+    oauth_client_id: str | None = None,
 ) -> bool:
     """Return whether a normal Claude/Codex launch can use its cached config."""
     if tool not in CAN_USE_CACHED_CONFIG_AGENTS:
         return False
 
     if refresh or model or explicit_provider is not None:
+        return False
+
+    # Reconfigure when the requested app differs from the cached helper.
+    if oauth_client_id is not None and oauth_client_id != (
+        state.get(OAUTH_CLIENT_ID_STATE_KEY) or ""
+    ):
         return False
 
     if tool == "codex" and smart_routing_v2.enabled():
@@ -2037,6 +2063,7 @@ def _launch_tool(
     managed: dict | None = None,
     recommendation: dict | None = None,
     model: str | None = None,
+    oauth_client_id: str | None = None,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
@@ -2064,7 +2091,10 @@ def _launch_tool(
         )
         ensure_bootstrap_dependencies(tool, update_existing=needs_auto_configure)
         if needs_auto_configure:
-            _auto_configure_tool(tool)
+            if oauth_client_id is None:
+                _auto_configure_tool(tool)
+            else:
+                _auto_configure_tool(tool, oauth_client_id=oauth_client_id)
         state = ensure_provider_state(tool)
         # Remembered before the fallback below collapses the two cases: a managed config may not
         # silently override a provider the user typed on the command line (it errors instead).
@@ -2080,6 +2110,7 @@ def _launch_tool(
             model=model,
             explicit_provider=explicit_provider,
             workspace_url=workspace_url,
+            oauth_client_id=oauth_client_id,
         ):
             print_section(_launch_title(tool))
             if forwarded_model:
@@ -2102,12 +2133,14 @@ def _launch_tool(
         # tools like pi which read multiple model bundles never run on
         # stale state from before a tool added a new bundle). Under a provider
         # this heavy discovery is skipped (only a web-search model is fetched).
+        oauth_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id is not None else {}
         state = configure_shared_state(
             state["workspace"],
             profile=state.get("profile"),
             tools=[tool],
             skip_model_discovery=bool(provider) or managed_models_known,
             skip_preflight=skip_preflight,
+            **oauth_kwargs,
         )
         # An admin-published managed config wins over the developer's own settings. Layered on after
         # `configure_shared_state`, whose returned state it overrides, and before the provider and
@@ -2361,6 +2394,16 @@ WorkspaceOption = Annotated[
     ),
 ]
 
+OauthClientIdOption = Annotated[
+    str | None,
+    typer.Option(
+        "--oauth-client-id",
+        help="Authenticate with this custom OAuth app instead of the built-in `databricks-cli` "
+        "app, and remember it for this workspace. Pass an empty string to go back to the "
+        "built-in app.",
+    ),
+]
+
 
 @app.callback(invoke_without_command=True)
 def default(
@@ -2571,6 +2614,7 @@ def claude_cmd(
     skip_preflight: SkipPreflightOption = False,
     skip_managed_config: SkipManagedConfigOption = False,
     workspace: WorkspaceOption = None,
+    oauth_client_id: OauthClientIdOption = None,
     enable_model_discovery: Annotated[
         bool,
         typer.Option(
@@ -2615,6 +2659,7 @@ def claude_cmd(
             refresh=refresh,
             skip_preflight=skip_preflight,
             workspace_url=workspace,
+            oauth_client_id=oauth_client_id,
         )
 
 
@@ -2761,6 +2806,7 @@ def configure(
             "CI / headless environments.",
         ),
     ] = False,
+    oauth_client_id: OauthClientIdOption = None,
     skip_validate: Annotated[
         bool,
         typer.Option(
@@ -2887,6 +2933,8 @@ def configure(
             skip_kwargs["use_pat"] = True
         if skip_validate:
             skip_kwargs["skip_validate"] = True
+        if oauth_client_id is not None:
+            skip_kwargs["oauth_client_id"] = oauth_client_id
         # Only forward the Fable opt-in when the user passed the flag; `None`
         # (neither flag given) lets configure_shared_state inherit the prior
         # workspace setting instead of clobbering it.
@@ -2955,6 +3003,7 @@ def configure(
                     tools=[],
                     force_login=not use_pat,
                     use_pat=use_pat,
+                    oauth_client_id=oauth_client_id,
                 )
             else:
                 # Neither model agents nor cursor -> empty/invalid --agents list.
@@ -2971,6 +3020,7 @@ def configure(
                 tools=[],
                 force_login=not use_pat,
                 use_pat=use_pat,
+                oauth_client_id=oauth_client_id,
             )
         else:
             # Tool binaries are installed after the user picks which agents

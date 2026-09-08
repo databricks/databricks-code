@@ -360,6 +360,7 @@ def render_overlay(
     relayed_base_url: str | None = None,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    oauth_client_id: str | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Claude settings.json.
 
@@ -477,7 +478,9 @@ def render_overlay(
     if relayed:
         keys = [["env", k] for k in env]
     else:
-        overlay["apiKeyHelper"] = build_auth_shell_command(workspace, profile, use_pat=use_pat)
+        overlay["apiKeyHelper"] = build_auth_shell_command(
+            workspace, profile, use_pat=use_pat, oauth_client_id=oauth_client_id
+        )
         keys = [["apiKeyHelper"]] + [["env", k] for k in env]
 
     # Disable Claude Code's built-in WebSearch: it declares Anthropic's hosted
@@ -641,6 +644,7 @@ def write_tool_config(
         relayed_base_url=relayed_base_url,
         route_root_model=route_root_model,
         custom_model=custom_model,
+        oauth_client_id=state.get("oauth_client_id"),
     )
     tracing_env_vars = tracing_env(state, "claude")
     stop_hook_command = claude_tracing_stop_hook_command() if tracing_env_vars else None
