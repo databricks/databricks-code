@@ -531,7 +531,6 @@ class TestSubcommandRouting:
             patch("ucode.cli.ensure_bootstrap_dependencies"),
             patch("ucode.cli.load_state", return_value=state),
             patch("ucode.cli.ensure_provider_state", return_value=state),
-            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
             patch("ucode.cli.configure_shared_state", return_value=state),
             patch(
                 "ucode.cli.resolve_launch_model",
@@ -619,7 +618,6 @@ class TestSubcommandRouting:
             patch("ucode.cli.ensure_bootstrap_dependencies"),
             patch("ucode.cli.load_state", return_value=state),
             patch("ucode.cli.ensure_provider_state", return_value=state),
-            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
             patch("ucode.cli.configure_shared_state", return_value=state),
             patch(
                 "ucode.cli.resolve_launch_model",
@@ -787,7 +785,6 @@ class TestClaudeModelFlag:
             patch("ucode.cli.ensure_bootstrap_dependencies"),
             patch("ucode.cli.load_state", return_value=state),
             patch("ucode.cli.ensure_provider_state", return_value=state),
-            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
             patch("ucode.cli.configure_shared_state", return_value=state),
             patch(
                 "ucode.cli.resolve_launch_model",
@@ -1195,7 +1192,6 @@ class TestStatus:
         assert "https://example.databricks.com/ai-gateway/gemini" not in result.output
 
     def test_status_shows_managed_config_box_when_present_and_enabled(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         managed = {
             "enabled_agents": {"claude": {}, "codex": {}},
             "mcp_servers": [{"name": "github-mcp", "type": "external"}],
@@ -1213,22 +1209,7 @@ class TestStatus:
         assert "github-mcp" in result.output
         assert "debug-ci" in result.output
 
-    def test_status_hides_managed_config_box_when_feature_disabled(self, monkeypatch):
-        monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
-        managed = {"enabled_agents": {"claude": {}}}
-        with (
-            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.load_managed_state", return_value=managed) as load_managed,
-        ):
-            result = runner.invoke(app, ["status"])
-
-        assert result.exit_code == 0, result.output
-        assert "Workspace-managed config" not in result.output
-        # Feature off: the managed cache is never consulted.
-        load_managed.assert_not_called()
-
     def test_status_hides_managed_config_box_when_none_present(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         with (
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
             patch("ucode.cli.load_managed_state", return_value=None),
@@ -1682,66 +1663,6 @@ class TestDoctorCommand:
 
 
 class TestAutoConfigureOnFirstRun:
-    def test_uses_existing_claude_settings_without_preflight(self, tmp_path):
-        from pathlib import Path
-
-        settings_path = tmp_path / "ucode-settings.json"
-        settings_path.write_text("{}", encoding="utf-8")
-        with (
-            patch("ucode.cli.ensure_bootstrap_dependencies"),
-            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.configure_shared_state") as mock_preflight,
-            patch("ucode.cli.configure_tool") as mock_configure,
-            patch("ucode.cli.claude_agent.CLAUDE_SETTINGS_PATH", Path(settings_path)),
-            patch("ucode.cli.launch_agent") as mock_launch,
-        ):
-            result = runner.invoke(app, ["claude"])
-
-        assert result.exit_code == 0, result.output
-        mock_preflight.assert_not_called()
-        mock_configure.assert_not_called()
-        mock_launch.assert_called_once()
-
-    def test_uses_existing_codex_config_without_preflight(self):
-        with (
-            patch("ucode.cli.ensure_bootstrap_dependencies"),
-            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.configure_shared_state") as mock_preflight,
-            patch("ucode.cli.configure_tool") as mock_configure,
-            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
-            patch("ucode.cli.install_databricks_ai_tools_for_agents") as mock_ai_tools,
-            patch("ucode.cli.launch_agent") as mock_launch,
-        ):
-            result = runner.invoke(app, ["codex"])
-
-        assert result.exit_code == 0, result.output
-        mock_preflight.assert_not_called()
-        mock_configure.assert_not_called()
-        mock_ai_tools.assert_not_called()
-        mock_launch.assert_called_once()
-
-    def test_workspace_flag_uses_cached_codex_config_without_preflight(self):
-        with (
-            patch("ucode.cli.ensure_bootstrap_dependencies"),
-            patch("ucode.cli.set_current_workspace") as mock_set_workspace,
-            patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli.configure_shared_state") as mock_preflight,
-            patch("ucode.cli.configure_tool") as mock_configure,
-            patch("ucode.cli.smart_routing_v2.enabled", return_value=False),
-            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
-            patch("ucode.cli.launch_agent") as mock_launch,
-        ):
-            result = runner.invoke(app, ["codex", "--workspace", "https://example.databricks.com/"])
-
-        assert result.exit_code == 0, result.output
-        mock_set_workspace.assert_called_once_with("https://example.databricks.com")
-        mock_preflight.assert_not_called()
-        mock_configure.assert_not_called()
-        mock_launch.assert_called_once()
-
     def test_triggers_when_no_workspace(self):
         """Auto-configure runs when state has no workspace."""
         empty_state = {}
@@ -1844,178 +1765,6 @@ def test_cursor_launch_uses_unity_gateway_branding():
 
     assert result.exit_code == 0, result.output
     assert "Unity Gateway with Cursor" in result.output
-
-
-class TestCachedConfigPredicate:
-    @staticmethod
-    def _kwargs(**overrides):
-        kwargs = {
-            "refresh": False,
-            "model": None,
-            "explicit_provider": None,
-            "workspace_url": None,
-        }
-        kwargs.update(overrides)
-        return kwargs
-
-    def test_accepts_configured_codex_launch(self):
-        import ucode.cli as cli_mod
-
-        with (
-            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
-            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
-            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=True),
-        ):
-            assert (
-                cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
-                is True
-            )
-
-        with (
-            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
-            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
-            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=False),
-        ):
-            assert (
-                cli_mod._can_launch_from_cached_config("codex", MINIMAL_STATE, **self._kwargs())
-                is False
-            )
-
-    def test_accepts_claude_only_when_managed_settings_are_verified(self, tmp_path):
-        import ucode.cli as cli_mod
-
-        settings_path = tmp_path / "ucode-settings.json"
-        settings_path.write_text("{}", encoding="utf-8")
-        with (
-            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
-            patch("ucode.cli.claude_agent.CLAUDE_SETTINGS_PATH", settings_path),
-            patch("ucode.cli.claude_agent.managed_settings_are_current", return_value=True),
-        ):
-            assert (
-                cli_mod._can_launch_from_cached_config("claude", MINIMAL_STATE, **self._kwargs())
-                is True
-            )
-
-        with (
-            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
-            patch("ucode.cli.claude_agent.CLAUDE_SETTINGS_PATH", settings_path),
-            patch("ucode.cli.claude_agent.managed_settings_are_current", return_value=False),
-        ):
-            assert (
-                cli_mod._can_launch_from_cached_config("claude", MINIMAL_STATE, **self._kwargs())
-                is False
-            )
-
-    def test_accepts_codex_v2_launch_with_complete_model_cache(self, monkeypatch):
-        import ucode.cli as cli_mod
-
-        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
-        state = {
-            **MINIMAL_STATE,
-            "codex_models": ["system.ai.gpt-5-6-sol"],
-            "oss_models": ["system.ai.glm-5-2"],
-        }
-        with (
-            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
-            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
-            patch("ucode.cli.codex_agent.managed_config_is_current", return_value=True),
-        ):
-            assert cli_mod._can_launch_from_cached_config("codex", state, **self._kwargs()) is True
-
-    @pytest.mark.parametrize(
-        ("incomplete_key", "value"),
-        [
-            ("codex_models", None),
-            ("codex_models", []),
-            ("oss_models", None),
-            ("oss_models", []),
-        ],
-    )
-    def test_rejects_codex_v2_launch_with_incomplete_model_cache(
-        self, monkeypatch, incomplete_key, value
-    ):
-        import ucode.cli as cli_mod
-
-        monkeypatch.setenv("ENABLE_SMART_ROUTING_V2", "1")
-        state = {
-            **MINIMAL_STATE,
-            "codex_models": ["system.ai.gpt-5-6-sol"],
-            "oss_models": ["system.ai.glm-5-2"],
-        }
-        if value is None:
-            state.pop(incomplete_key)
-        else:
-            state[incomplete_key] = value
-        with patch("ucode.cli.managed_agent_config_enabled", return_value=False):
-            assert cli_mod._can_launch_from_cached_config("codex", state, **self._kwargs()) is False
-
-    @pytest.mark.parametrize(
-        "override",
-        [
-            {"refresh": True},
-            {"explicit_provider": "catalog.schema.provider"},
-            {"workspace_url": "https://other.databricks.com"},
-        ],
-    )
-    def test_rejects_dynamic_launch_overrides(self, override):
-        import ucode.cli as cli_mod
-
-        with (
-            patch("ucode.cli.managed_agent_config_enabled", return_value=False),
-            patch("ucode.cli.codex_agent.has_ucode_config", return_value=True),
-        ):
-            assert (
-                cli_mod._can_launch_from_cached_config(
-                    "codex", MINIMAL_STATE, **self._kwargs(**override)
-                )
-                is False
-            )
-
-
-class TestPassthroughArgs:
-    @pytest.mark.parametrize(
-        "tool,extra_args",
-        [
-            ("claude", ["-r"]),
-            ("claude", ["--resume"]),
-            ("codex", ["--full-auto"]),
-            ("gemini", ["--debug"]),
-            ("opencode", ["--model", "my-model"]),
-            ("claude", ["-r", "--some-flag", "value"]),
-        ],
-    )
-    def test_extra_args_forwarded(self, tool, extra_args):
-        patches = _patch_launch(tool)
-        with (
-            patches[0],
-            patches[1],
-            patches[2],
-            patches[3],
-            patches[4],
-            patches[5],
-            patches[6],
-            patches[7] as mock_launch,
-        ):
-            result = runner.invoke(app, [tool, *extra_args])
-        assert result.exit_code == 0, result.output
-        forwarded = mock_launch.call_args[0][2]
-        assert forwarded == extra_args
-
-    def test_no_extra_args_passes_empty_list(self):
-        patches = _patch_launch("claude")
-        with (
-            patches[0],
-            patches[1],
-            patches[2],
-            patches[3],
-            patches[4],
-            patches[5],
-            patches[6],
-            patches[7] as mock_launch,
-        ):
-            runner.invoke(app, ["claude"])
-        forwarded = mock_launch.call_args[0][2]
-        assert forwarded == []
 
 
 class TestConfigureAgentFlag:
@@ -3501,7 +3250,6 @@ class TestSkipPreflightFlag:
             patch("ucode.cli._auto_configure_tool"),
             patch("ucode.cli.load_state", return_value=MINIMAL_STATE),
             patch("ucode.cli.ensure_provider_state", return_value=MINIMAL_STATE),
-            patch("ucode.cli._can_launch_from_cached_config", return_value=False),
             patch("ucode.cli.configure_shared_state", cfg),
             patch("ucode.cli.codex_agent.has_ucode_config", return_value=False),
             patch(
@@ -3568,37 +3316,14 @@ class TestFetchManagedConfig:
         return cli_mod._fetch_managed_config(state)
 
     def test_fetches_fresh_when_enabled(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr(
             "ucode.cli.refresh_managed_config", lambda state: ({"enabled_agents": {}}, False)
         )
         assert self._fetch({"workspace": "https://w"}) == ({"enabled_agents": {}}, False)
 
-    @pytest.mark.parametrize("env_value", [None, "", "0", "off", "no"])
-    def test_disabled_reads_nothing_at_all(self, monkeypatch, env_value):
-        """While the feature is opt-in, a disabled launch must not read the config or the network."""
-        if env_value is None:
-            monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
-        else:
-            monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", env_value)
-        for name in ("refresh_managed_config", "load_managed_state"):
-            monkeypatch.setattr(
-                f"ucode.cli.{name}",
-                lambda *a, called=name, **k: pytest.fail(f"{called} must not run when disabled"),
-            )
-        assert self._fetch({"workspace": "https://w"}) == (None, False)
-
-    def test_skip_managed_config_makes_the_fetch_a_no_op(self, monkeypatch):
-        # --skip-managed-config clears the enabling env var, so the read behaves as feature-off:
-        # no fetch, no cache read, no network — just None.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config", lambda state: pytest.fail("should not fetch")
-        )
-        import ucode.cli as cli_mod
-
-        cli_mod._disable_managed_config_if_requested(True)
-        assert self._fetch({"workspace": "https://w"}) == (None, False)
+    def test_feature_disabled_returns_none_and_the_flag(self, monkeypatch):
+        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, True))
+        assert self._fetch({"workspace": "https://w"}) == (None, True)
 
 
 class TestManagedConfigDecidesDiscoveryFromFreshRead:
@@ -3609,7 +3334,6 @@ class TestManagedConfigDecidesDiscoveryFromFreshRead:
         models. Deciding from that cache would skip discovery for a config that no longer supplies
         models, so the launch would have neither.
         """
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         stale_cache = {
             "enabled_agents": {"claude": {"model_config": {"models": {"default_opus_model": "m"}}}}
         }
@@ -3634,372 +3358,6 @@ class TestManagedConfigDecidesDiscoveryFromFreshRead:
         assert mock_shared.call_args.kwargs["skip_model_discovery"] is False
 
 
-class TestConfigureDeprecation:
-    """`ucode configure` resolves the target workspace first, authenticates, then branches on the
-    caller's role and whether the workspace already publishes a managed config (AIGTWY-4338)."""
-
-    @pytest.fixture(autouse=True)
-    def _stub_auth(self, monkeypatch):
-        # The resolver authenticates up front (before the config read and admin check); keep that a
-        # no-op so these tests never touch a real Databricks login.
-        monkeypatch.setattr("ucode.cli.ensure_databricks_auth", lambda *a, **k: None)
-
-    @staticmethod
-    def _resolve(entries=None):
-        import ucode.cli as cli_mod
-
-        return cli_mod._resolve_workspace_then_maybe_reject(entries)
-
-    @staticmethod
-    def _stub_admin(monkeypatch, value):
-        """Stub the best-effort admin check the has-config branch runs (token + SCIM)."""
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: value)
-
-    @staticmethod
-    def _stub_setup(monkeypatch):
-        """Replace ``setup_command`` with a recorder returning exit code 0."""
-        setup_calls: list[dict] = []
-        monkeypatch.setattr(
-            "ucode.cli.setup_command", lambda **kwargs: setup_calls.append(kwargs) or 0
-        )
-        return setup_calls
-
-    def test_non_admin_with_config_confirms_and_exits(self, monkeypatch, capsys):
-        # A non-admin on a managed workspace has nothing to configure locally — the launch path
-        # applies the config every run. Configure just shows what's in force and points at `ucode`;
-        # it must not route into setup or write anything.
-        import typer
-
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: ({"enabled_agents": {"claude": {}}}, False),
-        )
-        self._stub_admin(monkeypatch, False)
-        monkeypatch.setattr(
-            "ucode.cli.setup_command",
-            lambda **kwargs: pytest.fail("a non-admin must not be routed into setup"),
-        )
-        with pytest.raises(typer.Exit) as exc:
-            self._resolve([("https://w", None)])
-        assert exc.value.exit_code == 0
-        out = capsys.readouterr().out
-        assert "you're all set" in out
-        assert "Run `ug`" in out
-
-    def test_fetches_the_config_rather_than_reading_a_cold_cache(self, monkeypatch):
-        # The gap this guards: on a fresh machine the local cache is empty until the first launch,
-        # so a cache read would miss a config the workspace does publish. The resolver must fetch.
-        import typer
-
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
-        # Cold cache — a cache read would wrongly fall through to the local configure flow.
-        monkeypatch.setattr("ucode.cli.load_managed_state", lambda ws: None)
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: ({"enabled_agents": {"claude": {}}}, False),
-        )
-        self._stub_admin(monkeypatch, False)
-        with pytest.raises(typer.Exit) as exc:
-            self._resolve([("https://w", None)])
-        assert exc.value.exit_code == 0
-
-    def test_admin_with_config_runs_setup(self, monkeypatch):
-        # An admin on a workspace that already has a config is dropped into setup — whose
-        # existing-config menu offers re-author/delete — rather than the confirm-only path.
-        import typer
-
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: ({"enabled_agents": {"claude": {}}}, False),
-        )
-        self._stub_admin(monkeypatch, True)
-        setup_calls = self._stub_setup(monkeypatch)
-        with pytest.raises(typer.Exit) as exc:
-            self._resolve([("https://w", None)])
-        assert exc.value.exit_code == 0
-        assert setup_calls == [
-            {
-                "workspace": "https://w",
-                "profile": None,
-                "command_label": "Configure unity-gateway CLI",
-                "token": "tok",
-            }
-        ]
-
-    def test_admin_status_unknown_with_config_confirms_without_setup(self, monkeypatch):
-        # `is_workspace_admin` returns None when the SCIM check fails; treat as non-admin and take
-        # the confirm path rather than routing an unverifiable caller into the admin-only setup flow.
-        import typer
-
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: ({"enabled_agents": {"claude": {}}}, False),
-        )
-        self._stub_admin(monkeypatch, None)
-        monkeypatch.setattr(
-            "ucode.cli.setup_command",
-            lambda **kwargs: pytest.fail("unknown admin status must not route into setup"),
-        )
-        with pytest.raises(typer.Exit) as exc:
-            self._resolve([("https://w", None)])
-        assert exc.value.exit_code == 0
-
-    def test_token_failure_with_config_confirms_without_checking_admin(self, monkeypatch):
-        # A token failure must not block the confirm path for a config the workspace does publish.
-        import typer
-
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: ({"enabled_agents": {"claude": {}}}, False),
-        )
-
-        def _boom(ws, profile=None):
-            raise RuntimeError("no token")
-
-        monkeypatch.setattr("ucode.cli.get_databricks_token", _boom)
-        monkeypatch.setattr(
-            "ucode.cli.is_workspace_admin",
-            lambda ws, tok: pytest.fail("admin check needs a token"),
-        )
-        monkeypatch.setattr(
-            "ucode.cli.setup_command", lambda **kwargs: pytest.fail("no setup without a token")
-        )
-        with pytest.raises(typer.Exit) as exc:
-            self._resolve([("https://w", None)])
-        assert exc.value.exit_code == 0
-
-    @staticmethod
-    def _stub_not_admin(monkeypatch):
-        # No managed config -> the resolver now checks admin status; keep the developer case simple.
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: False)
-
-    def test_prompts_for_the_workspace_before_checking_the_config(self, monkeypatch):
-        # The whole point: even under a managed config the developer can still switch workspaces,
-        # so the prompt runs (and the picked workspace is made current) before the config check.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        picked = []
-        monkeypatch.setattr(
-            "ucode.cli._prompt_for_configuration", lambda tool=None: ("https://picked", None)
-        )
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: picked.append(ws))
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
-        self._stub_not_admin(monkeypatch)
-        entries = self._resolve(None)
-        assert picked == ["https://picked"]
-        assert entries == [("https://picked", None)]
-
-    def test_returns_flag_entries_and_proceeds_without_a_managed_config(self, monkeypatch):
-        # Setting up a new workspace still goes through `ucode configure`, so hand the resolved
-        # workspace back to the caller instead of re-prompting.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
-        self._stub_not_admin(monkeypatch)
-        entries = self._resolve([("https://w", None)])
-        assert entries == [("https://w", None)]
-
-    def test_admin_with_no_config_runs_setup_in_place(self, monkeypatch):
-        # `configure` is replacing `setup`: an admin on a config-less workspace is dropped straight
-        # into the setup authoring flow (reusing the resolved workspace/profile) and the command
-        # exits with setup's own status code — no prompt, no fall-through to the manual flow.
-        import typer
-
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
-        setup_calls: list[dict] = []
-        monkeypatch.setattr(
-            "ucode.cli.setup_command",
-            lambda **kwargs: setup_calls.append(kwargs) or 0,
-        )
-        with pytest.raises(typer.Exit) as exc:
-            self._resolve([("https://w", None)])
-        assert exc.value.exit_code == 0
-        assert setup_calls == [
-            {
-                "workspace": "https://w",
-                "profile": None,
-                "command_label": "Configure unity-gateway CLI",
-                "token": "tok",
-            }
-        ]
-
-    def test_setup_failure_maps_to_a_nonzero_exit(self, monkeypatch):
-        # `setup_command` raises RuntimeError for actionable failures; the resolver surfaces it as a
-        # clean non-zero exit rather than letting it bubble as an unhandled error.
-        import typer
-
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
-
-        def _boom(**kwargs):
-            raise RuntimeError("no agents available")
-
-        monkeypatch.setattr("ucode.cli.setup_command", _boom)
-        with pytest.raises(typer.Exit) as exc:
-            self._resolve([("https://w", None)])
-        assert exc.value.exit_code == 1
-
-    def test_non_admin_with_no_config_falls_through_without_setup(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: False)
-        monkeypatch.setattr(
-            "ucode.cli.setup_command",
-            lambda **kwargs: pytest.fail("a non-admin must not be routed into setup"),
-        )
-        entries = self._resolve([("https://w", None)])
-        assert entries == [("https://w", None)]
-
-    def test_admin_check_failure_falls_through_without_setup(self, monkeypatch):
-        # `is_workspace_admin` returns None when the check itself fails; treat as "not an admin" so
-        # a developer is never blocked behind an authoring flow they can't complete.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, False))
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: None)
-        monkeypatch.setattr(
-            "ucode.cli.setup_command",
-            lambda **kwargs: pytest.fail("no setup when admin status is unverifiable"),
-        )
-        entries = self._resolve([("https://w", None)])
-        assert entries == [("https://w", None)]
-
-    def test_feature_disabled_server_side_does_not_run_setup(self, monkeypatch):
-        # The coding-agent-configs feature isn't enabled server-side, so `ucode setup` can't publish.
-        # Even an admin just falls through to the normal configure flow.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.refresh_managed_config", lambda state: (None, True))
-        monkeypatch.setattr("ucode.cli.get_databricks_token", lambda ws, profile=None: "tok")
-        monkeypatch.setattr("ucode.cli.is_workspace_admin", lambda ws, tok: True)
-        monkeypatch.setattr(
-            "ucode.cli.setup_command",
-            lambda **kwargs: pytest.fail("setup can't publish when the feature is disabled"),
-        )
-        entries = self._resolve([("https://w", None)])
-        assert entries == [("https://w", None)]
-
-    def test_configure_command_exits_zero_without_erroring(self, monkeypatch):
-        # `typer.Exit(0)` subclasses RuntimeError, so the command's own RuntimeError handler must
-        # not catch the clean exit and print `str(exc)` -> a bare, meaningless "ERROR 0".
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr("ucode.cli.set_current_workspace", lambda ws: None)
-        monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: ({"enabled_agents": {"claude": {}}}, False),
-        )
-        self._stub_admin(monkeypatch, False)
-        with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli._prompt_for_configuration", return_value=("https://w", None)),
-        ):
-            result = runner.invoke(app, ["configure"])
-        assert result.exit_code == 0, result.output
-        assert "ERROR" not in result.output
-
-    @pytest.mark.parametrize("env_value", [None, "", "0"])
-    def test_passes_entries_through_when_the_env_var_is_off(self, monkeypatch, capsys, env_value):
-        if env_value is None:
-            monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
-        else:
-            monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", env_value)
-        monkeypatch.setattr(
-            "ucode.cli.load_managed_state",
-            lambda ws: pytest.fail("must not read the config when disabled"),
-        )
-        monkeypatch.setattr(
-            "ucode.cli._prompt_for_configuration",
-            lambda tool=None: pytest.fail("must not prompt when disabled"),
-        )
-        assert self._resolve(None) is None
-        assert capsys.readouterr().out == ""
-
-
-class TestPolicySummary:
-    """The box shown to a developer when their admin's config is applied."""
-
-    MANAGED = {
-        "default_agent": "claude",
-        "enabled_agents": {"claude": {"model_config": {"default_model": "system.ai.opus"}}},
-        "budget_policy": {
-            "display_name": "paved-path",
-            # A fraction of the budget, as the API validates it: 0.8 renders as "at 80%".
-            "tiers": [
-                {"spending_percentage": 0.8, "default_agent": "opencode", "default_model": "haiku"}
-            ],
-        },
-    }
-
-    def test_lists_the_tiers_and_the_applied_model(self, capsys):
-        import ucode.cli as cli_mod
-
-        cli_mod._print_managed_summary(self.MANAGED, {"workspace": "https://w"}, "claude")
-        out = capsys.readouterr().out
-        assert "paved-path" in out
-        assert "at 80%" in out and "OpenCode" in out and "haiku" in out
-        assert "system.ai.opus" in out
-
-    def test_lists_managed_mcps_and_skills(self, capsys):
-        import ucode.cli as cli_mod
-
-        managed = {
-            **self.MANAGED,
-            "mcp_servers": [{"name": "system.ai.slack", "type": "mcp-service"}],
-            "skills": {"names": ["main.default.my_skill"]},
-        }
-        cli_mod._print_managed_summary(managed, {"workspace": "https://w"}, "claude")
-        out = capsys.readouterr().out
-        assert "system.ai.slack" in out
-        assert "main.default.my_skill" in out
-        # Marked pending until ucode registers them locally.
-        assert "pending" in out
-
-    def test_mcp_and_skill_rows_say_none_when_the_config_names_none(self, capsys):
-        import ucode.cli as cli_mod
-
-        # Shown rather than omitted: a missing row leaves "my admin set none" ambiguous.
-        cli_mod._print_managed_summary(self.MANAGED, {"workspace": "https://w"}, "claude")
-        out = capsys.readouterr().out
-        assert "MCPs:" in out and "Skills:" in out
-        assert out.count("none configured") == 2
-        assert "pending" not in out
-
-    def test_no_policy_rows_without_a_budget_policy(self, capsys):
-        import ucode.cli as cli_mod
-
-        cli_mod._print_managed_summary(
-            {"enabled_agents": {"claude": {}}}, {"workspace": "w"}, "claude"
-        )
-        out = capsys.readouterr().out
-        assert "Policy:" not in out
-        assert "Claude Code" in out
-
-
 class TestBareUcode:
     """Bare `ucode` launches the managed default agent, or explains why it can't."""
 
@@ -4016,7 +3374,6 @@ class TestBareUcode:
         coding_agent_config_feature_disabled=False,
     ):
         launched: list[tuple] = []
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
@@ -4091,24 +3448,16 @@ class TestBareUcode:
         assert launched == []
         assert "Ask a workspace admin" in result.output
 
-    def test_admin_without_a_config_sees_no_setup_when_feature_disabled(self, monkeypatch):
+    def test_feature_disabled_guides_without_managed_mention(self, monkeypatch):
         result, launched = self._run(
             monkeypatch, managed=None, is_admin=True, coding_agent_config_feature_disabled=True
         )
         assert result.exit_code == 0, result.output
         assert launched == []
-        assert "ug setup" not in result.output
-
-    def test_non_admin_without_a_config_sees_no_setup_when_feature_disabled(self, monkeypatch):
-        result, launched = self._run(
-            monkeypatch, managed=None, is_admin=False, coding_agent_config_feature_disabled=True
-        )
-        assert result.exit_code == 0, result.output
-        assert launched == []
-        assert "ug setup" not in result.output
+        assert "ug configure" in result.output
+        assert "managed" not in result.output.lower()
 
     def test_dry_run_uses_the_cache_and_does_not_fetch(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
@@ -4130,7 +3479,6 @@ class TestBareUcode:
         # --dry-run doesn't fetch, so the feature-disabled flag is never assigned by the fetch path.
         # With no cached config it must still be well-defined (defaults False) rather than raising
         # UnboundLocalError when the guidance check reads it.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
@@ -4153,7 +3501,6 @@ class TestBareUcode:
     def test_skip_preflight_still_resolves_an_agent_from_the_managed_config(self, monkeypatch):
         # --skip-preflight is now only about auth/gateway re-validation, decoupled from managed
         # config, so bare `ucode --skip-preflight` still fetches the config and picks its agent.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr("ucode.cli.install_databricks_cli", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.apply_pat_environment", lambda *a, **k: None)
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
@@ -4174,35 +3521,8 @@ class TestBareUcode:
         assert seen["tool"] == "claude"
         assert seen["skip_preflight"] is True
 
-    def test_skip_managed_config_behaves_as_feature_off(self, monkeypatch):
-        # --skip-managed-config clears the enabling env var, so bare `ucode` has no config to pick an
-        # agent from and just prints help — exactly the feature-off behavior, no fetch.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: pytest.fail("--skip-managed-config must not fetch"),
-        )
-        result = runner.invoke(app, ["--skip-managed-config"])
-        assert result.exit_code == 0, result.output
-        assert "Usage:" in result.output
-
-    @pytest.mark.parametrize("env_value", [None, "", "0"])
-    def test_prints_help_when_the_env_var_is_off(self, monkeypatch, env_value):
-        if env_value is None:
-            monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
-        else:
-            monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", env_value)
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: pytest.fail("must not fetch when disabled"),
-        )
-        result = runner.invoke(app, [])
-        assert result.exit_code == 0, result.output
-        assert "Usage:" in result.output
-
     def test_subcommands_still_work(self, monkeypatch):
         # The callback runs for every invocation, so it must not intercept `ucode status`.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         monkeypatch.setattr(
             "ucode.cli.refresh_managed_config",
             lambda state: pytest.fail("the callback must not run for a subcommand"),
@@ -4210,29 +3530,6 @@ class TestBareUcode:
         monkeypatch.setattr("ucode.cli.load_state", lambda: {"workspace": "https://w"})
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 0, result.output
-
-    def test_launcher_skip_managed_config_does_not_fetch(self, monkeypatch):
-        # `ucode claude --skip-managed-config` clears the env var, so the launch never reads the
-        # workspace's managed config and falls back to the developer's own settings.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
-        monkeypatch.setattr(
-            "ucode.cli.refresh_managed_config",
-            lambda state: pytest.fail("--skip-managed-config must not fetch"),
-        )
-        state = dict(MINIMAL_STATE)
-        with (
-            patch("ucode.cli.load_state", return_value=state),
-            patch("ucode.cli.apply_pat_environment"),
-            patch("ucode.cli.ensure_bootstrap_dependencies"),
-            patch("ucode.cli.ensure_provider_state", return_value=state),
-            patch("ucode.cli.configure_shared_state", return_value=state),
-            patch("ucode.cli.configure_tool", return_value=state),
-            patch("ucode.cli.get_databricks_token", return_value="tok"),
-            patch("ucode.cli.launch_agent"),
-        ):
-            result = runner.invoke(app, ["claude", "--skip-managed-config"])
-        assert result.exit_code == 0, result.output
-        assert "managed coding agent config" not in result.output
 
 
 class TestBudgetRecommendationAtLaunch:
@@ -4263,13 +3560,11 @@ class TestBudgetRecommendationAtLaunch:
         return result, calls, cfg
 
     def test_not_checked_without_a_managed_config(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         result, calls, _ = self._launch(monkeypatch, managed=None)
         assert result.exit_code == 0, result.output
         assert calls == []
 
     def test_the_recommended_agent_gets_the_recommended_model(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         managed = {
             "enabled_agents": {
                 "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}}
@@ -4283,7 +3578,6 @@ class TestBudgetRecommendationAtLaunch:
         assert cfg.call_args.args[2] == "system.ai.claude-haiku-4-5"
 
     def test_passes_configured_claude_defaults_to_writer(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         managed = {
             "enabled_agents": {
                 "claude": {
@@ -4306,7 +3600,6 @@ class TestBudgetRecommendationAtLaunch:
     def test_another_agent_keeps_its_own_model_and_is_told_why(self, monkeypatch):
         # A tier's model belongs to the tier's agent; pinning it on claude would land a Kimi id in
         # ANTHROPIC_MODEL, which the Anthropic-dialect endpoint cannot serve.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         managed = {
             "enabled_agents": {
                 "claude": {"model_config": {"default_model": "system.ai.claude-opus-4-8"}},
@@ -4328,7 +3621,6 @@ class TestBudgetRecommendationAtLaunch:
         assert "recommends OpenCode" in result.output
 
     def test_a_failed_read_does_not_block_the_launch(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         result, _calls, _cfg = self._launch(
             monkeypatch,
             managed={"enabled_agents": {"claude": {}}},
@@ -4340,7 +3632,6 @@ class TestBudgetRecommendationAtLaunch:
 
     def test_a_token_failure_does_not_block_the_launch(self, monkeypatch):
         # Auth can lapse between the config refresh and the budget check.
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         state = dict(MINIMAL_STATE)
         monkeypatch.setattr("ucode.cli.get_model_recommendation", lambda ws, tok: (None, None))
         with (
@@ -4362,7 +3653,6 @@ class TestBudgetRecommendationAtLaunch:
         assert "Could not check your budget" in result.output
 
     def test_shows_the_budget_bar(self, monkeypatch):
-        monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", "1")
         result, _calls, _cfg = self._launch(
             monkeypatch,
             managed={"enabled_agents": {"claude": {}}},
@@ -4376,16 +3666,6 @@ class TestBudgetRecommendationAtLaunch:
         assert result.exit_code == 0, result.output
         assert "83% used" in result.output
         assert "█" in result.output
-
-    @pytest.mark.parametrize("env_value", [None, "", "0"])
-    def test_not_checked_when_the_env_var_is_off(self, monkeypatch, env_value):
-        if env_value is None:
-            monkeypatch.delenv("ENABLE_MANAGED_AGENT_CONFIG", raising=False)
-        else:
-            monkeypatch.setenv("ENABLE_MANAGED_AGENT_CONFIG", env_value)
-        result, calls, _ = self._launch(monkeypatch, managed=None)
-        assert result.exit_code == 0, result.output
-        assert calls == []
 
 
 class TestMcpProxyCmdForwardsUsePat:
