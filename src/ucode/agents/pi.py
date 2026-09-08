@@ -22,8 +22,10 @@ pi today — they live behind /ai-gateway/mlflow/v1 with per-model
 config we don't currently maintain.
 
 Each provider's `apiKey` is pi's `!command` config value rather than a baked
-bearer, so pi re-runs `ucode auth-token` itself and never holds a token that
-can go stale (the same on-demand model as OpenCode's auth plugin).
+bearer, so pi mints one per request via `ucode auth-token` and nothing that
+expires is written to `models.json` (the on-demand model OpenCode's auth plugin
+already uses). A token still reaches the process environment: `launch` exports
+`OAUTH_TOKEN` as before.
 """
 
 from __future__ import annotations
