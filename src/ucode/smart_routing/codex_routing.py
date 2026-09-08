@@ -99,7 +99,7 @@ def route_pre_tool_use(
             workspace, token, task, available_models, timeout=timeout
         ),
         default_task_label="Codex subagent task",
-        model_id_mapper=codex_model_id,
+        model_id_mapper=lambda model: model,
         record_decision=record,
     )
 

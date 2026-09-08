@@ -24,7 +24,7 @@ from ucode.databricks import (
     list_anthropic_model_catalog,
     list_anthropic_models,
 )
-from ucode.smart_routing import claude_routing, codex_interposer, routing
+from ucode.smart_routing import claude_routing, codex_interposer, codex_routing, routing
 from ucode.smart_routing.claude_hooks import (
     FIRST_PROMPT_SOCKET_ENV,
     sync_first_prompt_hook,
@@ -414,10 +414,47 @@ def launch_claude(
     sys.exit(returncode)
 
 
-# TODO: Replace with /codex/v1/models once /codex/v1/models can send GPT models as well.
-def _cached_routing_models(state: dict) -> list[str]:
-    """Return the persisted UC model-service ids usable by Codex routing."""
-    return routing_models(state)
+def _model_catalog() -> tuple[Path, list[str]] | None:
+    """Read the first configured Codex model catalog using Codex config precedence."""
+    from ucode.agents import codex
+
+    config_paths = (
+        codex._managed_config_path(),
+        codex.CODEX_CONFIG_PATH,
+        _codex_home_config_path(),
+    )
+    for config_path in dict.fromkeys(config_paths):
+        if config_path is None:
+            continue
+        configured_path = read_toml_safe(config_path).get("model_catalog_json")
+        if not isinstance(configured_path, str) or not configured_path.strip():
+            continue
+        catalog_path = Path(configured_path).expanduser()
+        rows = read_json_safe(catalog_path).get("models")
+        if not isinstance(rows, list):
+            return catalog_path, []
+        models: list[str] = []
+        seen_models: set[str] = set()
+        for row in rows:
+            slug = row.get("slug") if isinstance(row, dict) else None
+            if not isinstance(slug, str):
+                continue
+            model = slug.strip()
+            if not model or model in seen_models:
+                continue
+            seen_models.add(model)
+            models.append(model)
+        return catalog_path, models
+    return None
+
+
+def configured_codex_models(state: dict) -> tuple[list[str], Path | None]:
+    """Return catalog models when configured, otherwise the existing routing models."""
+    catalog = _model_catalog()
+    if catalog is not None:
+        catalog_path, models = catalog
+        return models, catalog_path
+    return [codex_routing.codex_model_id(model) for model in routing_models(state)], None
 
 
 def _codex_home_config_path() -> Path:
@@ -444,6 +481,8 @@ def launch_codex(
     *,
     binary: str,
     start_model: str | None,
+    available_models: list[str],
+    catalog_path: Path | None,
     render_overlay: Callable[..., dict],
 ) -> NoReturn:
     workspace = state.get("workspace")
@@ -458,7 +497,6 @@ def launch_codex(
 
     profile = state.get("profile")
     os.environ[OAUTH_TOKEN_ENV_VAR] = get_databricks_token(workspace, profile)
-    available_models = _cached_routing_models(state)
     if not available_models:
         print_note(
             "Smart routing model metadata is unavailable; starting Codex on gpt-5.6-luna "
@@ -470,6 +508,8 @@ def launch_codex(
         state.get("profile"),
         use_pat=bool(state.get("use_pat")),
     )
+    if catalog_path is not None:
+        overlay["model_catalog_json"] = str(catalog_path)
     overlay["hooks"] = {
         "PreToolUse": _v2_pre_tool_use_hooks(state, available_models),
     }

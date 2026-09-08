@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 from websockets.asyncio.client import connect
@@ -99,7 +99,6 @@ class _Session:
                 if decision is None:
                     self.log(f"[ROUTE] selection failed; keeping current model: {reason}")
                     return TuiFrameResult(raw, needs_settings_update=False)
-                decision = replace(decision, model=codex_routing.codex_model_id(decision.model))
                 self.target = decision.model
                 if self.switch_message_fn is not None:
                     self.switch_message = self.switch_message_fn(decision.model, decision.rationale)
