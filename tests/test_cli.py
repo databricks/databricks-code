@@ -994,6 +994,32 @@ class TestAuthTokenCommand:
         assert result.exit_code == 0
         fetch.assert_called_once_with("https://ws", None, force_refresh=True)
 
+    def test_oauth_client_id_is_forwarded(self):
+        with (
+            patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
+            patch("ucode.cli.get_databricks_token", return_value="tok") as fetch,
+        ):
+            result = runner.invoke(app, ["auth-token", "--oauth-client-id", "custom-app-id"])
+        assert result.exit_code == 0
+        assert result.stdout == "tok\n"
+        fetch.assert_called_once_with(
+            "https://ws", None, force_refresh=False, oauth_client_id="custom-app-id"
+        )
+
+    def test_oauth_client_id_error_stays_off_stdout(self):
+        with (
+            patch("ucode.cli.load_state", return_value={"workspace": "https://ws"}),
+            patch(
+                "ucode.cli.get_databricks_token",
+                side_effect=RuntimeError(
+                    "Not signed in to https://ws with OAuth app custom-app-id"
+                ),
+            ),
+        ):
+            result = runner.invoke(app, ["auth-token", "--oauth-client-id", "custom-app-id"])
+        assert result.exit_code == 1
+        assert result.stdout == ""
+
     def test_errors_without_workspace(self):
         with patch("ucode.cli.load_state", return_value={}):
             result = runner.invoke(app, ["auth-token"])

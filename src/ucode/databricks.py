@@ -897,12 +897,49 @@ def _profile_args(profile: str | None) -> list[str]:
     return ["--profile", profile] if profile else []
 
 
-def has_valid_databricks_auth(workspace: str, profile: str | None = None) -> bool:
+OAUTH_CLIENT_ID_STATE_KEY = "oauth_client_id"
+
+
+def _workspace_state_for_host(workspace: str) -> dict:
+    """Return the saved state for a workspace host."""
+    from ucode.state import load_full_state  # local import: state.py imports this module
+
+    workspaces = load_full_state().get("workspaces")
+    if not isinstance(workspaces, dict):
+        return {}
+    trimmed = workspace.rstrip("/")
+    for candidate in (workspace, trimmed, f"{trimmed}/"):
+        entry = workspaces.get(candidate)
+        if isinstance(entry, dict):
+            return entry
+    return {}
+
+
+def resolve_oauth_client_id(workspace: str, explicit: str | None = None) -> str | None:
+    """Resolve an explicit or saved OAuth client ID."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    value = _workspace_state_for_host(workspace).get(OAUTH_CLIENT_ID_STATE_KEY)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def has_valid_databricks_auth(
+    workspace: str, profile: str | None = None, *, oauth_client_id: str | None = None
+) -> bool:
     # Honor the CI short-circuit (see ``get_databricks_token``): if a
     # pre-fetched bearer is available, treat auth as valid and skip the
     # `databricks auth token` shell-out (which only knows user-OAuth).
     if os.environ.get("DATABRICKS_BEARER", "").strip():
         return True
+    client_id = resolve_oauth_client_id(workspace, oauth_client_id)
+    if client_id:
+        from ucode import oauth
+
+        try:
+            return bool(oauth.get_token(workspace, client_id))
+        except RuntimeError as exc:
+            _debug("has_valid_databricks_auth", f"custom OAuth unavailable: {exc}")
+            return False
     _log_auth_diagnostics()
     # Mirror run_databricks_login: when ~/.databrickscfg has multiple
     # profiles for the same host, `databricks auth token --host …` refuses
@@ -1083,12 +1120,22 @@ def apply_pat_environment(state: dict) -> None:
     ensure_pat_bearer(state.get("profile"))
 
 
-def run_databricks_login(workspace: str, profile: str | None = None) -> None:
+def run_databricks_login(
+    workspace: str, profile: str | None = None, *, oauth_client_id: str | None = None
+) -> None:
     """Run databricks auth login unconditionally.
 
     When ``profile`` is provided, it is passed via ``--profile``. Otherwise we
     fall back to looking up an existing profile by host so a stored session is
-    refreshed in place rather than overwriting another profile's tokens."""
+    refreshed in place rather than overwriting another profile's tokens.
+
+    A custom client ID uses ucode's PKCE flow."""
+    client_id = resolve_oauth_client_id(workspace, oauth_client_id)
+    if client_id:
+        from ucode import oauth
+
+        oauth.login(workspace, client_id)
+        return
     print_section("Databricks Login")
     print_kv("Workspace", workspace)
     print_note("A browser may open for `databricks auth login`.")
@@ -1111,21 +1158,29 @@ def run_databricks_login(workspace: str, profile: str | None = None) -> None:
 
 
 def ensure_databricks_auth(
-    workspace: str, profile: str | None = None, *, quiet: bool = False
+    workspace: str,
+    profile: str | None = None,
+    *,
+    quiet: bool = False,
+    oauth_client_id: str | None = None,
 ) -> None:
     """Check auth and login only if needed (used by launch path).
 
     ``quiet`` suppresses the "already available" line for a caller that only needs a token before
     some later step re-authenticates and reports it — otherwise the same success prints twice. A
     login that actually runs is never silent.
+
+    ``oauth_client_id`` applies to both validation and login.
     """
     with spinner("Checking Databricks auth..."):
-        auth_is_valid = has_valid_databricks_auth(workspace, profile)
+        auth_is_valid = has_valid_databricks_auth(
+            workspace, profile, oauth_client_id=oauth_client_id
+        )
     if auth_is_valid:
         if not quiet:
             print_success(f"Databricks auth already available for {workspace}")
         return
-    run_databricks_login(workspace, profile)
+    run_databricks_login(workspace, profile, oauth_client_id=oauth_client_id)
 
 
 def get_databricks_token(
@@ -1133,6 +1188,7 @@ def get_databricks_token(
     profile: str | None = None,
     *,
     force_refresh: bool = False,
+    oauth_client_id: str | None = None,
 ) -> str:
     # ``DATABRICKS_BEARER`` is the CI escape hatch: when set, skip the
     # `databricks auth token` subprocess entirely and return the pre-fetched
@@ -1144,6 +1200,13 @@ def get_databricks_token(
     if bearer:
         _debug("get_databricks_token", "using DATABRICKS_BEARER env var")
         return bearer
+
+    client_id = resolve_oauth_client_id(workspace, oauth_client_id)
+    if client_id:
+        from ucode import oauth
+
+        _debug("get_databricks_token", f"custom OAuth client {client_id}")
+        return oauth.get_token(workspace, client_id, force_refresh=force_refresh)
 
     _log_auth_diagnostics()
     # See has_valid_databricks_auth: resolve the profile from the host when
@@ -1430,7 +1493,11 @@ def _ucode_binary() -> str:
 
 
 def build_auth_token_argv(
-    workspace: str, profile: str | None = None, *, use_pat: bool = False
+    workspace: str,
+    profile: str | None = None,
+    *,
+    use_pat: bool = False,
+    oauth_client_id: str | None = None,
 ) -> list[str]:
     """Argv for the cross-platform token helper: `ucode auth-token ...`.
 
@@ -1443,11 +1510,17 @@ def build_auth_token_argv(
         argv += ["--profile", profile]
     if use_pat:
         argv.append("--use-pat")
+    if oauth_client_id:
+        argv += ["--oauth-client-id", oauth_client_id]
     return argv
 
 
 def build_mcp_proxy_argv(
-    url: str, workspace: str, profile: str | None = None, *, use_pat: bool = False
+    url: str,
+    workspace: str,
+    profile: str | None = None,
+    *,
+    use_pat: bool = False,
 ) -> list[str]:
     """Argv for the stdio MCP bridge: `ucode mcp-proxy --url ... --host ...`.
 
@@ -1468,14 +1541,20 @@ def build_mcp_proxy_argv(
 
 
 def build_auth_shell_command(
-    workspace: str, profile: str | None = None, *, use_pat: bool = False
+    workspace: str,
+    profile: str | None = None,
+    *,
+    use_pat: bool = False,
+    oauth_client_id: str | None = None,
 ) -> str:
     """Single-line, shell-quoted form of :func:`build_auth_token_argv`.
 
     Used where a tool wants the helper as one command *string* (Claude Code's
     `apiKeyHelper`). On every platform this resolves to the `ucode auth-token`
     executable rather than a POSIX shell pipeline, so no `sh`/`jq` is required."""
-    argv = build_auth_token_argv(workspace, profile, use_pat=use_pat)
+    argv = build_auth_token_argv(
+        workspace, profile, use_pat=use_pat, oauth_client_id=oauth_client_id
+    )
     if platform.system() == "Windows":
         return subprocess.list2cmdline(argv)
     return shlex.join(argv)

@@ -1491,6 +1491,14 @@ def auth_token_cmd(
         bool,
         typer.Option("--force-refresh", help="Force the Databricks CLI to mint a new token."),
     ] = False,
+    oauth_client_id: Annotated[
+        str | None,
+        typer.Option(
+            "--oauth-client-id",
+            help="Authenticate with this custom OAuth app instead of the built-in "
+            "`databricks-cli` app. Defaults to the workspace's configured client id.",
+        ),
+    ] = None,
 ) -> None:
     """Print a Databricks bearer token to stdout, then exit.
 
@@ -1521,7 +1529,10 @@ def auth_token_cmd(
             )
             raise typer.Exit(1)
     try:
-        token = get_databricks_token(workspace, profile, force_refresh=force_refresh)
+        oauth_kwargs = {"oauth_client_id": oauth_client_id} if oauth_client_id else {}
+        token = get_databricks_token(
+            workspace, profile, force_refresh=force_refresh, **oauth_kwargs
+        )
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None
