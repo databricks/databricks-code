@@ -10,6 +10,7 @@ import subprocess
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from typing import Any
 from urllib.parse import urlparse
 
@@ -446,13 +447,17 @@ def discover_all_mcp_service_names(
     workspace: str,
     profile: str | None = None,
     on_progress: Callable[[int, int, int], None] | None = None,
+    on_services: Callable[[list[str]], None] | None = None,
 ) -> list[str]:
     """All MCP services across every `<catalog>.<schema>` in the workspace. This
     walks the workspace (see `list_all_mcp_services`) and is the workspace-wide
     counterpart to `discover_mcp_service_names`. `on_progress` is forwarded to
-    the walk for live count reporting."""
+    the walk for live count reporting, and `on_services` to stream newly-found
+    service names into the picker as the walk progresses."""
     token = get_databricks_token(workspace, profile)
-    names, _reason = list_all_mcp_services(workspace, token, on_progress=on_progress)
+    names, _reason = list_all_mcp_services(
+        workspace, token, on_progress=on_progress, on_services=on_services
+    )
     return names
 
 
@@ -707,13 +712,40 @@ def _add_choice(selection: str, title: str) -> questionary.Choice:
     return questionary.Choice(title=title, value=f"{MCP_ADD_PREFIX}{selection}")
 
 
+def _mcp_service_choice(name: str, known_names: set[str], additive: bool) -> questionary.Choice:
+    """Picker choice for one MCP-service full name (`<catalog>.<schema>.<id>`).
+
+    Shared by the initial `build_mcp_picker_choices` render and the background walk that
+    streams more services in, so a streamed row is built identically to an up-front one
+    (and dedupes by value against what's already shown). An already-registered service is
+    a removable toggle under `configure mcp` and a non-toggleable note under `mcp add`
+    (additive); an unregistered one is an add-choice."""
+    registered_as = name.replace(".", "-")
+    display_title = f"MCP: {name}"
+    if registered_as in known_names:
+        if additive:
+            return questionary.Choice(
+                title=display_title, value=registered_as, disabled="already configured"
+            )
+        return _server_choice(registered_as, True, display_title)
+    return _add_choice(f"{MCP_SERVICE_SELECTION_PREFIX}{name}", display_title)
+
+
 def _scrolling_checkbox(
     message: str,
     choices: list[questionary.Choice | questionary.Separator],
     instruction: str,
     style: questionary.Style,
     allow_back: bool = False,
+    background_loader: Callable[[Callable[[list[questionary.Choice]], None]], None] | None = None,
 ) -> Question:
+    """Multi-select checkbox picker.
+
+    ``background_loader``, if given, streams more choices in after the picker is already
+    on screen: it's run on a daemon thread and handed an ``append(choices)`` callback that
+    adds rows (deduped by value) and repaints, so the picker opens instantly on whatever
+    ``choices`` are ready and fills in the rest without blocking. A footer shows a live
+    "loading more…" count while it runs."""
     merged_style = merge_styles_default(
         [
             questionary.Style([("bottom-toolbar", "noreverse")]),
@@ -725,6 +757,8 @@ def _scrolling_checkbox(
         pointer="›",
         show_description=False,
     )
+    # Live loading state for the background-loader footer (see below).
+    loading = {"active": background_loader is not None, "found": 0}
 
     def get_prompt_tokens() -> list[tuple[str, str]]:
         tokens = [("class:qmark", ""), ("class:question", f" {message} ")]
@@ -743,8 +777,19 @@ def _scrolling_checkbox(
         control.error_message = None
         return True
 
-    visible_rows = min(MCP_PICKER_VISIBLE_ROWS, max(1, len(choices)))
-    has_more_choices = len(choices) > MCP_PICKER_VISIBLE_ROWS
+    @Condition
+    def has_more_choices() -> bool:
+        # Live so the scroll hint appears as background-loaded rows stream in.
+        return len(control.choices) > MCP_PICKER_VISIBLE_ROWS
+
+    @Condition
+    def is_loading() -> bool:
+        return bool(loading["active"])
+
+    def loading_tokens() -> list[tuple[str, str]]:
+        return [
+            ("class:instruction", f"  ⏳ loading more MCP services… ({loading['found']} found)")
+        ]
 
     @Condition
     def has_search_string() -> bool:
@@ -762,7 +807,15 @@ def _scrolling_checkbox(
                     content=FormattedTextControl(get_prompt_tokens),
                 ),
                 ConditionalContainer(
-                    Window(control, height=Dimension(preferred=visible_rows, max=visible_rows)),
+                    # Height tracks the live choice count (capped at the visible max) so the
+                    # window grows as background-loaded rows stream in, with no blank gap when
+                    # only a few choices are present.
+                    Window(
+                        control,
+                        height=lambda: Dimension.exact(
+                            min(MCP_PICKER_VISIBLE_ROWS, max(1, len(control.choices)))
+                        ),
+                    ),
                     filter=~IsDone(),
                 ),
                 ConditionalContainer(
@@ -772,7 +825,14 @@ def _scrolling_checkbox(
                             lambda: [("class:instruction", "  ↑/↓ scroll for more")]
                         ),
                     ),
-                    filter=Condition(lambda: has_more_choices) & ~IsDone(),
+                    filter=has_more_choices & ~IsDone(),
+                ),
+                ConditionalContainer(
+                    Window(
+                        height=Dimension.exact(1),
+                        content=FormattedTextControl(loading_tokens),
+                    ),
+                    filter=is_loading & ~IsDone(),
                 ),
                 ConditionalContainer(
                     Window(
@@ -864,13 +924,41 @@ def _scrolling_checkbox(
     def _(_event: Any) -> None:
         """Ignore other text input."""
 
-    return Question(
-        Application(
-            layout=layout,
-            key_bindings=bindings,
-            style=merged_style,
-        )
+    app: Application = Application(
+        layout=layout,
+        key_bindings=bindings,
+        style=merged_style,
     )
+
+    if background_loader is not None:
+
+        def append(new_choices: list[questionary.Choice]) -> None:
+            # Called from the loader (worker) thread. Rebind choices atomically (rather than
+            # mutating in place) so a concurrent render never iterates a changing list, and
+            # dedupe by value against what's already shown. Selections are tracked by value,
+            # so appended rows never disturb existing checkboxes/scroll/filter.
+            shown = {c.value for c in control.choices if isinstance(c, questionary.Choice)}
+            additions = [c for c in new_choices if c.value not in shown]
+            if additions:
+                control.choices = [*control.choices, *additions]
+                loading["found"] += len(additions)
+            with suppress(Exception):
+                app.invalidate()
+
+        def worker() -> None:
+            try:
+                background_loader(append)
+            except Exception:
+                # Discovery is best-effort; a failed background walk just stops streaming.
+                pass
+            finally:
+                loading["active"] = False
+                with suppress(Exception):
+                    app.invalidate()
+
+        threading.Thread(target=worker, name="mcp-picker-loader", daemon=True).start()
+
+    return Question(app)
 
 
 def build_mcp_picker_choices(
@@ -908,15 +996,10 @@ def build_mcp_picker_choices(
 
     for name in available_mcp_service_names or []:
         # Picker shows the dotted UC name; state/agents store the dashed form
-        # (see resolver). Compare against the dashed form when checking what's
-        # already registered.
-        registered_as = name.replace(".", "-")
-        display_title = f"MCP: {name}"
-        if registered_as in known_names:
-            choices.append(known_choice(registered_as, display_title))
-        else:
-            choices.append(_add_choice(f"{MCP_SERVICE_SELECTION_PREFIX}{name}", display_title))
-        displayed_names.add(registered_as)
+        # (see resolver). The shared helper is also used by the background walk that
+        # streams more services in, so up-front and streamed rows match exactly.
+        choices.append(_mcp_service_choice(name, known_names, additive))
+        displayed_names.add(name.replace(".", "-"))
 
     for name in available_external_names:
         display_title = f"Connection: {name}"
@@ -1011,13 +1094,18 @@ def prompt_for_mcp_server_choices(
     available_uc_functions_servers: list[dict] | None = None,
     allow_back: bool = False,
     additive: bool = False,
+    background_loader: Callable[[Callable[[list[questionary.Choice]], None]], None] | None = None,
 ) -> list[str] | None | _Back:
     """Show the MCP server picker. Returns the list of selected values, `None`
     if cancelled (Ctrl-C), or `_BACK` if `allow_back` and the user pressed Left
     to return to the previous wizard step.
 
     ``additive`` (``ucode mcp add``) shows already-configured servers as
-    non-toggleable notes instead of pre-checked, removable boxes."""
+    non-toggleable notes instead of pre-checked, removable boxes.
+
+    ``background_loader`` streams more choices in after the picker opens (see
+    `_scrolling_checkbox`) — used to load the workspace-wide MCP-services walk without
+    blocking on it up front."""
     instruction = "(space to toggle, ctrl-a all, enter to save, type to filter)"
     if allow_back:
         instruction = "(space to toggle, ctrl-a all, ← back, enter to save, type to filter)"
@@ -1036,6 +1124,7 @@ def prompt_for_mcp_server_choices(
         style=_picker_style(),
         instruction=instruction,
         allow_back=allow_back,
+        background_loader=background_loader,
     ).ask()
     if selection is None:
         return None
@@ -1381,6 +1470,26 @@ def _discover_mcp_source_with_progress(
         return []
 
 
+def _mcp_services_background_loader(
+    workspace: str,
+    profile: str | None,
+    known_names: set[str],
+    additive: bool,
+) -> Callable[[Callable[[list[questionary.Choice]], None]], None]:
+    """Return a picker `background_loader` that runs the workspace-wide MCP-services walk and
+    streams each schema's newly-found services into the open picker as choices, so the walk
+    never blocks the picker from opening. Deduping against already-shown rows (e.g. the fast
+    `system.ai` list) is handled by the picker's append."""
+
+    def loader(append: Callable[[list[questionary.Choice]], None]) -> None:
+        def on_services(new_names: list[str]) -> None:
+            append([_mcp_service_choice(name, known_names, additive) for name in new_names])
+
+        discover_all_mcp_service_names(workspace, profile, on_services=on_services)
+
+    return loader
+
+
 def _discover_selected_mcp_sources(
     workspace: str, profile: str | None, sources: set[str]
 ) -> dict[str, list]:
@@ -1404,22 +1513,15 @@ def _discover_selected_mcp_sources(
         if "apps" in sources
         else []
     )
-    # MCP services: curated `system.ai` list plus the workspace-wide walk,
-    # merged and de-duplicated (the walk skips the `system` catalog).
+    # MCP services: only the fast curated `system.ai` list is fetched synchronously so the
+    # picker opens immediately. The slow workspace-wide walk streams in afterward via the
+    # picker's background loader (see `_mcp_services_background_loader`).
     services: list[str] = []
     if "mcp-services" in sources:
-        curated = _discover_mcp_source(
+        services = _discover_mcp_source(
             "MCP services",
             lambda: discover_mcp_service_names(workspace, profile),
         )
-        walked = _discover_mcp_source_with_progress(
-            "all MCP services",
-            "schemas",
-            lambda on_progress: discover_all_mcp_service_names(
-                workspace, profile, on_progress=on_progress
-            ),
-        )
-        services = list(dict.fromkeys(curated + walked))
     genie = (
         _discover_mcp_source(
             "Genie spaces",
@@ -2013,6 +2115,16 @@ def configure_mcp_command(
             sources = set(available_source_keys)
         discovered = _discover_selected_mcp_sources(workspace, profile, sources)
 
+        # The fast `system.ai` list is shown immediately; the slow workspace-wide walk
+        # streams in behind it so the picker never blocks on it.
+        services_loader = (
+            _mcp_services_background_loader(
+                workspace, profile, set(original_by_name), additive=append
+            )
+            if "mcp-services" in sources
+            else None
+        )
+
         selections = prompt_for_mcp_server_choices(
             discovered["external"],
             discovered["genie"],
@@ -2023,6 +2135,7 @@ def configure_mcp_command(
             discovered["uc_functions"],
             allow_back=prompt_sources,
             additive=append,
+            background_loader=services_loader,
         )
         if selections is None:
             return 0

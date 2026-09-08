@@ -2802,6 +2802,7 @@ def list_all_mcp_services(
     *,
     deadline_seconds: float = _MCP_SERVICES_WALK_DEADLINE_SECONDS,
     on_progress: Callable[[int, int, int], None] | None = None,
+    on_services: Callable[[list[str]], None] | None = None,
 ) -> tuple[list[str], str | None]:
     """Return sorted unique MCP-service full names across every `<catalog>.<schema>`
     in the workspace. The mcp-services API is one-schema-per-call, so this walks
@@ -2810,7 +2811,10 @@ def list_all_mcp_services(
 
     `on_progress`, if given, is called as each schema's listing completes with
     `(schemas_done, schemas_total, services_found)` so callers can render a live
-    count. It is invoked serially from the draining thread (not the workers).
+    count. `on_services`, if given, is called with each schema's newly-found service
+    names (deduped against everything emitted so far) so callers can stream results
+    into a picker as the walk progresses instead of waiting for the full result. Both
+    are invoked serially from the draining thread (not the workers).
 
     This walk is the slow, workspace-wide counterpart to `list_mcp_services`
     (single schema)."""
@@ -2886,10 +2890,13 @@ def list_all_mcp_services(
         def collect_services(result, _ref):
             nonlocal schemas_done
             found, _ = result
+            new = [n for n in found if n not in names]
             names.update(found)
             schemas_done += 1
             if on_progress is not None:
                 on_progress(schemas_done, schemas_total, len(names))
+            if on_services is not None and new:
+                on_services(sorted(new))
 
         _drain_with_deadline(service_futures, deadline, collect_services)
         pool.shutdown(wait=False, cancel_futures=True)

@@ -1014,57 +1014,39 @@ class TestConfigureMcpCommand:
             }
         ]
 
-    def test_registers_mcp_service_from_workspace_wide_walk(self, monkeypatch):
-        """The workspace-wide walk runs by default and folds its services into
-        the picker via the same mcp-service path as the curated system.ai list."""
-        saved_states: list[dict] = []
-        configured: list[tuple[str, str, str]] = []
+    def test_workspace_wide_walk_streams_services_into_picker(self, monkeypatch):
+        """The workspace-wide walk no longer blocks the picker: it runs via the picker's
+        background loader and streams each schema's services in as add-choices."""
         walk_calls: list[str] = []
 
-        monkeypatch.setattr(mcp, "load_state", lambda: {**CLAUDE_STATE})
-        monkeypatch.setattr(mcp.shutil, "which", lambda binary: f"/usr/bin/{binary}")
-        monkeypatch.setattr(mcp, "ensure_databricks_auth", lambda workspace, profile=None: None)
-        monkeypatch.setattr(mcp, "available_mcp_clients", lambda: ["claude"])
-        monkeypatch.setattr(
-            mcp, "discover_external_mcp_connection_names", lambda workspace, profile=None: []
-        )
-        monkeypatch.setattr(mcp, "discover_genie_mcp_servers", lambda workspace, profile=None: [])
-        monkeypatch.setattr(mcp, "discover_app_mcp_servers", lambda workspace, profile=None: [])
-        _patch_mcp_choices(
-            monkeypatch,
-            f"{mcp.MCP_ADD_PREFIX}{mcp.MCP_SERVICE_SELECTION_PREFIX}mycat.myschema.weather",
-        )
-
-        def fake_walk(workspace, profile=None, on_progress=None):
+        def fake_walk(workspace, profile=None, on_progress=None, on_services=None):
             walk_calls.append(workspace)
+            if on_services is not None:
+                on_services(["mycat.myschema.weather"])
             return ["mycat.myschema.weather"]
 
         monkeypatch.setattr(mcp, "discover_all_mcp_service_names", fake_walk)
-        monkeypatch.setattr(
-            mcp,
-            "configure_client_mcp_server",
-            lambda client, name, url, *a, **kw: configured.append((client, name, url)) or [],
-        )
-        monkeypatch.setattr(mcp, "save_state", lambda state: saved_states.append(state.copy()))
 
-        assert mcp.configure_mcp_command() == 0
+        loader = mcp._mcp_services_background_loader(WS, None, set(), additive=True)
+        appended: list = []
+        loader(appended.extend)
 
         assert walk_calls == [WS]
-        assert configured == [
-            (
-                "claude",
-                "mycat-myschema-weather",
-                f"{WS}/ai-gateway/mcp-services/mycat.myschema.weather",
-            )
+        assert [c.value for c in appended] == [
+            f"{mcp.MCP_ADD_PREFIX}{mcp.MCP_SERVICE_SELECTION_PREFIX}mycat.myschema.weather"
         ]
-        assert saved_states[-1]["mcp_servers"] == [
-            {
-                "name": "mycat-myschema-weather",
-                "url": f"{WS}/ai-gateway/mcp-services/mycat.myschema.weather",
-                "auth": "proxy",
-                "clients": ["claude"],
-            }
-        ]
+
+    def test_mcp_service_choice_known_vs_unknown(self):
+        # Unregistered -> an add-choice; already-registered -> a removable toggle
+        # (configure mcp) or a disabled note (mcp add, additive).
+        add = mcp._mcp_service_choice("mycat.sch.weather", set(), additive=False)
+        assert (
+            add.value == f"{mcp.MCP_ADD_PREFIX}{mcp.MCP_SERVICE_SELECTION_PREFIX}mycat.sch.weather"
+        )
+        toggle = mcp._mcp_service_choice("mycat.sch.weather", {"mycat-sch-weather"}, additive=False)
+        assert toggle.value == "mycat-sch-weather" and toggle.checked
+        note = mcp._mcp_service_choice("mycat.sch.weather", {"mycat-sch-weather"}, additive=True)
+        assert note.value == "mycat-sch-weather" and note.disabled
 
     def test_skips_slow_walks_unless_source_selected(self, monkeypatch):
         """Vector Search and UC functions walk the workspace and are OFF by
