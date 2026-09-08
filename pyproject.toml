@@ -37,6 +37,7 @@ dependencies = [
 tracing = ["mlflow[databricks]>=3.4"]
 
 [project.scripts]
+ug = "ucode.cli:main"
 ucode = "ucode.cli:main"
 
 [tool.hatch.build.targets.wheel]

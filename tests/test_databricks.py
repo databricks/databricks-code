@@ -195,6 +195,21 @@ class TestDiscoverClaudeModels:
             {"max_retries": 2},
         )
 
+    def test_lists_anthropic_display_names_with_model_ids(self, monkeypatch):
+        payload = {
+            "data": [
+                {"id": "system.ai.glm-5-3-flash", "display_name": "GLM 5.3 Flash"},
+                {"id": "opaque-model-id"},
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda *_args, **_kwargs: (payload, None))
+
+        catalog = db_mod.list_anthropic_model_catalog(WS, "token")
+
+        assert catalog.model_ids == ["system.ai.glm-5-3-flash", "opaque-model-id"]
+        assert catalog.model_id_to_display_name == {"system.ai.glm-5-3-flash": "GLM 5.3 Flash"}
+        assert catalog.error_msg is None
+
     def test_selects_opus_4_8_when_advertised(self, monkeypatch):
         payload = {
             "data": [
@@ -885,6 +900,28 @@ class TestResolveProviderService:
         service, error = db_mod.resolve_provider_service("claude", "main.x.y", WS, "token")
         assert service is None
         assert "not available" in error
+
+    def test_gemini_enterprise_ok_for_gemini(self, monkeypatch):
+        payload = {
+            "model_provider_services": [
+                {
+                    "name": "model-provider-services/main.schema1.gemini-svc",
+                    "config": {
+                        "provider_type": "EXTERNAL_MODEL_PROVIDER_TYPE_GEMINI_ENTERPRISE",
+                        "targets": [{"model": "gemini-3.5-flash"}],
+                    },
+                }
+            ]
+        }
+        monkeypatch.setattr(
+            db_mod, "_http_get_json", lambda url, token, timeout=30: (payload, None)
+        )
+        service, error = db_mod.resolve_provider_service(
+            "gemini", "main.schema1.gemini-svc", WS, "token"
+        )
+        assert error is None
+        assert service["provider_type"] == "gemini_enterprise"
+        assert service["targets"] == ["gemini-3.5-flash"]
 
 
 class TestModelProviderFeatureUnavailable:

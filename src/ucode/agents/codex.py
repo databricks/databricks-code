@@ -14,6 +14,7 @@ from pathlib import Path
 import tomlkit
 from tomlkit.exceptions import ParseError
 
+from ucode.codex_config import codex_config_args
 from ucode.config_io import (
     APP_DIR,
     ToolSpec,
@@ -524,6 +525,19 @@ def launch(state: dict, tool_args: list[str]) -> None:
         )
     if workspace:
         os.environ["OAUTH_TOKEN"] = get_databricks_token(workspace, state.get("profile"))
+    if tool_args[:1] == ["app"]:
+        # `codex app` rejects --profile. Pass the ucode profile as --config
+        # overrides instead, preserving its Databricks provider and auth
+        # settings without changing the user's base config.toml.
+        profile_doc = read_toml_safe(CODEX_CONFIG_PATH)
+        if not profile_doc:
+            raise RuntimeError(
+                f"Cannot launch Codex app with the ucode profile because {CODEX_CONFIG_PATH} "
+                "is missing or empty. Run `ucode configure --agents codex` first."
+            )
+        config_args = codex_config_args(profile_doc)
+        exec_or_spawn([binary, "app", *config_args, *tool_args[1:]])
+        return  # unreachable in production (exec replaces the process)
     # Run codex with --profile first — the TUI and runtime subcommands
     # (exec/resume/mcp/...) keep ucode's Databricks routing, including any added
     # by future codex versions. codex rejects the global --profile on

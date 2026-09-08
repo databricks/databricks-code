@@ -24,6 +24,7 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, cast, overload
@@ -68,6 +69,15 @@ _HTTP_GET_RETRY_BASE_SECONDS = 1.0
 _HTTP_GET_RETRY_MAX_SECONDS = 5.0
 _HTTP_GET_RETRY_AFTER_JITTER_SECONDS = 0.25
 _ANTHROPIC_MODEL_DISCOVERY_SETUP_MAX_RETRIES = 2
+
+
+@dataclass(frozen=True)
+class AnthropicModelCatalog:
+    """Models advertised by AI Gateway's Anthropic endpoint."""
+
+    model_ids: list[str]
+    model_id_to_display_name: dict[str, str]
+    error_msg: str | None = None
 
 
 def _debug_enabled() -> bool:
@@ -2092,11 +2102,13 @@ def build_skills_mcp_url(workspace: str, locations: list[str]) -> str:
 # Maps the gateway routing dialect a coding tool speaks to the Model Provider
 # Service `provider_type`s it can be backed by. claude speaks Anthropic's API,
 # which both the `anthropic` and `amazon_bedrock` provider types serve (Bedrock
-# just exposes different model ids); codex speaks OpenAI's. Tags are the short
-# form produced by `_provider_type_tag` (e.g. `amazon_bedrock`).
+# just exposes different model ids); codex speaks OpenAI's; gemini speaks
+# Google's, served by a Gemini Enterprise provider. Tags are the short form
+# produced by `_provider_type_tag` (e.g. `amazon_bedrock`).
 _TOOL_PROVIDER_TYPES: dict[str, tuple[str, ...]] = {
     "claude": ("anthropic", "amazon_bedrock"),
     "codex": ("openai",),
+    "gemini": ("gemini_enterprise",),
 }
 
 # Provider types that expose Bedrock-style model ids (e.g.
@@ -2872,12 +2884,19 @@ def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | 
     using that mode must not apply ucode's legacy ``databricks-claude-*`` family
     validation.
     """
+    catalog = list_anthropic_model_catalog(workspace, token)
+    return catalog.model_ids, catalog.error_msg
+
+
+def list_anthropic_model_catalog(workspace: str, token: str) -> AnthropicModelCatalog:
+    """Return advertised Anthropic model ids and their optional display names."""
     payload, reason = _get_anthropic_models_json(workspace, token)
     if payload is None:
-        return [], reason
+        return AnthropicModelCatalog(model_ids=[], model_id_to_display_name={}, error_msg=reason)
 
     data = cast(dict, payload) if isinstance(payload, dict) else {}
     model_ids: list[str] = []
+    display_names: dict[str, str] = {}
     seen: set[str] = set()
     for model in data.get("data", []):
         if not isinstance(model, dict):
@@ -2886,9 +2905,16 @@ def list_anthropic_models(workspace: str, token: str) -> tuple[list[str], str | 
         if isinstance(model_id, str) and model_id and model_id not in seen:
             seen.add(model_id)
             model_ids.append(model_id)
+            display_name = model.get("display_name")
+            if isinstance(display_name, str) and display_name:
+                display_names[model_id] = display_name
     if model_ids:
-        return model_ids, None
-    return [], "AI Gateway returned no Anthropic model ids"
+        return AnthropicModelCatalog(model_ids=model_ids, model_id_to_display_name=display_names)
+    return AnthropicModelCatalog(
+        model_ids=[],
+        model_id_to_display_name={},
+        error_msg="AI Gateway returned no Anthropic model ids",
+    )
 
 
 def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], str | None]:
