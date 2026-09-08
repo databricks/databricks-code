@@ -1857,15 +1857,19 @@ def _apply_managed_skills(managed: dict, tool: str, state: dict) -> None:
     _download_managed_skills(managed, state)
 
 
-def _claude_launch_supports_smart_routing(
-    tool_args: list[str], *, explicit_prompt: bool, model: str | None
+def _should_launch_smart_routing(
+    tool: str,
+    tool_args: list[str],
+    *,
+    explicit_prompt: bool,
+    model: str | None,
 ) -> bool:
-    """Return whether this Claude invocation can route its first prompt.
+    """Return whether this agent invocation can route its first prompt.
 
-    A model selected through ucode or Claude's own ``--model`` option always wins over
-    smart routing. Bare launches and prompts passed after ucode's ``--`` separator are
-    routable. Otherwise, a leading option such as ``--session-id <id>`` still starts a
-    session, while a leading positional argument such as ``update`` is a Claude command.
+    A selected model always wins over smart routing. Bare launches and prompts passed
+    after ucode's ``--`` separator are routable. Claude also supports leading options
+    such as ``--session-id <id>``; a leading positional argument such as ``update`` is
+    a command and cannot route a first prompt.
 
     Values belonging to arbitrary Claude options cannot be identified without duplicating
     Claude's option parser, so the first forwarded argument determines whether the invocation
@@ -1873,7 +1877,9 @@ def _claude_launch_supports_smart_routing(
     """
     if model is not None or has_explicit_model_arg(tool_args):
         return False
-    return not tool_args or explicit_prompt or tool_args[0].startswith("-")
+    if not tool_args or explicit_prompt:
+        return True
+    return tool == "claude" and tool_args[0].startswith("-")
 
 
 def _launch_options(
@@ -1885,14 +1891,6 @@ def _launch_options(
     model: str | None,
     provider: str | None,
 ) -> LaunchOptions:
-    has_model_override = model is not None or explicit_model_arg_value(tool_args) is not None
-    supports_prompt_routing = (
-        _claude_launch_supports_smart_routing(
-            tool_args, explicit_prompt=explicit_prompt, model=model
-        )
-        if tool == "claude"
-        else not has_model_override and (not tool_args or explicit_prompt)
-    )
     return LaunchOptions(
         claude_launch_model=model if tool == "claude" and provider is None else None,
         launch_smart_routing=(
@@ -1903,7 +1901,12 @@ def _launch_options(
             # Smart routing does not currently support Model Provider Services.
             and provider is None
             # Route a supported interactive launch shape.
-            and supports_prompt_routing
+            and _should_launch_smart_routing(
+                tool,
+                tool_args,
+                explicit_prompt=explicit_prompt,
+                model=model,
+            )
         ),
     )
 

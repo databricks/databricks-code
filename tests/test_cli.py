@@ -517,13 +517,18 @@ class TestSubcommandRouting:
     @pytest.mark.parametrize(
         ("tool_args", "expected"),
         [
+            (["--session-id"], True),
+            (["--session-id", "--verbose"], True),
             (["--session-id", "session-123"], True),
+            (["--verbose", "--session-id", "session-123"], True),
             (["--verbose"], True),
             (["-c"], True),
             (["update"], False),
+            (["update", "--session-id", "session-123"], False),
             (["--model", "fixed"], False),
             (["--model=fixed"], False),
             (["-m", "fixed"], False),
+            (["--session-id", "session-123", "--model", "fixed"], False),
         ],
     )
     def test_claude_options_allow_smart_routing_except_model(self, tool_args, expected):
