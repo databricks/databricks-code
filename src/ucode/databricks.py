@@ -14,6 +14,7 @@ import random
 import re
 import shlex
 import shutil
+import ssl
 import subprocess
 import time
 from collections.abc import Callable
@@ -229,6 +230,29 @@ def _log_auth_diagnostics() -> None:
         _debug(f"databrickscfg ({cfg_path})", f"read error: {exc}")
 
 
+@functools.cache
+def _make_ssl_context() -> ssl.SSLContext:
+    """Return an SSL context that trusts the system CA bundle plus any custom CA
+    pointed to by REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, or SSL_CERT_FILE.
+
+    Enterprise environments often inject a self-signed certificate via an SSL
+    inspection proxy. curl picks it up from the system store automatically;
+    Python's default ssl context doesn't on all platforms. Honoring the same
+    env vars that curl and the `requests` library use lets customers point ucode
+    at their enterprise CA bundle without patching the system Python install."""
+    ctx = ssl.create_default_context()
+    for env_var in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
+        ca_bundle = os.environ.get(env_var, "").strip()
+        if ca_bundle and Path(ca_bundle).is_file():
+            try:
+                ctx.load_verify_locations(cafile=ca_bundle)
+            except OSError:
+                continue
+            else:
+                break
+    return ctx
+
+
 def _http_get_retry_delay(retry_after: str | None, retry_index: int) -> float:
     if retry_after is not None:
         try:
@@ -272,7 +296,9 @@ def _http_get_json(
     )
     for attempt in range(max_retries + 1):
         try:
-            with urllib_request.urlopen(request, timeout=timeout) as response:
+            with urllib_request.urlopen(
+                request, timeout=timeout, context=_make_ssl_context()
+            ) as response:
                 body = response.read().decode("utf-8")
             _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
             if _debug_enabled():
@@ -349,7 +375,9 @@ def _http_send_json(
         headers["Content-Type"] = "application/json"
     request = urllib_request.Request(url, data=body_bytes, method=method, headers=headers)
     try:
-        with urllib_request.urlopen(request, timeout=timeout) as response:
+        with urllib_request.urlopen(
+            request, timeout=timeout, context=_make_ssl_context()
+        ) as response:
             body = response.read().decode("utf-8")
         _debug(f"{method} {url}", f"HTTP {response.status}, {len(body)} bytes")
         if _debug_enabled():
@@ -420,7 +448,9 @@ def _http_get_bytes(url: str, token: str, *, timeout: int = 10) -> tuple[bytes |
     """
     request = urllib_request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
-        with urllib_request.urlopen(request, timeout=timeout) as response:
+        with urllib_request.urlopen(
+            request, timeout=timeout, context=_make_ssl_context()
+        ) as response:
             body = response.read()
         _debug(f"GET {url}", f"HTTP 200, {len(body)} bytes")
         return body, None
@@ -3269,7 +3299,7 @@ def discover_sql_warehouses(
     )
 
     try:
-        with urllib_request.urlopen(request, timeout=20) as response:
+        with urllib_request.urlopen(request, timeout=20, context=_make_ssl_context()) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib_error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
