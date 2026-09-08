@@ -138,7 +138,7 @@ class TestUpgrade:
 
     @staticmethod
     def _requirement(distribution: str) -> str:
-        return f"{distribution} @ git+https://github.com/databricks/ucode"
+        return f"{distribution} @ git+https://github.com/databricks/unity-gateway"
 
     def test_before_cutover_upgrades_ucode_normally_without_verification(self):
         with (
@@ -159,7 +159,7 @@ class TestUpgrade:
         assert "ucode upgraded" in result.output
 
     def test_cutover_migrates_legacy_distribution_and_verifies_commands(self):
-        git_url = "git+https://github.com/databricks/ucode"
+        git_url = "git+https://github.com/databricks/unity-gateway"
         rename_failure = subprocess.CompletedProcess(
             [],
             1,
@@ -269,7 +269,7 @@ class TestUpgrade:
 
         assert result.exit_code == 1
         assert "legacy `ucode` tool was removed" in result.output
-        assert "uv tool install --force git+https://github.com/databricks/ucode" in re.sub(
+        assert "uv tool install --force git+https://github.com/databricks/unity-gateway" in re.sub(
             r"\s+", " ", result.output
         )
 
