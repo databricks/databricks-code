@@ -98,12 +98,18 @@ def _parse_version(value: str) -> tuple[int, int, int] | None:
     return int(major), int(minor), int(patch)
 
 
-def _installed_version_status() -> tuple[str, bool] | None:
+def minimum_version_error() -> str | None:
+    """Return the active smart-routing version blocker, if any."""
+    if not smart_routing_v2.enabled():
+        return None
     version = agent_version(SPEC["binary"])
     parsed = _parse_version(version)
-    if parsed is None:
+    if parsed is None or parsed >= MINIMUM_ROUTING_CODEX_VERSION:
         return None
-    return version, parsed < MINIMUM_CODEX_VERSION
+    return (
+        "Codex smart routing requires Codex "
+        f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version}."
+    )
 
 
 def _use_legacy_layout() -> bool:
@@ -499,13 +505,6 @@ def launch(state: dict, tool_args: list[str]) -> None:
     binary = SPEC["binary"]
     workspace = state.get("workspace")
     if smart_routing_v2.enabled():
-        version_text = agent_version(binary)
-        parsed_version = _parse_version(version_text)
-        if parsed_version is not None and parsed_version < MINIMUM_ROUTING_CODEX_VERSION:
-            raise RuntimeError(
-                "Codex smart routing requires Codex "
-                f"{MINIMUM_ROUTING_CODEX_VERSION_TEXT} or newer; found {version_text}."
-            )
 
         def _app_server_start_model() -> str:
             managed_model = default_model(state)
