@@ -53,33 +53,19 @@ def _routing_hook_groups(state: dict) -> dict[str, list[dict]]:
 
 
 def merge_pre_tool_use_hooks(
-    existing: list[dict],
-    state: dict,
-    *,
-    available_models: list[str],
+    existing: list[dict], state: dict, *, available_models: list[str]
 ) -> list[dict]:
     """Add the ucode spawn hook to an existing Codex PreToolUse hook list."""
     doc = {"hooks": {"PreToolUse": copy.deepcopy(existing)}}
     hooks.sync_managed_hooks(
         doc,
         ROUTING_HOOK_COMMAND_MARKER,
-        {
-            "PreToolUse": [
-                _pre_tool_use_hook_group(
-                    state,
-                    available_models=available_models,
-                )
-            ]
-        },
+        {"PreToolUse": [_pre_tool_use_hook_group(state, available_models=available_models)]},
     )
     return doc["hooks"]["PreToolUse"]
 
 
-def _pre_tool_use_hook_group(
-    state: dict,
-    *,
-    available_models: list[str] | None = None,
-) -> dict:
+def _pre_tool_use_hook_group(state: dict, *, available_models: list[str] | None = None) -> dict:
     route_argv = _routing_hook_argv(
         state,
         "route-subagent",
@@ -92,10 +78,7 @@ def _pre_tool_use_hook_group(
 
 
 def _routing_hook_argv(
-    state: dict,
-    event: str,
-    *,
-    available_models: list[str] | None = None,
+    state: dict, event: str, *, available_models: list[str] | None = None
 ) -> list[str]:
     workspace = str(state.get("workspace") or "")
     argv = [
