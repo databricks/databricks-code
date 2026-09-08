@@ -1829,7 +1829,7 @@ def discover_model_services(
     # Smart routing's CLAUDE_ROUTE_ARMS require claude-opus-4-8, but the
     # newest-wins sort above picks opus-5 when both exist — making the
     # routing availability check fail. Pin opus-4-8 when it's available so
-    # routing works with the currently-deployed task_v1 router. Revert to
+    # routing works with the current task_v2 router. Revert to
     # newest-wins once the router accepts opus-5 (PR databricks-eng/universe#2365446).
     _prefer_opus_4_8(claude_models, ids)
 
