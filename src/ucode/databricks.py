@@ -3062,6 +3062,10 @@ def discover_codex_models(workspace: str, token: str) -> tuple[list[str], str | 
     )
 
 
+def discover_anthropic_messages_models(workspace: str, token: str) -> tuple[list[str], str | None]:
+    return discover_endpoints_with_api_type(workspace, token, "anthropic/v1/messages")
+
+
 def fetch_gemini_models(workspace: str, token: str) -> list[str]:
     models, _ = discover_gemini_models(workspace, token)
     return models

@@ -31,6 +31,7 @@ from ucode.databricks import (
     all_users_can_use_schema,
     create_coding_agent_config,
     delete_coding_agent_config,
+    discover_anthropic_messages_models,
     discover_claude_models_unbucketed,
     ensure_databricks_auth,
     get_databricks_token,
@@ -1969,21 +1970,37 @@ def _with_claude_inventory(state: dict, workspace: str, profile: str | None) -> 
     what the wizard happened to leave behind, which also covers a hand-edited or ``--from-file``
     manifest authored on another machine.
 
+    Also fetches workspace endpoints exposing ``anthropic/v1/messages`` (custom Model Serving the
+    UC listing misses) onto ``state["anthropic_messages_models"]`` for the same reason.
+
     Best-effort: a failed listing returns ``state`` untouched, leaving validation on the narrower
     inventory rather than blocking a publish on a transient API error.
     """
-    if isinstance(state.get("all_claude_models"), list) and state["all_claude_models"]:
-        return state
     try:
         token = get_databricks_token(workspace, profile)
-        all_claude, _ = discover_claude_models_unbucketed(workspace, token)
     except (RuntimeError, OSError):
         # OSError covers a missing `databricks` binary: `get_databricks_token` shells out, so a
         # machine without the CLI on PATH raises FileNotFoundError rather than RuntimeError.
         return state
-    if not all_claude:
-        return state
-    return {**state, "all_claude_models": all_claude}
+    updated = state
+    if not (isinstance(state.get("all_claude_models"), list) and state["all_claude_models"]):
+        try:
+            all_claude, _ = discover_claude_models_unbucketed(workspace, token)
+        except (RuntimeError, OSError):
+            all_claude = []
+        if all_claude:
+            updated = {**updated, "all_claude_models": all_claude}
+    if not (
+        isinstance(state.get("anthropic_messages_models"), list)
+        and state["anthropic_messages_models"]
+    ):
+        try:
+            messages_models, _ = discover_anthropic_messages_models(workspace, token)
+        except (RuntimeError, OSError):
+            messages_models = []
+        if messages_models:
+            updated = {**updated, "anthropic_messages_models": messages_models}
+    return updated
 
 
 def publish_command(*, file_path: str | None = None, yes: bool = False) -> int:

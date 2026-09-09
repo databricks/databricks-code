@@ -370,7 +370,13 @@ def _known_models(state: dict) -> set[str]:
     claude_models = state.get("claude_models")
     if isinstance(claude_models, dict):
         known.update(m for m in claude_models.values() if isinstance(m, str) and m)
-    for key in ("codex_models", "gemini_models", "oss_models", "all_claude_models"):
+    for key in (
+        "codex_models",
+        "gemini_models",
+        "oss_models",
+        "all_claude_models",
+        "anthropic_messages_models",
+    ):
         models = state.get(key)
         if isinstance(models, list):
             known.update(m for m in models if isinstance(m, str) and m)

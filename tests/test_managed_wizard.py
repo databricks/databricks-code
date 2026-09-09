@@ -2606,6 +2606,39 @@ class TestPublishCommand:
         )
         assert published
 
+    def test_a_custom_messages_api_ms_publishes(self):
+        # A hand-edited manifest pinning a custom Model Serving (exposing
+        # anthropic/v1/messages) used to be rejected as unknown — the UC listing
+        # doesn't contain it. `apply` now re-fetches the Messages-API endpoints so
+        # validation accepts it.
+        managed_config_mod.save_managed_state(
+            WORKSPACE,
+            {
+                "default_agent": "claude",
+                "enabled_agents": {
+                    "claude": {"model_config": {"default_model": "main.default.my_claude_ms"}}
+                },
+            },
+        )
+        published: dict = {}
+
+        def fake_create(workspace, token, payload):
+            published["payload"] = payload
+            return {"name": "coding-agent-configs/new"}, None
+
+        assert (
+            self._run(
+                discover_claude_models_unbucketed=lambda *a, **k: ([], None),
+                discover_anthropic_messages_models=lambda *a, **k: (
+                    ["main.default.my_claude_ms"],
+                    None,
+                ),
+                create_coding_agent_config=fake_create,
+            )
+            == 0
+        )
+        assert published, "the manifest should have been published"
+
     def test_declining_the_prompt_publishes_nothing(self):
         managed_config_mod.save_managed_state(WORKSPACE, self.MANIFEST)
         created = {"called": False}

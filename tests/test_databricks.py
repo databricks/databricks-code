@@ -1283,6 +1283,37 @@ class TestDiscoverGeminiModels:
         assert reason is None
         assert models == ["databricks-gpt-5-2-codex", "databricks-gpt-4-1"]
 
+    def test_anthropic_messages_returns_messages_api_endpoints(self, monkeypatch):
+        # Mirrors discover_codex_models but for anthropic/v1/messages — surfaces
+        # custom Model Serving the name-keyed Claude discoveries miss.
+        payload = {
+            "endpoints": [
+                {
+                    "name": name,
+                    "config": {
+                        "served_entities": [
+                            {
+                                "foundation_model": {
+                                    "ai_gateway_v2_supported": True,
+                                    "api_types": [api_type],
+                                }
+                            }
+                        ]
+                    },
+                }
+                for name, api_type in [
+                    ("main.default.my_claude_ms", "anthropic/v1/messages"),
+                    ("databricks-gpt-5-2-codex", "openai/v1/responses"),
+                ]
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda url, token: (payload, None))
+
+        models, reason = db_mod.discover_anthropic_messages_models(WS, "token")
+
+        assert reason is None
+        assert models == ["main.default.my_claude_ms"]
+
 
 class TestResolvePatToken:
     def test_reads_pat_profile_token_from_cfg(self, monkeypatch, tmp_path):

@@ -565,6 +565,19 @@ class TestValidate:
         errors = validate_manifest(manifest, state)
         assert any("not available on this workspace" in e for e in errors)
 
+    def test_custom_messages_api_ms_is_accepted(self):
+        # A custom Model Serving endpoint exposing anthropic/v1/messages isn't in the
+        # UC `all_claude_models` listing, but is routable — `anthropic_messages_models`
+        # vouches for it the way `custom_models` does for a hand-typed id.
+        manifest = {
+            "default_agent": "claude",
+            "enabled_agents": {
+                "claude": {"model_config": {"default_model": "main.default.my_claude_ms"}}
+            },
+        }
+        state = {**STATE, "anthropic_messages_models": ["main.default.my_claude_ms"]}
+        assert validate_manifest(manifest, state) == []
+
     def test_custom_model_is_accepted_via_the_marker(self):
         # A hand-typed model service outside the discovered inventory is listed in `custom_models`
         # (it was verified to exist when entered), so the inventory check must not reject it.
