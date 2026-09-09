@@ -156,7 +156,12 @@ CLAUDE_DEFAULT_MODEL_ENV_KEYS = {
 }
 # Launch-scoped feature flags that ucode may write into Claude settings. These
 # must be removed again when the corresponding launch flag is absent.
-CLAUDE_CONDITIONAL_ENV_KEYS = ("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",)
+CLAUDE_CONDITIONAL_ENV_KEYS = (
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+    # Written only for credentialed (non-relayed) launches; pruned on a relayed launch so
+    # gateway login mode can't shadow the subscription OAuth (see render_overlay).
+    "CLAUDE_CODE_USE_GATEWAY",
+)
 # Env keys ucode used to write but no longer does; stripped from the managed
 # settings file on every launch so stale values never linger.
 CLAUDE_REMOVED_ENV_KEYS = ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",)
@@ -368,8 +373,17 @@ def render_overlay(
         # not set CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS (see CLAUDE_REMOVED_ENV_KEYS).
         "ENABLE_PROMPT_CACHING_1H": "1",
         "ENABLE_TOOL_SEARCH": "true",
-        "CLAUDE_CODE_USE_GATEWAY": "1",
     }
+    # Gateway login mode — only for credentialed (non-relayed) paths, where an
+    # apiKeyHelper supplies the gateway credential this mode expects. Relayed has no
+    # such credential: it relies on Claude Code's own subscription OAuth as the
+    # Authorization credential. Claude Code 2.1.261+ makes gateway login mode ignore a
+    # subscription login and demand a gateway `/login`, which the relayed loopback proxy
+    # can't satisfy — so relayed sessions loop on login. Requests still route through the
+    # gateway via ANTHROPIC_BASE_URL without this flag. In CLAUDE_CONDITIONAL_ENV_KEYS so
+    # a value a prior non-relayed launch wrote is pruned when a relayed launch omits it.
+    if not relayed:
+        env["CLAUDE_CODE_USE_GATEWAY"] = "1"
     # Intentionally NOT setting ANTHROPIC_MODEL by default. Setting it produces a
     # duplicate catalog row in Claude Code's /model picker (e.g. "Opus 4.8 (1M
     # context) ✓") on top of the family-alias row from ANTHROPIC_DEFAULT_OPUS_MODEL.
