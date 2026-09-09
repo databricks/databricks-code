@@ -117,6 +117,10 @@ class TestBuildToolBaseUrl:
         with pytest.raises(RuntimeError, match="multiple base URLs"):
             build_tool_base_url("opencode", WS)
 
+    def test_omp_raises(self):
+        with pytest.raises(RuntimeError, match="multiple base URLs"):
+            build_tool_base_url("omp", WS)
+
     def test_unsupported_tool_raises(self):
         with pytest.raises(RuntimeError, match="Unsupported"):
             build_tool_base_url("unknown", WS)

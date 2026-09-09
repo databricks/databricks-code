@@ -3386,6 +3386,8 @@ def build_tool_base_url(tool: str, workspace: str) -> str:
         )
     if tool == "pi":
         raise RuntimeError("Pi has multiple base URLs — use build_pi_base_urls() instead.")
+    if tool == "omp":
+        raise RuntimeError("Oh My Pi has multiple base URLs — use build_pi_base_urls() instead.")
     raise RuntimeError(f"Unsupported tool '{tool}'.")
 
 
