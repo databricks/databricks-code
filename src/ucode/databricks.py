@@ -1541,6 +1541,10 @@ _MODEL_TOKEN_LIMITS: dict[str, dict[str, int]] = {
     # GLM-4.6: 200k context, but the gateway caps output well below the model's
     # native 128k — pin 25k so requests aren't rejected.
     "glm": {"context": 200_000, "output": 25_000},
+    # Amazon Bedrock Nova (Micro/Lite/Pro), served over Converse: the gateway
+    # rejects an output cap of 10k or more ("model limit of 10000"), so pin a
+    # value safely under it. Claude/others have no known low cap and stay unset.
+    "nova": {"context": 300_000, "output": 8_192},
 }
 
 
@@ -2104,8 +2108,9 @@ def build_skills_mcp_url(workspace: str, locations: list[str]) -> str:
 # produced by `_provider_type_tag` (e.g. `amazon_bedrock`).
 _TOOL_PROVIDER_TYPES: dict[str, tuple[str, ...]] = {
     "claude": ("anthropic", "amazon_bedrock"),
-    "codex": ("openai",),
+    "codex": ("openai", "amazon_bedrock"),
     "gemini": ("gemini_enterprise",),
+    "pi": ("anthropic", "amazon_bedrock"),
 }
 
 # Provider types that expose Bedrock-style model ids (e.g.
@@ -2333,12 +2338,13 @@ def service_usable_for_tool(tool: str, service: dict) -> bool:
     Beyond the provider-type match, a Bedrock service is only usable for claude
     if it exposes at least one Claude model in its targets — otherwise there's no
     routable model id to pin. (Anthropic services use canonical names, so any
-    match is usable.)
+    match is usable.) Codex uses the OpenAI-compatible Bedrock endpoint, so any
+    Bedrock service is usable for it regardless of declared targets.
     """
     provider_type = service.get("provider_type", "")
     if not tool_supports_provider_type(tool, provider_type):
         return False
-    if provider_type in BEDROCK_PROVIDER_TYPES:
+    if tool == "claude" and provider_type in BEDROCK_PROVIDER_TYPES:
         return bool(map_claude_family_models(service.get("targets") or []))
     return True
 
@@ -2379,8 +2385,10 @@ def resolve_provider_service(
             f"Model provider service '{service_name}' is a '{provider_type}' provider, "
             f"which {tool} can't route to (supported: {supported})."
         )
-    if provider_type in BEDROCK_PROVIDER_TYPES and not map_claude_family_models(
-        match.get("targets") or []
+    if (
+        tool == "claude"
+        and provider_type in BEDROCK_PROVIDER_TYPES
+        and not map_claude_family_models(match.get("targets") or [])
     ):
         return None, (
             f"Model provider service '{service_name}' exposes no Claude models — "
@@ -3076,6 +3084,44 @@ class GatewayProbe(NamedTuple):
     conclusive: bool = True
 
 
+def list_mps_codex_models(
+    service_name: str, workspace: str, token: str
+) -> tuple[list[str], str | None]:
+    """List models available through a Bedrock MPS's OpenAI-compatible endpoint.
+
+    Queries ``{workspace}/ai-gateway/codex/v1/models`` with the
+    ``Databricks-Model-Provider-Service`` header so the gateway asks the MPS
+    what models it exposes.  Used when a service has ``allow_all_targets`` set
+    and no explicit targets are declared.
+
+    Returns ``(model_ids, reason)`` where ``reason`` is non-None on failure.
+    """
+    url = f"{build_tool_base_url('codex', workspace)}/models"
+    req = urllib_request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Databricks-Model-Provider-Service": service_name,
+        },
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+        payload = json.loads(body)
+    except urllib_error.HTTPError as exc:
+        return [], f"HTTP {exc.code}"
+    except Exception as exc:
+        return [], str(exc)
+    if not isinstance(payload, dict):
+        return [], "unexpected response shape"
+    data = payload.get("data") or []
+    models = sorted(
+        str(m["id"]) for m in data if isinstance(m, dict) and isinstance(m.get("id"), str)
+    )
+    return models, None
+
+
 _MODEL_SERVICE_PROBE_PAGE_SIZE = 50
 _MODEL_SERVICE_PROBE_MAX_PAGES = 20
 _MODEL_SERVICE_EMPTY_DETAIL = (
@@ -3413,6 +3459,10 @@ def build_pi_base_urls(workspace: str) -> dict[str, str]:
         "claude": build_tool_base_url("claude", workspace),
         "openai": build_tool_base_url("codex", workspace),
         "gemini": build_tool_base_url("gemini", workspace) + "/v1beta",
+        # Bedrock routes through the standard gateway; MPS header selects the provider.
+        # Do NOT include the MPS name in the path — /ai-gateway/amazonbedrock/ maps to
+        # the control plane (bedrock.amazonaws.com), not the runtime.
+        "bedrock": f"{workspace}/ai-gateway",
     }
 
 
