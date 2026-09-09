@@ -9,11 +9,10 @@ import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib import metadata
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.panel import Panel
-from typer._click import Context as ClickContext
 from typer.core import TyperCommand
 
 from ucode.agents import (
@@ -2174,7 +2173,7 @@ _PROMPT_SUFFIX_KEY = "ucode_explicit_prompt_suffix"
 class _PromptAwareCommand(TyperCommand):
     """Record an agent's ``--`` prompt separator before Click removes it."""
 
-    def parse_args(self, ctx: ClickContext, args: list[str]) -> list[str]:
+    def parse_args(self, ctx: Any, args: list[str]) -> list[str]:
         try:
             separator = args.index("--")
         except ValueError:
