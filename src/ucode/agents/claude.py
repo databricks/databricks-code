@@ -786,6 +786,9 @@ def _reconcile_managed_settings(
     configuration mirrors ucode's settings there. The same compose operation that produced the
     private file is applied to the existing managed file, preserving unrelated IT-authored keys.
 
+    `ug configure` updates gateway-owned fields in this file, but does not generate or modify
+    the `modelPicker` object; an existing picker is retained by the merge.
+
     Relayed launches are skipped: they depend on a per-session loopback refresh proxy that only runs
     during `ucode claude`, so a bare `claude` could not reach the gateway anyway.
     """
