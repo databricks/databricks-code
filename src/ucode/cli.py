@@ -323,6 +323,25 @@ def _custom_oauth_config(
     )
 
 
+def _has_saved_custom_oauth(workspaces: list[tuple[str, str | None]] | None) -> bool:
+    full_state = load_full_state()
+    workspace_states = full_state.get("workspaces")
+    if not isinstance(workspace_states, dict):
+        return False
+    if workspaces is None:
+        current_workspace = full_state.get("current_workspace")
+        target_workspaces = [current_workspace] if isinstance(current_workspace, str) else []
+    else:
+        target_workspaces = [
+            normalize_workspace_url(workspace) for workspace, _profile in workspaces
+        ]
+    return any(
+        isinstance(workspace_states.get(workspace), dict)
+        and "custom_oauth" in workspace_states[workspace]
+        for workspace in target_workspaces
+    )
+
+
 def _parse_agents_option(agents: str) -> list[str]:
     tools: list[str] = []
     for raw_tool in agents.split(","):
@@ -434,6 +453,7 @@ def configure_shared_state(
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
     custom_oauth: CustomOAuthConfig | None = None,
+    clear_custom_oauth: bool = False,
 ) -> dict:
     """Log into Databricks, verify AI Gateway, fetch model lists, persist state.
 
@@ -503,7 +523,9 @@ def configure_shared_state(
     else:
         state.pop("fable_enabled", None)
     state["databricks_ai_tools_enabled"] = databricks_ai_tools_enabled
-    if custom_oauth is not None:
+    if clear_custom_oauth:
+        state.pop("custom_oauth", None)
+    elif custom_oauth is not None:
         state["custom_oauth"] = dict(custom_oauth)
     elif previous_workspace != workspace:
         state.pop("custom_oauth", None)
@@ -672,12 +694,15 @@ def _configure_shared_workspace_states(
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
     custom_oauth: CustomOAuthConfig | None = None,
+    clear_custom_oauth: bool = False,
 ) -> list[dict]:
     if not workspaces:
         raise RuntimeError("At least one workspace must be provided.")
     states: list[dict] = []
     for workspace, profile in workspaces:
         custom_oauth_kwargs = {"custom_oauth": custom_oauth} if custom_oauth is not None else {}
+        if clear_custom_oauth:
+            custom_oauth_kwargs["clear_custom_oauth"] = True
         states.append(
             configure_shared_state(
                 workspace,
@@ -771,6 +796,7 @@ def configure_workspace_command(
     fable_enabled: bool | None = None,
     databricks_ai_tools_enabled: bool | None = None,
     custom_oauth: CustomOAuthConfig | None = None,
+    clear_custom_oauth: bool = False,
     offer_optional_setup: bool = False,
 ) -> int:
     if tool is not None and selected_tools is not None:
@@ -792,6 +818,7 @@ def configure_workspace_command(
             fable_enabled=fable_enabled,
             databricks_ai_tools_enabled=databricks_ai_tools_enabled,
             custom_oauth=custom_oauth,
+            clear_custom_oauth=clear_custom_oauth,
         )
         state = states[0]
         state = configure_single_tool(tool, state)
@@ -832,6 +859,7 @@ def configure_workspace_command(
         fable_enabled=fable_enabled,
         databricks_ai_tools_enabled=databricks_ai_tools_enabled,
         custom_oauth=custom_oauth,
+        clear_custom_oauth=clear_custom_oauth,
     )
     state = states[0]
     save_state(state)
@@ -2870,6 +2898,12 @@ def configure(
             skip_kwargs["databricks_ai_tools_enabled"] = enable_databricks_ai_tools
         if custom_oauth is not None:
             skip_kwargs["custom_oauth"] = custom_oauth
+        elif (mcp is None or agent is not None or agents is not None) and _has_saved_custom_oauth(
+            workspace_entries
+        ):
+            # An explicit agent configuration without custom OAuth options
+            # resets that workspace to the standard Databricks auth helper.
+            skip_kwargs["clear_custom_oauth"] = True
         # Set True only in the fully-interactive branch below; gates the optional
         # MCP setup prompt so flag-driven / scripted runs are never interrupted.
         fully_interactive = False

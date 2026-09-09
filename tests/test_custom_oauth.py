@@ -245,6 +245,37 @@ class TestConfigureCustomOAuth:
             },
         )
 
+    def test_configure_without_custom_options_resets_custom_oauth(self):
+        with (
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.install_tool_binary"),
+            patch(
+                "ucode.cli.load_full_state",
+                return_value={
+                    "current_workspace": WS,
+                    "workspaces": {WS: {"custom_oauth": {"client_id": "old"}}},
+                },
+            ),
+            patch("ucode.cli.configure_workspace_command") as configure_workspace,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "configure",
+                    "--agent",
+                    "claude",
+                    "--workspaces",
+                    WS,
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        configure_workspace.assert_called_once_with(
+            "claude",
+            workspaces=[(WS, None)],
+            clear_custom_oauth=True,
+        )
+
     def test_shared_state_persists_custom_oauth(self, monkeypatch):
         custom_oauth = {
             "client_id": "custom-client",
@@ -265,6 +296,24 @@ class TestConfigureCustomOAuth:
 
         assert state["custom_oauth"] == custom_oauth
         assert saved[-1]["custom_oauth"] == custom_oauth
+
+    def test_shared_state_clears_custom_oauth(self, monkeypatch):
+        monkeypatch.setattr(
+            cli_mod,
+            "load_state",
+            lambda: {"workspace": WS, "custom_oauth": {"client_id": "old"}},
+        )
+        monkeypatch.setattr(cli_mod, "save_state", lambda _state: None)
+        monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda _workspace: None)
+
+        state = cli_mod.configure_shared_state(
+            WS,
+            tools=["claude"],
+            skip_preflight=True,
+            clear_custom_oauth=True,
+        )
+
+        assert "custom_oauth" not in state
 
 
 class TestLaunchCustomOAuth:
