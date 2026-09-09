@@ -246,35 +246,20 @@ class TestConfigureCustomOAuth:
         )
 
     def test_configure_without_custom_options_resets_custom_oauth(self):
+        state = {"workspace": WS, "available_tools": ["claude"]}
         with (
-            patch("ucode.cli.install_databricks_cli"),
-            patch("ucode.cli.install_tool_binary"),
-            patch(
-                "ucode.cli.load_full_state",
-                return_value={
-                    "current_workspace": WS,
-                    "workspaces": {WS: {"custom_oauth": {"client_id": "old"}}},
-                },
-            ),
-            patch("ucode.cli.configure_workspace_command") as configure_workspace,
+            patch("ucode.cli._configure_shared_workspace_states", return_value=[state]) as shared,
+            patch("ucode.cli.configure_single_tool", return_value=state),
+            patch("ucode.cli.install_databricks_ai_tools_for_agents"),
         ):
-            result = runner.invoke(
-                app,
-                [
-                    "configure",
-                    "--agent",
-                    "claude",
-                    "--workspaces",
-                    WS,
-                ],
+            result = cli_mod.configure_workspace_command(
+                "claude",
+                workspaces=[(WS, None)],
+                skip_validate=True,
             )
 
-        assert result.exit_code == 0, result.output
-        configure_workspace.assert_called_once_with(
-            "claude",
-            workspaces=[(WS, None)],
-            clear_custom_oauth=True,
-        )
+        assert result == 0
+        assert shared.call_args.kwargs["clear_custom_oauth"] is True
 
     def test_shared_state_persists_custom_oauth(self, monkeypatch):
         custom_oauth = {
@@ -371,3 +356,15 @@ class TestLaunchCustomOAuth:
             tools=["codex"],
             custom_oauth=custom_oauth,
         )
+
+    def test_auto_configure_does_not_clear_custom_oauth(self):
+        state = {"workspace": WS, "profile": None, "available_tools": ["claude"]}
+        with (
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state) as configure_shared,
+            patch("ucode.cli.configure_single_tool", return_value=state),
+            patch("ucode.cli.validate_tool", return_value=(True, None)),
+        ):
+            cli_mod._auto_configure_tool("claude")
+
+        configure_shared.assert_called_once_with(WS, profile=None, tools=["claude"])
