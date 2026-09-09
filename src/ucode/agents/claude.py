@@ -1323,7 +1323,6 @@ def launch(
     if (
         workspace
         and os.environ.get(GATEWAY_MODEL_DISCOVERY_ENV_VAR) == "1"
-        and not _has_provider_launch(state)
     ):
         # Discovery is launch-scoped. Pass it in the process environment rather
         # than persisting it in Claude's private or OS-managed settings.
