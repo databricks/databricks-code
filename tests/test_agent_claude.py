@@ -263,6 +263,19 @@ class TestRenderOverlay:
         assert "Databricks-Model-Provider-Service: c.s.mps" in headers
         assert "X-Databricks-AI-Gateway-Token" not in headers
 
+    def test_relayed_omits_use_gateway(self):
+        # Gateway login mode (Claude Code 2.1.261+) ignores the subscription OAuth relayed
+        # depends on and loops on /login, so relayed must not enter it. Non-relayed still does.
+        overlay, keys = claude.render_overlay(
+            WS,
+            None,
+            provider="c.s.mps",
+            relayed=True,
+            relayed_base_url="http://127.0.0.1:9",
+        )
+        assert "CLAUDE_CODE_USE_GATEWAY" not in overlay["env"]
+        assert ["env", "CLAUDE_CODE_USE_GATEWAY"] not in keys
+
     def test_model_overrides_when_all_provided(self):
         models = {
             "sonnet": "databricks-claude-sonnet-4-6",
@@ -642,6 +655,16 @@ class TestWriteToolConfigStripsRemovedEnvKeys:
         claude.write_tool_config(state, "databricks-claude-sonnet-4")
 
         assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in written[0]["env"]
+
+    def test_relayed_prunes_stale_use_gateway(self, monkeypatch):
+        # A prior non-relayed launch may have written CLAUDE_CODE_USE_GATEWAY; a relayed
+        # launch must drop it so gateway login mode can't shadow the subscription OAuth.
+        existing = {"env": {"CLAUDE_CODE_USE_GATEWAY": "1"}}
+        written: list = []
+        self._patch(monkeypatch, existing, written)
+        state = {"workspace": WS, "codex_models": [], "relayed_proxy_port": 9999}
+        claude.write_tool_config(state, None, provider="c.s.mps", relayed=True)
+        assert "CLAUDE_CODE_USE_GATEWAY" not in written[0]["env"]
 
 
 FAKE_MANAGED_PATH = Path("/tmp/ucode-test/managed-settings.json")
