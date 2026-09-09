@@ -7,7 +7,6 @@ import os
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import tomlkit
 from tomlkit.exceptions import ParseError
@@ -21,6 +20,7 @@ from ucode.config_io import (
     read_toml_safe,
     write_toml_file,
 )
+from ucode.custom_oauth import CustomOAuthConfig, build_custom_auth_token_argv
 from ucode.databricks import (
     build_auth_token_argv,
     build_tool_base_url,
@@ -51,9 +51,6 @@ from ucode.telemetry import agent_version, ucode_version
 from ucode.ui import print_warning_err
 
 from .args import LaunchOptions
-
-if TYPE_CHECKING:
-    from ucode.custom_oauth import CustomOAuthConfig
 
 CODEX_CONFIG_DIR = Path.home() / ".codex"
 CODEX_PROFILE_NAME = "ucode"
@@ -153,8 +150,6 @@ def _provider_block(
     custom_oauth: CustomOAuthConfig | None = None,
 ) -> dict:
     if custom_oauth:
-        from ucode.custom_oauth import build_custom_auth_token_argv
-
         auth_argv = build_custom_auth_token_argv(workspace, custom_oauth)
     else:
         auth_argv = build_auth_token_argv(workspace, databricks_profile, use_pat=use_pat)

@@ -13,7 +13,7 @@ import subprocess
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 from ucode import gateway_proxy
 from ucode.config_io import (
@@ -25,6 +25,7 @@ from ucode.config_io import (
     write_json_file,
 )
 from ucode.constants import LOOPBACK_HOST
+from ucode.custom_oauth import CustomOAuthConfig, build_custom_auth_shell_command
 from ucode.databricks import (
     build_auth_shell_command,
     build_tool_base_url,
@@ -52,9 +53,6 @@ from ucode.state import MANAGED_OVERLAY_KEY, get_provider_service, mark_tool_man
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_note, print_success, print_warning
-
-if TYPE_CHECKING:
-    from ucode.custom_oauth import CustomOAuthConfig
 
 from .args import LaunchOptions, has_explicit_model_arg
 
@@ -428,8 +426,6 @@ def render_overlay(
         keys = [["env", k] for k in env]
     else:
         if custom_oauth:
-            from ucode.custom_oauth import build_custom_auth_shell_command
-
             overlay["apiKeyHelper"] = build_custom_auth_shell_command(workspace, custom_oauth)
         else:
             overlay["apiKeyHelper"] = build_auth_shell_command(workspace, profile, use_pat=use_pat)

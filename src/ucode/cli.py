@@ -9,7 +9,7 @@ import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib import metadata
-from typing import TYPE_CHECKING, Annotated
+from typing import Annotated
 
 import typer
 from rich.panel import Panel
@@ -45,6 +45,12 @@ from ucode.agents.args import has_explicit_model_arg
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
 from ucode.config_io import is_dry_run, restore_file, set_dry_run
+from ucode.custom_oauth import (
+    DEFAULT_REDIRECT_URL,
+    CustomOAuthConfig,
+    create_custom_oauth_config,
+    get_custom_client_token,
+)
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
@@ -148,9 +154,6 @@ from ucode.ui import (
     status_badge,
 )
 from ucode.usage import usage as usage_report
-
-if TYPE_CHECKING:
-    from ucode.custom_oauth import CustomOAuthConfig
 
 _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
     "claude": ("claude", "opencode", "copilot", "pi"),
@@ -313,8 +316,6 @@ def _custom_oauth_config(
         raise RuntimeError("--redirect-url and --scopes require --client-id.")
     if scopes is None:
         raise RuntimeError("--scopes is required with --client-id.")
-
-    from ucode.custom_oauth import DEFAULT_REDIRECT_URL, create_custom_oauth_config
 
     return create_custom_oauth_config(
         client_id,
@@ -1483,8 +1484,6 @@ def auth_token_cmd(
             raise typer.Exit(1)
     try:
         if client_id is not None:
-            from ucode.custom_oauth import DEFAULT_REDIRECT_URL, get_custom_client_token
-
             assert scopes is not None
             token = get_custom_client_token(
                 workspace,

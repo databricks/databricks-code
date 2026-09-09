@@ -6,6 +6,11 @@ import json
 from typing import cast
 
 from ucode.config_io import APP_DIR, is_dry_run
+from ucode.custom_oauth import (
+    CustomOAuthConfig,
+    build_custom_auth_shell_command,
+    build_custom_auth_token_argv,
+)
 from ucode.databricks import (
     build_auth_shell_command,
     build_auth_token_argv,
@@ -169,12 +174,6 @@ def build_agent_state(state: dict) -> dict[str, dict]:
     codex_auth_argv = auth_argv
     custom_oauth = state.get("custom_oauth")
     if isinstance(custom_oauth, dict):
-        from ucode.custom_oauth import (
-            CustomOAuthConfig,
-            build_custom_auth_shell_command,
-            build_custom_auth_token_argv,
-        )
-
         typed_custom_oauth = cast(CustomOAuthConfig, custom_oauth)
         claude_auth_command = build_custom_auth_shell_command(workspace, typed_custom_oauth)
         codex_auth_command = claude_auth_command

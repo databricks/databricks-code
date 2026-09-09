@@ -9,7 +9,10 @@ from collections.abc import Sequence
 from typing import TypedDict
 from urllib.parse import urlparse
 
+from databricks.sdk import oauth
+
 from ucode.constants import LOCALHOST, LOOPBACK_HOST
+from ucode.databricks import build_auth_token_argv
 from ucode.ui import err_console, normalize_workspace_url, print_warning_err
 
 DEFAULT_REDIRECT_URL = f"http://{LOCALHOST}:8020"
@@ -65,8 +68,6 @@ def create_custom_oauth_config(
 
 
 def build_custom_auth_token_argv(workspace: str, config: CustomOAuthConfig) -> list[str]:
-    from ucode.databricks import build_auth_token_argv
-
     normalized = create_custom_oauth_config(
         config["client_id"], config["scopes"], config["redirect_url"]
     )
@@ -97,8 +98,6 @@ def get_custom_client_token(
     force_refresh: bool = False,
 ) -> str:
     """Reuse the SDK's PKCE flow and per-workspace/client token cache."""
-    from databricks.sdk import oauth
-
     config = create_custom_oauth_config(client_id, scopes, redirect_url)
     workspace = normalize_workspace_url(workspace)
     try:
