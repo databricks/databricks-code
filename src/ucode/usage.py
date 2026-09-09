@@ -53,8 +53,8 @@ def usage() -> int:
 
     if budget_spend is None:
         print_note(
-            "Budget spend and threshold are unavailable. "
-            "Please configure a coding agent budget policy first."
+            "Usage information is unavailable. Ask your workspace admin to configure "
+            "Unity Gateway Budgets and add it to the workspace configuration."
         )
         return 0
 

@@ -91,8 +91,8 @@ class TestUsageCommand:
 
         assert usage() == 0
         assert notes == [
-            "Budget spend and threshold are unavailable. "
-            "Please configure a coding agent budget policy first."
+            "Usage information is unavailable. Ask your workspace admin to configure "
+            "Unity Gateway Budgets and add it to the workspace configuration."
         ]
 
     def test_requires_a_configured_workspace(self, monkeypatch):
