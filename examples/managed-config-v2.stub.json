@@ -1,0 +1,41 @@
+{
+  "spec_version": 1,
+  "display_name": "example paved path",
+  "default_agent": "claude_code",
+  "enabled_agents": {
+    "claude_code": {
+      "models": {
+        "names": [
+          "system.ai.claude-opus-4-8",
+          "system.ai.claude-sonnet-4-6",
+          "system.ai.claude-haiku-4-5"
+        ]
+      },
+      "default_model": "system.ai.claude-opus-4-8",
+      "default_alias_models": {
+        "opus": "system.ai.claude-opus-4-8",
+        "sonnet": "system.ai.claude-sonnet-4-6",
+        "haiku": "system.ai.claude-haiku-4-5"
+      },
+      "smart_routing_config": { "enabled": false },
+      "http_headers": {}
+    },
+    "codex": {
+      "models": { "model_provider_service": "main.default.openai-mps" },
+      "default_model": "gpt-5.4",
+      "smart_routing_config": { "enabled": false },
+      "http_headers": {}
+    }
+  },
+  "spend_tiers": {
+    "budget_id": "00000000-0000-0000-0000-000000000000",
+    "tiers": [
+      {
+        "spending_percentage": 0.9,
+        "default_agent": "codex",
+        "default_model": "gpt-5.4"
+      }
+    ]
+  },
+  "tracing": { "enabled": true }
+}
