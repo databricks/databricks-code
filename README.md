@@ -58,9 +58,9 @@ ug claude --enable-smart-routing
 ```
 
 The flag applies only to that launch; later launches use normal model selection unless the flag is
-passed again. Smart routing uses the `task_v1` router by default. Power users can select another
+passed again. Smart routing uses the `task_v2` router by default. Power users can select another
 router for a launch by setting `SMART_ROUTER_NAME`, for example
-`SMART_ROUTER_NAME=task_v2 ug codex --enable-smart-routing`.
+`SMART_ROUTER_NAME=task_v1 ug codex --enable-smart-routing`.
 
 To configure all tools at once:
 
