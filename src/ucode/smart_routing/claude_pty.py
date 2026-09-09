@@ -180,6 +180,19 @@ def first_prompt_hook_output(response: dict | None) -> dict | None:
     }
 
 
+class _FirstPromptSocketThread(threading.Thread):
+    """Server thread for the first-prompt hook socket.
+
+    Carries a bind failure outward: the kernel enforces a short (~104-char on
+    macOS) AF_UNIX path limit, and without this the serving loop dies silently
+    while callers only see a missing socket file.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.bind_error: OSError | None = None
+
+
 def serve_first_prompt_socket(
     path: Path,
     route_prompt: Callable[[str], FirstPromptRoute],
@@ -187,7 +200,7 @@ def serve_first_prompt_socket(
     stop: threading.Event,
     *,
     log: Callable[[str], None] = lambda _message: None,
-) -> threading.Thread:
+) -> _FirstPromptSocketThread:
     """Serve the hook protocol, blocking exactly one non-command prompt."""
 
     def serve() -> None:
@@ -200,6 +213,7 @@ def serve_first_prompt_socket(
             server.listen(4)
             server.settimeout(0.5)
         except OSError as exc:
+            thread.bind_error = exc
             log(f"[ERR] first-prompt socket bind failed: {exc!r}")
             return
         log(f"[READY] first-prompt socket {path}")
@@ -251,7 +265,7 @@ def serve_first_prompt_socket(
         finally:
             server.close()
 
-    thread = threading.Thread(target=serve, name="claude-first-prompt", daemon=True)
+    thread = _FirstPromptSocketThread(target=serve, name="claude-first-prompt", daemon=True)
     thread.start()
     return thread
 
@@ -328,8 +342,11 @@ def run_claude_pty(
     if not socket_path.exists():
         log("[ERR] first-prompt socket was not ready before Claude launch")
         stop.set()
+        bind_error = getattr(server_thread, "bind_error", None)
+        detail = f" ({bind_error})" if bind_error is not None else ""
         raise RuntimeError(
-            "Smart routing could not start its local prompt-routing socket; Claude was not launched."
+            "Smart routing could not start its local prompt-routing socket"
+            f" at {socket_path}{detail}; Claude was not launched."
         )
 
     pid, master_fd = pty.fork()
