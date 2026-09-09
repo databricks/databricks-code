@@ -13,7 +13,7 @@ import subprocess
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from ucode import gateway_proxy
 from ucode.config_io import (
@@ -52,6 +52,9 @@ from ucode.state import MANAGED_OVERLAY_KEY, get_provider_service, mark_tool_man
 from ucode.telemetry import agent_version, ucode_version
 from ucode.tracing import tracing_env
 from ucode.ui import print_note, print_success, print_warning
+
+if TYPE_CHECKING:
+    from ucode.custom_oauth import CustomOAuthConfig
 
 from .args import LaunchOptions, has_explicit_model_arg
 
@@ -312,6 +315,7 @@ def render_overlay(
     disable_web_search: bool = False,
     profile: str | None = None,
     use_pat: bool = False,
+    custom_oauth: CustomOAuthConfig | None = None,
     provider: str | None = None,
     provider_models: dict[str, str] | None = None,
     fable_enabled: bool = False,
@@ -423,7 +427,12 @@ def render_overlay(
     if relayed:
         keys = [["env", k] for k in env]
     else:
-        overlay["apiKeyHelper"] = build_auth_shell_command(workspace, profile, use_pat=use_pat)
+        if custom_oauth:
+            from ucode.custom_oauth import build_custom_auth_shell_command
+
+            overlay["apiKeyHelper"] = build_custom_auth_shell_command(workspace, custom_oauth)
+        else:
+            overlay["apiKeyHelper"] = build_auth_shell_command(workspace, profile, use_pat=use_pat)
         keys = [["apiKeyHelper"]] + [["env", k] for k in env]
 
     # Disable Claude Code's built-in WebSearch: it declares Anthropic's hosted
@@ -580,6 +589,7 @@ def write_tool_config(
         disable_web_search=web_search_model is not None,
         profile=state.get("profile"),
         use_pat=bool(state.get("use_pat")),
+        custom_oauth=state.get("custom_oauth"),
         provider=provider,
         provider_models=provider_models,
         fable_enabled=bool(state.get("fable_enabled")),

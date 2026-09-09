@@ -267,6 +267,30 @@ class TestBuildAgentState:
             assert "--use-pat" in result[agent]["auth_command"]
             assert "--profile DEFAULT" in result[agent]["auth_command"]
 
+    def test_custom_oauth_applies_to_claude_and_codex(self):
+        result = build_agent_state(
+            {
+                "workspace": "https://example.databricks.com",
+                "base_urls": FAKE_URLS,
+                "custom_oauth": {
+                    "client_id": "custom-client",
+                    "redirect_url": "http://localhost:8020/callback",
+                    "scopes": ["offline_access", "model-serving"],
+                },
+            }
+        )
+
+        assert "--client-id custom-client" in result["claude"]["auth_command"]
+        assert result["codex"]["auth"]["args"][-6:] == [
+            "--client-id",
+            "custom-client",
+            "--redirect-url",
+            "http://localhost:8020/callback",
+            "--scopes",
+            "offline_access,model-serving",
+        ]
+        assert "--client-id" not in result["pi"]["auth_command"]
+
 
 # ---------------------------------------------------------------------------
 # mark_tool_managed

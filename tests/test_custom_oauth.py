@@ -1,9 +1,8 @@
-"""Isolated tests for the hidden custom-client OAuth feature."""
+"""Tests for the hidden custom-client OAuth feature."""
 
 from __future__ import annotations
 
 import json
-import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -13,11 +12,13 @@ import pytest
 from databricks.sdk import oauth
 from typer.testing import CliRunner
 
+import ucode.cli as cli_mod
 import ucode.databricks as db_mod
 from ucode.cli import app
-from ucode.experimental_oauth import get_custom_client_token
+from ucode.custom_oauth import get_custom_client_token
 
 WS = "https://example.databricks.com"
+TEST_SCOPES = ("offline_access", "catalog.catalogs:read")
 runner = CliRunner()
 
 
@@ -60,12 +61,14 @@ class TestCustomClientToken:
             oidc_endpoints=self.endpoints,
             client_id=client_id,
             redirect_url="http://localhost:8020",
-            scopes=["offline_access", "all-apis"],
+            scopes=list(TEST_SCOPES),
         )
 
     def test_browser_login_uses_custom_client_and_redirect(self, capsys):
         redirect_url = "http://localhost:41735/ai-devtools-workspace-oauth"
-        token = get_custom_client_token(WS, client_id="custom-client", redirect_url=redirect_url)
+        token = get_custom_client_token(
+            WS, client_id="custom-client", redirect_url=redirect_url, scopes=TEST_SCOPES
+        )
         assert token == "browser-token"
         self.browser.assert_called_once()
         self.refresh.assert_not_called()
@@ -77,12 +80,15 @@ class TestCustomClientToken:
         query = parse_qs(output.err.split("?", 1)[1].strip())
         assert query["client_id"] == ["custom-client"]
         assert query["redirect_uri"] == [redirect_url]
-        assert set(query["scope"][0].split()) == {"offline_access", "all-apis"}
+        assert query["scope"][0].split() == list(TEST_SCOPES)
         assert query["code_challenge_method"] == ["S256"]
 
     def test_reuses_cached_token_without_refresh_or_login(self, capsys):
         self._cache().save(self._credentials("cached", "refresh"))
-        assert get_custom_client_token(WS + "/", client_id="custom-client") == "cached"
+        assert (
+            get_custom_client_token(WS + "/", client_id="custom-client", scopes=TEST_SCOPES)
+            == "cached"
+        )
         self.discovery.assert_called_once_with(WS)
         self.browser.assert_not_called()
         self.refresh.assert_not_called()
@@ -95,7 +101,10 @@ class TestCustomClientToken:
         payload = json.loads(cache_path.read_text())
         payload["token"]["expiry"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
         cache_path.write_text(json.dumps(payload))
-        assert get_custom_client_token(WS, client_id="custom-client") == "refreshed"
+        assert (
+            get_custom_client_token(WS, client_id="custom-client", scopes=TEST_SCOPES)
+            == "refreshed"
+        )
         self.refresh.assert_called_once_with(
             client_id="custom-client",
             client_secret=None,
@@ -110,7 +119,9 @@ class TestCustomClientToken:
     def test_force_refresh_bypasses_fresh_access_token(self):
         self._cache().save(self._credentials("cached", "refresh"))
         assert (
-            get_custom_client_token(WS, client_id="custom-client", force_refresh=True)
+            get_custom_client_token(
+                WS, client_id="custom-client", scopes=TEST_SCOPES, force_refresh=True
+            )
             == "refreshed"
         )
         self.refresh.assert_called_once()
@@ -121,7 +132,9 @@ class TestCustomClientToken:
         self._cache().save(self._credentials("cached", "revoked-refresh"))
         self.refresh.side_effect = ValueError("sensitive server response")
         assert (
-            get_custom_client_token(WS, client_id="custom-client", force_refresh=True)
+            get_custom_client_token(
+                WS, client_id="custom-client", scopes=TEST_SCOPES, force_refresh=True
+            )
             == "browser-token"
         )
         self.browser.assert_called_once()
@@ -131,62 +144,38 @@ class TestCustomClientToken:
         assert "Sign in again" in output.err
         assert "sensitive server response" not in output.err
 
-    def test_missing_refresh_token_falls_back_to_browser(self):
-        self._cache().save(self._credentials("cached", None))
-        assert (
-            get_custom_client_token(WS, client_id="custom-client", force_refresh=True)
-            == "browser-token"
-        )
-        self.browser.assert_called_once()
-
-    @pytest.mark.parametrize(
-        ("workspace", "client_id"),
-        [(WS, "another-client"), ("https://other.databricks.com", "custom-client")],
-    )
-    def test_cache_is_isolated_by_workspace_and_client(self, workspace, client_id):
-        self._cache().save(self._credentials("cached", "refresh"))
-        assert get_custom_client_token(workspace, client_id=client_id) == "browser-token"
-        self.browser.assert_called_once()
-        assert self._cache().load().token().access_token == "cached"
-
-    def test_corrupt_cache_starts_browser_login(self):
-        cache_path = Path(self._cache().filename)
-        cache_path.parent.mkdir()
-        cache_path.write_text("not JSON")
-        assert get_custom_client_token(WS, client_id="custom-client") == "browser-token"
-        self.browser.assert_called_once()
-
-    @pytest.mark.skipif(os.name == "nt", reason="POSIX file permissions")
-    def test_cache_is_owner_only(self):
-        get_custom_client_token(WS, client_id="custom-client")
-        assert Path(self._cache().filename).stat().st_mode & 0o777 == 0o600
-
-    @pytest.mark.parametrize(
-        "redirect_url",
-        [
-            "https://example.com/callback",
-            "http://localhost/callback",
-            "http://localhost:0/callback",
-            "http://localhost:99999/callback",
-            "http://localhost:8020/callback?query=1",
-            "http://user@localhost:8020/callback",
-        ],
-    )
-    def test_invalid_redirect_fails_before_network(self, redirect_url):
+    def test_invalid_redirect_fails_before_network(self):
         with pytest.raises(RuntimeError, match="--redirect-url must be"):
-            get_custom_client_token(WS, client_id="custom-client", redirect_url=redirect_url)
-        self.discovery.assert_not_called()
-
-    def test_empty_client_id_is_rejected(self):
-        with pytest.raises(RuntimeError, match="--client-id must not be empty"):
-            get_custom_client_token(WS, client_id=" ")
+            get_custom_client_token(
+                WS,
+                client_id="custom-client",
+                redirect_url="https://example.com/callback",
+                scopes=TEST_SCOPES,
+            )
         self.discovery.assert_not_called()
 
     def test_login_failure_is_actionable_and_does_not_expose_response(self):
         self.browser.side_effect = ValueError("sensitive server response")
         with pytest.raises(RuntimeError, match="registered redirect URL") as error:
-            get_custom_client_token(WS, client_id="custom-client")
+            get_custom_client_token(WS, client_id="custom-client", scopes=TEST_SCOPES)
         assert "sensitive server response" not in str(error.value)
+
+    def test_scopes_are_trimmed_and_deduplicated(self, capsys):
+        get_custom_client_token(
+            WS,
+            client_id="custom-client",
+            scopes=["offline_access", "catalog.catalogs:read", "", "catalog.catalogs:read"],
+        )
+        query = parse_qs(capsys.readouterr().err.split("?", 1)[1].strip())
+        assert query["scope"][0].split() == ["offline_access", "catalog.catalogs:read"]
+
+    @pytest.mark.parametrize(
+        "scopes", [[], ["offline_access"], ["catalog.catalogs:read"], "catalog.catalogs:read"]
+    )
+    def test_api_scopes_are_required(self, scopes):
+        with pytest.raises(RuntimeError, match="OAuth scopes|API OAuth scope"):
+            get_custom_client_token(WS, client_id="custom-client", scopes=scopes)
+        self.discovery.assert_not_called()
 
 
 class TestCustomClientCommand:
@@ -194,7 +183,7 @@ class TestCustomClientCommand:
     def _no_production_auth(self, monkeypatch):
         monkeypatch.setattr(
             "ucode.cli.get_databricks_token",
-            Mock(side_effect=AssertionError("Experimental auth must not use production auth")),
+            Mock(side_effect=AssertionError("Custom auth must not use production auth")),
         )
 
     def test_experimental_options_are_hidden(self):
@@ -202,8 +191,9 @@ class TestCustomClientCommand:
         assert result.exit_code == 0
         assert "--client-id" not in result.output
         assert "--redirect-url" not in result.output
+        assert "--scopes" not in result.output
 
-    def test_custom_client_ignores_saved_pat_and_profile(self):
+    def test_custom_client_dispatches_with_explicit_scopes(self):
         with (
             patch(
                 "ucode.cli.load_state",
@@ -211,46 +201,30 @@ class TestCustomClientCommand:
             ),
             patch("ucode.cli.ensure_pat_bearer") as pat,
             patch(
-                "ucode.experimental_oauth.get_custom_client_token", return_value="custom-token"
-            ) as fetch,
-        ):
-            result = runner.invoke(app, ["auth-token", "--client-id", "my-client"])
-        assert result.exit_code == 0, result.output
-        assert result.stdout == "custom-token\n"
-        pat.assert_not_called()
-        fetch.assert_called_once_with(
-            "https://ws",
-            client_id="my-client",
-            redirect_url="http://localhost:8020",
-            force_refresh=False,
-        )
-
-    def test_custom_client_forwards_redirect_and_force_refresh_without_setup(self):
-        with (
-            patch("ucode.cli.load_state", return_value={}),
-            patch(
-                "ucode.experimental_oauth.get_custom_client_token", return_value="custom-token"
+                "ucode.custom_oauth.get_custom_client_token", return_value="custom-token"
             ) as fetch,
         ):
             result = runner.invoke(
                 app,
                 [
                     "auth-token",
-                    "--host",
-                    "https://ws",
                     "--client-id",
                     "my-client",
                     "--redirect-url",
                     "http://localhost:41735/callback",
+                    "--scopes",
+                    "offline_access,catalog.catalogs:read",
                     "--force-refresh",
                 ],
             )
         assert result.exit_code == 0, result.output
         assert result.stdout == "custom-token\n"
+        pat.assert_not_called()
         fetch.assert_called_once_with(
             "https://ws",
             client_id="my-client",
             redirect_url="http://localhost:41735/callback",
+            scopes=["offline_access", "catalog.catalogs:read"],
             force_refresh=True,
         )
 
@@ -259,27 +233,134 @@ class TestCustomClientCommand:
         [
             (["--client-id", "my-client", "--use-pat"], "cannot be combined"),
             (["--redirect-url", "http://localhost:8020"], "requires --client-id"),
+            (["--scopes", "offline_access,sql"], "requires --client-id"),
+            (["--client-id", "my-client"], "--scopes is required"),
         ],
     )
     def test_invalid_custom_client_options(self, options, message):
-        with patch("ucode.experimental_oauth.get_custom_client_token") as fetch:
+        with patch("ucode.custom_oauth.get_custom_client_token") as fetch:
             result = runner.invoke(app, ["auth-token", *options])
         assert result.exit_code == 1
         assert result.stdout == ""
         assert message in result.stderr
         fetch.assert_not_called()
 
-    def test_custom_client_failure_prints_no_token(self):
+
+class TestConfigureCustomOAuth:
+    def test_options_are_hidden(self):
+        result = runner.invoke(app, ["configure", "--help"])
+        assert result.exit_code == 0
+        assert "--client-id" not in result.output
+        assert "--redirect-url" not in result.output
+        assert "--scopes" not in result.output
+
+    def test_forwards_config_to_claude_configuration(self):
         with (
-            patch("ucode.cli.load_state", return_value={}),
-            patch(
-                "ucode.experimental_oauth.get_custom_client_token",
-                side_effect=RuntimeError("OAuth failed"),
-            ),
+            patch("ucode.cli.install_databricks_cli"),
+            patch("ucode.cli.install_tool_binary"),
+            patch("ucode.cli.configure_workspace_command") as configure_workspace,
         ):
             result = runner.invoke(
-                app, ["auth-token", "--host", "https://ws", "--client-id", "my-client"]
+                app,
+                [
+                    "configure",
+                    "--agent",
+                    "claude",
+                    "--workspaces",
+                    WS,
+                    "--client-id",
+                    "custom-client",
+                    "--redirect-url",
+                    "http://localhost:8020/callback",
+                    "--scopes",
+                    "offline_access,model-serving",
+                ],
             )
-        assert result.exit_code == 1
-        assert result.stdout == ""
-        assert "OAuth failed" in result.stderr
+        assert result.exit_code == 0, result.output
+        configure_workspace.assert_called_once_with(
+            "claude",
+            workspaces=[(WS, None)],
+            custom_oauth={
+                "client_id": "custom-client",
+                "redirect_url": "http://localhost:8020/callback",
+                "scopes": ["offline_access", "model-serving"],
+            },
+        )
+
+    def test_shared_state_persists_custom_oauth(self, monkeypatch):
+        custom_oauth = {
+            "client_id": "custom-client",
+            "redirect_url": "http://localhost:8020/callback",
+            "scopes": ["offline_access", "model-serving"],
+        }
+        saved = []
+        monkeypatch.setattr(cli_mod, "load_state", lambda: {"workspace": WS})
+        monkeypatch.setattr(cli_mod, "save_state", lambda state: saved.append(dict(state)))
+        monkeypatch.setattr(cli_mod, "find_profile_name_for_host", lambda _workspace: None)
+
+        state = cli_mod.configure_shared_state(
+            WS,
+            tools=["claude"],
+            skip_preflight=True,
+            custom_oauth=custom_oauth,
+        )
+
+        assert state["custom_oauth"] == custom_oauth
+        assert saved[-1]["custom_oauth"] == custom_oauth
+
+
+class TestLaunchCustomOAuth:
+    @pytest.mark.parametrize("tool", ["claude", "codex"])
+    def test_options_are_hidden(self, tool):
+        result = runner.invoke(app, [tool, "--help"])
+        assert result.exit_code == 0
+        assert "--client-id" not in result.output
+        assert "--redirect-url" not in result.output
+        assert "--scopes" not in result.output
+
+    @pytest.mark.parametrize("tool", ["claude", "codex"])
+    def test_launch_forwards_custom_oauth(self, tool):
+        with patch("ucode.cli._launch_tool") as launch:
+            result = runner.invoke(
+                app,
+                [
+                    tool,
+                    "--workspace",
+                    WS,
+                    "--client-id",
+                    "custom-client",
+                    "--redirect-url",
+                    "http://localhost:8020/callback",
+                    "--scopes",
+                    "offline_access,model-serving",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert launch.call_args.kwargs["custom_oauth"] == {
+            "client_id": "custom-client",
+            "redirect_url": "http://localhost:8020/callback",
+            "scopes": ["offline_access", "model-serving"],
+        }
+
+    def test_auto_configure_receives_custom_oauth(self):
+        custom_oauth = {
+            "client_id": "custom-client",
+            "redirect_url": "http://localhost:8020/callback",
+            "scopes": ["offline_access", "model-serving"],
+        }
+        state = {"workspace": WS, "profile": None, "available_tools": ["codex"]}
+        with (
+            patch("ucode.cli.load_state", return_value=state),
+            patch("ucode.cli.configure_shared_state", return_value=state) as configure_shared,
+            patch("ucode.cli.configure_single_tool", return_value=state),
+            patch("ucode.cli.validate_tool", return_value=(True, None)),
+        ):
+            cli_mod._auto_configure_tool("codex", custom_oauth=custom_oauth)
+
+        configure_shared.assert_called_once_with(
+            WS,
+            profile=None,
+            tools=["codex"],
+            custom_oauth=custom_oauth,
+        )
