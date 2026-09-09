@@ -56,7 +56,7 @@ CLAUDE_ROUTED_AGENT_PROMPT = (
 # Keep this pattern in sync with the server-side Anthropic model prefixing logic. The prefix is
 # needed because Anthropic omits models from its catalog unless the model id contains "anthropic"
 # or "claude".
-_ANTHROPIC_AIGW_MODEL_RE = re.compile(r"^anthropic-aigw-[0-9a-fA-F]{8}-(.+)$")
+_ANTHROPIC_AIGW_MODEL_RE = re.compile(r"^anthropic-(?:aigw-[0-9a-fA-F]{8}|aigtwy-[^-]+)-(.+)$")
 
 
 def _model_picker_catalog() -> AnthropicModelCatalog | None:
@@ -155,11 +155,16 @@ def _canonical_claude_models(model_ids: list[str]) -> list[str]:
     )
 
 
+def _unwrapped_claude_model_id(model: str) -> str:
+    """Strip the Anthropic gateway wrapper, preserving the embedded model id."""
+    if match := _ANTHROPIC_AIGW_MODEL_RE.fullmatch(model):
+        return match.group(1)
+    return model
+
+
 def _claude_router_model_id(model: str) -> str:
     """Unwrap an Anthropic gateway id, then apply standard model normalization."""
-    if match := _ANTHROPIC_AIGW_MODEL_RE.fullmatch(model):
-        model = match.group(1)
-    return routing.normalize_model(model)
+    return routing.normalize_model(_unwrapped_claude_model_id(model))
 
 
 def _claude_model_overrides(model_ids: list[str]) -> dict[str, str]:
@@ -246,7 +251,7 @@ def _request_claude_routing_decision(
         token,
         prompt,
         route_options,
-        lambda selected: available.get(routing.normalize_model(selected)),
+        lambda selected: available.get(_claude_router_model_id(selected)),
         router_name=routing.configured_router_name(),
         timeout=CLAUDE_ROUTE_SELECTION_TIMEOUT_S,
     )
@@ -431,7 +436,7 @@ def launch_claude(
     def route_prompt(prompt: str) -> claude_pty.FirstPromptRoute:
         decision = _route_claude_prompt(state, token, prompt, model_ids)
         return claude_pty.FirstPromptRoute(
-            model=model_name(decision.model),
+            model=model_name(_unwrapped_claude_model_id(decision.model)),
             display_model=catalog.model_id_to_display_name.get(decision.model, decision.model),
             rationale=decision.rationale,
         )
