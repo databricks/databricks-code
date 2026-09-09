@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import re
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from ucode.databricks import (
     build_auth_token_argv,
     build_tool_base_url,
     get_databricks_token,
+    get_model_provider_service,
 )
 from ucode.launcher import exec_or_spawn
 from ucode.managed_files import (
@@ -57,6 +60,11 @@ CODEX_CONFIG_PATH = CODEX_CONFIG_DIR / f"{CODEX_PROFILE_NAME}.config.toml"
 CODEX_BACKUP_PATH = APP_DIR / "codex-ucode-config.backup.toml"
 LEGACY_CODEX_CONFIG_PATH = CODEX_CONFIG_DIR / "config.toml"
 LEGACY_CODEX_BACKUP_PATH = APP_DIR / "codex-config.backup.toml"
+# Augmented model catalog ucode writes when routing Codex at a Bedrock MPS. Codex's
+# remote catalog endpoint (codex/v1/models) is disabled on the gateway, so without
+# this Codex has no metadata for Bedrock target ids (e.g. us.openai.gpt-5.6-luna) and
+# degrades to fallback metadata — losing web search and reasoning config.
+CODEX_MODEL_CATALOG_PATH = CODEX_CONFIG_DIR / "ucode-model-catalog.json"
 CODEX_MODEL_PROVIDER_NAME = "ucode-databricks"
 MINIMUM_CODEX_VERSION = (0, 134, 0)
 MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
@@ -77,6 +85,7 @@ SPEC: ToolSpec = {
 MANAGED_KEYS: list[list[str]] = [
     ["model_provider"],
     ["model"],
+    ["model_catalog_json"],
     ["model_providers", CODEX_MODEL_PROVIDER_NAME],
     ["model_providers", CODEX_MODEL_PROVIDER_NAME, "http_headers"],
 ]
@@ -304,13 +313,118 @@ def revert_legacy_shared_config() -> bool:
     return _strip_legacy_ucode_entries(_legacy_config_path())
 
 
+def _canonical_codex_slug(target: str) -> str:
+    """Return the built-in Codex slug a Bedrock target id derives from.
+
+    Bedrock exposes OpenAI models under region/vendor-prefixed ids
+    (``us.openai.gpt-5.6-luna``, ``openai.gpt-oss-120b-1:0``). Codex's built-in
+    catalog keys off the bare model name (``gpt-5.6-luna``), so strip everything up
+    to and including the ``openai.`` segment. A target with no ``openai.`` segment
+    (e.g. ``anthropic.claude-opus-4-8``, ``us.xai.grok-4.6``) has no Codex metadata
+    to borrow and is returned unchanged, so the by-slug lookup simply misses it.
+    """
+    marker = "openai."
+    idx = target.rfind(marker)
+    return target[idx + len(marker) :] if idx != -1 else target
+
+
+def _codex_builtin_catalog() -> dict | None:
+    """Return Codex's pristine built-in model catalog, or None if unavailable.
+
+    Runs ``codex debug models`` with no ``--profile``, so it reads the base config
+    rather than ucode's profile — the profile is where ucode writes
+    ``model_catalog_json``, and reading through it would fold prior clones back into
+    the source (a compounding feedback loop).
+    """
+    try:
+        result = subprocess.run(
+            [SPEC["binary"], "debug", "models"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        catalog = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return catalog if isinstance(catalog, dict) else None
+
+
+def build_model_catalog(targets: list[str]) -> Path | None:
+    """Write an augmented Codex catalog cloning built-in entries under Bedrock slugs.
+
+    For each Bedrock target whose canonical slug matches a built-in Codex model, add
+    a copy of that model's metadata keyed by the full Bedrock id, so Codex resolves
+    real metadata for ids like ``us.openai.gpt-5.6-luna`` instead of falling back.
+    Best-effort: returns the written path, or None when the catalog can't be built
+    (Codex missing, no matching targets) so callers degrade to plain fallback.
+    """
+    catalog = _codex_builtin_catalog()
+    if catalog is None:
+        return None
+    models = catalog.get("models")
+    if not isinstance(models, list):
+        return None
+    target_set = set(targets)
+    # Drop any stale clones (a slug equal to a current target) so regeneration is
+    # idempotent, then re-clone from the pristine canonical entries below.
+    models = [m for m in models if not (isinstance(m, dict) and m.get("slug") in target_set)]
+    by_slug = {m["slug"]: m for m in models if isinstance(m, dict) and "slug" in m}
+    added = False
+    for target in targets:
+        canonical = by_slug.get(_canonical_codex_slug(target))
+        if canonical is None:
+            continue
+        clone = copy.deepcopy(canonical)
+        clone["slug"] = target
+        models.append(clone)
+        added = True
+    if not added:
+        return None
+    catalog["models"] = models
+    try:
+        CODEX_MODEL_CATALOG_PATH.write_text(json.dumps(catalog))
+    except OSError:
+        return None
+    return CODEX_MODEL_CATALOG_PATH
+
+
+def _provider_catalog_path(state: dict, provider: str | None) -> Path | None:
+    """Build the augmented catalog for ``provider``'s MPS targets, or None.
+
+    Best-effort and self-contained: fetches the service's targets and generates the
+    catalog. Any failure (no provider, listing error, no OpenAI targets) returns None
+    so config writing proceeds without the ``model_catalog_json`` pin.
+    """
+    if not provider:
+        return None
+    workspace = state.get("workspace")
+    if not workspace:
+        return None
+    try:
+        token = get_databricks_token(workspace, state.get("profile"))
+        service, _ = get_model_provider_service(provider, workspace, token)
+    except Exception:
+        return None
+    if not service:
+        return None
+    targets = service.get("targets") or []
+    return build_model_catalog(targets) if targets else None
+
+
 def write_tool_config(state: dict, model: str | None = None, provider: str | None = None) -> dict:
     workspace = state["workspace"]
-    # Leave model selection to Codex. The gateway still receives the configured
-    # provider and authentication settings, while Codex uses its own default.
-    # A managed default is the sole exception.
+    # Leave model selection to Codex — except when a provider is set and a target
+    # model was resolved from its MPS targets, or an admin managed default exists.
     managed_model = state.get("codex_default_model")
-    chosen_model = managed_model if isinstance(managed_model, str) else None
+    chosen_model = (model if provider else None) or (
+        managed_model if isinstance(managed_model, str) else None
+    )
     databricks_profile = state.get("profile")
 
     if _use_legacy_layout():
@@ -351,6 +465,11 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         use_pat=bool(state.get("use_pat")),
         provider=provider,
     )
+    # Under a Bedrock MPS, pin an augmented catalog so Codex has metadata for the
+    # provider-side target ids (the gateway's codex/v1/models endpoint is disabled).
+    catalog_path = _provider_catalog_path(state, provider)
+    if catalog_path is not None:
+        overlay["model_catalog_json"] = str(catalog_path)
 
     def compose(base: dict) -> dict:
         deep_merge_dict(base, copy.deepcopy(overlay))
@@ -358,6 +477,9 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         if chosen_model is None:
             for key in ("model", "model_reasoning_effort"):
                 base.pop(key, None)
+        # Drop a stale catalog pin when this run isn't routing through a provider.
+        if catalog_path is None:
+            base.pop("model_catalog_json", None)
         return base
 
     doc = read_toml_safe(CODEX_CONFIG_PATH)
@@ -472,9 +594,30 @@ def default_model(state: dict) -> str | None:
     return None
 
 
+def _has_active_mps() -> bool:
+    """True when the ucode Codex config has a Databricks-Model-Provider-Service header set.
+
+    When an MPS is active the model written to the config is the Bedrock target id
+    (e.g. ``us.openai.gpt-5.6-luna``) that the gateway uses for routing.  Clearing
+    that id here would cause Codex to fall back to its own model picker, which queries
+    OpenAI directly and returns an id the MPS doesn't recognise.
+    """
+    doc = read_toml_safe(CODEX_CONFIG_PATH)
+    providers = doc.get("model_providers")
+    if not isinstance(providers, dict):
+        return False
+    gateway = providers.get(CODEX_MODEL_PROVIDER_NAME)
+    if not isinstance(gateway, dict):
+        return False
+    headers = gateway.get("http_headers")
+    return isinstance(headers, dict) and bool(headers.get("Databricks-Model-Provider-Service"))
+
+
 def clear_model_preferences(state: dict) -> bool:
     """Remove ucode profile model preferences so Codex selects its default."""
     if isinstance(state.get("codex_default_model"), str):
+        return False
+    if _has_active_mps():
         return False
     doc = read_toml_safe(CODEX_CONFIG_PATH)
     changed = False

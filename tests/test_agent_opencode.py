@@ -500,3 +500,251 @@ class TestWriteToolConfigStaleProviderCleanup:
 
         written = json.loads(config_file.read_text())
         assert written["model"] == "databricks-anthropic/claude-sonnet"
+
+
+def _bedrock_base_urls() -> dict[str, str]:
+    return {
+        **_base_urls(),
+        "bedrock": f"{WS}/ai-gateway",
+    }
+
+
+class TestRenderOverlayBedrock:
+    def test_bedrock_provider_added_when_provider_and_targets(self):
+        overlay, _ = opencode.render_overlay(
+            None,
+            "tok",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=["anthropic.claude-3-haiku-20240307-v1:0"],
+        )
+        assert "databricks-bedrock" in overlay["provider"]
+
+    def test_bedrock_uses_amazon_bedrock_npm_package(self):
+        overlay, _ = opencode.render_overlay(
+            None,
+            "tok",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=["anthropic.claude-3-haiku-20240307-v1:0"],
+        )
+        assert overlay["provider"]["databricks-bedrock"]["npm"] == "@ai-sdk/amazon-bedrock"
+
+    def test_bedrock_uses_gateway_base_url(self):
+        overlay, _ = opencode.render_overlay(
+            None,
+            "tok",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=["anthropic.claude-3-haiku-20240307-v1:0"],
+        )
+        options = overlay["provider"]["databricks-bedrock"]["options"]
+        assert options["baseURL"] == f"{WS}/ai-gateway"
+
+    def test_bedrock_uses_token_as_api_key(self):
+        overlay, _ = opencode.render_overlay(
+            None,
+            "mytoken",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=["anthropic.claude-3-haiku-20240307-v1:0"],
+        )
+        assert overlay["provider"]["databricks-bedrock"]["options"]["apiKey"] == "mytoken"
+
+    def test_bedrock_no_region_in_options(self):
+        overlay, _ = opencode.render_overlay(
+            None,
+            "tok",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=["anthropic.claude-3-haiku-20240307-v1:0"],
+        )
+        assert "region" not in overlay["provider"]["databricks-bedrock"]["options"]
+
+    def test_bedrock_mps_header_is_per_model(self):
+        target = "anthropic.claude-3-haiku-20240307-v1:0"
+        overlay, _ = opencode.render_overlay(
+            None,
+            "tok",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=[target],
+        )
+        model_entry = overlay["provider"]["databricks-bedrock"]["models"][target]
+        assert model_entry["headers"]["Databricks-Model-Provider-Service"] == "main.ai.my-mps"
+
+    def test_bedrock_ua_header_is_per_model(self, monkeypatch):
+        monkeypatch.setattr("ucode.agents.opencode.ucode_version", lambda: "1.0.0")
+        monkeypatch.setattr("ucode.agents.opencode.agent_version", lambda _: "2.0.0")
+        target = "anthropic.claude-3-haiku-20240307-v1:0"
+        overlay, _ = opencode.render_overlay(
+            None,
+            "tok",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=[target],
+        )
+        ua = overlay["provider"]["databricks-bedrock"]["models"][target]["headers"]["User-Agent"]
+        assert ua == "ucode/1.0.0 opencode/2.0.0"
+
+    def test_bedrock_no_authorization_header_at_provider_level(self):
+        overlay, _ = opencode.render_overlay(
+            None,
+            "tok",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=["anthropic.claude-3-haiku-20240307-v1:0"],
+        )
+        assert "headers" not in overlay["provider"]["databricks-bedrock"]["options"]
+
+    def test_bedrock_model_selector_prefixed(self):
+        target = "anthropic.claude-3-haiku-20240307-v1:0"
+        overlay, _ = opencode.render_overlay(
+            None,
+            "tok",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=[target],
+        )
+        assert overlay["model"] == f"databricks-bedrock/{target}"
+
+    def test_bedrock_all_targets_listed_as_models(self):
+        targets = [
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            "anthropic.claude-3-sonnet-20240229-v1:0",
+        ]
+        overlay, _ = opencode.render_overlay(
+            None,
+            "tok",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=targets,
+        )
+        models = overlay["provider"]["databricks-bedrock"]["models"]
+        assert set(models.keys()) == set(targets)
+
+    def test_bedrock_managed_key_tracked(self):
+        _, keys = opencode.render_overlay(
+            None,
+            "tok",
+            _bedrock_base_urls(),
+            {},
+            provider="main.ai.my-mps",
+            bedrock_targets=["anthropic.claude-3-haiku-20240307-v1:0"],
+        )
+        assert ["provider", "databricks-bedrock"] in keys
+
+
+class TestRefreshTokenOnceBedrockPreservation:
+    """_refresh_token_once must preserve an existing databricks-bedrock provider block."""
+
+    def _setup(self, tmp_path, monkeypatch):
+        import ucode.agents.opencode as oc_mod
+        import ucode.config_io as config_io_mod
+
+        monkeypatch.setattr(config_io_mod, "APP_DIR", tmp_path)
+        config_file = tmp_path / "opencode.json"
+        backup_file = tmp_path / "opencode-backup.json"
+        monkeypatch.setattr(oc_mod, "OPENCODE_CONFIG_PATH", config_file)
+        monkeypatch.setattr(oc_mod, "OPENCODE_BACKUP_PATH", backup_file)
+        return oc_mod, config_file
+
+    def _state(self) -> dict:
+        return {
+            "workspace": WS,
+            "base_urls": {"opencode": _bedrock_base_urls()},
+            "opencode_models": {"anthropic": ["claude-sonnet"]},
+            "managed_configs": {},
+        }
+
+    def test_bedrock_block_survives_token_refresh(self, tmp_path, monkeypatch):
+        """Regression: token refresh must not clobber the databricks-bedrock provider block."""
+        oc_mod, config_file = self._setup(tmp_path, monkeypatch)
+
+        bedrock_config = {
+            "model": "databricks-bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            "provider": {
+                "databricks-bedrock": {
+                    "npm": "@ai-sdk/amazon-bedrock",
+                    "options": {
+                        "baseURL": f"{WS}/ai-gateway",
+                        "apiKey": "old-token",
+                    },
+                    "models": {
+                        "anthropic.claude-3-haiku-20240307-v1:0": {
+                            "headers": {
+                                "User-Agent": "ucode/0.1.0 opencode/0.74.0",
+                                "Databricks-Model-Provider-Service": "my-mps-provider",
+                            }
+                        },
+                        "anthropic.claude-3-sonnet-20240229-v1:0": {
+                            "headers": {
+                                "User-Agent": "ucode/0.1.0 opencode/0.74.0",
+                                "Databricks-Model-Provider-Service": "my-mps-provider",
+                            }
+                        },
+                    },
+                }
+            },
+        }
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps(bedrock_config), encoding="utf-8")
+
+        with (
+            patch("ucode.agents.opencode.get_databricks_token", return_value="new-token"),
+            patch("ucode.agents.opencode.save_state"),
+        ):
+            token = oc_mod._refresh_token_once(self._state())
+
+        assert token == "new-token"
+
+        written = json.loads(config_file.read_text())
+        providers = written.get("provider", {})
+
+        assert "databricks-bedrock" in providers
+        bedrock = providers["databricks-bedrock"]
+        assert bedrock["options"]["apiKey"] == "new-token"
+
+        model_ids = list(bedrock["models"].keys())
+        assert "anthropic.claude-3-haiku-20240307-v1:0" in model_ids
+        assert "anthropic.claude-3-sonnet-20240229-v1:0" in model_ids
+
+        for entry in bedrock["models"].values():
+            assert entry["headers"]["Databricks-Model-Provider-Service"] == "my-mps-provider"
+
+    def test_no_bedrock_block_uses_default_model(self, tmp_path, monkeypatch):
+        """Without a bedrock block, _refresh_token_once falls back to the normal path."""
+        oc_mod, config_file = self._setup(tmp_path, monkeypatch)
+
+        existing_config = {
+            "model": "databricks-anthropic/claude-sonnet",
+            "provider": {
+                "databricks-anthropic": {
+                    "npm": "@ai-sdk/anthropic",
+                    "options": {"baseURL": f"{WS}/ai-gateway/anthropic/v1", "apiKey": "old-token"},
+                    "models": {"claude-sonnet": {}},
+                }
+            },
+        }
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps(existing_config), encoding="utf-8")
+
+        with (
+            patch("ucode.agents.opencode.get_databricks_token", return_value="new-token"),
+            patch("ucode.agents.opencode.save_state"),
+        ):
+            token = oc_mod._refresh_token_once(self._state())
+
+        assert token == "new-token"
+        written = json.loads(config_file.read_text())
+        assert "databricks-anthropic" in written.get("provider", {})

@@ -638,12 +638,16 @@ class TestListModelProviderServices:
             "main.schema2.bedrock-svc",
         ]
 
-    def test_codex_filters_to_openai(self, monkeypatch):
+    def test_codex_filters_to_openai_and_bedrock(self, monkeypatch):
+        # codex supports both openai and amazon_bedrock provider types.
         monkeypatch.setattr(
             db_mod, "_http_get_json", lambda url, token, timeout=30: (self._PAYLOAD, None)
         )
         names, _ = db_mod.list_tool_provider_services("codex", WS, "token")
-        assert names == ["main.schema1.openai-svc"]
+        assert "main.schema1.openai-svc" in names
+        assert "main.schema2.bedrock-svc" in names
+        assert "main.schema2.bedrock-titan-svc" in names
+        assert "main.schema1.anthropic-svc" not in names
 
 
 class TestMapClaudeFamilyModels:
@@ -904,6 +908,33 @@ class TestResolveProviderService:
         )
         assert service is None
         assert "no Claude models" in error
+
+    def test_codex_bedrock_openai_compat_ok(self, monkeypatch):
+        # Bedrock MPS exposing non-Claude (OpenAI-compatible) models must work for codex.
+        self._patch(monkeypatch)
+        service, error = db_mod.resolve_provider_service(
+            "codex", "main.schema2.bedrock-titan-svc", WS, "token"
+        )
+        assert error is None
+        assert service["provider_type"] == "amazon_bedrock"
+
+    def test_codex_bedrock_with_claude_targets_ok(self, monkeypatch):
+        # Bedrock MPS that happens to expose Claude targets is also valid for codex.
+        self._patch(monkeypatch)
+        service, error = db_mod.resolve_provider_service(
+            "codex", "main.schema2.bedrock-svc", WS, "token"
+        )
+        assert error is None
+        assert service["provider_type"] == "amazon_bedrock"
+
+    def test_codex_anthropic_rejected(self, monkeypatch):
+        # codex does not speak the Anthropic Messages API.
+        self._patch(monkeypatch)
+        service, error = db_mod.resolve_provider_service(
+            "codex", "main.schema1.anthropic-svc", WS, "token"
+        )
+        assert service is None
+        assert "can't route to" in error
 
     def test_not_found_lists_usable(self, monkeypatch):
         self._patch(monkeypatch)

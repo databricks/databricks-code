@@ -46,6 +46,7 @@ from ucode.databricks import (
     build_pi_base_urls,
     classify_model_family,
     get_databricks_token,
+    model_token_limits,
 )
 from ucode.state import mark_tool_managed, save_state
 from ucode.telemetry import agent_version, ucode_version
@@ -71,6 +72,7 @@ PROVIDER_NAMES = (
     "databricks-claude",
     "databricks-openai",
     "databricks-gemini",
+    "databricks-bedrock",
 )
 
 PROVIDER_KEYS: list[list[str]] = [["providers", name] for name in PROVIDER_NAMES]
@@ -99,13 +101,31 @@ def _resolve_model_selector(
     return model
 
 
+def _bedrock_model_entry(model_id: str) -> dict:
+    """A Pi model entry for a Bedrock target, pinning known token limits.
+
+    Some Bedrock models cap output well below what Pi requests by default (e.g.
+    Nova rejects a `maxTokens` of 10k or more), so pin `maxTokens`/`contextWindow`
+    when the model has a known limit. Models with no known limit are left unbounded.
+    """
+    entry: dict = {"id": model_id}
+    limits = model_token_limits(model_id)
+    if limits is not None:
+        entry["contextWindow"] = limits["context"]
+        entry["maxTokens"] = limits["output"]
+    return entry
+
+
 def render_overlay(
-    model: str,
+    model: str | None,
     token: str,
     pi_base_urls: dict[str, str],
     claude_models: dict[str, str],
     codex_models: list[str],
     gemini_models: list[str],
+    *,
+    provider: str | None = None,
+    bedrock_targets: list[str] | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Pi's private agent config."""
     providers: dict = {}
@@ -149,9 +169,30 @@ def render_overlay(
             "models": [{"id": m} for m in gemini_models],
         }
         keys.append(["providers", "databricks-gemini"])
-    overlay: dict = {
-        "model": _resolve_model_selector(model, claude_models, codex_models, gemini_models),
-    }
+    if provider and bedrock_targets:
+        providers["databricks-bedrock"] = {
+            "baseUrl": pi_base_urls.get(
+                "bedrock", f"{pi_base_urls['claude'].rsplit('/ai-gateway', 1)[0]}/ai-gateway"
+            ),
+            "api": "bedrock-converse-stream",
+            "apiKey": token,
+            "authHeader": True,
+            # Pi's bedrock-converse-stream client (AWS SDK style) sets its own
+            # User-Agent; adding ours produces two `user-agent` values and the
+            # gateway rejects the request ("Header field ... must only have a
+            # single value"). Send only the MPS selector header here.
+            "headers": {"Databricks-Model-Provider-Service": provider},
+            "models": [_bedrock_model_entry(t) for t in bedrock_targets],
+        }
+        keys.append(["providers", "databricks-bedrock"])
+    resolved = _resolve_model_selector(model or "", claude_models, codex_models, gemini_models)
+    # Bedrock model IDs contain no `/` (e.g. `anthropic.claude-3-haiku-20240307-v1:0`), so
+    # _resolve_model_selector returns them unprefixed. _write_settings splits on `/` to get
+    # provider/model — without the prefix it gets an empty model_id and skips defaultProvider.
+    # Always force the `databricks-bedrock/` prefix when the Bedrock provider is active.
+    if "databricks-bedrock" in providers and bedrock_targets:
+        resolved = f"databricks-bedrock/{bedrock_targets[0]}"
+    overlay: dict = {"model": resolved}
     if providers:
         overlay["providers"] = providers
     return overlay, keys
@@ -159,10 +200,12 @@ def render_overlay(
 
 def write_tool_config(
     state: dict,
-    model: str,
+    model: str | None,
     token: str | None = None,
     *,
     force_refresh: bool = False,
+    provider: str | None = None,
+    bedrock_targets: list[str] | None = None,
 ) -> tuple[dict, str]:
     backup_existing_file(PI_CONFIG_PATH, PI_BACKUP_PATH)
     if token is None:
@@ -183,6 +226,8 @@ def write_tool_config(
         claude_models,
         codex_models,
         gemini_models,
+        provider=provider,
+        bedrock_targets=bedrock_targets,
     )
     existing = read_json_safe(PI_CONFIG_PATH)
     providers = existing.get("providers")
@@ -261,6 +306,33 @@ def default_model(state: dict) -> str | None:
 
 
 def _refresh_token_once(state: dict, *, force_refresh: bool = False) -> str:
+    # Preserve a Bedrock provider block across token refreshes. The block is
+    # self-describing: its MPS header + model ids are enough to re-render it,
+    # so a refresh keeps routing through Bedrock instead of dropping to a
+    # system-hosted model. When the config has no Bedrock block (a non-Bedrock
+    # session, or after a non-Bedrock reconfigure overwrote it), fall through
+    # to the normal path.
+    existing = read_json_safe(PI_CONFIG_PATH)
+    bedrock = (existing.get("providers") or {}).get("databricks-bedrock")
+    provider: str | None = None
+    bedrock_targets: list[str] | None = None
+    if isinstance(bedrock, dict):
+        headers = bedrock.get("headers") or {}
+        provider = headers.get("Databricks-Model-Provider-Service")
+        bedrock_targets = [
+            m["id"]
+            for m in (bedrock.get("models") or [])
+            if isinstance(m, dict) and isinstance(m.get("id"), str)
+        ] or None
+    if provider and bedrock_targets:
+        _, token = write_tool_config(
+            state,
+            bedrock_targets[0],
+            force_refresh=force_refresh,
+            provider=provider,
+            bedrock_targets=bedrock_targets,
+        )
+        return token
     model = default_model(state)
     if not model:
         raise RuntimeError("No Pi model is available on this workspace.")
