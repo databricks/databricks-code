@@ -356,8 +356,7 @@ The output looks like:
 | `ug status` | Show current workspace, base URLs, managed config files, and selected models |
 | `ug export` | Print the workspace's managed config as portable JSON (`--file <file>` / `-f` to write a file) |
 | `ug doctor` | Diagnose local issues (uv, npm, Databricks CLI, workspace, credentials, agent CLIs, tracing) and offer to fix any problems found |
-| `ug usage` | Show AI Gateway usage summary, plus your budget spend against its alert threshold when the workspace reports one |
-| `ug usage --warehouse-id <id>` | Query a specific SQL warehouse instead of discovering one |
+| `ug usage` | Show your AI Gateway dollars spent and total budget |
 | `ug revert` | Clear saved state and restore backed-up config files |
 | `ug configure --dry-run` | Preview config files without writing them |
 | `ug configure --agents claude,codex` | Configure specific agents without the interactive picker |
