@@ -225,6 +225,24 @@ class TestDiscoverClaudeModels:
         assert reason is None
         assert models["opus"] == "databricks-claude-opus-4-8"
 
+    def test_buckets_system_ai_claude_models(self, monkeypatch):
+        payload = {
+            "data": [
+                {"id": "system.ai.claude-opus-4-8"},
+                {"id": "system.ai.claude-sonnet-4-6"},
+                {"id": "system.ai.glm-5-3-flash"},
+            ]
+        }
+        monkeypatch.setattr(db_mod, "_http_get_json", lambda *_args, **_kwargs: (payload, None))
+
+        models, reason = db_mod.discover_claude_models(WS, "token")
+
+        assert reason is None
+        assert models == {
+            "opus": "system.ai.claude-opus-4-8",
+            "sonnet": "system.ai.claude-sonnet-4-6",
+        }
+
     def test_buckets_fable_family(self, monkeypatch):
         payload = {
             "data": [
@@ -3013,6 +3031,7 @@ class TestCodingAgentConfigCrudClients:
         assert "budget_id" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
         assert "default_options" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
         assert "tiers" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
+        assert "spec_version" not in db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS
 
     def test_update_mask_covers_every_field_the_manifest_can_set(self):
         # A path ucode omits is a field a re-run silently cannot clear, since the server merges per
@@ -3038,7 +3057,7 @@ class TestCodingAgentConfigCrudClients:
                 }
             )
         )
-        assert set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS) == emitted | {"spec_version"}
+        assert set(db_mod.MANAGED_CONFIG_UPDATE_MASK_PATHS) == emitted
 
     def test_delete_returns_only_a_reason(self, monkeypatch):
         seen = {}
