@@ -56,7 +56,7 @@ CLAUDE_ROUTED_AGENT_PROMPT = (
 # Keep this pattern in sync with the server-side Anthropic model prefixing logic. The prefix is
 # needed because Anthropic omits models from its catalog unless the model id contains "anthropic"
 # or "claude".
-_ANTHROPIC_AIGW_MODEL_RE = re.compile(r"^anthropic-(?:aigw-[0-9a-fA-F]{8}|aigtwy-[^-]+)-(.+)$")
+_ANTHROPIC_AIGW_MODEL_RE = re.compile(r"^anthropic-aigw-[0-9a-fA-F]{8}-(.+)$")
 
 
 def _model_picker_catalog() -> AnthropicModelCatalog | None:

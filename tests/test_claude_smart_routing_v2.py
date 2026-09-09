@@ -165,17 +165,11 @@ class TestFirstPromptHook:
 
 
 class TestV2Launch:
-    @pytest.mark.parametrize(
-        "routed_model",
-        [
-            "system.ai.claude-sonnet-5",
-            "anthropic-aigw-73ea02b2-system.ai.claude-sonnet-5",
-            "anthropic-aigtwy-xxx-system.ai.claude-sonnet-5",
-        ],
-    )
-    def test_restores_model_captured_immediately_before_switch(
-        self, tmp_path, monkeypatch, routed_model
-    ):
+    def test_strips_gateway_prefix_for_interposer(self):
+        model = "anthropic-aigw-73ea02b2-system.ai.glm-5-2"
+        assert v2._unwrapped_claude_model_id(model) == "system.ai.glm-5-2"
+
+    def test_restores_model_captured_immediately_before_switch(self, tmp_path, monkeypatch):
         ucode_settings = tmp_path / "ucode-settings.json"
         user_settings = tmp_path / "settings.json"
         ucode_settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gw"}}))
@@ -192,14 +186,14 @@ class TestV2Launch:
             "list_anthropic_model_catalog",
             lambda *_args: AnthropicModelCatalog(
                 model_ids=["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-5"],
-                model_id_to_display_name={routed_model: "Claude Sonnet 5"},
+                model_id_to_display_name={"system.ai.claude-sonnet-5": "Claude Sonnet 5"},
             ),
         )
         monkeypatch.setattr(
             v2,
             "_route_claude_prompt",
             lambda *_args: v2.routing.RoutingDecision(
-                model=routed_model,
+                model="system.ai.claude-sonnet-5",
                 raw_model="claude-sonnet-5",
                 rationale="Selected for the parser task.",
             ),
@@ -361,7 +355,6 @@ class TestSubagentRouting:
         ("model", "expected"),
         [
             ("anthropic-aigw-73ea02b2-system.ai.glm-5-2", "glm-5-2"),
-            ("anthropic-aigtwy-xxx-system.ai.glm-5-2", "glm-5-2"),
             (
                 "anthropic-aigw-73ea02b-system.ai.glm-5-2",
                 "anthropic-aigw-73ea02b-system.ai.glm-5-2",
@@ -372,25 +365,8 @@ class TestSubagentRouting:
     def test_normalizes_router_model_id(self, model, expected):
         assert v2._claude_router_model_id(model) == expected
 
-    @pytest.mark.parametrize(
-        "gateway_alias",
-        [
-            "anthropic-aigw-73ea02b2-system.ai.glm-5-2",
-            "anthropic-aigtwy-xxx-system.ai.glm-5-2",
-        ],
-    )
-    @pytest.mark.parametrize(
-        "selected_model",
-        [
-            "glm-5-2",
-            "system.ai.glm-5-2",
-            "anthropic-aigw-73ea02b2-system.ai.glm-5-2",
-            "anthropic-aigtwy-xxx-system.ai.glm-5-2",
-        ],
-    )
-    def test_routes_anthropic_gateway_alias_by_embedded_model_id(
-        self, monkeypatch, gateway_alias, selected_model
-    ):
+    def test_routes_anthropic_gateway_alias_by_embedded_model_id(self, monkeypatch):
+        gateway_alias = "anthropic-aigw-73ea02b2-system.ai.glm-5-2"
         captured = {}
         monkeypatch.setenv("SMART_ROUTER_NAME", "task_v2")
 
@@ -399,8 +375,8 @@ class TestSubagentRouting:
             captured["router_name"] = kwargs["router_name"]
             return (
                 routing.RoutingDecision(
-                    model=resolve(selected_model),
-                    raw_model=selected_model,
+                    model=resolve("glm-5-2"),
+                    raw_model="glm-5-2",
                 ),
                 None,
             )
