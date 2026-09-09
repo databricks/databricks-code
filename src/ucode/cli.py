@@ -2337,6 +2337,13 @@ def codex_cmd(
             "before any `--` separator.",
         ),
     ] = None,
+    parent: Annotated[
+        str | None,
+        typer.Option(
+            "--parent",
+            help="Discover model services in `<catalog>.<schema>`.",
+        ),
+    ] = None,
     refresh: Annotated[
         bool,
         typer.Option(
@@ -2378,6 +2385,7 @@ def codex_cmd(
             refresh=refresh,
             skip_preflight=skip_preflight,
             workspace_url=workspace,
+            parent_schema=parent,
         )
 
 

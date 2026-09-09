@@ -430,7 +430,9 @@ def configure_tool(
 ) -> dict:
     result: dict | tuple[dict, str]
     if tool == "codex":
-        result = codex.write_tool_config(state, model, provider=provider)
+        result = codex.write_tool_config(
+            state, model, provider=provider, parent_schema=parent_schema
+        )
     elif tool == "claude":
         # A Model Provider Service routes by header and pins no Databricks
         # model, so the usual "model required" guard doesn't apply to claude.
