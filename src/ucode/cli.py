@@ -48,6 +48,7 @@ from ucode.config_io import is_dry_run, restore_file, set_dry_run
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
+    create_databricks_user_token,
     discover_claude_models,
     discover_codex_models,
     discover_gemini_models,
@@ -1391,7 +1392,8 @@ def auth_token_cmd(
         print_err("No workspace configured. Run `ug configure` first.")
         raise typer.Exit(1)
     profile = profile or state.get("profile")
-    if use_pat or state.get("use_pat"):
+    use_static_token = bool(use_pat or state.get("use_pat"))
+    if use_static_token:
         # --use-pat explicitly means "serve the profile's static PAT". Fail
         # closed if it can't be read rather than falling through to OAuth —
         # `auth token` cannot serve a PAT-only profile, so that path would
@@ -1405,7 +1407,15 @@ def auth_token_cmd(
             )
             raise typer.Exit(1)
     try:
-        token = get_databricks_token(workspace, profile, force_refresh=force_refresh)
+        if use_static_token:
+            token = get_databricks_token(workspace, profile)
+        else:
+            # The OAuth token is used to mint a short-lived user token, so it
+            # must be fresh even when the caller did not explicitly request a
+            # refresh.  ``--force-refresh`` remains accepted for callers (such
+            # as OpenCode's 401 retry path) that already pass it.
+            token = get_databricks_token(workspace, profile, force_refresh=True)
+            token = create_databricks_user_token(workspace, token, lifetime_seconds=10)
     except RuntimeError as exc:
         print_err(str(exc))
         raise typer.Exit(1) from None

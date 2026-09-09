@@ -169,6 +169,10 @@ class TestRenderOverlay:
         overlay, _ = claude.render_overlay(WS, "s4")
         assert "x-databricks-use-coding-agent-mode" in overlay["env"]["ANTHROPIC_CUSTOM_HEADERS"]
 
+    def test_auth_token_cache_ttl(self):
+        overlay, _ = claude.render_overlay(WS, "s4")
+        assert overlay["env"]["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] == "900000"
+
     def test_does_not_disable_experimental_betas(self):
         # Would suppress the beta header 1h prompt caching needs.
         overlay, _ = claude.render_overlay(WS, "s4")

@@ -27,6 +27,7 @@ from ucode.databricks import (
     build_skills_mcp_url,
     build_tool_base_url,
     classify_model_family,
+    create_databricks_user_token,
     databricks_cli_version,
     discover_sql_warehouses,
     ensure_databricks_cli_version,
@@ -61,6 +62,22 @@ class _FakeResponse:
 
     def read(self):
         return self._body
+
+
+class TestCreateDatabricksUserToken:
+    def test_creates_token_with_requested_lifetime(self, monkeypatch):
+        calls = []
+
+        def fake_post(url, token, payload, timeout=10):
+            calls.append((url, token, payload, timeout))
+            return {"token_value": "short-lived"}, None
+
+        monkeypatch.setattr(db_mod, "_http_post_json", fake_post)
+
+        assert create_databricks_user_token(WS, "oauth-token", lifetime_seconds=10) == "short-lived"
+        assert calls == [
+            (f"{WS}/api/2.0/token/create", "oauth-token", {"lifetime_seconds": 10}, 10)
+        ]
 
 
 class TestWorkspaceHostname:

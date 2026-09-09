@@ -218,6 +218,8 @@ class TestHydrateState:
 
         assert result["agents"]["claude"]["model"] == "claude-opus"
         assert result["agents"]["claude"]["base_url"] == FAKE_URLS["claude"]
+        assert result["agents"]["claude"]["auth_refresh_interval_ms"] == 900_000
+        assert result["agents"]["claude"]["env"]["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] == "900000"
         # Cross-platform helper, not the old POSIX `if [ -n ... ]` pipeline (#116).
         assert "auth-token" in result["agents"]["claude"]["auth_command"]
         assert "if [ -n" not in result["agents"]["claude"]["auth_command"]
@@ -227,8 +229,10 @@ class TestHydrateState:
         codex_auth = result["agents"]["codex"]["auth"]
         assert codex_auth["command"] != "sh"
         assert codex_auth["args"][0] == "auth-token"
+        assert codex_auth["refresh_interval_ms"] == 900_000
         assert result["agents"]["pi"]["model"] == "claude-opus"
         assert result["agents"]["pi"]["base_urls"] == FAKE_URLS["pi"]
+        assert result["agents"]["pi"]["auth_refresh_interval_ms"] == 900_000
 
     def test_normalizes_managed_configs_dict_entry(self):
         state = {"managed_configs": {"claude": {"keys": [["env", "X"]]}}}
