@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -188,6 +189,7 @@ class TestCodexWriteConfig:
         monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", backup_path)
         monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
         monkeypatch.setattr(codex, "save_state", lambda state: None)
+        monkeypatch.setattr(codex, "_provider_catalog_path", lambda *a, **k: None)
 
         # An earlier run pinned a model.
         codex.write_tool_config({"workspace": WS, "codex_models": ["gpt-5"]})
@@ -374,6 +376,116 @@ class TestCodexWriteConfig:
         doc = read_toml_safe(legacy_path)
         assert doc["profiles"]["other"]["model_provider"] == "keep"
         assert doc["profiles"]["ucode"]["model_provider"] == "ucode-databricks"
+
+
+_BUILTIN_CATALOG = {
+    "models": [
+        {"slug": "gpt-5.6-luna", "display_name": "GPT-5.6-Luna", "context_window": 272000},
+        {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "context_window": 272000},
+    ]
+}
+
+
+class TestCodexCanonicalSlug:
+    def test_strips_region_and_vendor(self):
+        assert codex._canonical_codex_slug("us.openai.gpt-5.6-luna") == "gpt-5.6-luna"
+
+    def test_strips_vendor_without_region(self):
+        assert codex._canonical_codex_slug("openai.gpt-oss-120b-1:0") == "gpt-oss-120b-1:0"
+
+    def test_leaves_non_openai_unchanged(self):
+        assert (
+            codex._canonical_codex_slug("anthropic.claude-opus-4-8") == "anthropic.claude-opus-4-8"
+        )
+        assert codex._canonical_codex_slug("us.xai.grok-4.6") == "us.xai.grok-4.6"
+
+
+class TestCodexBuildModelCatalog:
+    def _patch(self, tmp_path, monkeypatch, catalog=_BUILTIN_CATALOG):
+        monkeypatch.setattr(codex, "CODEX_MODEL_CATALOG_PATH", tmp_path / "catalog.json")
+        monkeypatch.setattr(
+            codex, "_codex_builtin_catalog", lambda: json.loads(json.dumps(catalog))
+        )
+
+    def test_clones_openai_targets_and_skips_others(self, tmp_path, monkeypatch):
+        self._patch(tmp_path, monkeypatch)
+        path = codex.build_model_catalog(
+            ["us.openai.gpt-5.6-luna", "anthropic.claude-opus-4-8", "us.xai.grok-4.6"]
+        )
+        assert path is not None
+        slugs = [m["slug"] for m in json.loads(path.read_text())["models"]]
+        assert "us.openai.gpt-5.6-luna" in slugs  # cloned
+        assert "anthropic.claude-opus-4-8" not in slugs  # no codex metadata to borrow
+        assert "us.xai.grok-4.6" not in slugs
+
+    def test_clone_copies_canonical_metadata(self, tmp_path, monkeypatch):
+        self._patch(tmp_path, monkeypatch)
+        path = codex.build_model_catalog(["us.openai.gpt-5.6-luna"])
+        clone = next(
+            m
+            for m in json.loads(path.read_text())["models"]
+            if m["slug"] == "us.openai.gpt-5.6-luna"
+        )
+        assert clone["context_window"] == 272000
+        assert clone["display_name"] == "GPT-5.6-Luna"
+
+    def test_idempotent_no_duplicate_clones(self, tmp_path, monkeypatch):
+        self._patch(tmp_path, monkeypatch)
+        codex.build_model_catalog(["us.openai.gpt-5.6-luna"])
+        path = codex.build_model_catalog(["us.openai.gpt-5.6-luna"])
+        slugs = [m["slug"] for m in json.loads(path.read_text())["models"]]
+        assert slugs.count("us.openai.gpt-5.6-luna") == 1
+
+    def test_no_matching_targets_returns_none(self, tmp_path, monkeypatch):
+        self._patch(tmp_path, monkeypatch)
+        assert codex.build_model_catalog(["anthropic.claude-opus-4-8"]) is None
+
+    def test_returns_none_when_codex_catalog_unavailable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(codex, "CODEX_MODEL_CATALOG_PATH", tmp_path / "catalog.json")
+        monkeypatch.setattr(codex, "_codex_builtin_catalog", lambda: None)
+        assert codex.build_model_catalog(["us.openai.gpt-5.6-luna"]) is None
+
+
+class TestCodexProviderCatalogIntegration:
+    def _patch(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
+        monkeypatch.setattr(codex, "agent_version", lambda binary: "0.134.0")
+        monkeypatch.setattr(codex, "save_state", lambda state: None)
+        return config_path
+
+    def test_provider_pins_model_catalog_json(self, tmp_path, monkeypatch):
+        config_path = self._patch(tmp_path, monkeypatch)
+        catalog = tmp_path / "ucode-model-catalog.json"
+        monkeypatch.setattr(codex, "_provider_catalog_path", lambda state, provider: catalog)
+        codex.write_tool_config({"workspace": WS}, provider="eng.ai.bedrock")
+        assert read_toml_safe(config_path)["model_catalog_json"] == str(catalog)
+
+    def test_no_provider_drops_stale_catalog_pin(self, tmp_path, monkeypatch):
+        config_path = self._patch(tmp_path, monkeypatch)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text('model_catalog_json = "/old/catalog.json"\n', encoding="utf-8")
+        monkeypatch.setattr(codex, "_provider_catalog_path", lambda state, provider: None)
+        codex.write_tool_config({"workspace": WS})
+        assert "model_catalog_json" not in read_toml_safe(config_path)
+
+
+class TestClearModelPreferencesWithMps:
+    def test_skips_clear_when_mps_header_present(self, tmp_path, monkeypatch):
+        config_path = tmp_path / ".codex" / "ucode.config.toml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            'model = "us.openai.gpt-5.6-luna"\n'
+            "[model_providers.ucode-databricks.http_headers]\n"
+            'Databricks-Model-Provider-Service = "eng.ai.bedrock"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(codex, "CODEX_CONFIG_PATH", config_path)
+        monkeypatch.setattr(codex, "CODEX_BACKUP_PATH", tmp_path / "backup.toml")
+
+        assert codex.clear_model_preferences({}) is False
+        assert read_toml_safe(config_path)["model"] == "us.openai.gpt-5.6-luna"
 
 
 class TestCodexLegacyLayoutDetection:
