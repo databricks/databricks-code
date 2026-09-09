@@ -167,6 +167,7 @@ CLAUDE_MANAGED_CUSTOM_HEADER_NAMES = frozenset(
         "x-databricks-use-coding-agent-mode",
         "user-agent",
         "databricks-model-provider-service",
+        "databricks-model-service-parent-schema",
     }
 )
 CLAUDE_TRACING_STOP_HOOK_SUFFIX = " autolog claude stop-hook"
@@ -321,6 +322,7 @@ def render_overlay(
     relayed_base_url: str | None = None,
     route_root_model: str | None = None,
     custom_model: str | None = None,
+    parent_schema: str | None = None,
 ) -> tuple[dict, list[list[str]]]:
     """Return (overlay, managed_key_paths) for Claude settings.json.
 
@@ -358,6 +360,8 @@ def render_overlay(
     ]
     if provider:
         header_lines.append(f"Databricks-Model-Provider-Service: {provider}")
+    elif parent_schema:
+        header_lines.append(f"Databricks-Model-Service-Parent-Schema: {parent_schema}")
     # Relayed: the X-Databricks-AI-Gateway-Token swap header is added per request
     # by the refresh proxy, not here — a static value would go stale mid-session.
     custom_headers = "\n".join(header_lines)
@@ -572,6 +576,7 @@ def write_tool_config(
     route_root_model: str | None = None,
     custom_model: str | None = None,
     coding_agent_config_defaults: dict[str, str] | None = None,
+    parent_schema: str | None = None,
 ) -> dict:
     backup_existing_file(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
     web_search_model = _resolve_web_search_model(state)
@@ -593,6 +598,7 @@ def write_tool_config(
         relayed_base_url=relayed_base_url,
         route_root_model=route_root_model,
         custom_model=custom_model,
+        parent_schema=parent_schema,
     )
     tracing_env_vars = tracing_env(state, "claude")
     stop_hook_command = claude_tracing_stop_hook_command() if tracing_env_vars else None

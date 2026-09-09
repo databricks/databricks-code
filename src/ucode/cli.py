@@ -1965,10 +1965,18 @@ def _launch_tool(
     managed: dict | None = None,
     recommendation: dict | None = None,
     model: str | None = None,
+    parent_schema: str | None = None,
     custom_oauth: CustomOAuthConfig | None = None,
 ) -> None:
     try:
         tool = normalize_tool(tool_name)
+        if parent_schema is not None:
+            parts = parent_schema.split(".")
+            if len(parts) != 2 or any(
+                not part or any(ch in " /" or ord(ch) < 32 or ord(ch) == 127 for ch in part)
+                for part in parts
+            ):
+                raise RuntimeError("--parent must be `<catalog>.<schema>`.")
         explicit_prompt = _has_explicit_prompt(ctx)
         smart_routing_enabled = smart_routing_v2.enabled()
         # Launchers such as isaac put their harness arguments after `--`, so the harness's own
@@ -2063,6 +2071,7 @@ def _launch_tool(
                 )
             if managed_provider:
                 provider = managed_provider
+        effective_parent_schema = None if provider else parent_schema
         # Checked after the managed config settles `provider`: an admin-set provider must trip this
         # guard too, or routing would be persisted as on while a provider is active.
         if tool in CAN_USE_CACHED_CONFIG_AGENTS and smart_routing_enabled and provider:
@@ -2157,6 +2166,7 @@ def _launch_tool(
             # Claude's explicit model is launch-scoped and is passed through LaunchOptions below.
             custom_model=None,
             coding_agent_config_defaults=coding_agent_config_defaults,
+            parent_schema=effective_parent_schema,
         )
         # Relayed = a Claude subscription: forward --model to Claude Code's own flag, like `-- --model X`.
         if tool == "claude" and provider and relayed and model and not forwarded_model:
@@ -2420,6 +2430,13 @@ def codex_cmd(
             "before any `--` separator.",
         ),
     ] = None,
+    parent: Annotated[
+        str | None,
+        typer.Option(
+            "--parent",
+            help="Discover model services in `<catalog>.<schema>`.",
+        ),
+    ] = None,
     refresh: Annotated[
         bool,
         typer.Option(
@@ -2480,6 +2497,7 @@ def codex_cmd(
             refresh=refresh,
             skip_preflight=skip_preflight,
             workspace_url=workspace,
+            parent_schema=parent,
             custom_oauth=custom_oauth,
         )
 
@@ -2498,6 +2516,13 @@ def claude_cmd(
             help="Route through a Unity Catalog Model Provider Service "
             "(<catalog>.<schema>.<name>). Skips Databricks model pinning; pass "
             "before any `--` separator.",
+        ),
+    ] = None,
+    parent: Annotated[
+        str | None,
+        typer.Option(
+            "--parent",
+            help="Discover model services in `<catalog>.<schema>`.",
         ),
     ] = None,
     model: Annotated[
@@ -2582,6 +2607,7 @@ def claude_cmd(
             refresh=refresh,
             skip_preflight=skip_preflight,
             workspace_url=workspace,
+            parent_schema=parent,
             custom_oauth=custom_oauth,
         )
 

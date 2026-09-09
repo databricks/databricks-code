@@ -17,6 +17,7 @@ from ucode.config_io import (
     ToolSpec,
     backup_existing_file,
     deep_merge_dict,
+    prune_key_paths,
     read_toml_safe,
     write_toml_file,
 )
@@ -59,6 +60,7 @@ CODEX_BACKUP_PATH = APP_DIR / "codex-ucode-config.backup.toml"
 LEGACY_CODEX_CONFIG_PATH = CODEX_CONFIG_DIR / "config.toml"
 LEGACY_CODEX_BACKUP_PATH = APP_DIR / "codex-config.backup.toml"
 CODEX_MODEL_PROVIDER_NAME = "ucode-databricks"
+MODEL_SERVICE_PARENT_SCHEMA_HEADER = "Databricks-Model-Service-Parent-Schema"
 MINIMUM_CODEX_VERSION = (0, 134, 0)
 MINIMUM_CODEX_VERSION_TEXT = "0.134.0"
 MINIMUM_ROUTING_CODEX_VERSION = (0, 145, 0)
@@ -147,6 +149,7 @@ def _provider_block(
     databricks_profile: str | None,
     use_pat: bool = False,
     provider: str | None = None,
+    parent_schema: str | None = None,
     custom_oauth: CustomOAuthConfig | None = None,
 ) -> dict:
     if custom_oauth:
@@ -161,6 +164,8 @@ def _provider_block(
     # provider from this header on every request.
     if provider:
         http_headers["Databricks-Model-Provider-Service"] = provider
+    elif parent_schema:
+        http_headers[MODEL_SERVICE_PARENT_SCHEMA_HEADER] = parent_schema
     return {
         "name": "Databricks AI Gateway",
         "base_url": base_url,
@@ -183,6 +188,7 @@ def render_overlay(
     databricks_profile: str | None = None,
     use_pat: bool = False,
     provider: str | None = None,
+    parent_schema: str | None = None,
     custom_oauth: CustomOAuthConfig | None = None,
 ) -> dict:
     overlay: dict = {"model_provider": CODEX_MODEL_PROVIDER_NAME}
@@ -190,7 +196,12 @@ def render_overlay(
         overlay["model"] = model
     overlay["model_providers"] = {
         CODEX_MODEL_PROVIDER_NAME: _provider_block(
-            workspace, databricks_profile, use_pat, provider, custom_oauth
+            workspace,
+            databricks_profile,
+            use_pat=use_pat,
+            provider=provider,
+            parent_schema=parent_schema,
+            custom_oauth=custom_oauth,
         ),
     }
     return overlay
@@ -202,6 +213,7 @@ def render_legacy_overlay(
     databricks_profile: str | None = None,
     use_pat: bool = False,
     provider: str | None = None,
+    parent_schema: str | None = None,
     custom_oauth: CustomOAuthConfig | None = None,
 ) -> dict:
     """Overlay for Codex CLI < 0.134.0, which only reads `~/.codex/config.toml`.
@@ -217,7 +229,12 @@ def render_legacy_overlay(
         "profiles": {CODEX_PROFILE_NAME: profile_block},
         "model_providers": {
             CODEX_MODEL_PROVIDER_NAME: _provider_block(
-                workspace, databricks_profile, use_pat, provider, custom_oauth
+                workspace,
+                databricks_profile,
+                use_pat=use_pat,
+                provider=provider,
+                parent_schema=parent_schema,
+                custom_oauth=custom_oauth,
             ),
         },
     }
@@ -311,7 +328,12 @@ def revert_legacy_shared_config() -> bool:
     return _strip_legacy_ucode_entries(_legacy_config_path())
 
 
-def write_tool_config(state: dict, model: str | None = None, provider: str | None = None) -> dict:
+def write_tool_config(
+    state: dict,
+    model: str | None = None,
+    provider: str | None = None,
+    parent_schema: str | None = None,
+) -> dict:
     workspace = state["workspace"]
     # Leave model selection to Codex. The gateway still receives the configured
     # provider and authentication settings, while Codex uses its own default.
@@ -332,6 +354,7 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
             databricks_profile,
             use_pat=bool(state.get("use_pat")),
             provider=provider,
+            parent_schema=parent_schema,
             custom_oauth=state.get("custom_oauth"),
         )
         doc = read_toml_safe(LEGACY_CODEX_CONFIG_PATH)
@@ -345,6 +368,18 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         ):
             for key in ("model", "model_reasoning_effort"):
                 profiles[CODEX_PROFILE_NAME].pop(key, None)
+        if parent_schema is None:
+            prune_key_paths(
+                doc,
+                [
+                    [
+                        "model_providers",
+                        CODEX_MODEL_PROVIDER_NAME,
+                        "http_headers",
+                        MODEL_SERVICE_PARENT_SCHEMA_HEADER,
+                    ]
+                ],
+            )
         write_toml_file(LEGACY_CODEX_CONFIG_PATH, doc)
         state = mark_tool_managed(state, "codex", LEGACY_MANAGED_KEYS)
         save_state(state)
@@ -358,6 +393,7 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         databricks_profile,
         use_pat=bool(state.get("use_pat")),
         provider=provider,
+        parent_schema=parent_schema,
         custom_oauth=state.get("custom_oauth"),
     )
 
@@ -367,6 +403,10 @@ def write_tool_config(state: dict, model: str | None = None, provider: str | Non
         if chosen_model is None:
             for key in ("model", "model_reasoning_effort"):
                 base.pop(key, None)
+        if parent_schema is None:
+            base["model_providers"][CODEX_MODEL_PROVIDER_NAME]["http_headers"].pop(
+                MODEL_SERVICE_PARENT_SCHEMA_HEADER, None
+            )
         return base
 
     doc = read_toml_safe(CODEX_CONFIG_PATH)
