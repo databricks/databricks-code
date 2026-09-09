@@ -1047,6 +1047,14 @@ class TestConfigureMcpCommand:
         note = mcp._mcp_service_choice("mycat.sch.weather", {"mycat-sch-weather"}, additive=True)
         assert note.value == "mycat-sch-weather" and note.disabled
 
+    def test_merge_new_choices_dedupes_by_value(self):
+        # Background-streamed rows are deduped against what's already shown, by Choice value,
+        # so a service already listed (e.g. from the fast system.ai pass) isn't added twice.
+        a = mcp._mcp_service_choice("cat.sch.a", set(), additive=False)
+        b = mcp._mcp_service_choice("cat.sch.b", set(), additive=False)
+        merged = mcp._merge_new_choices([a], [a, b])
+        assert [c.value for c in merged] == [b.value]
+
     def test_skips_slow_walks_unless_source_selected(self, monkeypatch):
         """Vector Search and UC functions walk the workspace and are OFF by
         default on the search-sources screen, so their discovery must not run

@@ -8,6 +8,7 @@ import shutil
 import string
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
@@ -731,6 +732,16 @@ def _mcp_service_choice(name: str, known_names: set[str], additive: bool) -> que
     return _add_choice(f"{MCP_SERVICE_SELECTION_PREFIX}{name}", display_title)
 
 
+def _merge_new_choices(
+    existing: list[questionary.Choice | questionary.Separator],
+    new_choices: list[questionary.Choice],
+) -> list[questionary.Choice]:
+    """Return the choices from ``new_choices`` not already present in ``existing`` (compared by
+    Choice value). Used to dedupe background-streamed picker rows against what's already shown."""
+    shown = {c.value for c in existing if isinstance(c, questionary.Choice)}
+    return [c for c in new_choices if isinstance(c, questionary.Choice) and c.value not in shown]
+
+
 def _scrolling_checkbox(
     message: str,
     choices: list[questionary.Choice | questionary.Separator],
@@ -931,19 +942,34 @@ def _scrolling_checkbox(
     )
 
     if background_loader is not None:
+        started = False
+
+        def run_on_loop(fn: Callable[[], None]) -> None:
+            # Background updates MUST run on the picker's event-loop thread: mutating the control
+            # off-thread drops rows (prompt_toolkit's invalidate() no-ops until the app is running)
+            # and disturbs live input (toggling/removal). Wait briefly for the app to start, then
+            # hand `fn` to the loop; bail once the picker has closed or if it never starts in time.
+            nonlocal started
+            deadline = time.monotonic() + 15.0
+            while not (app.is_running and app.loop is not None):
+                if started or time.monotonic() > deadline:
+                    return
+                time.sleep(0.02)
+            started = True
+            with suppress(Exception):
+                app.loop.call_soon_threadsafe(fn)
 
         def append(new_choices: list[questionary.Choice]) -> None:
-            # Called from the loader (worker) thread. Rebind choices atomically (rather than
-            # mutating in place) so a concurrent render never iterates a changing list, and
-            # dedupe by value against what's already shown. Selections are tracked by value,
-            # so appended rows never disturb existing checkboxes/scroll/filter.
-            shown = {c.value for c in control.choices if isinstance(c, questionary.Choice)}
-            additions = [c for c in new_choices if c.value not in shown]
-            if additions:
-                control.choices = [*control.choices, *additions]
-                loading["found"] += len(additions)
-            with suppress(Exception):
-                app.invalidate()
+            def apply() -> None:
+                # On the UI thread: rebind choices (atomic; render reads the list live) and repaint.
+                # Selections track by value, so appended rows never disturb checkboxes/scroll/filter.
+                additions = _merge_new_choices(control.choices, new_choices)
+                if additions:
+                    control.choices = [*control.choices, *additions]
+                    loading["found"] += len(additions)
+                    app.invalidate()
+
+            run_on_loop(apply)
 
         def worker() -> None:
             try:
@@ -952,9 +978,12 @@ def _scrolling_checkbox(
                 # Discovery is best-effort; a failed background walk just stops streaming.
                 pass
             finally:
-                loading["active"] = False
-                with suppress(Exception):
+
+                def finish() -> None:
+                    loading["active"] = False
                     app.invalidate()
+
+                run_on_loop(finish)
 
         threading.Thread(target=worker, name="mcp-picker-loader", daemon=True).start()
 
