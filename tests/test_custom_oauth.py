@@ -150,6 +150,11 @@ class TestCustomClientToken:
             get_custom_client_token(WS, client_id="custom-client", scopes=scopes)
         self.discovery.assert_not_called()
 
+    def test_missing_sdk_explains_how_to_install_custom_oauth(self, monkeypatch):
+        monkeypatch.setattr("ucode.custom_oauth.oauth", None)
+        with pytest.raises(RuntimeError, match=r"ucode\[custom-oauth\]"):
+            get_custom_client_token(WS, client_id="custom-client", scopes=TEST_SCOPES)
+
 
 class TestCustomClientCommand:
     @pytest.fixture(autouse=True)

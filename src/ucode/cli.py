@@ -15,6 +15,7 @@ import typer
 from rich.panel import Panel
 from typer.core import TyperCommand
 
+from ucode import custom_oauth
 from ucode.agents import (
     TOOL_SPECS,
     LaunchOptions,
@@ -44,12 +45,6 @@ from ucode.agents.args import has_explicit_model_arg
 from ucode.agents.codex import revert_legacy_shared_config
 from ucode.agents.pi import PI_SETTINGS_BACKUP_PATH, PI_SETTINGS_PATH
 from ucode.config_io import is_dry_run, restore_file, set_dry_run
-from ucode.custom_oauth import (
-    DEFAULT_REDIRECT_URL,
-    CustomOAuthConfig,
-    create_custom_oauth_config,
-    get_custom_client_token,
-)
 from ucode.databricks import (
     apply_pat_environment,
     build_shared_base_urls,
@@ -153,6 +148,8 @@ from ucode.ui import (
     status_badge,
 )
 from ucode.usage import usage as usage_report
+
+CustomOAuthConfig = custom_oauth.CustomOAuthConfig
 
 _DISCOVERY_CONSUMERS: dict[str, tuple[str, ...]] = {
     "claude": ("claude", "opencode", "copilot", "pi"),
@@ -316,10 +313,10 @@ def _custom_oauth_config(
     if scopes is None:
         raise RuntimeError("--scopes is required with --client-id.")
 
-    return create_custom_oauth_config(
+    return custom_oauth.create_custom_oauth_config(
         client_id,
         scopes.split(","),
-        redirect_url or DEFAULT_REDIRECT_URL,
+        redirect_url or custom_oauth.DEFAULT_REDIRECT_URL,
     )
 
 
@@ -1484,10 +1481,14 @@ def auth_token_cmd(
     try:
         if client_id is not None:
             assert scopes is not None
-            token = get_custom_client_token(
+            token = custom_oauth.get_custom_client_token(
                 workspace,
                 client_id=client_id,
-                redirect_url=redirect_url if redirect_url is not None else DEFAULT_REDIRECT_URL,
+                redirect_url=(
+                    redirect_url
+                    if redirect_url is not None
+                    else custom_oauth.DEFAULT_REDIRECT_URL
+                ),
                 scopes=scopes.split(","),
                 force_refresh=force_refresh,
             )
