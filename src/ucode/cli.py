@@ -1485,9 +1485,7 @@ def auth_token_cmd(
                 workspace,
                 client_id=client_id,
                 redirect_url=(
-                    redirect_url
-                    if redirect_url is not None
-                    else custom_oauth.DEFAULT_REDIRECT_URL
+                    redirect_url if redirect_url is not None else custom_oauth.DEFAULT_REDIRECT_URL
                 ),
                 scopes=scopes.split(","),
                 force_refresh=force_refresh,
