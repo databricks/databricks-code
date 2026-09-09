@@ -57,9 +57,11 @@ from ucode.databricks import (
     find_profile_name_for_host,
     get_databricks_profiles,
     get_databricks_token,
+    get_model_provider_service,
     install_databricks_cli,
     is_model_provider_feature_unavailable,
     is_workspace_admin,
+    list_model_provider_services,
     list_profile_entries,
     list_tool_provider_services,
     normalize_workspace_url,
@@ -67,6 +69,7 @@ from ucode.databricks import (
     resolve_pat_token,
     resolve_provider_launch_model,
     run_databricks_login,
+    service_usable_for_tool,
 )
 from ucode.managed_budget import (
     budget_usage_percent,
@@ -132,6 +135,7 @@ from ucode.tracing import configure_tracing_command
 from ucode.ui import (
     console,
     heading,
+    muted,
     print_err,
     print_heading,
     print_kv,
@@ -140,9 +144,11 @@ from ucode.ui import (
     print_success,
     print_warning,
     prompt_for_selection,
+    prompt_for_text,
     prompt_for_tools,
     prompt_for_workspace,
     prompt_yes_no,
+    render_box_table,
     set_verbosity,
     spinner,
     status_badge,
@@ -1051,6 +1057,10 @@ mcp_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(mcp_app, name="mcp", help="MCP servers exposed by ug.")
 skill_app = typer.Typer(add_completion=False, no_args_is_help=True)
 app.add_typer(skill_app, name="skill", help="Databricks Skills for your coding tools.")
+providers_app = typer.Typer(add_completion=False, no_args_is_help=True)
+app.add_typer(
+    providers_app, name="providers", help="Inspect Model Provider Services on the workspace."
+)
 setup_app = typer.Typer(add_completion=False, no_args_is_help=False)
 app.add_typer(
     setup_app,
@@ -2016,6 +2026,7 @@ def _launch_tool(
         # The router's per-launch pick for the root session. Codex pins it as the
         # resolved model; claude pins it via ANTHROPIC_MODEL (route_root_model).
         route_root_model = None
+        bedrock_targets: list[str] | None = None
         if provider:
             # Routing through a Model Provider Service pins no Databricks model;
             # the agent uses its own canonical model names (header selects the
@@ -2031,6 +2042,24 @@ def _launch_tool(
                 resolved_model, gemini_error = resolve_gemini_provider_model(state, provider, model)
                 if gemini_error:
                     raise RuntimeError(gemini_error)
+            elif tool in ("pi", "opencode"):
+                # Pi and OpenCode receive the MPS targets as their databricks-bedrock
+                # model list; a single model is also set as the default for the session.
+                _pi_token = get_databricks_token(state["workspace"], state.get("profile"))
+                with spinner("Fetching provider model targets..."):
+                    _pi_svc, _ = get_model_provider_service(provider, state["workspace"], _pi_token)
+                if _pi_svc:
+                    bedrock_targets = _pi_svc.get("targets") or []
+                    if bedrock_targets:
+                        resolved_model = bedrock_targets[0]
+                    elif _pi_svc.get("allow_all_targets"):
+                        _pi_entered = prompt_for_text(
+                            f"Enter a Bedrock model ID to use with '{provider}'",
+                            required=True,
+                        )
+                        if _pi_entered:
+                            bedrock_targets = [_pi_entered]
+                            resolved_model = _pi_entered
         else:
             # A managed default_model is the model the admin wants sessions to start on, so it goes
             # in as the explicit model rather than being applied afterwards: for codex the proto has
@@ -2064,6 +2093,7 @@ def _launch_tool(
             # Claude's explicit model is launch-scoped and is passed through LaunchOptions below.
             custom_model=None,
             coding_agent_config_defaults=coding_agent_config_defaults,
+            bedrock_targets=bedrock_targets,
         )
         # Relayed = a Claude subscription: forward --model to Claude Code's own flag, like `-- --model X`.
         if tool == "claude" and provider and relayed and model and not forwarded_model:
@@ -2484,10 +2514,18 @@ def gemini_cmd(
 )
 def opencode_cmd(
     ctx: typer.Context,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            help="Route through a Unity Catalog Model Provider Service "
+            "(<catalog>.<schema>.<name>). Pass before any `--` separator.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
 ) -> None:
     """Launch OpenCode via Databricks."""
-    _launch_tool("opencode", ctx, skip_preflight=skip_preflight)
+    _launch_tool("opencode", ctx, provider=provider, skip_preflight=skip_preflight)
 
 
 @app.command("copilot", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -2502,10 +2540,18 @@ def copilot_cmd(
 @app.command("pi", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def pi_cmd(
     ctx: typer.Context,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            help="Route through a Unity Catalog Model Provider Service "
+            "(<catalog>.<schema>.<name>). Pass before any `--` separator.",
+        ),
+    ] = None,
     skip_preflight: SkipPreflightOption = False,
 ) -> None:
     """Launch Pi coding agent via Databricks."""
-    _launch_tool("pi", ctx, skip_preflight=skip_preflight)
+    _launch_tool("pi", ctx, provider=provider, skip_preflight=skip_preflight)
 
 
 @app.command("cursor", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
@@ -3351,6 +3397,88 @@ def _verify_upgraded_commands() -> None:
                 f"Upgrade completed, but `{command} --version` failed"
                 f"{f': {detail}' if detail else '.'}"
             )
+
+
+@providers_app.command("list")
+def providers_list_cmd(
+    tool: Annotated[
+        str | None,
+        typer.Option(
+            "--tool", help="Filter to services usable by a specific tool (claude, codex)."
+        ),
+    ] = None,
+) -> None:
+    """List Model Provider Services on the workspace."""
+    state = load_state()
+    workspace = state.get("workspace")
+    if not workspace:
+        print_err("No workspace configured. Run `ucode configure` first.")
+        raise typer.Exit(1) from None
+    token = get_databricks_token(workspace, state.get("profile"))
+    with spinner("Fetching model provider services..."):
+        services, reason = list_model_provider_services(workspace, token)
+    if reason is not None:
+        print_err(f"Could not list model provider services: {reason}")
+        raise typer.Exit(1) from None
+    if tool:
+        services = [s for s in services if service_usable_for_tool(tool, s)]
+    if not services:
+        msg = "No model provider services found" + (f" for {tool}" if tool else "") + "."
+        print_note(msg)
+        return
+    rows = [
+        [
+            s["name"],
+            s["provider_type"],
+            ", ".join(s["targets"])
+            if s["targets"]
+            else ("(all)" if s["allow_all_targets"] else "—"),
+        ]
+        for s in services
+    ]
+    print_section("Model Provider Services")
+    console.print(
+        render_box_table(["Service", "Provider", "Targets"], rows, max_widths=[60, 20, 60])
+    )
+    if tool:
+        console.print(muted(f"  Filtered to services usable by {tool}."))
+
+
+@providers_app.command("show")
+def providers_show_cmd(
+    service_name: Annotated[
+        str,
+        typer.Argument(help="Fully qualified service name (catalog.schema.service)."),
+    ],
+) -> None:
+    """Show targets and configuration for a Model Provider Service."""
+    state = load_state()
+    workspace = state.get("workspace")
+    if not workspace:
+        print_err("No workspace configured. Run `ucode configure` first.")
+        raise typer.Exit(1) from None
+    token = get_databricks_token(workspace, state.get("profile"))
+    with spinner(f"Fetching {service_name}..."):
+        service, reason = get_model_provider_service(service_name, workspace, token)
+    if reason is not None:
+        print_err(f"Could not fetch '{service_name}': {reason}")
+        raise typer.Exit(1) from None
+    if service is None:
+        print_err(f"Model provider service '{service_name}' not found.")
+        raise typer.Exit(1) from None
+    print_section(service["name"])
+    print_kv("Provider type", service["provider_type"])
+    if service["relayed"]:
+        print_kv("Relay", "yes (subscription-backed, no credential stored)")
+    if service["allow_all_targets"]:
+        print_kv("Allow all targets", "yes")
+    targets = service["targets"]
+    if targets:
+        print_kv("Targets", targets[0])
+        for t in targets[1:]:
+            print_kv("", t)
+    else:
+        print_kv("Targets", "none declared")
 
 
 def main() -> None:

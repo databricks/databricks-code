@@ -426,6 +426,7 @@ def configure_tool(
     route_root_model: str | None = None,
     custom_model: str | None = None,
     coding_agent_config_defaults: dict[str, str] | None = None,
+    bedrock_targets: list[str] | None = None,
 ) -> dict:
     result: dict | tuple[dict, str]
     if tool == "codex":
@@ -446,17 +447,27 @@ def configure_tool(
             coding_agent_config_defaults=coding_agent_config_defaults,
         )
     else:
-        # Every tool in this branch needs a model — including gemini under a provider,
-        # which still pins the service's target model in the URL.
-        if not model:
+        # provider routing is claude/codex-only; every other tool needs a model —
+        # except pi with a Bedrock provider, where targets replace the model list.
+        # gemini under a provider still pins the service's target model in the URL.
+        if not model and not (tool in ("pi", "opencode") and provider and bedrock_targets):
             raise RuntimeError(f"A {tool} model must be selected before configuration.")
         if tool == "gemini":
+            assert model is not None
             result = gemini.write_tool_config(state, model, provider=provider)
         elif tool == "copilot":
+            assert model is not None
             result = copilot.write_tool_config(state, model)
         elif tool == "pi":
-            result = pi.write_tool_config(state, model)
+            result = pi.write_tool_config(
+                state, model, provider=provider, bedrock_targets=bedrock_targets
+            )
+        elif tool == "opencode":
+            result = opencode.write_tool_config(
+                state, model, provider=provider, bedrock_targets=bedrock_targets
+            )
         else:
+            assert model is not None
             result = opencode.write_tool_config(state, model)
     # gemini/opencode/copilot/pi return (state, token); codex/claude return state
     if isinstance(result, tuple):
