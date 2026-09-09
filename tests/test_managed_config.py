@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 
 import pytest
 
@@ -138,6 +139,95 @@ class TestNormalize:
         assert normalize_managed_config({}) == {}
 
 
+# A v2 CodingAgentConfig: enabled_agents keyed by agent name, models split into a `models` block +
+# `default_model` + `default_alias_models`, `http_headers`, and `spend_tiers`. What AIGTWY-4572 emits
+# and what the stub carries.
+RAW_MANIFEST_V2 = {
+    "spec_version": 1,
+    "default_agent": "claude_code",
+    "enabled_agents": {
+        "claude_code": {
+            "models": {
+                "names": ["system.ai.claude-opus-4-8", "system.ai.claude-sonnet-4-6"],
+            },
+            "default_model": "system.ai.claude-opus-4-8",
+            "default_alias_models": {
+                "opus": "system.ai.claude-opus-4-8",
+                "sonnet": "system.ai.claude-sonnet-4-6",
+                "haiku": "system.ai.claude-haiku-4-5",
+            },
+            "smart_routing_config": {"enabled": True},
+            "http_headers": {"x-databricks-workspace": "eng-ml-inference"},
+        },
+        "codex": {
+            "models": {"model_provider_service": "main.default.openai-mps"},
+            "default_model": "gpt-5.4",
+            "http_headers": {},
+        },
+    },
+    "spend_tiers": {
+        "budget_id": "c6563b45-df9a-4b19-afb2-d42dc2b52576",
+        "tiers": [
+            {
+                "spending_percentage": 0.9,
+                "default_agent": "codex",
+                "default_model": "gpt-5.4",
+            },
+        ],
+    },
+    "tracing": {"enabled": True},
+}
+
+
+class TestNormalizeV2:
+    def test_maps_agent_names_to_tool_names(self):
+        cfg = normalize_managed_config(RAW_MANIFEST_V2)
+        assert cfg["default_agent"] == "claude"
+        assert set(cfg["enabled_agents"]) == {"claude", "codex"}
+
+    def test_claude_alias_models_map_to_family_slots(self):
+        claude = normalize_managed_config(RAW_MANIFEST_V2)["enabled_agents"]["claude"]
+        assert claude["model_config"]["models"] == {
+            "default_opus_model": "system.ai.claude-opus-4-8",
+            "default_sonnet_model": "system.ai.claude-sonnet-4-6",
+            "default_haiku_model": "system.ai.claude-haiku-4-5",
+        }
+        assert claude["model_config"]["default_model"] == "system.ai.claude-opus-4-8"
+
+    def test_http_headers_map_to_custom_headers(self):
+        claude = normalize_managed_config(RAW_MANIFEST_V2)["enabled_agents"]["claude"]
+        assert claude["custom_headers"] == {"x-databricks-workspace": "eng-ml-inference"}
+
+    def test_static_names_and_service_location_are_not_yet_consumed(self):
+        # The static allow-list and auto-discovery source land with the picker/discovery writers in a
+        # follow-up; PR-1 deliberately does not carry them into the internal shape.
+        claude = normalize_managed_config(RAW_MANIFEST_V2)["enabled_agents"]["claude"]
+        assert "names" not in claude["model_config"]
+        assert "model_service_location" not in claude["model_config"]
+
+    def test_codex_provider_service(self):
+        codex = normalize_managed_config(RAW_MANIFEST_V2)["enabled_agents"]["codex"]
+        assert codex["model_config"]["model_provider_service"] == "main.default.openai-mps"
+        assert codex["model_config"]["default_model"] == "gpt-5.4"
+
+    def test_spend_tiers_normalize_like_budget_policy(self):
+        cfg = normalize_managed_config(RAW_MANIFEST_V2)
+        assert cfg["budget_policy"]["budget_id"] == "c6563b45-df9a-4b19-afb2-d42dc2b52576"
+        assert cfg["budget_policy"]["tiers"][0]["default_agent"] == "codex"
+
+    def test_v2_tracing_enabled_carries_no_table(self):
+        # v2 `tracing.enabled` has no table FQN, so nothing lands in the (table-shaped) internal key.
+        assert "tracing_table" not in normalize_managed_config(RAW_MANIFEST_V2)
+
+    def test_spec_version_not_carried_into_internal_manifest(self):
+        # Kept out so the serialize/normalize round trip (which never sees spec_version) is unaffected.
+        assert "spec_version" not in normalize_managed_config(RAW_MANIFEST_V2)
+
+    def test_unknown_v2_agent_name_dropped(self):
+        raw = {"enabled_agents": {"future_agent": {"default_model": "m"}}}
+        assert "enabled_agents" not in normalize_managed_config(raw)
+
+
 class TestGetManagedConfig:
     def test_returns_normalized_first_config(self, monkeypatch):
         monkeypatch.setattr(
@@ -196,6 +286,71 @@ class TestGetManagedConfig:
         cfg, reason_out = get_managed_config("https://ws", "tok")
         assert cfg is None
         assert reason_out == reason
+
+    def test_normalizes_v2_wire_shape(self, monkeypatch):
+        monkeypatch.setattr(
+            mc_mod, "fetch_managed_coding_agent_configs", lambda ws, tok: ([RAW_MANIFEST_V2], None)
+        )
+        cfg, reason = get_managed_config("https://ws", "tok")
+        assert reason is None
+        assert cfg["default_agent"] == "claude"
+        assert set(cfg["enabled_agents"]) == {"claude", "codex"}
+
+    def test_spec_version_newer_than_supported_is_refused(self, monkeypatch):
+        raw = {**RAW_MANIFEST_V2, "spec_version": mc_mod.MAX_SPEC_VERSION + 1}
+        monkeypatch.setattr(
+            mc_mod, "fetch_managed_coding_agent_configs", lambda ws, tok: ([raw], None)
+        )
+        cfg, reason = get_managed_config("https://ws", "tok")
+        # Refused (reason set) rather than misread, so the launch path keeps the last-known-good
+        # cache instead of applying a config it can't parse.
+        assert cfg is None
+        assert reason is not None and "spec_version" in reason
+
+    @pytest.mark.parametrize("bad_spec", ["2", 2.0, True])
+    def test_malformed_spec_version_is_refused(self, monkeypatch, bad_spec):
+        raw = {**RAW_MANIFEST_V2, "spec_version": bad_spec}
+        monkeypatch.setattr(
+            mc_mod, "fetch_managed_coding_agent_configs", lambda ws, tok: ([raw], None)
+        )
+        cfg, reason = get_managed_config("https://ws", "tok")
+        assert cfg is None
+        assert reason is not None and "spec_version" in reason
+
+
+class TestManagedConfigStub:
+    def test_stub_short_circuits_the_http_read(self, tmp_path, monkeypatch):
+        stub = tmp_path / "v2.json"
+        stub.write_text(json.dumps(RAW_MANIFEST_V2), encoding="utf-8")
+        monkeypatch.setenv("UCODE_MANAGED_CONFIG_STUB", str(stub))
+
+        def _fail(ws, tok):
+            raise AssertionError("stub set: the HTTP read must not run")
+
+        monkeypatch.setattr(mc_mod, "fetch_managed_coding_agent_configs", _fail)
+        cfg, reason = get_managed_config("https://ws", "tok")
+        assert reason is None
+        assert cfg["default_agent"] == "claude"
+
+    def test_stub_applies_the_spec_version_gate(self, tmp_path, monkeypatch):
+        stub = tmp_path / "v2.json"
+        stub.write_text(
+            json.dumps({**RAW_MANIFEST_V2, "spec_version": mc_mod.MAX_SPEC_VERSION + 1}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("UCODE_MANAGED_CONFIG_STUB", str(stub))
+        cfg, reason = get_managed_config("https://ws", "tok")
+        assert cfg is None
+        assert reason is not None and "spec_version" in reason
+
+    def test_unreadable_stub_falls_through_to_the_http_read(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("UCODE_MANAGED_CONFIG_STUB", str(tmp_path / "missing.json"))
+        monkeypatch.setattr(
+            mc_mod, "fetch_managed_coding_agent_configs", lambda ws, tok: ([RAW_MANIFEST_V2], None)
+        )
+        cfg, reason = get_managed_config("https://ws", "tok")
+        assert reason is None
+        assert cfg["default_agent"] == "claude"
 
 
 class TestPersistence:
@@ -336,13 +491,15 @@ class TestRefreshManagedConfig:
     def test_persists_and_returns_the_manifest(self, monkeypatch):
         saved: list[tuple] = []
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (MANAGED, None))
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: saved.append((ws, cfg)))
+        monkeypatch.setattr(
+            mc_mod, "save_managed_state", lambda ws, cfg, **kwargs: saved.append((ws, cfg))
+        )
         assert refresh_managed_config(_state()) == (MANAGED, False)
         assert saved == [(WORKSPACE, MANAGED)]
 
     def test_no_managed_config_returns_none(self, monkeypatch):
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
+        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg, **kwargs: None)
         result, _ = refresh_managed_config(_state())
         assert result is None
 
@@ -412,7 +569,9 @@ class TestRefreshManagedConfig:
         monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: MANAGED)
         monkeypatch.setattr(mc_mod, "print_warning", lambda msg: warnings.append(msg))
         monkeypatch.setattr(
-            mc_mod, "save_managed_state", lambda ws, cfg: pytest.fail("must not clear the cache")
+            mc_mod,
+            "save_managed_state",
+            lambda ws, cfg, **kwargs: pytest.fail("must not clear the cache"),
         )
         assert refresh_managed_config(_state()) == (MANAGED, False)
         assert "not readable by you" in warnings[0]
@@ -421,7 +580,7 @@ class TestRefreshManagedConfig:
         # A successful read saying "no config" means the admin removed it — that's authoritative,
         # so a previously persisted file must not resurrect the old policy.
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
+        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg, **kwargs: None)
         monkeypatch.setattr(
             mc_mod, "load_managed_state", lambda ws: pytest.fail("must not fall back")
         )
@@ -433,7 +592,9 @@ class TestRefreshManagedConfig:
         # failed read would put a dead policy back into force.
         saved: list[tuple] = []
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: saved.append((ws, cfg)))
+        monkeypatch.setattr(
+            mc_mod, "save_managed_state", lambda ws, cfg, **kwargs: saved.append((ws, cfg))
+        )
         monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: None)
         result, _ = refresh_managed_config(_state())
         assert result is None
@@ -477,7 +638,9 @@ class TestRefreshManagedConfig:
         reason = 'HTTP 400 Bad Request: {"error_code":"FEATURE_DISABLED"}'
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, reason))
         monkeypatch.setattr(mc_mod, "load_managed_state", lambda ws: MANAGED)
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: saved.append((ws, cfg)))
+        monkeypatch.setattr(
+            mc_mod, "save_managed_state", lambda ws, cfg, **kwargs: saved.append((ws, cfg))
+        )
         monkeypatch.setattr(
             mc_mod,
             "print_warning",
@@ -500,11 +663,76 @@ class TestRefreshManagedConfig:
 
     def test_successful_no_config_clears_the_flag(self, monkeypatch):
         monkeypatch.setattr(mc_mod, "get_managed_config", lambda ws, tok: (None, None))
-        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg: None)
+        monkeypatch.setattr(mc_mod, "save_managed_state", lambda ws, cfg, **kwargs: None)
         state = _state()
         result, flag = refresh_managed_config(state)
         assert result is None
         assert flag is False
+
+
+class TestManagedConfigTtl:
+    """The launch-time TTL gate: a recently-fetched config is reused without a network round trip.
+
+    These exercise the real persistence (the conftest isolates ``MANAGED_STATE_PATH`` to a tmp file)
+    so the on-disk ``retrieved_at`` actually drives the decision; only the network read is stubbed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_token(self, monkeypatch):
+        monkeypatch.setattr(mc_mod, "get_databricks_token", lambda ws, profile: "tok")
+
+    @staticmethod
+    def _counting_fetch(monkeypatch, result=(MANAGED, None)):
+        calls = {"n": 0}
+
+        def fetch(ws, tok):
+            calls["n"] += 1
+            return result
+
+        monkeypatch.setattr(mc_mod, "get_managed_config", fetch)
+        return calls
+
+    def test_fresh_cache_skips_the_fetch(self, monkeypatch):
+        save_managed_state(WORKSPACE, MANAGED, retrieved_at=time.time())
+        calls = self._counting_fetch(monkeypatch)
+        result, flag = refresh_managed_config(_state())
+        assert result == MANAGED
+        assert flag is False
+        assert calls["n"] == 0
+
+    def test_stale_cache_refetches(self, monkeypatch):
+        save_managed_state(
+            WORKSPACE, MANAGED, retrieved_at=time.time() - mc_mod.MANAGED_CONFIG_TTL_SECONDS - 60
+        )
+        calls = self._counting_fetch(monkeypatch)
+        refresh_managed_config(_state())
+        assert calls["n"] == 1
+
+    def test_unstamped_local_draft_is_not_treated_as_fresh(self, monkeypatch):
+        # A locally-authored draft (ucode setup) is saved without a retrieved_at, so a launch must
+        # still read the workspace rather than apply the unpublished draft as if it were fetched.
+        save_managed_state(WORKSPACE, MANAGED)  # no retrieved_at -> not a fetched cache entry
+        calls = self._counting_fetch(monkeypatch)
+        refresh_managed_config(_state())
+        assert calls["n"] == 1
+
+    def test_force_bypasses_the_ttl(self, monkeypatch):
+        save_managed_state(WORKSPACE, MANAGED, retrieved_at=time.time())  # fresh
+        calls = self._counting_fetch(monkeypatch)
+        refresh_managed_config(_state(), force=True)
+        assert calls["n"] == 1
+
+    def test_empty_cache_always_fetches(self, monkeypatch):
+        # A "no config" / feature-disabled marker must be re-checked so those states stay accurate.
+        save_managed_state(WORKSPACE, {}, retrieved_at=time.time())  # fresh but empty
+        calls = self._counting_fetch(monkeypatch)
+        refresh_managed_config(_state())
+        assert calls["n"] == 1
+
+    def test_first_launch_with_no_cache_fetches(self, monkeypatch):
+        calls = self._counting_fetch(monkeypatch)
+        refresh_managed_config(_state())
+        assert calls["n"] == 1
 
 
 class TestGetModelRecommendation:

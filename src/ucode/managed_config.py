@@ -26,7 +26,9 @@ that logic stays pure and I/O-free.
 from __future__ import annotations
 
 import json
+import math
 import os
+import time
 from pathlib import Path
 from typing import NamedTuple, cast
 
@@ -39,6 +41,11 @@ from ucode.databricks import (
 from ucode.ui import console, print_warning
 
 MANAGED_STATE_PATH = config_io.APP_DIR / "managed-state.json"
+
+# How long a fetched config stays fresh before a launch re-fetches it. The config sync is the only
+# thing gated: the budget-tier recommendation (recommendModel) still runs every launch so routing
+# tracks live spend. Hardcoded for now; a server-driven value can replace it later.
+MANAGED_CONFIG_TTL_SECONDS = 30 * 60
 
 # Shown to a developer when their workspace has no admin-defined managed config yet — the normal
 # case, not an error. Kept here so the CLI (which surfaces it) uses one consistent message.
@@ -55,6 +62,29 @@ AGENT_ENUM_TO_TOOL: dict[str, str] = {
     "CODING_AGENT_COPILOT": "copilot",
     "CODING_AGENT_PI": "pi",
     "CODING_AGENT_OPENCODE": "opencode",
+}
+
+# v2 keys ``enabled_agents`` by agent name (``claude_code``) rather than the proto enum
+# (``CODING_AGENT_CLAUDE_CODE``). The name is the enum minus its ``CODING_AGENT_`` prefix, lowered —
+# derived so a new agent stays a single edit to the enum map above.
+_AGENT_ENUM_PREFIX = "CODING_AGENT_"
+AGENT_NAME_TO_TOOL: dict[str, str] = {
+    enum[len(_AGENT_ENUM_PREFIX) :].lower(): tool for enum, tool in AGENT_ENUM_TO_TOOL.items()
+}
+
+# The newest ``spec_version`` this build understands. A config declaring a higher version is refused
+# rather than misread (forward-compat gate): the developer keeps their last-known-good cache and is
+# told to upgrade.
+MAX_SPEC_VERSION = 1
+
+# v2 ``default_alias_models`` family -> the Claude family slot the internal shape and
+# ``managed_resolve`` already key by. Lets a v2 config's alias defaults flow through the same path as
+# the legacy ``ClaudeDefaultModels`` slots.
+_V2_ALIAS_FAMILY_TO_SLOT: dict[str, str] = {
+    "opus": "default_opus_model",
+    "sonnet": "default_sonnet_model",
+    "haiku": "default_haiku_model",
+    "fable": "default_fable_model",
 }
 
 # McpServerType proto enum -> ucode's short type tag. Mirrors the selection prefixes in ``mcp.py``;
@@ -162,13 +192,9 @@ def _normalize_enabled_agent(entry: object) -> tuple[str, dict] | None:
         return None
     config_in = _as_dict(entry_dict.get("config"))
     agent_config: dict = {}
-    headers = config_in.get("custom_headers")
-    if isinstance(headers, dict):
-        clean = {
-            k: v for k, v in _as_dict(headers).items() if isinstance(k, str) and isinstance(v, str)
-        }
-        if clean:
-            agent_config["custom_headers"] = clean
+    headers = _clean_str_dict(config_in.get("custom_headers"))
+    if headers:
+        agent_config["custom_headers"] = headers
     tracing_table = _tracing_table(config_in.get("tracing_config"))
     if tracing_table:
         agent_config["tracing_table"] = tracing_table
@@ -176,6 +202,68 @@ def _normalize_enabled_agent(entry: object) -> tuple[str, dict] | None:
     if model_config is not None:
         agent_config["model_config"] = model_config
     return tool, agent_config
+
+
+def _resolve_agent_tool(key: object) -> str | None:
+    """Map an agent reference to a ucode tool name, accepting either spelling.
+
+    v1 responses carry the proto enum (``CODING_AGENT_CLAUDE_CODE``); v2 keys agents by name
+    (``claude_code``). Both resolve to the same tool, or None when this build doesn't know the agent.
+    """
+    name = _str(key)
+    if name is None:
+        return None
+    return AGENT_ENUM_TO_TOOL.get(name) or AGENT_NAME_TO_TOOL.get(name)
+
+
+def _normalize_model_config_v2(agent: dict[str, object]) -> dict | None:
+    """Normalize a v2 agent's model block into the internal ``model_config`` shape.
+
+    Reads the fields the launch/apply path already consumes: ``model_provider_service`` (under the v2
+    ``models`` object), the scalar ``default_model``, and ``default_alias_models`` (Claude family
+    defaults, mapped onto the same slots the legacy ``ClaudeDefaultModels`` shape used so they reach
+    the launch path unchanged). The v2 static ``models.names`` allow-list and ``model_service_location``
+    auto-discovery source are deliberately not read here yet — they are consumed together with the
+    picker/discovery writers in a follow-up, so parsing them now would carry fields nothing acts on.
+    """
+    result: dict = {}
+    default_model = _str(agent.get("default_model"))
+    if default_model:
+        result["default_model"] = default_model
+    provider = _str(_as_dict(agent.get("models")).get("model_provider_service"))
+    if provider:
+        result["model_provider_service"] = provider
+    slots = {
+        _V2_ALIAS_FAMILY_TO_SLOT[family]: model
+        for family, raw in _as_dict(agent.get("default_alias_models")).items()
+        if isinstance(family, str) and family in _V2_ALIAS_FAMILY_TO_SLOT and (model := _str(raw))
+    }
+    if slots:
+        result["models"] = slots
+    return result or None
+
+
+def _normalize_enabled_agent_v2(agent: object) -> dict:
+    """Normalize one v2 ``enabled_agents`` value (already keyed by agent name) into an agent config.
+
+    v2 renames ``custom_headers`` to ``http_headers`` and drops the per-agent ``tracing_config``
+    (tracing is a top-level concern in v2). Other keys map onto the same internal shape the v1 path
+    produces, so downstream reconcile/apply code is unaffected.
+    """
+    agent_dict = _as_dict(agent)
+    agent_config: dict = {}
+    headers = _clean_str_dict(agent_dict.get("http_headers"))
+    if headers:
+        agent_config["custom_headers"] = headers
+    model_config = _normalize_model_config_v2(agent_dict)
+    if model_config is not None:
+        agent_config["model_config"] = model_config
+    return agent_config
+
+
+def _clean_str_dict(value: object) -> dict[str, str]:
+    """Keep only the string->string entries of ``value`` (a headers map), or an empty dict."""
+    return {k: v for k, v in _as_dict(value).items() if isinstance(k, str) and isinstance(v, str)}
 
 
 def _tracing_table(tracing: object) -> str | None:
@@ -215,7 +303,7 @@ def _normalize_budget_policy(value: object) -> dict | None:
         if not isinstance(pct, (int, float)) or isinstance(pct, bool):
             continue
         tier_out: dict = {"spending_percentage": float(pct)}
-        agent = AGENT_ENUM_TO_TOOL.get(_str(tier_dict.get("default_agent")) or "")
+        agent = _resolve_agent_tool(tier_dict.get("default_agent"))
         if agent:
             tier_out["default_agent"] = agent
         model = _str(tier_dict.get("default_model"))
@@ -241,16 +329,10 @@ def normalize_managed_config(raw: dict) -> dict:
     display_name = _str(raw.get("display_name"))
     if display_name:
         result["display_name"] = display_name
-    default_agent = AGENT_ENUM_TO_TOOL.get(_str(raw.get("default_agent")) or "")
+    default_agent = _resolve_agent_tool(raw.get("default_agent"))
     if default_agent:
         result["default_agent"] = default_agent
-    enabled_agents: dict[str, dict] = {}
-    raw_agents = raw.get("enabled_agents")
-    for entry in raw_agents if isinstance(raw_agents, list) else []:
-        normalized = _normalize_enabled_agent(entry)
-        if normalized is not None:
-            tool, agent_config = normalized
-            enabled_agents[tool] = agent_config
+    enabled_agents = _normalize_enabled_agents(raw.get("enabled_agents"))
     if enabled_agents:
         result["enabled_agents"] = enabled_agents
     mcp_servers = _normalize_mcp_servers(raw.get("mcp_servers"))
@@ -262,10 +344,32 @@ def normalize_managed_config(raw: dict) -> dict:
     tracing_table = _tracing_table(raw.get("tracing"))
     if tracing_table:
         result["tracing_table"] = tracing_table
-    budget_policy = _normalize_budget_policy(raw.get("budget_policy"))
+    budget_policy = _normalize_budget_policy(raw.get("budget_policy") or raw.get("spend_tiers"))
     if budget_policy is not None:
         result["budget_policy"] = budget_policy
     return result
+
+
+def _normalize_enabled_agents(raw_agents: object) -> dict[str, dict]:
+    """Normalize ``enabled_agents`` from either wire shape into ``{tool: agent_config}``.
+
+    v1 sends a repeated ``EnabledAgent`` list (each carrying its own ``agent`` enum); v2 sends a map
+    keyed by agent name. Either way the result keys by ucode tool name, dropping agents this build
+    doesn't recognize.
+    """
+    enabled_agents: dict[str, dict] = {}
+    if isinstance(raw_agents, list):
+        for entry in raw_agents:
+            normalized = _normalize_enabled_agent(entry)
+            if normalized is not None:
+                tool, agent_config = normalized
+                enabled_agents[tool] = agent_config
+    elif isinstance(raw_agents, dict):
+        for key, agent in raw_agents.items():
+            tool = _resolve_agent_tool(key)
+            if tool is not None:
+                enabled_agents[tool] = _normalize_enabled_agent_v2(agent)
+    return enabled_agents
 
 
 def _decimal(value: object) -> float | None:
@@ -320,7 +424,15 @@ def get_managed_config(workspace: str, token: str) -> FetchedManagedConfig:
     about rather than silently launch without.
 
     v0 stores at most one config per workspace, so the first entry is the workspace's config.
+
+    ``UCODE_MANAGED_CONFIG_STUB`` short-circuits the HTTP read: when it names a readable JSON file,
+    that file's single CodingAgentConfig is used verbatim. It exists so this client can be exercised
+    against the v2 shape before the server emits it (AIGTWY-4572); unset in normal use. See
+    ``examples/managed-config-v2.stub.json`` for a sample.
     """
+    stub = _stub_config()
+    if stub is not None:
+        return _gate_and_normalize(stub)
     configs, reason = fetch_managed_coding_agent_configs(workspace, token)
     if reason is not None:
         if _is_feature_disabled(reason):
@@ -331,7 +443,46 @@ def get_managed_config(workspace: str, token: str) -> FetchedManagedConfig:
         return FetchedManagedConfig(None, reason)
     if not configs:
         return FetchedManagedConfig(None, None)
-    return FetchedManagedConfig(normalize_managed_config(configs[0]), None)
+    return _gate_and_normalize(configs[0])
+
+
+def _stub_config() -> dict | None:
+    """The stub CodingAgentConfig named by ``UCODE_MANAGED_CONFIG_STUB``, or None when unset/bad."""
+    path = os.environ.get("UCODE_MANAGED_CONFIG_STUB")
+    if not path:
+        return None
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        print_warning(f"UCODE_MANAGED_CONFIG_STUB could not be read ({exc}); ignoring it.")
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _gate_and_normalize(raw: dict) -> FetchedManagedConfig:
+    """Apply the ``spec_version`` forward-compat gate, then normalize.
+
+    A config declaring a ``spec_version`` newer than this build understands is refused as an
+    unresolved read (``reason`` set), so the launch path falls back to the last-known-good cache and
+    never blocks — the same treatment as any read this build can't act on.
+    """
+    spec = raw.get("spec_version")
+    if spec is not None:
+        if isinstance(spec, bool) or not isinstance(spec, int):
+            # A malformed spec_version (e.g. "2" or 2.0) is treated as unresolved rather than
+            # normalized, so the launch path keeps its last-known-good cache.
+            return FetchedManagedConfig(
+                None,
+                f"This workspace's managed config has an unrecognized spec_version ({spec!r}); "
+                "update Unity Gateway with `ug upgrade`.",
+            )
+        if spec > MAX_SPEC_VERSION:
+            return FetchedManagedConfig(
+                None,
+                f"This workspace's managed config needs a newer Unity Gateway (spec_version {spec}; "
+                f"this build supports up to {MAX_SPEC_VERSION}). Run `ug upgrade`.",
+            )
+    return FetchedManagedConfig(normalize_managed_config(raw), None)
 
 
 def _is_not_found(reason: str) -> bool:
@@ -354,7 +505,7 @@ def _is_permission_denied(reason: str) -> bool:
     return "http 403" in lowered or "permission_denied" in lowered
 
 
-def save_managed_state(workspace: str, config: dict) -> None:
+def save_managed_state(workspace: str, config: dict, *, retrieved_at: float | None = None) -> None:
     """Persist the normalized managed config to ``~/.ucode/managed-state.json`` at mode 0600.
 
     The file is org-authored, not developer-editable — 0600 keeps it readable/writable only by the
@@ -363,8 +514,15 @@ def save_managed_state(workspace: str, config: dict) -> None:
     An empty ``config`` records "this workspace has no managed config", which matters because the
     file doubles as the fallback when a later read fails: without it, removing a config server-side
     would leave the old one on disk to be reapplied after a transient outage.
+
+    ``retrieved_at`` (epoch seconds) records when this config was fetched from the workspace and is
+    set only by :func:`refresh_managed_config`; it drives the launch-time TTL skip. It is left unset
+    by default so a locally-authored draft (``ucode setup``) is never mistaken for fetched state that
+    a launch could apply without reading the workspace.
     """
-    payload = {"workspace": workspace, "config": config}
+    payload: dict = {"workspace": workspace, "config": config}
+    if retrieved_at is not None:
+        payload["retrieved_at"] = retrieved_at
     if config_io.is_dry_run():
         # Print rather than write, matching how the agent config writers behave under --dry-run.
         console.print(
@@ -408,6 +566,25 @@ def load_managed_state(workspace: str | None) -> dict | None:
     return config if isinstance(config, dict) else None
 
 
+def _load_retrieved_at(workspace: str) -> float | None:
+    """When the persisted config for ``workspace`` was last fetched, or None if absent/mismatched.
+
+    A file from before this field existed simply has no timestamp, so it reads as stale and the next
+    launch re-fetches — no migration needed.
+    """
+    data = config_io.read_json_safe(MANAGED_STATE_PATH)
+    if data.get("workspace") != workspace:
+        return None
+    retrieved_at = data.get("retrieved_at")
+    if isinstance(retrieved_at, bool) or not isinstance(retrieved_at, (int, float)):
+        return None
+    try:
+        value = float(retrieved_at)
+    except (OverflowError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def managed_state_workspace() -> str | None:
     """The workspace the on-disk managed config was authored/pulled for, or None when there is none.
 
@@ -418,12 +595,18 @@ def managed_state_workspace() -> str | None:
     return workspace if isinstance(workspace, str) and workspace else None
 
 
-def refresh_managed_config(state: dict) -> ManagedConfigResult:
+def refresh_managed_config(state: dict, *, force: bool = False) -> ManagedConfigResult:
     """Fetch the workspace's managed config and persist it as a :class:`ManagedConfigResult`.
 
     Runs on every launch so a developer picks up an admin's edits without re-running
     ``ucode configure``. The manifest is None when the workspace has no managed config — the normal
     case for a workspace whose admin hasn't published one.
+
+    A recently-fetched config is reused without a network round trip: when a non-empty config was
+    persisted within :data:`MANAGED_CONFIG_TTL_SECONDS`, that cached config is returned as-is and no
+    fetch or re-sync happens, so back-to-back launches don't re-hit the control plane. ``force``
+    bypasses the TTL to always fetch. Only a positive cached config short-circuits — an empty cache
+    (no config, or a feature-disabled marker) always re-fetches so those states stay accurate.
 
     A failed fetch never blocks the launch: an unreachable control plane shouldn't stop someone from
     coding. Instead it falls back to the last config persisted for this workspace, so the admin's
@@ -441,6 +624,10 @@ def refresh_managed_config(state: dict) -> ManagedConfigResult:
     workspace = state.get("workspace")
     if not workspace:
         return ManagedConfigResult(None, False)
+    if not force:
+        cached = _fresh_cached_config(workspace)
+        if cached is not None:
+            return ManagedConfigResult(cached, False)
     try:
         token = get_databricks_token(workspace, state.get("profile"))
     except RuntimeError as exc:
@@ -458,8 +645,24 @@ def refresh_managed_config(state: dict) -> ManagedConfigResult:
         # into force after the next transient outage.
         save_managed_state(workspace, {})
         return ManagedConfigResult(None, False)
-    save_managed_state(workspace, managed)
+    save_managed_state(workspace, managed, retrieved_at=time.time())
     return ManagedConfigResult(managed, False)
+
+
+def _fresh_cached_config(workspace: str) -> dict | None:
+    """The persisted config for ``workspace`` when it is still within the TTL, else None.
+
+    Returns only a non-empty config: an empty cache (no config, or a feature-disabled marker) reads
+    as "not fresh" so the caller re-fetches and keeps those states current.
+    """
+    retrieved_at = _load_retrieved_at(workspace)
+    if retrieved_at is None:
+        return None
+    age = time.time() - retrieved_at
+    # A future timestamp (clock rollback) reads as not-fresh so it can't pin a removed config.
+    if not 0 <= age < MANAGED_CONFIG_TTL_SECONDS:
+        return None
+    return load_managed_state(workspace) or None
 
 
 def _is_feature_disabled(reason: str) -> bool:
