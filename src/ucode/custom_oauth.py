@@ -9,9 +9,10 @@ from collections.abc import Sequence
 from typing import TypedDict
 from urllib.parse import urlparse
 
+from ucode.constants import LOCALHOST, LOOPBACK_HOST
 from ucode.ui import err_console, normalize_workspace_url, print_warning_err
 
-DEFAULT_REDIRECT_URL = "http://localhost:8020"
+DEFAULT_REDIRECT_URL = f"http://{LOCALHOST}:8020"
 
 
 class CustomOAuthConfig(TypedDict):
@@ -36,7 +37,7 @@ def _validate_redirect_url(redirect_url: str) -> None:
         redirect = urlparse(redirect_url)
         valid_redirect = (
             redirect.scheme == "http"
-            and redirect.hostname in {"localhost", "127.0.0.1"}
+            and redirect.hostname in {LOCALHOST, LOOPBACK_HOST}
             and redirect.port is not None
             and redirect.port > 0
             and not (redirect.username or redirect.password or redirect.query or redirect.fragment)
