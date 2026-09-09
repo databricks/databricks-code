@@ -3358,6 +3358,7 @@ wheels = [
 name = "ucode"
 source = { editable = "." }
 dependencies = [
+    { name = "databricks-sdk" },
     { name = "databricks-sql-connector" },
     { name = "httpx" },
     { name = "mcp" },
@@ -3381,6 +3382,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "databricks-sdk", specifier = ">=0.135.0" },
     { name = "databricks-sql-connector", specifier = ">=3.6.0" },
     { name = "httpx", specifier = ">=0.27.1" },
     { name = "mcp", specifier = ">=1.28.0" },
