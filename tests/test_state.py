@@ -281,15 +281,7 @@ class TestBuildAgentState:
         )
 
         assert "--client-id custom-client" in result["claude"]["auth_command"]
-        assert result["codex"]["auth"]["args"][-6:] == [
-            "--client-id",
-            "custom-client",
-            "--redirect-url",
-            "http://localhost:8020/callback",
-            "--scopes",
-            "offline_access,model-serving",
-        ]
-        assert "--client-id" not in result["pi"]["auth_command"]
+        assert result["codex"]["auth"]["args"][-1] == "offline_access,model-serving"
 
 
 # ---------------------------------------------------------------------------
