@@ -473,9 +473,30 @@ def default_model(state: dict) -> str | None:
     return None
 
 
+def _has_active_mps() -> bool:
+    """True when the ucode Codex config has a Databricks-Model-Provider-Service header set.
+
+    When an MPS is active the model written to the config is the Bedrock target id
+    (e.g. ``us.openai.gpt-5.6-luna``) that the gateway uses for routing.  Clearing
+    that id here would cause Codex to fall back to its own model picker, which queries
+    OpenAI directly and returns an id the MPS doesn't recognise.
+    """
+    doc = read_toml_safe(CODEX_CONFIG_PATH)
+    providers = doc.get("model_providers")
+    if not isinstance(providers, dict):
+        return False
+    gateway = providers.get(CODEX_MODEL_PROVIDER_NAME)
+    if not isinstance(gateway, dict):
+        return False
+    headers = gateway.get("http_headers")
+    return isinstance(headers, dict) and bool(headers.get("Databricks-Model-Provider-Service"))
+
+
 def clear_model_preferences(state: dict) -> bool:
     """Remove ucode profile model preferences so Codex selects its default."""
     if isinstance(state.get("codex_default_model"), str):
+        return False
+    if _has_active_mps():
         return False
     doc = read_toml_safe(CODEX_CONFIG_PATH)
     changed = False
