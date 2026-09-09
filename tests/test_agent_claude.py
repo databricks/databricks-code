@@ -738,6 +738,8 @@ class TestWriteToolConfigManagedSettings:
         # Private file still written; managed file written too.
         assert str(claude.CLAUDE_SETTINGS_PATH) in [p for p, _ in private_writes]
         assert [p for p, _ in managed_writes] == [str(FAKE_MANAGED_PATH)]
+        assert "modelPicker" not in private_writes[0][1]
+        assert "modelPicker" not in json.loads(managed_writes[0][1])
 
     def test_managed_file_preserves_other_keys(self, monkeypatch):
         private_writes: list = []
@@ -753,7 +755,7 @@ class TestWriteToolConfigManagedSettings:
         assert written["env"]["ANTHROPIC_BASE_URL"]
         assert written["apiKeyHelper"]
 
-    def test_managed_file_preserves_model_picker(self, monkeypatch):
+    def test_managed_file_updates_gateway_settings_without_changing_model_picker(self, monkeypatch):
         private_writes: list = []
         managed_writes: list = []
         picker = {
@@ -763,7 +765,14 @@ class TestWriteToolConfigManagedSettings:
                 {"model": "system.ai.glm-5-2"},
             ],
         }
-        existing = {str(FAKE_MANAGED_PATH): {"modelPicker": picker}}
+        existing = {
+            str(FAKE_MANAGED_PATH): {
+                "modelPicker": picker,
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://old-workspace.databricks.com/ai-gateway/anthropic"
+                },
+            }
+        }
         self._patch(monkeypatch, private_writes, managed_writes, existing)
         state = {"workspace": WS, "codex_models": []}
 
@@ -771,6 +780,7 @@ class TestWriteToolConfigManagedSettings:
 
         written = json.loads(managed_writes[0][1])
         assert written["modelPicker"] == picker
+        assert written["env"]["ANTHROPIC_BASE_URL"] == f"{WS}/ai-gateway/anthropic"
 
     def test_managed_file_strips_stale_gateway_model_discovery(self, monkeypatch):
         private_writes: list = []

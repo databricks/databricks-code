@@ -653,9 +653,6 @@ def write_tool_config(
                 else:
                     target_env[key] = selected_default_model
         merged = deep_merge_dict(base, overlay_for_merge)
-        if enforce_model_default_hierarchy and "modelPicker" in base:
-            # Claude's managed modelPicker is administrator-owned; ucode must leave it intact.
-            merged["modelPicker"] = copy.deepcopy(base["modelPicker"])
         overlay_custom_headers = overlay_for_merge["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY]
         merged["env"][ANTHROPIC_CUSTOM_HEADERS_ENV_KEY] = _merge_anthropic_custom_headers(
             existing_custom_headers, overlay_custom_headers
@@ -788,6 +785,9 @@ def _reconcile_managed_settings(
     The managed file is root-owned and the highest-precedence scope, so every normal Claude
     configuration mirrors ucode's settings there. The same compose operation that produced the
     private file is applied to the existing managed file, preserving unrelated IT-authored keys.
+
+    `ug configure` updates gateway-owned fields in this file, but does not generate or modify
+    the `modelPicker` object; an existing picker is retained by the merge.
 
     Relayed launches are skipped: they depend on a per-session loopback refresh proxy that only runs
     during `ucode claude`, so a bare `claude` could not reach the gateway anyway.
