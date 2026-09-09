@@ -1505,7 +1505,8 @@ _OSS_MODEL_FAMILIES = ("kimi-", "glm-", "deepseek-")
 # Claude model families ucode buckets, newest tier first. Each maps to a
 # Claude Code family alias (ANTHROPIC_DEFAULT_<FAMILY>_MODEL). Add an entry to
 # support a new family in both discovery paths (`claude-<family>-*` via the
-# model-services listing and `databricks-claude-<family>-*` via the AI Gateway).
+# model-services listing and either `databricks-claude-<family>-*` or
+# `system.ai.claude-<family>-*` via the AI Gateway).
 ANTHROPIC_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 
 
@@ -2938,7 +2939,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     result: dict[str, str] = {}
     for family in ANTHROPIC_FAMILIES:
         candidates = sorted(
-            [m for m in raw_ids if f"databricks-claude-{family}-" in m],
+            [m for m in raw_ids if f"claude-{family}-" in m],
             reverse=True,
         )
         if candidates:
@@ -2953,7 +2954,7 @@ def discover_claude_models(workspace: str, token: str) -> tuple[dict[str, str], 
     families = ",".join(ANTHROPIC_FAMILIES)
     return {}, (
         "AI Gateway returned model ids but none matched "
-        f"`databricks-claude-{{{families}}}-*` (got: {sample})"
+        f"`*-claude-{{{families}}}-*` (got: {sample})"
     )
 
 
